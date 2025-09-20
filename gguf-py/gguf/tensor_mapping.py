@@ -1463,6 +1463,90 @@ class TensorNameMap:
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
             "model.layers.{bid}.shared_head.norm",
         ),
+
+        # ifairy newly added
+        MODEL_TENSOR.TOKEN_EMBD_IMAG: (
+            "token_embeddings_imag.weight",
+        ),
+        MODEL_TENSOR.TOKEN_EMBD_REAL: (
+            "token_embeddings_real.weight",
+        ),
+        MODEL_TENSOR.FINAL_NORM_IMAG:(
+            "final_norm.weight_imag",
+        ),
+        MODEL_TENSOR.FINAL_NORM_REAL:(
+            "final_norm.weight_real",
+        ),
+        MODEL_TENSOR.FINAL_NORM:(),
+        MODEL_TENSOR.FFN_DOWN_IMAG: (
+            "layer.{bid}.mlp.down_proj.weight_imag",
+        ),
+        MODEL_TENSOR.FFN_DOWN_REAL: (
+            "layer.{bid}.mlp.down_proj.weight_real",
+        ),
+        MODEL_TENSOR.FFN_UP_IMAG: (
+            "layer.{bid}.mlp.up_proj.weight_imag",
+        ),
+        MODEL_TENSOR.FFN_UP_REAL: (
+            "layer.{bid}.mlp.up_proj.weight_real",
+        ),
+        MODEL_TENSOR.FFN_SUB_NORM_IMAG: (
+            "layer.{bid}.mlp.ffn_layernorm.weight_imag",
+        ),
+        MODEL_TENSOR.FFN_SUB_NORM_REAL: (
+            "layer.{bid}.mlp.ffn_layernorm.weight_real",
+        ),
+        MODEL_TENSOR.FFN_GATE_IMAG: (
+            "layer.{bid}.mlp.gate_proj.weight_imag",
+        ),
+        MODEL_TENSOR.FFN_GATE_REAL: (
+            "layer.{bid}.mlp.gate_proj.weight_real",
+        ),
+        MODEL_TENSOR.ATTN_Q_IMAG: (
+            "layer.{bid}.self_attn.q_proj.weight_imag",
+        ),
+        MODEL_TENSOR.ATTN_Q_REAL: (
+            "layer.{bid}.self_attn.q_proj.weight_real",
+        ),
+        MODEL_TENSOR.ATTN_K_IMAG: (
+            "layer.{bid}.self_attn.k_proj.weight_imag",
+        ),
+        MODEL_TENSOR.ATTN_K_REAL: (
+            "layer.{bid}.self_attn.k_proj.weight_real",
+        ),
+        MODEL_TENSOR.ATTN_V_IMAG: (
+            "layer.{bid}.self_attn.v_proj.weight_imag",
+        ),
+        MODEL_TENSOR.ATTN_V_REAL: (
+            "layer.{bid}.self_attn.v_proj.weight_real",
+        ),
+        MODEL_TENSOR.ATTN_OUT_IMAG: (
+            "layer.{bid}.self_attn.o_proj.weight_imag",
+        ),
+        MODEL_TENSOR.ATTN_OUT_REAL: (
+            "layer.{bid}.self_attn.o_proj.weight_real",
+        ),
+        MODEL_TENSOR.POST_NORM_IMAG: (
+            "layer.{bid}.post_layernorm.weight_imag",
+        ),
+        MODEL_TENSOR.POST_NORM_REAL: (
+            "layer.{bid}.post_layernorm.weight_real",
+        ),
+        MODEL_TENSOR.POST_NORM:(),
+        MODEL_TENSOR.PRE_NORM_IMAG: (
+            "layer.{bid}.pre_layernorm.weight_imag",
+        ),
+        MODEL_TENSOR.PRE_NORM_REAL: (
+            "layer.{bid}.pre_layernorm.weight_real",
+        ),
+        MODEL_TENSOR.PRE_NORM:(),
+        MODEL_TENSOR.ATTN_LAYERNORM_IMAG: (
+            "layer.{bid}.self_attn.attn_layernorm.weight_imag",
+        ),
+        MODEL_TENSOR.ATTN_LAYERNORM_REAL: (
+            "layer.{bid}.self_attn.attn_layernorm.weight_real",
+        ),
+        MODEL_TENSOR.ATTN_LAYERNORM:(),
     }
 
     # architecture-specific block mappings

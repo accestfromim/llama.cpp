@@ -401,6 +401,7 @@ class MODEL_ARCH(IntEnum):
     LLADA            = auto()
     LLADA_MOE        = auto()
     SEED_OSS         = auto()
+    IFAIRY           = auto() # newly added for ifairy
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -642,6 +643,40 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_SHARED_HEAD_HEAD = auto()
     NEXTN_SHARED_HEAD_NORM = auto()
 
+    # below all newly added for ifairy
+    TOKEN_EMBD_REAL      = auto() 
+    TOKEN_EMBD_IMAG      = auto()
+    FINAL_NORM_REAL      = auto()
+    FINAL_NORM_IMAG      = auto()
+    FINAL_NORM           = auto() # complex
+    FFN_DOWN_REAL        = auto()
+    FFN_DOWN_IMAG        = auto()
+    FFN_UP_REAL          = auto()
+    FFN_UP_IMAG          = auto()
+    FFN_SUB_NORM_REAL    = auto()
+    FFN_SUB_NORM_IMAG    = auto()
+    FFN_GATE_REAL        = auto()
+    FFN_GATE_IMAG        = auto()
+    POST_NORM_IMAG       = auto()
+    POST_NORM_REAL       = auto()
+    POST_NORM            = auto() # complex
+    PRE_NORM_IMAG        = auto()
+    PRE_NORM_REAL        = auto()
+    PRE_NORM             = auto() # complex
+    ATTN_LAYERNORM       = auto() # complex
+    ATTN_LAYERNORM_REAL  = auto()
+    ATTN_LAYERNORM_IMAG  = auto()
+    ATTN_Q_REAL          = auto()
+    ATTN_Q_IMAG          = auto()
+    ATTN_K_REAL          = auto()
+    ATTN_K_IMAG          = auto()
+    ATTN_V_REAL          = auto()
+    ATTN_V_IMAG          = auto()
+    ATTN_OUT_REAL        = auto()
+    ATTN_OUT_IMAG        = auto()
+
+    
+
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.MMPROJ:           "clip", # dummy arch for clip.cpp
@@ -738,6 +773,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LLADA:            "llada",
     MODEL_ARCH.LLADA_MOE:        "llada-moe",
     MODEL_ARCH.SEED_OSS:         "seed_oss",
+    MODEL_ARCH.IFAIRY:           "ifairy", # newly added for ifairy
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -978,9 +1014,71 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HNORM:               "blk.{bid}.nextn.hnorm",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD:    "blk.{bid}.nextn.shared_head_head",
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
+
+    # ifairy
+    MODEL_TENSOR.TOKEN_EMBD_REAL:           "token_embd_real",
+    MODEL_TENSOR.TOKEN_EMBD_IMAG:           "token_embd_imag",
+    MODEL_TENSOR.FINAL_NORM_IMAG:           "final_norm_imag",
+    MODEL_TENSOR.FINAL_NORM_REAL:           "final_norm_real",
+    MODEL_TENSOR.FINAL_NORM:                "final_norm",
+    MODEL_TENSOR.FFN_DOWN_IMAG:             "blk.{bid}.ffn_down_imag",
+    MODEL_TENSOR.FFN_DOWN_REAL:             "blk.{bid}.ffn_down_real",
+    MODEL_TENSOR.FFN_UP_IMAG:               "blk.{bid}.ffn_up_imag",
+    MODEL_TENSOR.FFN_UP_REAL:               "blk.{bid}.ffn_up_real",
+    MODEL_TENSOR.FFN_SUB_NORM_IMAG:         "blk.{bid}.ffn_sub_norm_imag",
+    MODEL_TENSOR.FFN_SUB_NORM_REAL:         "blk.{bid}.ffn_sub_norm_real",
+    MODEL_TENSOR.FFN_GATE_IMAG:             "blk.{bid}.ffn_gate_imag",
+    MODEL_TENSOR.FFN_GATE_REAL:             "blk.{bid}.ffn_gate_real",
+    MODEL_TENSOR.POST_NORM_IMAG:            "blk.{bid}.post_norm_imag",
+    MODEL_TENSOR.POST_NORM_REAL:            "blk.{bid}.post_norm_real",
+    MODEL_TENSOR.POST_NORM:                 "blk.{bid}.post_norm",
+    MODEL_TENSOR.PRE_NORM_IMAG:             "blk.{bid}.pre_norm_imag",
+    MODEL_TENSOR.PRE_NORM_REAL:             "blk.{bid}.pre_norm_real",
+    MODEL_TENSOR.PRE_NORM:                  "blk.{bid}.pre_norm",
+    MODEL_TENSOR.ATTN_LAYERNORM:            "blk.{bid}.attn_layernorm",
+    MODEL_TENSOR.ATTN_LAYERNORM_IMAG:       "blk.{bid}.attn_layernorm_imag",
+    MODEL_TENSOR.ATTN_LAYERNORM_REAL:       "blk.{bid}.attn_layernorm_real",
+    MODEL_TENSOR.ATTN_Q_IMAG:               "blk.{bid}.attn_q_imag",
+    MODEL_TENSOR.ATTN_Q_REAL:               "blk.{bid}.attn_q_real",
+    MODEL_TENSOR.ATTN_K_IMAG:               "blk.{bid}.attn_k_imag",
+    MODEL_TENSOR.ATTN_K_REAL:               "blk.{bid}.attn_k_real",
+    MODEL_TENSOR.ATTN_V_IMAG:               "blk.{bid}.attn_v_imag",
+    MODEL_TENSOR.ATTN_V_REAL:               "blk.{bid}.attn_v_real",
+    MODEL_TENSOR.ATTN_OUT_IMAG:             "blk.{bid}.attn_output_imag",
+    MODEL_TENSOR.ATTN_OUT_REAL:             "blk.{bid}.attn_output_real",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+    # newly added for ifairy
+    MODEL_ARCH.IFAIRY: [
+        MODEL_TENSOR.TOKEN_EMBD_IMAG,
+        MODEL_TENSOR.TOKEN_EMBD_REAL,
+        MODEL_TENSOR.FINAL_NORM_IMAG,
+        MODEL_TENSOR.FINAL_NORM_REAL,
+        MODEL_TENSOR.FFN_DOWN_IMAG,
+        MODEL_TENSOR.FFN_DOWN_REAL,
+        MODEL_TENSOR.FFN_UP_IMAG,
+        MODEL_TENSOR.FFN_UP_REAL,
+        MODEL_TENSOR.FFN_SUB_NORM_IMAG,
+        MODEL_TENSOR.FFN_SUB_NORM_REAL,
+        MODEL_TENSOR.FFN_GATE_IMAG,
+        MODEL_TENSOR.FFN_GATE_REAL,
+        MODEL_TENSOR.POST_NORM_IMAG,
+        MODEL_TENSOR.POST_NORM_REAL,
+        MODEL_TENSOR.PRE_NORM_IMAG,
+        MODEL_TENSOR.PRE_NORM_REAL,
+        MODEL_TENSOR.ATTN_LAYERNORM_IMAG,
+        MODEL_TENSOR.ATTN_LAYERNORM_REAL,
+        MODEL_TENSOR.ATTN_Q_IMAG,
+        MODEL_TENSOR.ATTN_Q_REAL,
+        MODEL_TENSOR.ATTN_K_IMAG,
+        MODEL_TENSOR.ATTN_K_REAL,
+        MODEL_TENSOR.ATTN_V_IMAG,
+        MODEL_TENSOR.ATTN_V_REAL,
+        MODEL_TENSOR.ATTN_OUT_IMAG,
+        MODEL_TENSOR.ATTN_OUT_REAL,
+        MODEL_TENSOR.OUTPUT,
+    ],
     MODEL_ARCH.MMPROJ: [
         MODEL_TENSOR.V_MMPROJ,
         MODEL_TENSOR.V_MMPROJ_FC,
@@ -2767,6 +2865,10 @@ MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.BAILINGMOE: [
         MODEL_TENSOR.ROPE_FREQS,
     ],
+    MODEL_ARCH.IFAIRY: [ # newly added for ifairy, 但我觉得没啥用，貌似本来也没有这两个层
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.ATTN_ROT_EMBD,
+    ],
 }
 
 #
@@ -2788,6 +2890,7 @@ class RopeScalingType(Enum):
     LINEAR   = 'linear'
     YARN     = 'yarn'
     LONGROPE = 'longrope'
+    IFAIRY   = 'ifairy' # newly added for ifairy
 
 
 class PoolingType(IntEnum):
@@ -2831,6 +2934,8 @@ class GGMLQuantizationType(IntEnum):
     TQ1_0   = 34
     TQ2_0   = 35
     MXFP4   = 39
+    F16_I2  = 40 # newly added for ifairy 暂时用这个，实际上还是F32格式来存，但是为了量化时候要有这么一个枚举类型先
+    IFAIRY  = 41 # newly added for ifairy
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -2974,6 +3079,8 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.TQ1_0:   (256, 2 + 4 * 13),
     GGMLQuantizationType.TQ2_0:   (256, 2 + 64),
     GGMLQuantizationType.MXFP4:   (32, 1 + 16),
+    GGMLQuantizationType.F16_I2:  (1, 2), # newly added for ifairy, 实际上还是F16格式来存
+    GGMLQuantizationType.IFAIRY:  (4, 1), # newly added for ifairy
 }
 
 
