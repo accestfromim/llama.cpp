@@ -1,3 +1,27 @@
+# 怎么跑ifairy
+## 转换hf模型文件
+### 在环境中添加修改过后的gguf python库
+在`gguf-py`目录下
+```pip install -e .```
+### 下载模型
+```hf download PKU-DS-LAB/Fairy-plus-minus-i-700M --local-dir .```
+### 运行转换脚本
+在下载了模型的目录下。这很重要。主要是转换脚本硬编码了个'.'进去。
+```python3 convert_ifairy.py . $(输出文件) --verbose```
+convert_ifairy.py这个脚本也在gguf-py目录下
+
+## 编译llama.cpp
+照着原来的README里编译就行，大概是以下两条
+```
+cmake -B build
+cmake --build build
+```
+## 运行推理
+```build/bin/llama-cli -m ../ifairy.gguf -p "I believe the meaning of life is" -n 128 -no-cnv -s 3057606903 -t 4```
+其中`-m`后是转换后的文件，`-p`后是提示词，`-n`后是输出的TOKEN数，`-s`是取样随机数，`-t`是线程数，`-no-cnv`大概是关闭会话
+
+
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
