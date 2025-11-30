@@ -88,7 +88,7 @@
   - 每个 `BBK` 循环后把 `int16` 扩展到 `int32`，累加到 `CBits_real/CBits_imag`。
 - `qgemm_lut_*`
   - 外层遍历 K：`for k_outer += BBK*…` 调用 `tbl_impl_*`。
-  - 反量化：
+- 反量化：
     ```
     scale_wr = d_real / lut_scale_r;
     scale_wi = d_imag / lut_scale_i;
@@ -100,6 +100,10 @@
 ### 5.4 参考实现现状
 - `ggml_ifairy_qgemm_lut_ref`（`ggml-ifairy-lut.c`）已实现解码 + 复数 dot + 反量化的参考内核，用于功能正确性验证和后续 NEON 内核对齐。当前读取的 QLUT 为顺序 int8 布局（尚未转置/nibble 化），输出布局为 `[real, imag]` 交错。
 - 未来将以 TL1 风格生成/手写 `tbl_impl_*` + `qgemm_ifairy_lut_*`，替换参考内核并同步调整 QLUT 生成与工作区偏移。
+
+### 5.5 前向调度
+- `ggml_compute_forward_mul_mat` 在 `GGML_IFAIRY_ARM_LUT` 下优先走 iFairy LUT：线程 0 先 `ggml_ifairy_transform_tensor`（填充 `tensor->extra`），再用 `ggml_ifairy_preprocessor` 将激活写入工作区（顺序：`qlut_r` → `qlut_i` → `lut_scales`），`ggml_barrier` 同步后由线程 0 调用参考 LUT 内核写回结果，其余线程仅同步；未命中条件即回退原路径。
+- 当前仅支持单列 matvec，后续 NEON TL1 内核接入时可在同一调度框架内替换 `qgemm`、扩展批次与 tile 分配。
 
 ### 5.5 调度与入口判定
 - `ggml_ifairy_can_mul_mat`（类似 BitNet）：

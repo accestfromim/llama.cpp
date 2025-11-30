@@ -49,6 +49,7 @@
    - 添加 `ggml_ifairy_can_mul_mat` 判定入口（类型/形状/批次/后端），并在 `ggml_mul_mat` ARM 分支优先检查 iFairy LUT，再回退。
    - 在线程 0 调用 `ggml_ifairy_preprocessor` 构造 LUT，`ggml_barrier` 同步后各线程按 tile 调用 `ggml_qgemm_ifairy_lut`。
    - 若 `src1` 为 F32，复用 BitNet 的 fp16 转存逻辑（或保持 F32 路径，注意工作区大小）。
+   - 已接入：`ggml_compute_forward_mul_mat` 在 `GGML_IFAIRY_ARM_LUT` 下优先判定 `ggml_ifairy_can_mul_mat`，线程 0 先触发 `ggml_ifairy_transform_tensor`（填充 extra）与 `ggml_ifairy_preprocessor`（写入 wdata：`qlut_r → qlut_i → lut_scales`），全线程 barrier 后由线程 0 调用 `ggml_ifairy_qgemm_lut_ref` 写回 `dst`，再 barrier 结束，未命中则回退原有路径。当前仍为单列 matvec（`ne1<=1`），wsize/布局与预处理保持一致，后续可替换为 NEON 内核与多线程切分。
 8. **数值校验与容错**
    - 在内核上加可编译时/运行时开关以强制回退，方便 A/B 对比。
    - 保证未匹配形状或缺少 `extra` 时立即回退旧路径，避免 crash。

@@ -1251,6 +1251,36 @@ void ggml_compute_forward_mul_mat(
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
+#if defined(GGML_IFAIRY_ARM_LUT)
+    if (ggml_ifairy_can_mul_mat(src0, src1, dst)) {
+        GGML_ASSERT(params->wdata != NULL);
+        GGML_ASSERT(params->wsize >= ggml_ifairy_mul_mat_get_wsize(src0, src1, dst));
+
+        const int m = (int) ne01;
+        const int k = (int) ne00;
+        const size_t qlut_bytes = (size_t) k * 32;
+
+        char * wdata = params->wdata;
+        int8_t * qlut_r = (int8_t *) wdata;
+        int8_t * qlut_i = (int8_t *) (wdata + qlut_bytes);
+        float  * lut_scales = (float *) (wdata + 2 * qlut_bytes);
+
+        if (ith == 0) {
+            ggml_ifairy_transform_tensor((struct ggml_tensor *) src0);
+            ggml_ifairy_preprocessor(m, k, src1->data, lut_scales, qlut_r, qlut_i);
+        }
+
+        ggml_barrier(params->threadpool);
+
+        if (ith == 0) {
+            const block_ifairy * w = (const block_ifairy *) src0->data;
+            ggml_ifairy_qgemm_lut_ref(w, qlut_r, qlut_i, lut_scales, k, m, (float *) dst->data);
+        }
+
+        ggml_barrier(params->threadpool);
+        return;
+    }
+#endif
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
