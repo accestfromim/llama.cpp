@@ -53,10 +53,12 @@
 8. **数值校验与容错**
    - 在内核上加可编译时/运行时开关以强制回退，方便 A/B 对比。
    - 保证未匹配形状或缺少 `extra` 时立即回退旧路径，避免 crash。
+   - 已落地：运行时环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 可整体关闭 LUT；`ggml_ifairy_can_mul_mat` 会拒绝形状/类型不符或宏/环境关闭；`ggml_compute_forward_mul_mat` 若工作区不足则直接回退原路径，避免触发断言。当前参考内核仅线程 0 执行，后续 NEON 内核接入时可保留同样的回退逻辑。
 9. **测试计划**
    - 单元/比对：扩展 `tests/test-ifairy-ref.py` 或新增 C 测试，构造固定 seed 的 matvec（1536×4096、1536×1536、4096×1536），比较 LUT on/off 的逐元素误差（real/imag 分开）。
    - 性能：在目标 ARM 设备上运行 `./build/bin/llama-cli ...` 与 `ggml_vec_dot_ifairy_q16_K` baseline，对比 tok/s；若需可加微基准（重复 1000 次）。
    - 工作区验证：在调试模式打印/断言 `wsize` 与偏移，确保无越界。
+   - 现状：新增 `tests/test-ifairy-lut.cpp`（构建标签 `test-ifairy-lut`）固定 seed 生成 ifairy quant 数据，跑 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref` 与高精度浮点解码结果对比（相对误差 1% 容忍，避免二次量化导致的饱和差异）；`ctest -R ifairy-lut` 通过。工作区不足/宏关闭时依赖回退逻辑保证安全。
 10. **工程化与维护**
     - 补充 CMake 选项与文档片段（README/IFAIRY_ARM_LUT_TL1.md 更新）说明如何启用/禁用 LUT。
     - 考虑脚本生成内核（参考 BitNet `preset_kernels` 模板）以覆盖更多形状，便于未来扩展。

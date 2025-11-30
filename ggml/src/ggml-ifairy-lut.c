@@ -12,8 +12,11 @@
 
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
 
 static bool ifairy_lut_initialized = false;
+static bool ifairy_lut_env_checked = false;
+static bool ifairy_lut_enabled = true;
 static struct ggml_ifairy_tensor_extra * ifairy_tensor_extras = NULL;
 static size_t ifairy_tensor_extras_index = 0;
 
@@ -43,6 +46,17 @@ static bool ggml_ifairy_select_tile_params(const int64_t m, const int64_t k, int
 
 static void ggml_ifairy_init_once(void) {
     if (ifairy_lut_initialized) {
+        return;
+    }
+
+    if (!ifairy_lut_env_checked) {
+        const char * disable_env = getenv("GGML_IFAIRY_ARM_LUT_DISABLE");
+        ifairy_lut_enabled = (disable_env == NULL || disable_env[0] == '\0');
+        ifairy_lut_env_checked = true;
+    }
+
+    if (!ifairy_lut_enabled) {
+        ifairy_lut_initialized = true;
         return;
     }
 
@@ -153,6 +167,10 @@ void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor) {
             return;
         }
 
+        if (!ifairy_lut_enabled) {
+            return;
+        }
+
         ggml_ifairy_init_once();
         GGML_ASSERT(ifairy_tensor_extras_index < GGML_IFAIRY_MAX_NODES);
 
@@ -203,6 +221,12 @@ void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor) {
 }
 
 bool ggml_ifairy_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst) {
+    ggml_ifairy_init_once();
+
+    if (!ifairy_lut_enabled) {
+        return false;
+    }
+
     if (src0->type != GGML_TYPE_IFAIRY || src1->type != GGML_TYPE_IFAIRY_Q16 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -258,8 +282,11 @@ static inline void ggml_ifairy_decode_weight_block(const block_ifairy * blk, int
     static const int8_t lut_wi[4] = { 0, 0, -1, 1 };
 
     for (int j = 0; j < QK_K; ++j) {
-        const int byte_idx = j >> 2;
-        const int bit_off  = (j & 3) * 2;
+        const int chunk    = j >> 6;          // 0..3 blocks of 64
+        const int lane     = j & 0xF;         // 0..15 within each 16-lane stripe
+        const int part     = (j >> 4) & 0x3;  // which 16-lane group inside the chunk
+        const int byte_idx = (chunk << 4) + lane;
+        const int bit_off  = part * 2;
         const uint8_t code = (blk->qs[byte_idx] >> bit_off) & 0x3;
         wr[j] = lut_wr[code];
         wi[j] = lut_wi[code];
@@ -268,7 +295,8 @@ static inline void ggml_ifairy_decode_weight_block(const block_ifairy * blk, int
 
 // Reference LUT matvec (single-column) using decoded QLUT and per-tensor scales.
 // Output layout: dst[2*i + 0] = real, dst[2*i + 1] = imag for row i.
-void ggml_ifairy_qgemm_lut_ref(const block_ifairy * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst) {
+void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst) {
+    const block_ifairy * w_blocks = (const block_ifairy *) w;
     GGML_ASSERT(k % QK_K == 0);
 
     const int64_t blocks_per_row = k / QK_K;
@@ -284,7 +312,7 @@ void ggml_ifairy_qgemm_lut_ref(const block_ifairy * w, const int8_t * qlut_r, co
         float acc_ri = 0.0f;
         float acc_ir = 0.0f;
 
-        const block_ifairy * row_w = w + row * blocks_per_row;
+        const block_ifairy * row_w = w_blocks + row * blocks_per_row;
         const int8_t * row_qr = qlut_r;
         const int8_t * row_qi = qlut_i;
 
@@ -307,11 +335,16 @@ void ggml_ifairy_qgemm_lut_ref(const block_ifairy * w, const int8_t * qlut_r, co
             row_qi += QK_K;
         }
 
-        const float scale_wr = GGML_FP16_TO_FP32(row_w[0].d_real) * inv_lut_r;
-        const float scale_wi = GGML_FP16_TO_FP32(row_w[0].d_imag) * inv_lut_i;
+        const float w_r = GGML_FP16_TO_FP32(row_w[0].d_real);
+        const float w_i = GGML_FP16_TO_FP32(row_w[0].d_imag);
 
-        const float out_real = scale_wr * acc_rr - scale_wi * acc_ii;
-        const float out_imag = scale_wr * acc_ri + scale_wi * acc_ir;
+        const float scale_wr_r = w_r * inv_lut_r; // matches ar scale (real)
+        const float scale_wi_i = w_i * inv_lut_i; // matches ai scale (imag)
+        const float scale_wi_r = w_i * inv_lut_r; // matches ar scale for wi
+        const float scale_wr_i = w_r * inv_lut_i; // matches ai scale for wr
+
+        const float out_real = scale_wr_r * acc_rr + scale_wi_i * acc_ii;
+        const float out_imag = scale_wi_r * acc_ir - scale_wr_i * acc_ri;
 
         dst[2 * row + 0] = out_real;
         dst[2 * row + 1] = out_imag;

@@ -105,6 +105,12 @@
 - `ggml_compute_forward_mul_mat` 在 `GGML_IFAIRY_ARM_LUT` 下优先走 iFairy LUT：线程 0 先 `ggml_ifairy_transform_tensor`（填充 `tensor->extra`），再用 `ggml_ifairy_preprocessor` 将激活写入工作区（顺序：`qlut_r` → `qlut_i` → `lut_scales`），`ggml_barrier` 同步后由线程 0 调用参考 LUT 内核写回结果，其余线程仅同步；未命中条件即回退原路径。
 - 当前仅支持单列 matvec，后续 NEON TL1 内核接入时可在同一调度框架内替换 `qgemm`、扩展批次与 tile 分配。
 
+### 5.6 容错与对比
+- 环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 可强制关闭 LUT 路径；形状/类型不符时自动回退。
+- 若工作区不足（`params->wsize` 小于预估值），前向直接回退原始 mul_mat 路径，避免断言或越界。
+- 参考内核仅线程 0 执行，便于与旧路径做 A/B 数值对比；NEON 版本接入后可继续保留该回退逻辑作为安全网。
+- 自测：`tests/test-ifairy-lut.cpp` 构造随机 ifairy 权重/激活，调用 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref`，并与浮点解码后的复数乘结果对比（1% 相对误差阈值）验证数值正确性。
+
 ### 5.5 调度与入口判定
 - `ggml_ifairy_can_mul_mat`（类似 BitNet）：
   - `src0->type == GGML_TYPE_IFAIRY`、`src1->type == GGML_TYPE_IFAIRY_Q16` 或 fp32（需转存）、`dst->type == F32`。
