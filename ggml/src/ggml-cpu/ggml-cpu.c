@@ -1234,7 +1234,7 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(ne3 == ne13);
 
 #if defined(GGML_IFAIRY_ARM_LUT)
-    if (src0->type == GGML_TYPE_IFAIRY && src0->backend == GGML_BACKEND_TYPE_CPU && src0->extra == NULL) {
+    if (src0->type == GGML_TYPE_IFAIRY && src0->extra == NULL) {
         ggml_ifairy_transform_tensor((struct ggml_tensor *) src0);
     }
 #endif

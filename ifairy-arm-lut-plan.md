@@ -60,9 +60,11 @@
    - 工作区验证：在调试模式打印/断言 `wsize` 与偏移，确保无越界。
    - 现状：新增 `tests/test-ifairy-lut.cpp`（构建标签 `test-ifairy-lut`）固定 seed 生成 ifairy quant 数据，跑 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref` 与高精度浮点解码结果对比（相对误差 1% 容忍，避免二次量化导致的饱和差异）；`ctest -R ifairy-lut` 通过。工作区不足/宏关闭时依赖回退逻辑保证安全。
 10. **工程化与维护**
-    - 补充 CMake 选项与文档片段（README/IFAIRY_ARM_LUT_TL1.md 更新）说明如何启用/禁用 LUT。
-    - 考虑脚本生成内核（参考 BitNet `preset_kernels` 模板）以覆盖更多形状，便于未来扩展。
-    - 预留后续批量/Metal 扩展的接口占位（如 `lut_scales_size`、`n_tile_num` 设计兼容）。
+    - 构建/配置：新增 CMake 选项 `GGML_IFAIRY_ARM_LUT`（默认 OFF），运行时可用 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 关闭；公共头 `ggml/include/ggml-ifairy.h` 提供 API；前向受宏保护。
+    - 测试/验证：新增 `tests/test-ifairy-lut` 覆盖参考 LUT 与浮点解码对比；后续内核变更复用此测试做回归。
+    - 代码生成：后续可借鉴 BitNet `preset_kernels` 做 QLUT 布局/内核脚本化生成，覆盖更多形状；当前仍使用参考内核与顺序 QLUT 布局。
+    - 回退/兼容：wsize 不足、形状不匹配或环境关闭时自动回退旧路径；设计字段（`lut_scales_size`、`n_tile_num` 等）预留批量/其他后端扩展。
+    - 现网验证：`cmake -B build -DGGML_IFAIRY_ARM_LUT=ON && cmake --build build -j` 后，`./build/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 128 -no-cnv` 成功运行（CPU-only，Metal 关闭），eval 12.38 ms/token（~80.8 tok/s），可作为启用 LUT 后的 sanity。
 
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。

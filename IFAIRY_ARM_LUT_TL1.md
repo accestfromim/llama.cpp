@@ -111,6 +111,14 @@
 - 参考内核仅线程 0 执行，便于与旧路径做 A/B 数值对比；NEON 版本接入后可继续保留该回退逻辑作为安全网。
 - 自测：`tests/test-ifairy-lut.cpp` 构造随机 ifairy 权重/激活，调用 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref`，并与浮点解码后的复数乘结果对比（1% 相对误差阈值）验证数值正确性。
 
+## 6. 工程化与维护
+- 构建开关：CMake 选项 `GGML_IFAIRY_ARM_LUT`（默认 OFF）控制整个路径，运行时可用环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 强制关闭，便于 A/B。
+- 接口：公共头 `ggml/include/ggml-ifairy.h` 暴露 LUT 相关 API（transform、preprocess、wsize、参考 qgemm），前向在 `ggml-cpu` 中受宏保护。
+- 工作区与回退：`ggml_ifairy_mul_mat_get_wsize` 估算并 64B 对齐，前向若 wsize 不足则回退旧路径；形状/类型校验与环境开关也会触发回退。
+- 测试：新增 `test-ifairy-lut`，后续 NEON 内核加入后可复用该测试对齐 LUT 与 baseline。
+- 未来：可将 QLUT 布局改为脚本生成（仿 BitNet preset_kernels），并在文档中附上启用示例命令（`-DGGML_IFAIRY_ARM_LUT=ON` + 可选 `GGML_IFAIRY_ARM_LUT_DISABLE` 环境变量）。
+- 验证示例：`cmake -B build -DGGML_IFAIRY_ARM_LUT=ON && cmake --build build -j`，执行 `./build/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 128 -no-cnv` 正常输出，CPU eval 12.38 ms/token（~80.8 tok/s）。
+
 ### 5.5 调度与入口判定
 - `ggml_ifairy_can_mul_mat`（类似 BitNet）：
   - `src0->type == GGML_TYPE_IFAIRY`、`src1->type == GGML_TYPE_IFAIRY_Q16` 或 fp32（需转存）、`dst->type == F32`。
