@@ -103,8 +103,8 @@ static void ggml_ifairy_per_tensor_quant(const block_ifairy_q16 * act_blocks, in
         for (int j = 0; j < QK_K; ++j) {
             const float vr = (float) blk->x_real[j] * d_r;
             const float vi = (float) blk->x_imag[j] * d_i;
-            max_r = GGML_MAX(max_r, ggml_ifairy_abs_f32(vr));
-            max_i = GGML_MAX(max_i, ggml_ifairy_abs_f32(vi));
+            max_r = MAX(max_r, ggml_ifairy_abs_f32(vr));
+            max_i = MAX(max_i, ggml_ifairy_abs_f32(vi));
         }
     }
 
@@ -251,4 +251,69 @@ void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, v
 
     ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
     ggml_ifairy_lut_ctor(act_blocks, k, inv_scales, (int8_t *) qlut_real, (int8_t *) qlut_imag);
+}
+
+static inline void ggml_ifairy_decode_weight_block(const block_ifairy * blk, int8_t * wr, int8_t * wi) {
+    static const int8_t lut_wr[4] = { -1, 1, 0, 0 };
+    static const int8_t lut_wi[4] = { 0, 0, -1, 1 };
+
+    for (int j = 0; j < QK_K; ++j) {
+        const int byte_idx = j >> 2;
+        const int bit_off  = (j & 3) * 2;
+        const uint8_t code = (blk->qs[byte_idx] >> bit_off) & 0x3;
+        wr[j] = lut_wr[code];
+        wi[j] = lut_wi[code];
+    }
+}
+
+// Reference LUT matvec (single-column) using decoded QLUT and per-tensor scales.
+// Output layout: dst[2*i + 0] = real, dst[2*i + 1] = imag for row i.
+void ggml_ifairy_qgemm_lut_ref(const block_ifairy * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst) {
+    GGML_ASSERT(k % QK_K == 0);
+
+    const int64_t blocks_per_row = k / QK_K;
+    const float inv_lut_r = lut_scales[0] != 0.0f ? 1.0f / lut_scales[0] : 0.0f;
+    const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
+
+    int8_t wr_buf[QK_K];
+    int8_t wi_buf[QK_K];
+
+    for (int64_t row = 0; row < m; ++row) {
+        float acc_rr = 0.0f;
+        float acc_ii = 0.0f;
+        float acc_ri = 0.0f;
+        float acc_ir = 0.0f;
+
+        const block_ifairy * row_w = w + row * blocks_per_row;
+        const int8_t * row_qr = qlut_r;
+        const int8_t * row_qi = qlut_i;
+
+        for (int64_t b = 0; b < blocks_per_row; ++b) {
+            ggml_ifairy_decode_weight_block(&row_w[b], wr_buf, wi_buf);
+
+            for (int j = 0; j < QK_K; ++j) {
+                const int8_t wr_v = wr_buf[j];
+                const int8_t wi_v = wi_buf[j];
+                const int8_t ar   = row_qr[j];
+                const int8_t ai   = row_qi[j];
+
+                acc_rr += (float) wr_v * (float) ar;
+                acc_ii += (float) wi_v * (float) ai;
+                acc_ri += (float) wr_v * (float) ai;
+                acc_ir += (float) wi_v * (float) ar;
+            }
+
+            row_qr += QK_K;
+            row_qi += QK_K;
+        }
+
+        const float scale_wr = GGML_FP16_TO_FP32(row_w[0].d_real) * inv_lut_r;
+        const float scale_wi = GGML_FP16_TO_FP32(row_w[0].d_imag) * inv_lut_i;
+
+        const float out_real = scale_wr * acc_rr - scale_wi * acc_ii;
+        const float out_imag = scale_wr * acc_ri + scale_wi * acc_ir;
+
+        dst[2 * row + 0] = out_real;
+        dst[2 * row + 1] = out_imag;
+    }
 }

@@ -42,11 +42,9 @@
    - 已实现：`ggml_ifairy_preprocessor`（`ggml-ifairy-lut.c`）对 `GGML_TYPE_IFAIRY_Q16` 激活进行 per-tensor quant（独立 real/imag max_abs → `lut_scales={127/max_r,127/max_i}`），再将 block 内 256 个 int8 激活按缩放写入 `qlut_r/qlut_i`；当前布局简单按顺序写入前 `k` 字节并将剩余工作区清零，后续内核接入时可替换为正式 nibble/转置布局。
    - 辅助：`ggml_ifairy_partial_max_reset`/`ggml_ifairy_per_tensor_quant`/`ggml_ifairy_lut_ctor` 拆分逻辑，便于后续替换生成代码或按 K 特化。
 6. **LUT 内核实现**
-   - 设计 `tbl_impl_*` 复数版：用 `vqtbl1` 查 `wr/wi` 与 `QLUT_R/QLUT_I`，执行复数共轭乘法累加到 `int32`。
-   - 依据目标形状生成 `qgemm_ifairy_lut_*`：K 维分块（`BBK*`）、M 维 tile（`BM*`），完成反量化：
-     - `scale_wr = d_real / lut_scale_r`，`scale_wi = d_imag / lut_scale_i`
-     - `C_real = scale_wr * acc_rr - scale_wi * acc_ii`；`C_imag = scale_wr * acc_ri + scale_wi * acc_ir`
-   - 参考 `BitNet/preset_kernels/*/bitnet-lut-kernels-tl1.h` 的向量化套路，决定是手写还是脚本生成 `ifairy-lut-kernels-tl1.h`。
+   - 已实现参考内核：`ggml_ifairy_qgemm_lut_ref`（`ggml-ifairy-lut.c`）解码 2-bit 权重块（`qs`→`wr/wi` 映射 {-1,+1,0,0}/{0,0,-1,+1}），对 `qlut_r/qlut_i` 做复数共轭乘积累计 `acc_rr/acc_ii/acc_ri/acc_ir`，并按 `scale_wr = d_real / lut_scale_r`、`scale_wi = d_imag / lut_scale_i` 反量化生成 real/imag 输出（当前输出布局：`dst[2*i]=real`，`dst[2*i+1]=imag`）。用于功能验证与后续 NEON 内核对齐。
+   - 形状/Tile：按行步长 `blocks_per_row = k/QK_K` 迭代，预留与 `bm/bk` 映射兼容；后续可替换为特化的 `tbl_impl_*` + `qgemm_ifairy_lut_*`（TL1 向量化）以覆盖 1536×4096、1536×1536、4096×1536。
+   - 当前 QLUT 布局仍为顺序 int8 写入（未做 8×8 转置/nibble 排列），内核按此读取；待最终内核生成时可切换到 BitNet 风格布局并同步预处理与 wsize 偏移。
 7. **前向调度接入**
    - 添加 `ggml_ifairy_can_mul_mat` 判定入口（类型/形状/批次/后端），并在 `ggml_mul_mat` ARM 分支优先检查 iFairy LUT，再回退。
    - 在线程 0 调用 `ggml_ifairy_preprocessor` 构造 LUT，`ggml_barrier` 同步后各线程按 tile 调用 `ggml_qgemm_ifairy_lut`。

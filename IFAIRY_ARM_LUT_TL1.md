@@ -97,6 +97,10 @@
     ```
   - 输出格式：与现有路径一致，实/虚交错或双通道由上游张量决定（通常以两行存储）。
 
+### 5.4 参考实现现状
+- `ggml_ifairy_qgemm_lut_ref`（`ggml-ifairy-lut.c`）已实现解码 + 复数 dot + 反量化的参考内核，用于功能正确性验证和后续 NEON 内核对齐。当前读取的 QLUT 为顺序 int8 布局（尚未转置/nibble 化），输出布局为 `[real, imag]` 交错。
+- 未来将以 TL1 风格生成/手写 `tbl_impl_*` + `qgemm_ifairy_lut_*`，替换参考内核并同步调整 QLUT 生成与工作区偏移。
+
 ### 5.5 调度与入口判定
 - `ggml_ifairy_can_mul_mat`（类似 BitNet）：
   - `src0->type == GGML_TYPE_IFAIRY`、`src1->type == GGML_TYPE_IFAIRY_Q16` 或 fp32（需转存）、`dst->type == F32`。
