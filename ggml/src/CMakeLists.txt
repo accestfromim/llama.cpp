@@ -204,6 +204,7 @@ add_library(ggml-base
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
+            ggml-ifairy-lut.c
             ggml-quants.c
             ggml-quants.h
             gguf.cpp)
@@ -392,6 +393,12 @@ foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)
     target_compile_features   (${target} PRIVATE c_std_11 cxx_std_17) # don't bump
 endforeach()
+
+if (GGML_IFAIRY_ARM_LUT)
+    foreach (target ggml-base ggml)
+        target_compile_definitions(${target} PUBLIC GGML_IFAIRY_ARM_LUT)
+    endforeach()
+endif()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 

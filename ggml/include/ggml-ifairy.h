@@ -1,0 +1,33 @@
+// Copyright (c) 2024 The ggml authors
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#include "ggml.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define GGML_IFAIRY_MAX_NODES 8192
+
+struct ggml_ifairy_tensor_extra {
+    int      lut_scales_size;
+    int      n_tile_num;
+    int      bk;
+    int      bm;
+    size_t   tile_stride;
+    size_t   c_tile_size;
+    size_t   scales_bytes;
+    uint8_t * qweights;
+    float   * scales; // pairs of {d_real, d_imag} per block
+};
+
+GGML_API void ggml_ifairy_lut_init(void);
+GGML_API void ggml_ifairy_lut_free(void);
+GGML_API void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor);
+
+#ifdef __cplusplus
+}
+#endif

@@ -27,15 +27,14 @@
    - 评估是否需要新的编译选项（CMake cache 变量）以隔离 LUT 代码生成。
    - 评估：`block_ifairy` = `qs[QK_K/4] + d_real + d_imag`，`block_ifairy_q16` = `x_real[256] + x_imag[256] + d_real + d_imag`；`ggml_vec_dot_ifairy_q16_K` 仅在 `__ARM_NEON && __ARM_FEATURE_DOTPROD` 下走 NEON inline asm，未加独立宏，输出通过 `((ggml_bf16_t *) s)[0/1]` 写回，else 回退泛型路径。
    - 基线：`cmake --build build --config Release -j $(sysctl -n hw.ncpu)` 成功；`./build/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 512 -no-cnv`（CPU 路径，Metal 不可用）得到 `eval 17.39 ms/token ≈ 57.5 tok/s`，可作为后续 LUT 对比；加载阶段提示 `unknown type ifairy` 但推理正常。
-   - 编译选项：当前无 iFairy 专用 CMake 选项/宏，后续需新增 `GGML_IFAIRY_ARM_LUT`（默认 OFF）隔离 LUT 代码生成，与 BitNet 宏完全解耦。
+   - 编译选项：新增 `GGML_IFAIRY_ARM_LUT`（默认 OFF，见 `ggml/CMakeLists.txt` + `ggml/src/CMakeLists.txt`），后续 LUT 路径均受该宏控制，与 BitNet 宏解耦。
 2. **宏与类型接口定义**
    - 在 `ggml/src/ggml-cpu/arm/` 或公共头中添加 `GGML_IFAIRY_ARM_LUT` 宏开关，与 BitNet 宏解耦。
    - 若需扩展 `bitnet_tensor_extra` 风格的 `extra`，决定是复用现有结构还是新建 `ifairy_tensor_extra`（含 `qweights`、`scales_real/imag`、`lut_scales_size=2`、`n_tile_num` 等）。
-   - 评估：`ggml` 侧尚未使用 `tensor->extra` 支持 iFairy；现有 `bitnet_tensor_extra` 位于 `BitNet/include/ggml-bitnet.h`（字段：`lut_scales_size/BK/n_tile_num/qweights/scales`），不含复数双尺度与 tile_stride 等信息，且引入会产生跨仓依赖。倾向在 `ggml` 内新增 `ifairy_tensor_extra`（含 `qweights`、`scales[2]`、`lut_scales_size=2`、`n_tile_num`、`tile_stride/c_tile_size`），并配套 `ggml_ifairy_{init/free}` 风格的生命周期管理。
+   - 现状：已在 `ggml/include/ggml-ifairy.h` 定义 `ggml_ifairy_tensor_extra`（`qweights`、`scales_bytes`、`scales` 双通道、`lut_scales_size=2`、`n_tile_num`、`bm/bk`、`tile_stride/c_tile_size`），并预留 `ggml_ifairy_lut_{init/free}` 接口，方便后续生命周期管理。
 3. **权重转换与 `extra` 填充**
-   - 实现 `ggml_ifairy_transform_tensor`（类比 `ggml_bitnet_transform_tensor`），读取 `block_ifairy` 末尾的 `d_real/d_imag` 并写入 `extra`。
-   - 选择 tile 参数（参考 BitNet `BM1536_4096` 等），计算 `n_tile_num = m / bm` 与 `tile_stride/c_tile_size`，保证 `m` 可整除。
-   - 在图构建阶段调用转换，确保 `tensor->extra` 在前向可用。
+   - 已实现：`ggml/src/ggml-ifairy-lut.c` 新增 `ggml_ifairy_transform_tensor`，提取每 block 的 `d_real/d_imag` 写入 `scales`（float 双通道），基于形状映射选择 `bm/bk`（覆盖 1536×4096、1536×1536、4096×1536，默认回退整行 bm），计算 `n_tile_num`、`tile_stride`（按 block 行大小 × bm）与 `c_tile_size`。
+   - 调用时机：在 `ggml_compute_forward_mul_mat`（CPU）中，若开启 `GGML_IFAIRY_ARM_LUT` 且 `src0` 为 `GGML_TYPE_IFAIRY`、`extra` 为空，则自动调用转换以填充 `tensor->extra`；后续 LUT 内核可直接读取。
 4. **工作区尺寸计算与布局**
    - 新增 `ggml_ifairy_mul_mat_get_wsize`：QLUT_real/QLUT_imag 按 `k/2*32` 字节、scales 2×`bitnet_float_type`，可选 fp16 缓存；做 64B 对齐。
    - 在 `ggml_mul_mat` 调度时复用 BitNet 的 `wdata` 布局顺序（fp16 缓冲 → qlut_r → qlut_i → lut_scales），明确偏移计算。

@@ -43,6 +43,7 @@
   - `qweights = tensor->data`（2-bit 主体），`scales = {d_real, d_imag}`（来自行尾）。
   - `tile_stride`、`c_tile_size` 与 BitNet 相同，保证线程切分一致。
 - 选择形状：iFairy 典型矩阵与 BitNet 的 TL1 内核一致（1536×4096、1536×1536、4096×1536），可直接生成同尺寸内核。
+- 实现进度：`ggml/src/ggml-ifairy-lut.c` 添加 `ggml_ifairy_transform_tensor`（受 `GGML_IFAIRY_ARM_LUT` 控制），将每 block 的 `d_real/d_imag` 抽取到 `scales`（float 双通道），并按形状映射设置 `bm/bk/n_tile_num/tile_stride/c_tile_size`；`ggml/include/ggml-ifairy.h` 暴露 `ggml_ifairy_tensor_extra` 供前向读取。
 
 ### 5.2 工作区规划
 - 建议顺序（与 BitNet 对齐，便于偏移复用）：

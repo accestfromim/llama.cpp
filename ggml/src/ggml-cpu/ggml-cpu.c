@@ -9,6 +9,7 @@
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
+#include "ggml-ifairy.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
@@ -1231,6 +1232,12 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(ne1 == ne11);
     GGML_ASSERT(ne2 == ne12);
     GGML_ASSERT(ne3 == ne13);
+
+#if defined(GGML_IFAIRY_ARM_LUT)
+    if (src0->type == GGML_TYPE_IFAIRY && src0->backend == GGML_BACKEND_TYPE_CPU && src0->extra == NULL) {
+        ggml_ifairy_transform_tensor((struct ggml_tensor *) src0);
+    }
+#endif
 
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(src0->type));
