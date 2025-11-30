@@ -8,6 +8,7 @@
 #include "vec.h"
 
 #include <float.h>
+#include <inttypes.h>
 #include <algorithm>
 #include <math.h>
 
@@ -5960,6 +5961,12 @@ static void ggml_compute_forward_rope_f16(
 inline static void rope_yarn_ifairy(
     float theta_extrap, float freq_scale, float corr_dims[2], int64_t i0, float ext_factor, float mscale,
     float * cos_theta, float * sin_theta) {
+    GGML_UNUSED(freq_scale);
+    GGML_UNUSED(corr_dims);
+    GGML_UNUSED(i0);
+    GGML_UNUSED(ext_factor);
+    GGML_UNUSED(mscale);
+
     // Standard RoPE: theta = inv_freq * position_id
     float theta = theta_extrap;
     //printf("%f ", theta);
@@ -5969,6 +5976,9 @@ inline static void rope_yarn_ifairy(
 static void ggml_rope_cache_init_ifairy(
      float theta_base, float freq_scale, const float * freq_factors, float corr_dims[2], int64_t ne0, float ext_factor, float mscale,
      float * cache, float sin_sign, float theta_scale) {
+    GGML_UNUSED(freq_factors);
+    GGML_UNUSED(theta_scale);
+
     // Standard RoPE: theta = inv_freq * position_id
     // inv_freq = 1.0 / (base ^ (i / head_dim))
     // theta_scale = base ^ (-2/n_dims), so base = theta_scale ^ (-n_dims/2)
@@ -6006,6 +6016,7 @@ static void ggml_compute_forward_rope_ifairy(
     const int mode       = ((int32_t *) dst->op_params)[2];
     //const int n_ctx      = ((int32_t *) dst->op_params)[3];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+    GGML_UNUSED(n_ctx_orig);
 
     memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
     memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
@@ -6048,6 +6059,7 @@ static void ggml_compute_forward_rope_ifairy(
     const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
     const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;  // ggml_rope_multi, multimodal rotary position embedding
     const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
+    GGML_UNUSED(is_neox);
 
     if (is_mrope) {
         GGML_ASSERT(sections[0] > 0 || sections[1] > 0 || sections[2] > 0);
@@ -6085,7 +6097,8 @@ static void ggml_compute_forward_rope_ifairy(
             }
             for(int i=0;i<n_dims*2;i++){
                 if(cache[i] != cache[i] || cache[i] > 1.f || cache[i] < -1.f){
-                    GGML_ABORT("nan discovered in cache, index: %d, value: %f, n_dims = %d, ne00 = %d, ne0 = %d", i, cache[i], n_dims, ne00, ne0);
+                    GGML_ABORT("nan discovered in cache, index: %d, value: %f, n_dims = %d, ne00 = %" PRId64 ", ne0 = %" PRId64,
+                               i, cache[i], n_dims, ne00, ne0);
                 }
             }
             GGML_ASSERT(nb0 == 4);

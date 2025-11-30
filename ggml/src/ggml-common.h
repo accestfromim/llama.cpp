@@ -271,7 +271,7 @@ static_assert(sizeof(block_ifairy) == sizeof(float) * 2 + QK_K / 4, "wrong ifair
 
 
 typedef struct {
-    uint8_t x_real[QK_K], x_imag[QK_K];
+    int8_t x_real[QK_K], x_imag[QK_K];
     float d_real, d_imag;
 } block_ifairy_q16;
 static_assert(sizeof(block_ifairy_q16) == sizeof(float) * 2 + QK_K * 2, "wrong ifairy_q16 block size/padding");

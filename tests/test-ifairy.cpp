@@ -31,7 +31,7 @@ extern "C" {
 // ============================================================================
 
 // 简单的 JSON 数组解析器
-std::vector<float> parse_json_float_array(const std::string& json_str, const std::string& key) {
+static std::vector<float> parse_json_float_array(const std::string& json_str, const std::string& key) {
     std::vector<float> result;
 
     // 查找 key
@@ -80,7 +80,7 @@ std::vector<float> parse_json_float_array(const std::string& json_str, const std
     return result;
 }
 
-int parse_json_int(const std::string& json_str, const std::string& key) {
+static int parse_json_int(const std::string& json_str, const std::string& key) {
     std::string search_key = "\"" + key + "\"";
     size_t key_pos = json_str.find(search_key);
     if (key_pos == std::string::npos) {
@@ -101,7 +101,7 @@ int parse_json_int(const std::string& json_str, const std::string& key) {
     return atoi(json_str.c_str() + num_start);
 }
 
-float parse_json_float(const std::string& json_str, const std::string& key) {
+static float parse_json_float(const std::string& json_str, const std::string& key) {
     std::string search_key = "\"" + key + "\"";
     size_t key_pos = json_str.find(search_key);
     if (key_pos == std::string::npos) {
@@ -122,7 +122,7 @@ float parse_json_float(const std::string& json_str, const std::string& key) {
     return strtof(json_str.c_str() + num_start, nullptr);
 }
 
-std::string read_file(const std::string& filename) {
+static std::string read_file(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         fprintf(stderr, "Error: Cannot open file '%s'\n", filename.c_str());
@@ -139,7 +139,7 @@ std::string read_file(const std::string& filename) {
 
 constexpr float MAX_ERROR = 1e-2f;  // 允许的最大误差
 
-bool compare_arrays(const float* a, const float* b, size_t n, float max_error = MAX_ERROR) {
+static bool compare_arrays(const float* a, const float* b, size_t n, float max_error = MAX_ERROR) {
     float max_diff = 0.0f;
     size_t max_diff_idx = 0;
 
@@ -165,7 +165,7 @@ bool compare_arrays(const float* a, const float* b, size_t n, float max_error = 
 // 测试 1: 量化/反量化
 // ============================================================================
 
-bool test_quantization() {
+static bool test_quantization() {
     printf("\n=== Test 1: Quantization/Dequantization ===\n");
 
     // 读取测试数据
@@ -216,7 +216,7 @@ bool test_quantization() {
 // 测试 2: ROPE 算子
 // ============================================================================
 
-bool test_rope() {
+static bool test_rope() {
     printf("\n=== Test 2: iFairy ROPE ===\n");
 
     // 读取测试数据
@@ -301,7 +301,7 @@ bool test_rope() {
 // 测试 3: 复数矩阵乘法
 // ============================================================================
 
-bool test_complex_matmul() {
+static bool test_complex_matmul() {
     printf("\n=== Test 3: Complex Matrix Multiplication ===\n");
 
     // 读取测试数据
@@ -394,6 +394,9 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
         }
+    }
+    if (verbose) {
+        printf("Verbose mode enabled\n");
     }
 
     // 初始化 GGML CPU

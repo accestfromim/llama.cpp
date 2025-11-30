@@ -2727,10 +2727,9 @@ void quantize_row_ifairy_q16_ref(const float * GGML_RESTRICT x, block_ifairy_q16
     }
 }
 
-size_t quantize_row_ifairy_q16(const float *restrict x, block_ifairy_q16 *restrict y, int64_t k){
-    // todo_tbr
+void quantize_row_ifairy_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k){
+    block_ifairy_q16 * GGML_RESTRICT y = vy;
     quantize_row_ifairy_q16_ref(x, y, k);
-    return k;
 }
 
 void dequantize_row_ifairy_q16(const block_ifairy_q16 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

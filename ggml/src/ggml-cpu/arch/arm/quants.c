@@ -130,6 +130,11 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wlanguage-extension-token"
+#endif
+
 void quantize_row_ifairy_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_K == 0);
     const int nb = k / QK_K;
@@ -1709,6 +1714,10 @@ void ggml_vec_dot_ifairy_q16_K(
     ggml_vec_dot_ifairy_q16_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);

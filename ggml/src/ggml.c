@@ -881,7 +881,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         // complex weights are handled by dedicated kernels; there is no generic
         // single-buffer dequantization compatible with ggml_to_float_t
         .to_float                 = NULL,
-        .from_float_ref           = (ggml_from_float_t) quantize_row_ifairy_ref,
+        // quantization requires separate real/imag buffers; keep reference path disabled
+        .from_float_ref           = NULL,
     },
     [GGML_TYPE_IFAIRY_Q16] = {
         .type_name                = "ifairy_q16",
