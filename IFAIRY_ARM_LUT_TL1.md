@@ -46,6 +46,12 @@
 - 实现进度：`ggml/src/ggml-ifairy-lut.c` 添加 `ggml_ifairy_transform_tensor`（受 `GGML_IFAIRY_ARM_LUT` 控制），将每 block 的 `d_real/d_imag` 抽取到 `scales`（float 双通道），并按形状映射设置 `bm/bk/n_tile_num/tile_stride/c_tile_size`；`ggml/include/ggml-ifairy.h` 暴露 `ggml_ifairy_tensor_extra` 供前向读取。
 
 ### 5.2 工作区规划
+- 计算：`ggml_ifairy_mul_mat_get_wsize` 针对单列 matvec 返回工作区大小，按列累计 `QLUT_R/QLUT_I`（各 `k/2*32` → 总 `k*32` 字节）与 `lut_scales`（2×`sizeof(float)`），最终 64B 对齐；未命中形状直接返回 0（回退旧路径）。
+- 布局（约定）：连续缓冲顺序为 `qlut_real` → `qlut_imag` → `lut_scales`，与后续预处理/内核偏移保持一致；如需 fp16 缓冲可追加在头部扩展（当前未启用）。
+- 集成：`ggml_graph_plan`（CPU，`GGML_IFAIRY_ARM_LUT`）在 MUL_MAT 估算阶段优先调用 iFairy wsize，为 LUT 预处理预留空间。
+- 实现进度：`ggml/src/ggml-ifairy-lut.c` 添加 `ggml_ifairy_transform_tensor`（受 `GGML_IFAIRY_ARM_LUT` 控制），将每 block 的 `d_real/d_imag` 抽取到 `scales`（float 双通道），并按形状映射设置 `bm/bk/n_tile_num/tile_stride/c_tile_size`；`ggml/include/ggml-ifairy.h` 暴露 `ggml_ifairy_tensor_extra` 供前向读取。
+
+### 5.2 工作区规划
 - 建议顺序（与 BitNet 对齐，便于偏移复用）：
   1. 可选 fp16 缓存（当输入是 fp32 时，用于转存 `act`）。
   2. `qlut_real`：`m_tile * k_tile /2 * 32` 字节。

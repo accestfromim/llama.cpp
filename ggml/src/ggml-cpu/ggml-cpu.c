@@ -2775,6 +2775,11 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
+#if defined(GGML_IFAIRY_ARM_LUT)
+                        if (ggml_ifairy_can_mul_mat(node->src[0], node->src[1], node)) {
+                            cur = ggml_ifairy_mul_mat_get_wsize(node->src[0], node->src[1], node);
+                        } else
+#endif
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }

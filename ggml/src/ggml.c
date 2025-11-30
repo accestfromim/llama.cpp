@@ -6,6 +6,9 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#if defined(GGML_IFAIRY_ARM_LUT)
+#include "ggml-ifairy.h"
+#endif
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"

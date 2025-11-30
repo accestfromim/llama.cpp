@@ -131,3 +131,43 @@ void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor) {
         ++ifairy_tensor_extras_index;
     }
 }
+
+bool ggml_ifairy_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_IFAIRY || src1->type != GGML_TYPE_IFAIRY_Q16 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (src1->ne[1] > 1) {
+        return false;
+    }
+
+    int bm = 0, bk = 0;
+    if (!ggml_ifairy_select_tile_params(src1->ne[1], src1->ne[0], &bm, &bk)) {
+        return false;
+    }
+
+    return true;
+}
+
+size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst) {
+    GGML_UNUSED(dst);
+    if (!ggml_ifairy_can_mul_mat(src0, src1, dst)) {
+        return 0;
+    }
+
+    const int64_t k   = src1->ne[0];
+    const int64_t m   = src1->ne[1];
+    int bm = 0, bk = 0;
+    const bool ok = ggml_ifairy_select_tile_params(m, k, &bm, &bk);
+    GGML_ASSERT(ok);
+    GGML_UNUSED(bk);
+
+    // QLUT layout: real + imag, each k/2*32 bytes per column
+    const size_t qlut_bytes_per_col = (size_t) k * 32;
+    const size_t lut_scales_bytes   = 2 * sizeof(float);
+    size_t wsize = m * (qlut_bytes_per_col + lut_scales_bytes);
+
+    // 64B align to match ggml allocator expectations
+    wsize = GGML_PAD(wsize, 64);
+    return wsize;
+}

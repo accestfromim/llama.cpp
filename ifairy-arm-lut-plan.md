@@ -36,8 +36,8 @@
    - 已实现：`ggml/src/ggml-ifairy-lut.c` 新增 `ggml_ifairy_transform_tensor`，提取每 block 的 `d_real/d_imag` 写入 `scales`（float 双通道），基于形状映射选择 `bm/bk`（覆盖 1536×4096、1536×1536、4096×1536，默认回退整行 bm），计算 `n_tile_num`、`tile_stride`（按 block 行大小 × bm）与 `c_tile_size`。
    - 调用时机：在 `ggml_compute_forward_mul_mat`（CPU）中，若开启 `GGML_IFAIRY_ARM_LUT` 且 `src0` 为 `GGML_TYPE_IFAIRY`、`extra` 为空，则自动调用转换以填充 `tensor->extra`；后续 LUT 内核可直接读取。
 4. **工作区尺寸计算与布局**
-   - 新增 `ggml_ifairy_mul_mat_get_wsize`：QLUT_real/QLUT_imag 按 `k/2*32` 字节、scales 2×`bitnet_float_type`，可选 fp16 缓存；做 64B 对齐。
-   - 在 `ggml_mul_mat` 调度时复用 BitNet 的 `wdata` 布局顺序（fp16 缓冲 → qlut_r → qlut_i → lut_scales），明确偏移计算。
+   - 已实现：`ggml_ifairy_mul_mat_get_wsize`（`ggml-ifairy-lut.c`）在形状命中时返回工作区大小：每列分配 `QLUT_R/QLUT_I`（各 `k/2*32`，总 `k*32` 字节）加 2×`sizeof(float)` 的 LUT scales，再对 `m` 列累加并 64B 对齐；`ggml_ifairy_can_mul_mat` 限定 `src0=IFAIRY`、`src1=IFAIRY_Q16`、`dst=F32` 且 `ne1<=1`。
+   - 集成：`ggml_graph_plan`（CPU）在 MUL_MAT 分支优先调用 iFairy wsize（受 `GGML_IFAIRY_ARM_LUT` 控制），为后续 LUT 预处理/内核预留连续缓冲；布局默认顺序为 QLUT_real → QLUT_imag → LUT scales（后续内核按此约定取偏移）。
 5. **激活预处理与 LUT 生成**
    - 编写 `per_tensor_quant` 复数版：分别求 real/imag max_abs，写入 `lut_scales_r/i = 127/max`，提供 `partial_max_reset`。
    - 实现 `ifairy_lut_ctor<K>`：量化 real/imag 到 int8，完成 8×8 转置与 nibble 排列，输出 `QLUT_R/QLUT_I` 两份查表。

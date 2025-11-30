@@ -27,6 +27,8 @@ struct ggml_ifairy_tensor_extra {
 GGML_API void ggml_ifairy_lut_init(void);
 GGML_API void ggml_ifairy_lut_free(void);
 GGML_API void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor);
+GGML_API bool ggml_ifairy_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst);
+GGML_API size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst);
 
 #ifdef __cplusplus
 }
