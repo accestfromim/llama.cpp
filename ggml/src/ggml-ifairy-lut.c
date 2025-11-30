@@ -74,6 +74,76 @@ void ggml_ifairy_lut_free(void) {
     ifairy_lut_initialized = false;
 }
 
+static inline int8_t ggml_ifairy_clamp_s8(const float v) {
+    const float clipped = v > 127.f ? 127.f : (v < -127.f ? -127.f : v);
+    return (int8_t) lrintf(clipped);
+}
+
+static inline float ggml_ifairy_abs_f32(float v) {
+    return v >= 0 ? v : -v;
+}
+
+static void ggml_ifairy_partial_max_reset(float * lut_scales) {
+    lut_scales[0] = 0.0f;
+    lut_scales[1] = 0.0f;
+}
+
+static void ggml_ifairy_per_tensor_quant(const block_ifairy_q16 * act_blocks, int64_t k, float * lut_scales_out, float * inv_scales_out) {
+    ggml_ifairy_partial_max_reset(lut_scales_out);
+
+    const int64_t n_blocks = k / QK_K;
+    float max_r = 0.0f;
+    float max_i = 0.0f;
+
+    for (int64_t bi = 0; bi < n_blocks; ++bi) {
+        const block_ifairy_q16 * blk = &act_blocks[bi];
+        const float d_r = GGML_FP16_TO_FP32(blk->d_real);
+        const float d_i = GGML_FP16_TO_FP32(blk->d_imag);
+
+        for (int j = 0; j < QK_K; ++j) {
+            const float vr = (float) blk->x_real[j] * d_r;
+            const float vi = (float) blk->x_imag[j] * d_i;
+            max_r = GGML_MAX(max_r, ggml_ifairy_abs_f32(vr));
+            max_i = GGML_MAX(max_i, ggml_ifairy_abs_f32(vi));
+        }
+    }
+
+    const float inv_r = max_r > 0.0f ? 127.0f / max_r : 0.0f;
+    const float inv_i = max_i > 0.0f ? 127.0f / max_i : 0.0f;
+
+    lut_scales_out[0] = inv_r;
+    lut_scales_out[1] = inv_i;
+    if (inv_scales_out) {
+        inv_scales_out[0] = inv_r;
+        inv_scales_out[1] = inv_i;
+    }
+}
+
+static void ggml_ifairy_lut_ctor(const block_ifairy_q16 * act_blocks, int64_t k, const float * inv_scales, int8_t * qlut_r, int8_t * qlut_i) {
+    const int64_t n_blocks = k / QK_K;
+
+    memset(qlut_r, 0, k * 32);
+    memset(qlut_i, 0, k * 32);
+
+    const float inv_r = inv_scales[0];
+    const float inv_i = inv_scales[1];
+
+    // TODO: refine layout to match tbl_impl permutation; currently writes first k bytes sequentially and leaves padding zeroed.
+    for (int64_t bi = 0; bi < n_blocks; ++bi) {
+        const block_ifairy_q16 * blk = &act_blocks[bi];
+        const float d_r = GGML_FP16_TO_FP32(blk->d_real);
+        const float d_i = GGML_FP16_TO_FP32(blk->d_imag);
+
+        const int64_t base = bi * QK_K;
+        for (int j = 0; j < QK_K; ++j) {
+            const float vr = (float) blk->x_real[j] * d_r * inv_r;
+            const float vi = (float) blk->x_imag[j] * d_i * inv_i;
+            qlut_r[base + j] = ggml_ifairy_clamp_s8(vr);
+            qlut_i[base + j] = ggml_ifairy_clamp_s8(vi);
+        }
+    }
+}
+
 void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor) {
 #if defined(GGML_USE_OPENMP)
 #pragma omp critical
@@ -170,4 +240,15 @@ size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const stru
     // 64B align to match ggml allocator expectations
     wsize = GGML_PAD(wsize, 64);
     return wsize;
+}
+
+void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, void * qlut_real, void * qlut_imag) {
+    GGML_UNUSED(m);
+    GGML_ASSERT(k % QK_K == 0);
+
+    const block_ifairy_q16 * act_blocks = (const block_ifairy_q16 *) B;
+    float inv_scales[2] = {0.0f, 0.0f};
+
+    ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
+    ggml_ifairy_lut_ctor(act_blocks, k, inv_scales, (int8_t *) qlut_real, (int8_t *) qlut_imag);
 }

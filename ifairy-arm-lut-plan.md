@@ -39,9 +39,8 @@
    - 已实现：`ggml_ifairy_mul_mat_get_wsize`（`ggml-ifairy-lut.c`）在形状命中时返回工作区大小：每列分配 `QLUT_R/QLUT_I`（各 `k/2*32`，总 `k*32` 字节）加 2×`sizeof(float)` 的 LUT scales，再对 `m` 列累加并 64B 对齐；`ggml_ifairy_can_mul_mat` 限定 `src0=IFAIRY`、`src1=IFAIRY_Q16`、`dst=F32` 且 `ne1<=1`。
    - 集成：`ggml_graph_plan`（CPU）在 MUL_MAT 分支优先调用 iFairy wsize（受 `GGML_IFAIRY_ARM_LUT` 控制），为后续 LUT 预处理/内核预留连续缓冲；布局默认顺序为 QLUT_real → QLUT_imag → LUT scales（后续内核按此约定取偏移）。
 5. **激活预处理与 LUT 生成**
-   - 编写 `per_tensor_quant` 复数版：分别求 real/imag max_abs，写入 `lut_scales_r/i = 127/max`，提供 `partial_max_reset`。
-   - 实现 `ifairy_lut_ctor<K>`：量化 real/imag 到 int8，完成 8×8 转置与 nibble 排列，输出 `QLUT_R/QLUT_I` 两份查表。
-   - 封装 `preprocessor_k<K>` 与泛化入口 `ggml_ifairy_preprocessor(m, k, B, lut_scales, qlut_r, qlut_i)`；覆盖至少 K∈{4096,1536} 组合。
+   - 已实现：`ggml_ifairy_preprocessor`（`ggml-ifairy-lut.c`）对 `GGML_TYPE_IFAIRY_Q16` 激活进行 per-tensor quant（独立 real/imag max_abs → `lut_scales={127/max_r,127/max_i}`），再将 block 内 256 个 int8 激活按缩放写入 `qlut_r/qlut_i`；当前布局简单按顺序写入前 `k` 字节并将剩余工作区清零，后续内核接入时可替换为正式 nibble/转置布局。
+   - 辅助：`ggml_ifairy_partial_max_reset`/`ggml_ifairy_per_tensor_quant`/`ggml_ifairy_lut_ctor` 拆分逻辑，便于后续替换生成代码或按 K 特化。
 6. **LUT 内核实现**
    - 设计 `tbl_impl_*` 复数版：用 `vqtbl1` 查 `wr/wi` 与 `QLUT_R/QLUT_I`，执行复数共轭乘法累加到 `int32`。
    - 依据目标形状生成 `qgemm_ifairy_lut_*`：K 维分块（`BBK*`）、M 维 tile（`BM*`），完成反量化：

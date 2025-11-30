@@ -73,11 +73,8 @@
   ```
 - 逻辑：
   1. `partial_max_reset`：将 `lut_scales_r/lut_scales_i` 置零。
-  2. `per_tensor_quant`（复数版）：分别扫描 `B_real/B_imag` 取 `max_abs`，写入 `lut_scales_r = 127/max_r`，`lut_scales_i = 127/max_i`。
-  3. `ifairy_lut_ctor<K>`：生成 `QLUT_R/QLUT_I`。做法：
-     - 将实部乘以 `lut_scales_r`、虚部乘以 `lut_scales_i`，量化到 int8。
-     - 使用与 BitNet 相同的 8×8 转置（`Transpose_8_8`）和 `tbl_mask` 排列，确保 nibble 索引与 `vqtbl1` 兼容。
-     - 写入两个查表区：`QLUT_R` 存 real，对应 wr 取值；`QLUT_I` 存 imag，对应 wi 取值。
+  2. `per_tensor_quant`（复数版）：扫描 `block_ifairy_q16`，按 `x_real/x_imag` × `d_real/d_imag` 计算 max_abs，写入 `lut_scales_r = 127/max_r`，`lut_scales_i = 127/max_i`。
+  3. `ifairy_lut_ctor`：将激活乘以对应 `lut_scales` 量化到 int8，当前实现顺序写入前 `k` 字节（其余填零，布局后续与内核联动时再替换为正式转置/nibble 排列）。
 - 形状分支：与内核一一对应，生成 `preprocessor_k<4096>`、`preprocessor_k<1536>` 等模板实例。
 
 ### 5.4 LUT 内核 `ifairy_tbl_impl_*` / `ggml_qgemm_ifairy_lut`

@@ -29,6 +29,7 @@ GGML_API void ggml_ifairy_lut_free(void);
 GGML_API void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor);
 GGML_API bool ggml_ifairy_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst);
 GGML_API size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const struct ggml_tensor * src1, const struct ggml_tensor * dst);
+GGML_API void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, void * qlut_real, void * qlut_imag);
 
 #ifdef __cplusplus
 }
