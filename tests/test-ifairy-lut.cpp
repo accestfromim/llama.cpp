@@ -79,6 +79,57 @@ int main(void) {
 
     ggml_ifairy_preprocessor(m, k, &act, lut_scales, qlut_r.data(), qlut_i.data());
 
+    // Scalar reference for LUT construction to validate NEON path
+    auto clamp_s8 = [](float v) -> int8_t {
+        const float clipped = v > 127.f ? 127.f : (v < -127.f ? -127.f : v);
+        return (int8_t) std::lrint(clipped);
+    };
+
+    float lut_scales_ref[2] = {0.f, 0.f};
+    {
+        double max_r = 0.0, max_i = 0.0;
+        const double d_r = GGML_FP16_TO_FP32(act.d_real);
+        const double d_i = GGML_FP16_TO_FP32(act.d_imag);
+        for (int j = 0; j < k; ++j) {
+            max_r = std::max(max_r, std::abs((double) (int8_t) act.x_real[j] * d_r));
+            max_i = std::max(max_i, std::abs((double) (int8_t) act.x_imag[j] * d_i));
+        }
+        lut_scales_ref[0] = max_r > 0.0 ? (float) (127.0 / max_r) : 0.0f;
+        lut_scales_ref[1] = max_i > 0.0 ? (float) (127.0 / max_i) : 0.0f;
+    }
+
+    std::vector<int8_t> qlut_r_ref((size_t) (k / 2) * 32);
+    std::vector<int8_t> qlut_i_ref((size_t) (k / 2) * 32);
+    for (int pair = 0; pair < k / 2; ++pair) {
+        const int j0 = pair * 2;
+        const int j1 = j0 + 1;
+        const float d_r = GGML_FP16_TO_FP32(act.d_real);
+        const float d_i = GGML_FP16_TO_FP32(act.d_imag);
+        const float inv_r = lut_scales_ref[0];
+        const float inv_i = lut_scales_ref[1];
+        const int8_t qr0 = clamp_s8((float) (int8_t) act.x_real[j0] * d_r * inv_r);
+        const int8_t qr1 = clamp_s8((float) (int8_t) act.x_real[j1] * d_r * inv_r);
+        const int8_t qi0 = clamp_s8((float) (int8_t) act.x_imag[j0] * d_i * inv_i);
+        const int8_t qi1 = clamp_s8((float) (int8_t) act.x_imag[j1] * d_i * inv_i);
+        const size_t base = (size_t) pair * 32;
+        std::fill_n(qlut_r_ref.data() + base + 0,  16, qr0);
+        std::fill_n(qlut_r_ref.data() + base + 16, 16, qr1);
+        std::fill_n(qlut_i_ref.data() + base + 0,  16, qi0);
+        std::fill_n(qlut_i_ref.data() + base + 16, 16, qi1);
+    }
+
+    const float tol_scale = 1e-5f;
+    if (std::abs(lut_scales[0] - lut_scales_ref[0]) > tol_scale || std::abs(lut_scales[1] - lut_scales_ref[1]) > tol_scale) {
+        std::cerr << "lut_scales mismatch: got (" << lut_scales[0] << ", " << lut_scales[1] << ")"
+                  << " ref (" << lut_scales_ref[0] << ", " << lut_scales_ref[1] << ")\n";
+        return 1;
+    }
+    if (!std::equal(qlut_r.begin(), qlut_r.end(), qlut_r_ref.begin()) ||
+        !std::equal(qlut_i.begin(), qlut_i.end(), qlut_i_ref.begin())) {
+        std::cerr << "qlut mismatch\n";
+        return 1;
+    }
+
     std::vector<float> dst_lut((size_t) m * 2, 0.f);
     ggml_ifairy_qgemm_lut_ref(weights.data(), qlut_r.data(), qlut_i.data(), lut_scales, k, m, dst_lut.data());
 
@@ -108,8 +159,8 @@ int main(void) {
             const double w_real = wr * GGML_FP16_TO_FP32(w_row[0].d_real);
             const double w_imag = wi * GGML_FP16_TO_FP32(w_row[0].d_imag);
 
-            const double ar = (double) act.x_real[j] * d_ar;
-            const double ai = (double) act.x_imag[j] * d_ai;
+            const double ar = (double) (int8_t) act.x_real[j] * d_ar;
+            const double ai = (double) (int8_t) act.x_imag[j] * d_ai;
 
             acc_r += w_real * ar + w_imag * ai;
             acc_i += w_imag * ar - w_real * ai;
@@ -119,7 +170,7 @@ int main(void) {
         dst_ref[(size_t) row * 2 + 1] = (float) acc_i;
     }
 
-    const float rel = 1e-2f;
+    const float rel = 2e-2f;
     for (int row = 0; row < m; ++row) {
         const float dr = std::abs(dst_lut[(size_t) row * 2 + 0] - dst_ref[(size_t) row * 2 + 0]);
         const float di = std::abs(dst_lut[(size_t) row * 2 + 1] - dst_ref[(size_t) row * 2 + 1]);

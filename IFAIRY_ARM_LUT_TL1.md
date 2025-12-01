@@ -73,8 +73,8 @@
   ```
 - 逻辑：
   1. `partial_max_reset`：将 `lut_scales_r/lut_scales_i` 置零。
-  2. `per_tensor_quant`（复数版）：扫描 `block_ifairy_q16`，按 `x_real/x_imag` × `d_real/d_imag` 计算 max_abs，NEON 同步归约 real/imag，写入 `lut_scales_r = 127/max_r`，`lut_scales_i = 127/max_i`。
-  3. `ifairy_lut_ctor`：将激活乘以对应 `lut_scales` 量化到 int8，使用 NEON + `Transpose_8_8` + `tbl_mask` 生成 TL1 nibble 布局：每对 (even, odd) 激活写入两张 16 项查表（偶/奇各一份），单通道大小 `k/2*32`，real/imag 各占一份。
+  2. `per_tensor_quant`（复数版）：扫描 `block_ifairy_q16`，按 `x_real/x_imag`（以 int8 符号解释）× `d_real/d_imag` 计算 max_abs，NEON 同步归约 real/imag，写入 `lut_scales_r = 127/max_r`，`lut_scales_i = 127/max_i`。
+  3. `ifairy_lut_ctor`：将激活乘以对应 `lut_scales` 量化到 int8，使用 NEON 分块量化（8 对激活）生成 TL1 nibble 布局：每对 (even, odd) 激活写入两张 16 项查表（偶/奇各一份），单通道大小 `k/2*32`，real/imag 各占一份。
 - 形状分支：与内核一一对应，生成 `preprocessor_k<4096>`、`preprocessor_k<1536>` 等模板实例。
 
 ### 5.4 LUT 内核 `ifairy_tbl_impl_*` / `ggml_qgemm_ifairy_lut`
@@ -99,7 +99,7 @@
 
 ### 5.4 参考实现现状
 - `ggml_ifairy_qgemm_lut_ref`（`ggml-ifairy-lut.c`）已实现解码 + 复数 dot + 反量化的参考内核，用于功能正确性验证和后续 NEON 内核对齐。当前读取的 QLUT 已改为 nibble 布局并由 NEON 构表（每对激活 2×16 表，偶/奇拆分），乘法仍标量解码权重并输出 `[real, imag]` 交错。
-- 未来将以 TL1 风格生成/手写 `tbl_impl_*` + `qgemm_ifairy_lut_*`，替换参考内核并同步调整 QLUT 构表为 SIMD 版本。
+- `ggml_ifairy_qgemm_lut_neon`（`ggml-ifairy-lut.c`）新增 DOTPROD 路径：`vqtbl1` 将权重码映射到 `wr/wi`，按偶/奇激活块取常数表，`vdotq_s32` 同步累计 `rr/ii/ri/ir`，最后用 `w_r/w_i` 与 `lut_scales` 反量化。前向在支持 DOTPROD 时优先调用，环境/形状不符回退标量；行区间接口支持线程切分（`row_start/row_end`），后续仍可迭代内核特化。
 
 ### 5.5 前向调度
 - `ggml_compute_forward_mul_mat` 在 `GGML_IFAIRY_ARM_LUT` 下优先走 iFairy LUT：线程 0 先 `ggml_ifairy_transform_tensor`（填充 `tensor->extra`），再用 `ggml_ifairy_preprocessor` 将激活写入工作区（顺序：`qlut_r` → `qlut_i` → `lut_scales`），`ggml_barrier` 同步后由线程 0 调用参考 LUT 内核写回结果，其余线程仅同步；未命中条件即回退原路径。
@@ -109,16 +109,17 @@
 - 环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 可强制关闭 LUT 路径；形状/类型不符时自动回退。
 - 若工作区不足（`params->wsize` 小于预估值），前向直接回退原始 mul_mat 路径，避免断言或越界。
 - 参考内核仅线程 0 执行，便于与旧路径做 A/B 数值对比；NEON 版本接入后可继续保留该回退逻辑作为安全网。
-- 自测：`tests/test-ifairy-lut.cpp` 构造随机 ifairy 权重/激活，调用 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref`，并与浮点解码后的复数乘结果对比（1% 相对误差阈值）验证数值正确性。
+- 自测：`tests/test-ifairy-lut.cpp` 构造随机 ifairy 权重/激活，先比对 LUT 构造结果（NEON vs 标量参考），再调用 `ggml_ifairy_qgemm_lut_ref`，与浮点解码后的复数乘结果对比（2% 相对误差阈值）验证数值正确性。
 
 ## 6. 标量 LUT → ARM TL1 SIMD 转换拆解
 - 标量现状：`ggml_ifairy_qgemm_lut_ref` 逐 block 标量解码 `wr/wi`，读取 NEON 构表的 nibble 布局 `qlut_r/qlut_i`（偶/奇查表各 16 项），做 4 路累加（`rr/ii/ri/ir`），最后按 `w_r/w_i` 与 `1/lut_scales` 反量化。
-- 与 BitNet TL1 差异：QLUT 尺寸/偏移已对齐且构表 NEON 化，但权重解码目前在循环内标量展开，TL1 用常量表 + `vqtbl1` 直接映射；累加现在逐元素，TL1 需要在 NEON 内核中同时查 real/imag 并用 `vdotq_s32` 累到 int32。
+- NEON 现状：`ggml_ifairy_qgemm_lut_neon` 用 `vqtbl1` 查权重码、`vdotq_s32` 累积 `rr/ii/ri/ir`，与参考共享 nibble QLUT；当前仍为单列 matvec，必要时回退标量。
+- 与 BitNet TL1 差异：QLUT 尺寸/偏移已对齐且构表 NEON 化，权重查表/累加已用 NEON，但尚未做 K/M 特化或批次切分，仍使用行首尺度 `d_real/d_imag`（单 block 场景无误）。
 - 迁移步骤（按依赖排序）：
   1) **QLUT 布局定版**：仿 BitNet TL1，单通道大小 `k/2*32`，real/imag 各占一份；更新 `wsize` 注释与偏移，删除现有 `memset(qlut, k*32)` 占位写，确保构表和内核共享同一 nibble 布局。（已完成：工作区按 nibble 计算，预处理生成偶/奇各一张 16 项表并被参考内核消费）
   2) **量化/构表 SIMD 化**：`ggml_ifairy_per_tensor_quant` 用 NEON 同时求 real/imag `max_abs`（`vld1_s8`→`vmovl`→`vcvtq_f32`×`d_*`→`vmaxq`）；`ggml_ifairy_lut_ctor` 参考 `Transpose_8_8`+`tbl_mask` 生成 nibble 友好布局的 `vec_lut_r[16]`、`vec_lut_i[16]`，一次写完 real/imag QLUT。
   3) **权重查表 SIMD 化**：构造 16B `tbl_wr`/`tbl_wi`（码 `0/1`→±1, `2/3`→±i），`tbl_impl_*` 中对 16B 权重用 `vshrq_n_u8`/`vandq` 拆高低 nibble，通过 `vqtbl1q_s8` 同步取 real/imag LUT，使用 `vdotq_s32`（或 `vmlal_s8`）分别累计 `rr/ii/ri/ir`，注意虚部符号在 `wi` 查表中编码。
-  4) **TL1 内核包装**：按 `(m,k)` 特化 `qgemm_ifairy_lut_{m}_{k}`，与 `bm/bk` 对齐 K 步长；反量化沿用 `w_r/w_i` 与 `lut_scales_r/i` 的共轭公式。`ggml_compute_forward_mul_mat` 中将参考内核替换为 NEON 版本，保留 scalar 版本做回退。
+  4) **TL1 内核包装**：按 `(m,k)` 特化 `qgemm_ifairy_lut_{m}_{k}`，与 `bm/bk` 对齐 K 步长；反量化沿用 `w_r/w_i` 与 `lut_scales_r/i` 的共轭公式。`ggml_compute_forward_mul_mat` 中将参考内核替换为 NEON 版本，保留 scalar 版本做回退。（已完成：通用 matvec 版本支持 DOTPROD，按线程切分行区间；后续可进一步按 `bm/bk` 特化）
   5) **验证与基线**：更新 `ggml_ifairy_mul_mat_get_wsize`/预处理偏移与新布局一致，补充 `tests/test-ifairy-lut` 读取 nibble QLUT 与 SIMD 内核对齐（对比参考解码路径），记录性能对比 `ggml_vec_dot_ifairy_q16_K`（tok/s 或 ms/token）。
 
 ## 7. 工程化与维护

@@ -1274,9 +1274,18 @@ void ggml_compute_forward_mul_mat(
 
             ggml_barrier(params->threadpool);
 
-            if (ith == 0) {
+            const int ithr = ith;
+            const int nthr = nth;
+            const int64_t row_start = (m * ithr) / nthr;
+            const int64_t row_end   = (m * (ithr + 1)) / nthr;
+
+            if (row_start < row_end) {
                 const block_ifairy * w = (const block_ifairy *) src0->data;
-                ggml_ifairy_qgemm_lut_ref(w, qlut_r, qlut_i, lut_scales, k, m, (float *) dst->data);
+    #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+                ggml_ifairy_qgemm_lut_neon_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
+    #else
+                ggml_ifairy_qgemm_lut_ref_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
+    #endif
             }
 
             ggml_barrier(params->threadpool);

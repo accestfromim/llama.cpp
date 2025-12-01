@@ -70,9 +70,9 @@
 - 目标：将现有标量参考 LUT（顺序 QLUT + 标量 wr/wi 解码）替换为 ARM NEON TL1 SIMD 路径，复用 BitNet LUT 工作区与查表模式，保持 iFairy 复数语义。
 - 待办步骤：
   1. **QLUT 布局与 wsize**（已完成）：把 `qlut_r/qlut_i` 改为 TL1 nibble 布局（单通道 `k/2*32`，每对激活输出偶/奇两张 16 项表），`ggml_ifairy_mul_mat_get_wsize`/CPU 前向偏移与之对齐，移除原有顺序写入与占位 memset。
-  2. **SIMD 量化/构表**（已完成）：`ggml_ifairy_per_tensor_quant` 用 NEON 同时归约 real/imag 最大值；`ggml_ifairy_lut_ctor` 参考 BitNet `Transpose_8_8` + `tbl_mask`，对每 8 对激活分块量化并写入 nibble 友好 QLUT（real/imag 独立）。
-  3. **权重查表 SIMD 化**：准备 16B `tbl_wr`/`tbl_wi`（映射码 0/1→±1，2/3→±i），`tbl_impl_*` 用 `vqtbl1` 对高/低 nibble 查 real/imag LUT，`vdotq_s32`（或 `vmlal_s8`）同步累计 `rr/ii/ri/ir`，保证虚部符号正确。
-  4. **TL1 内核封装**：按 `(m,k)`（1536×4096、1536×1536、4096×1536）特化 `qgemm_ifairy_lut_*`，与 `bm/bk` 分块匹配，反量化沿用 `w_r/w_i` 与 `lut_scales_r/i` 共轭公式；在 `ggml_compute_forward_mul_mat` 切换到 NEON 内核，保留 scalar 回退。
+  2. **SIMD 量化/构表**（已完成）：`ggml_ifairy_per_tensor_quant` 用 NEON 同时归约 real/imag 最大值；`ggml_ifairy_lut_ctor` 用 NEON 对每 8 对激活分块量化并写入 nibble 友好 QLUT（real/imag 独立，偶/奇各 16 项）。
+  3. **权重查表 SIMD 化**（已完成）：准备 16B `tbl_wr`/`tbl_wi`（映射码 0/1→±1，2/3→±i），`ggml_ifairy_qgemm_lut_neon` 用 `vqtbl1` 查权重码、`vdotq_s32` 累计 `rr/ii/ri/ir`，对未开启 DOTPROD 或工作区不足回退标量。
+  4. **TL1 内核封装**（已完成）：添加行区间版本的 NEON/标量 LUT 内核，前向按线程切分 `row_start/row_end` 并调用 DOTPROD 内核（不支持则回退标量），保持 BM/BK 选择与回退逻辑一致；当前仍是单列 matvec，后续可特化 `(m,k)` 内核进一步提速。
   5. **验证与基准**：扩展 `tests/test-ifairy-lut` 读取 nibble QLUT + SIMD 内核与参考解码对齐；在目标设备上对比 `ggml_vec_dot_ifairy_q16_K` 基线 tok/s，记录 LUT 开关差异。
 
 ## 交付物与完成判据
