@@ -120,7 +120,7 @@
   2) **量化/构表 SIMD 化**：`ggml_ifairy_per_tensor_quant` 用 NEON 同时求 real/imag `max_abs`（`vld1_s8`→`vmovl`→`vcvtq_f32`×`d_*`→`vmaxq`）；`ggml_ifairy_lut_ctor` 参考 `Transpose_8_8`+`tbl_mask` 生成 nibble 友好布局的 `vec_lut_r[16]`、`vec_lut_i[16]`，一次写完 real/imag QLUT。
   3) **权重查表 SIMD 化**：构造 16B `tbl_wr`/`tbl_wi`（码 `0/1`→±1, `2/3`→±i），`tbl_impl_*` 中对 16B 权重用 `vshrq_n_u8`/`vandq` 拆高低 nibble，通过 `vqtbl1q_s8` 同步取 real/imag LUT，使用 `vdotq_s32`（或 `vmlal_s8`）分别累计 `rr/ii/ri/ir`，注意虚部符号在 `wi` 查表中编码。
   4) **TL1 内核包装**：按 `(m,k)` 特化 `qgemm_ifairy_lut_{m}_{k}`，与 `bm/bk` 对齐 K 步长；反量化沿用 `w_r/w_i` 与 `lut_scales_r/i` 的共轭公式。`ggml_compute_forward_mul_mat` 中将参考内核替换为 NEON 版本，保留 scalar 版本做回退。（已完成：通用 matvec 版本支持 DOTPROD，按线程切分行区间；后续可进一步按 `bm/bk` 特化）
-  5) **验证与基线**：更新 `ggml_ifairy_mul_mat_get_wsize`/预处理偏移与新布局一致，补充 `tests/test-ifairy-lut` 读取 nibble QLUT 与 SIMD 内核对齐（对比参考解码路径），记录性能对比 `ggml_vec_dot_ifairy_q16_K`（tok/s 或 ms/token）。
+  5) **验证与基线**：更新 `ggml_ifairy_mul_mat_get_wsize`/预处理偏移与新布局一致，`tests/test-ifairy-lut` 校验 LUT 构造（NEON vs 标量）与参考解码（2% 容忍）对齐；`ctest -R ifairy-lut --test-dir build --output-on-failure` 通过，性能对比待在目标设备补充 tok/s。
 
 ## 7. 工程化与维护
 - 构建开关：CMake 选项 `GGML_IFAIRY_ARM_LUT`（默认 OFF）控制整个路径，运行时可用环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 强制关闭，便于 A/B。

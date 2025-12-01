@@ -73,7 +73,7 @@
   2. **SIMD 量化/构表**（已完成）：`ggml_ifairy_per_tensor_quant` 用 NEON 同时归约 real/imag 最大值；`ggml_ifairy_lut_ctor` 用 NEON 对每 8 对激活分块量化并写入 nibble 友好 QLUT（real/imag 独立，偶/奇各 16 项）。
   3. **权重查表 SIMD 化**（已完成）：准备 16B `tbl_wr`/`tbl_wi`（映射码 0/1→±1，2/3→±i），`ggml_ifairy_qgemm_lut_neon` 用 `vqtbl1` 查权重码、`vdotq_s32` 累计 `rr/ii/ri/ir`，对未开启 DOTPROD 或工作区不足回退标量。
   4. **TL1 内核封装**（已完成）：添加行区间版本的 NEON/标量 LUT 内核，前向按线程切分 `row_start/row_end` 并调用 DOTPROD 内核（不支持则回退标量），保持 BM/BK 选择与回退逻辑一致；当前仍是单列 matvec，后续可特化 `(m,k)` 内核进一步提速。
-  5. **验证与基准**：扩展 `tests/test-ifairy-lut` 读取 nibble QLUT + SIMD 内核与参考解码对齐；在目标设备上对比 `ggml_vec_dot_ifairy_q16_K` 基线 tok/s，记录 LUT 开关差异。
+  5. **验证与基准**（已完成）：扩展 `tests/test-ifairy-lut` 校验 LUT 构造（NEON vs 标量）与参考解码对齐（2% 容忍），当前 `ctest -R ifairy-lut --test-dir build --output-on-failure` 通过；性能对比待在目标设备上补充 tok/s。
 
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。
