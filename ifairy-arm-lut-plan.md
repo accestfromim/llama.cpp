@@ -66,6 +66,15 @@
     - 回退/兼容：wsize 不足、形状不匹配或环境关闭时自动回退旧路径；设计字段（`lut_scales_size`、`n_tile_num` 等）预留批量/其他后端扩展。
     - 现网验证：`cmake -B build -DGGML_IFAIRY_ARM_LUT=ON && cmake --build build -j` 后，`./build/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 128 -no-cnv` 成功运行（CPU-only，Metal 关闭），eval 12.38 ms/token（~80.8 tok/s），可作为启用 LUT 后的 sanity。
 
+## 标量 → NEON TL1 迁移任务拆解
+- 目标：将现有标量参考 LUT（顺序 QLUT + 标量 wr/wi 解码）替换为 ARM NEON TL1 SIMD 路径，复用 BitNet LUT 工作区与查表模式，保持 iFairy 复数语义。
+- 待办步骤：
+  1. **QLUT 布局与 wsize**：把 `qlut_r/qlut_i` 由顺序 int8 改为 TL1 nibble 布局（单通道 `k/2*32`），更新 `ggml_ifairy_mul_mat_get_wsize` 与预处理/内核偏移，去掉当前 memset 占位写。
+  2. **SIMD 量化/构表**：在 `ggml_ifairy_per_tensor_quant` 中用 NEON 同时归约 real/imag 最大值；`ggml_ifairy_lut_ctor` 参考 BitNet `Transpose_8_8` + `tbl_mask` 生成 nibble 友好表，分别写入 real/imag QLUT。
+  3. **权重查表 SIMD 化**：准备 16B `tbl_wr`/`tbl_wi`（映射码 0/1→±1，2/3→±i），`tbl_impl_*` 用 `vqtbl1` 对高/低 nibble 查 real/imag LUT，`vdotq_s32`（或 `vmlal_s8`）同步累计 `rr/ii/ri/ir`，保证虚部符号正确。
+  4. **TL1 内核封装**：按 `(m,k)`（1536×4096、1536×1536、4096×1536）特化 `qgemm_ifairy_lut_*`，与 `bm/bk` 分块匹配，反量化沿用 `w_r/w_i` 与 `lut_scales_r/i` 共轭公式；在 `ggml_compute_forward_mul_mat` 切换到 NEON 内核，保留 scalar 回退。
+  5. **验证与基准**：扩展 `tests/test-ifairy-lut` 读取 nibble QLUT + SIMD 内核与参考解码对齐；在目标设备上对比 `ggml_vec_dot_ifairy_q16_K` 基线 tok/s，记录 LUT 开关差异。
+
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。
 - `ggml_mul_mat` 路径能在匹配形状时使用 LUT，未匹配时保持旧行为，数值一致。

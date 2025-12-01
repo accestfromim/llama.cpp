@@ -111,7 +111,17 @@
 - 参考内核仅线程 0 执行，便于与旧路径做 A/B 数值对比；NEON 版本接入后可继续保留该回退逻辑作为安全网。
 - 自测：`tests/test-ifairy-lut.cpp` 构造随机 ifairy 权重/激活，调用 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref`，并与浮点解码后的复数乘结果对比（1% 相对误差阈值）验证数值正确性。
 
-## 6. 工程化与维护
+## 6. 标量 LUT → ARM TL1 SIMD 转换拆解
+- 标量现状：`ggml_ifairy_qgemm_lut_ref` 逐 block 标量解码 `wr/wi`，对顺序 `qlut_r/qlut_i` 做 4 路累加（`rr/ii/ri/ir`），最后按 `w_r/w_i` 与 `1/lut_scales` 反量化。
+- 与 BitNet TL1 差异：QLUT 当前为顺序 int8，需要替换为 nibble 对齐、8×8 转置后的 16 份查表（`lut_ctor`），且 iFairy 需要 real/imag 双份；权重解码目前在循环内标量展开，TL1 用常量表 + `vqtbl1` 直接映射；累加现在逐元素，TL1 需要在 NEON 内核中同时查 real/imag 并用 `vdotq_s32` 累到 int32。
+- 迁移步骤（按依赖排序）：
+  1) **QLUT 布局定版**：仿 BitNet TL1，单通道大小 `k/2*32`，real/imag 各占一份；更新 `wsize` 注释与偏移，删除现有 `memset(qlut, k*32)` 占位写，确保构表和内核共享同一 nibble 布局。
+  2) **量化/构表 SIMD 化**：`ggml_ifairy_per_tensor_quant` 用 NEON 同时求 real/imag `max_abs`（`vld1_s8`→`vmovl`→`vcvtq_f32`×`d_*`→`vmaxq`）；`ggml_ifairy_lut_ctor` 参考 `Transpose_8_8`+`tbl_mask` 生成 nibble 友好布局的 `vec_lut_r[16]`、`vec_lut_i[16]`，一次写完 real/imag QLUT。
+  3) **权重查表 SIMD 化**：构造 16B `tbl_wr`/`tbl_wi`（码 `0/1`→±1, `2/3`→±i），`tbl_impl_*` 中对 16B 权重用 `vshrq_n_u8`/`vandq` 拆高低 nibble，通过 `vqtbl1q_s8` 同步取 real/imag LUT，使用 `vdotq_s32`（或 `vmlal_s8`）分别累计 `rr/ii/ri/ir`，注意虚部符号在 `wi` 查表中编码。
+  4) **TL1 内核包装**：按 `(m,k)` 特化 `qgemm_ifairy_lut_{m}_{k}`，与 `bm/bk` 对齐 K 步长；反量化沿用 `w_r/w_i` 与 `lut_scales_r/i` 的共轭公式。`ggml_compute_forward_mul_mat` 中将参考内核替换为 NEON 版本，保留 scalar 版本做回退。
+  5) **验证与基线**：更新 `ggml_ifairy_mul_mat_get_wsize`/预处理偏移与新布局一致，补充 `tests/test-ifairy-lut` 读取 nibble QLUT 与 SIMD 内核对齐（对比参考解码路径），记录性能对比 `ggml_vec_dot_ifairy_q16_K`（tok/s 或 ms/token）。
+
+## 7. 工程化与维护
 - 构建开关：CMake 选项 `GGML_IFAIRY_ARM_LUT`（默认 OFF）控制整个路径，运行时可用环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 强制关闭，便于 A/B。
 - 接口：公共头 `ggml/include/ggml-ifairy.h` 暴露 LUT 相关 API（transform、preprocess、wsize、参考 qgemm），前向在 `ggml-cpu` 中受宏保护。
 - 工作区与回退：`ggml_ifairy_mul_mat_get_wsize` 估算并 64B 对齐，前向若 wsize 不足则回退旧路径；形状/类型校验与环境开关也会触发回退。
@@ -119,19 +129,19 @@
 - 未来：可将 QLUT 布局改为脚本生成（仿 BitNet preset_kernels），并在文档中附上启用示例命令（`-DGGML_IFAIRY_ARM_LUT=ON` + 可选 `GGML_IFAIRY_ARM_LUT_DISABLE` 环境变量）。
 - 验证示例：`cmake -B build -DGGML_IFAIRY_ARM_LUT=ON && cmake --build build -j`，执行 `./build/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 128 -no-cnv` 正常输出，CPU eval 12.38 ms/token（~80.8 tok/s）。
 
-### 5.5 调度与入口判定
+### 5.7 调度与入口判定
 - `ggml_ifairy_can_mul_mat`（类似 BitNet）：
   - `src0->type == GGML_TYPE_IFAIRY`、`src1->type == GGML_TYPE_IFAIRY_Q16` 或 fp32（需转存）、`dst->type == F32`。
   - `src1->ne[1] <= 1`（仅 matvec），后续再扩展批次。
   - `(m, k)` 命中已生成的内核组合。
 - `ggml_mul_mat` 中新增分支：优先检查 ifairy LUT → 回退到现有 `ggml_vec_dot_ifairy_q16_K`。
 
-## 6. 与现有点积路径的差异与收益
+## 8. 与现有点积路径的差异与收益
 - 主要差异：激活提前重排到 `QLUT`，主循环不再重复解码权重/激活，降低访存与分支；权重解码通过 `tbl` 共享 LUT。
 - 预期收益：在 1536/4096 典型形状上，比逐块 `sdot` 的实现更易向内存带宽对齐，性能类似 BitNet TL1（通常 1.3×~1.6×）。
 - 精度保持：使用独立的 `lut_scales_r/i` 与 `d_real/d_imag`，公式与现有复数乘法一致，无需修改训练/转换格式。
 
-## 7. 测试与验证建议
+## 9. 测试与验证建议
 - 单元测试：
   - 复用 `tests/test-ifairy-ref.py` 生成的小规模 matmul 用例，增加“LUT on/off”对比（可在内核中加开关）。
   - 针对 1536×4096、1536×1536、4096×1536 做逐元素误差对比（real/imag 独立对齐）。
@@ -140,7 +150,7 @@
   - 关注工作区尺寸是否命中 L2（可调 `bm/bbk`）。
 - 回退验证：关闭 `GGML_IFAIRY_ARM_LUT` 宏应回落到旧实现，结果一致。
 
-## 8. 后续扩展
+## 10. 后续扩展
 - 支持批量（`src1->ne[1] > 1`）：参考 BitNet TL2 的双 LUT（two/three 分支）做批量 LUT 构造。
 - Metal/GPU：当前设计 CPU-only，后续可在 Metal Backend 复用同样的 LUT 逻辑。
 - 自动生成内核：仿照 `preset_kernels/bitnet-lut-kernels-tl1.h`，根据模型维度脚本化生成 `ifairy-lut-kernels-tl1.h`，减少手写汇编。
