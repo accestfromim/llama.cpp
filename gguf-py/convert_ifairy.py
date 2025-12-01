@@ -233,6 +233,8 @@ def _pad_ifairy_ffn_pair(key: str, left: torch.Tensor, right: torch.Tensor, targ
         dim = pad_dim_down
     elif ".mlp.up_proj.weight" in base_key or ".mlp.gate_proj.weight" in base_key:
         dim = 0
+    elif ".mlp.ffn_layernorm.weight" in base_key:
+        dim = 0
     else:
         return left, right
 

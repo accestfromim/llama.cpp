@@ -23,8 +23,9 @@
 
 1) **配置与转换准备**
 - 核对 1.3B 配置读取是否覆盖隐藏维/头数/FFN 宽度：`gguf-py/convert_ifairy.py` 中的 `writer.add_*` 调用已从 config 读取，但需确保新增值无硬编码依赖（例如注释中的 1536/4096/16 仅为说明，可移除或更新）。
-- 处理多分片 safetensors：确认 `model.safetensors.index.json` 下的 `weight_map` 正常驱动 `quant_and_merge`/`noquant_*`，必要时增加日志或校验提示。
+- 处理多分片 safetensors：确认 `model.safetensors.index.json` 下的 `weight_map` 正常驱动 `quant_and_merge`/`noquant_*`，必要时增加日志或校验提示（已改为解析相对路径并在任意工作目录下可运行）。
 - 产出 GGUF：`python3 gguf-py/convert_ifairy.py models/Fairy-plus-minus-i-1.3B ifairy.gguf --verbose`。
+- 当前转换脚本调整：FFN 宽度会按 `F16_I2` block size（256）向上补齐（5460 -> 5632），并在写入元数据时使用补齐后的 feed_forward_length；对应的 `up/gate/down` 权重、`ffn_layernorm` 实/虚权重会在合并前补零以保证量化能对齐 256。转换日志会输出 padding 提示（`gguf: padding FFN dimension from ...`）。
 
 2) **模型类型识别**
 - 调整 `src/llama-model.cpp` 中 `LLM_ARCH_IFAIRY` 的类型判定，避免 1.3B 被误判为 `LLM_TYPE_700M`。建议依据 `n_embd` 或头数分支：`n_layer==24 && n_embd==2048 (&& n_head==32)` -> `LLM_TYPE_1_3B`，保留 700M 路径用于 `n_embd==1536`。
@@ -44,36 +45,10 @@
 - 单元测试：`python3 tests/test-ifairy-ref.py` 生成数据；`cmake --build build --target test-ifairy -j $(nproc)`；`ctest --test-dir build -R test-ifairy --output-on-failure`。
 - 转换验证：`python3 gguf-py/calidate_convert.py ifairy.gguf`（或 `gguf-py/test_convert*.py`）。
 - 推理冒烟：`./build/bin/llama-cli -m models/Fairy-plus-minus-i-1.3B/ifairy.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 256 -no-cnv`，对比 700M 的 tok/s 作为性能 sanity check。
+- 若加载报 `check_tensor_dims: tensor 'blk.0.ffn_sub_norm' has wrong shape; expected 11264, got 10920`，原因是 feed_forward_length 已补齐到 5632（*2=11264），但 `ffn_layernorm` 实/虚权重仍保持 5460（*2=10920）；需确保转换阶段对 `ffn_layernorm.weight_{real,imag}` 同步做零填充并重新生成 GGUF。
 
 6) **文档与清理**
 - 在 `IFAIRY_INFERENCE_PIPELINE.md` 或相关 README 中补充 1.3B 规格（hidden_size/heads/FFN）与转换命令。
 - 确认仓库中不残留临时生成物（中间 gguf/日志），仅保留最终 `ifairy.gguf`。
 
 完成上述步骤后，再根据需要扩展性能基准（`build/bin/llama-bench`, `llama-perplexity`）与多后端验证。***
-
-## 性能瓶颈分析（1.3B, CPU 单线程基线）
-
-- Profiling 命令：`./build/bin/llama-cli -m models/Fairy-plus-minus-i-1.3B/ifairy.gguf --gpu-layers 0 -t 1 -p "I believe the meaning of life is" -n 256 -no-cnv`
-- 观测：`ggml_vec_dot_f32` ~55%、`ggml_compute_forward_ifairy_split` ~25%（time profiler）。
-- 可能原因：
-  - `ggml_vec_dot_f32`：单线程 F32 点积成为所有 matmul 的主瓶颈；若构建时未启用 `GGML_SIMD`/`GGML_NATIVE`/Accelerate/BLAS，会落入标量路径；iFairy 复数 matmul会将同一输入做两次 dot（实/虚），且每层多次 split/merge 导致重复读写。
-  - `ggml_compute_forward_ifairy_split`：逐元素 BF16→F32 解包 + 分离实/虚的标量循环，内层未向量化且 i0 维串行；每层多次调用（norm、FFN、QKV）导致频繁内存搬运/缓存未命中。
-
-## 1.3B 性能提升方案（优先级从易到难）
-
-1. **构建验证与基线复测**
-   - 重新构建启用 CPU 向量化：`cmake -B build -DGGML_NATIVE=ON -DGGML_ACCELERATE=ON`（或对应 BLAS 后端），确认日志中 `GGML_SIMD`/NEON/SVE/AVX512 已开启。
-   - 保持 `--gpu-layers 0 -t 1` 重跑上面命令记录 tok/s，作为后续优化对照。
-2. **ggml_vec_dot_f32 内核优化**
-   - 对 2048 维常见长度增加专用内核（对齐/预取/更深 unroll），确保在 AArch64 触发 NEON/SVE/FMA 路径而非标量；必要时为大于阈值的 n 调用 vDSP/CBLAS `sdot`。
-   - 复数 matmul 融合：为 iFairy 增加“成对 dot”的复数 GEMV/GEMM 内核，减少实部/虚部两次遍历以及重复加载 activations。
-   - 检查 F16_I2 解码是否在内层重复展开；若是，考虑增加量化专用 dot（直接读量化位宽，减少 F32 展开）。
-3. **降低 split/merge 频次与向量化**
-   - 将 `ifairy_build_norm` / FFN 路径改为以 split 后的张量为中间格式，避免层内反复 split→merge→split；只在需要与通用算子交互时再 merge。
-   - 在 `ggml_compute_forward_ifairy_split` 中使用批量 BF16→F32 转换（如以 16 或 32 宽度的 NEON/SVE load + F32 store），并让并行划分同时覆盖 i0 维，提升 L1/L2 利用率。
-   - 评估将 split 与 RoPE/RMSNorm 融合为单核，减少一次内存往返（当前分离后又立即做旋转/归一）。
-4. **调度与线程利用**
-   - 将 `ggml_compute_forward_ifairy_split` 采用 `ggml_parallelize` 或扩展分片策略，使 `-t N` 能在 i0/i1 维同时并行（当前仅按行均分）。
-   - 评估在 matmul 前后增加简易 prefetch/缓存对齐，减少 split 输出被后续 dot 再次读入时的缓存抖动。
-5. **验证与回归检查**
-   - 每完成一个优化点，固定 prompt 复测 tok/s、`llama-bench`，并对比 `ctest -R ifairy` 确认数值一致；记录是否仍是 CPU 热点、火焰图是否迁移到其他算子。
