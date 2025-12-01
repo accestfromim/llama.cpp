@@ -80,7 +80,7 @@ option(GGML_STATIC "ggml: static link libraries"                     OFF)
 option(GGML_NATIVE "ggml: optimize the build for the current system" ${GGML_NATIVE_DEFAULT})
 option(GGML_LTO    "ggml: enable link time optimization"             OFF)
 option(GGML_CCACHE "ggml: use ccache if available"                   ON)
-option(GGML_IFAIRY_ARM_LUT "ggml: enable ARM LUT path for iFairy complex 2-bit weights" OFF)
+option(GGML_IFAIRY_ARM_LUT "ggml: enable ARM LUT path for iFairy complex 2-bit weights" ON)
 
 # debug
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)

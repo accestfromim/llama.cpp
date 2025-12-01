@@ -1260,16 +1260,27 @@ void ggml_compute_forward_mul_mat(
 
             const int m = (int) ne01;
             const int k = (int) ne00;
+            const int64_t ncols = ne11;
+            const bool needs_q16 = src1->type == GGML_TYPE_F32;
+            const size_t act_q16_bytes = needs_q16 ? GGML_PAD((size_t) ggml_row_size(GGML_TYPE_IFAIRY_Q16, k) * (size_t) ncols, 64) : 0;
             const size_t qlut_bytes = (size_t) (k / 2) * 32;
 
             char * wdata = params->wdata;
-            int8_t * qlut_r = (int8_t *) wdata;
-            int8_t * qlut_i = (int8_t *) (wdata + qlut_bytes);
-            float  * lut_scales = (float *) (wdata + 2 * qlut_bytes);
+            int8_t * qlut_r = (int8_t *) (wdata + act_q16_bytes);
+            int8_t * qlut_i = (int8_t *) (wdata + act_q16_bytes + qlut_bytes);
+            float  * lut_scales = (float *) (wdata + act_q16_bytes + 2 * qlut_bytes);
 
             if (ith == 0) {
                 ggml_ifairy_transform_tensor((struct ggml_tensor *) src0);
-                ggml_ifairy_preprocessor(m, k, src1->data, lut_scales, qlut_r, qlut_i);
+                const void * act_src = src1->data;
+                if (needs_q16) {
+                    ggml_from_float_t quant = type_traits_cpu[GGML_TYPE_IFAIRY_Q16].from_float;
+                    GGML_ASSERT(quant != NULL);
+                    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+                    quant((const float *) src1->data, wdata, k);
+                    act_src = wdata;
+                }
+                ggml_ifairy_preprocessor(m, k, act_src, lut_scales, qlut_r, qlut_i);
             }
 
             ggml_barrier(params->threadpool);

@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -20,8 +21,18 @@
 static bool ifairy_lut_initialized = false;
 static bool ifairy_lut_env_checked = false;
 static bool ifairy_lut_enabled = true;
+static bool ifairy_lut_debug = false;
 static struct ggml_ifairy_tensor_extra * ifairy_tensor_extras = NULL;
 static size_t ifairy_tensor_extras_index = 0;
+static int ifairy_lut_debug_reports = 0;
+
+#define GGML_IFAIRY_DEBUG(...) \
+    do { \
+        if (ifairy_lut_debug && ifairy_lut_debug_reports < 8) { \
+            GGML_LOG_INFO(__VA_ARGS__); \
+            ++ifairy_lut_debug_reports; \
+        } \
+    } while (0)
 
 static bool ggml_ifairy_select_tile_params(const int64_t m, const int64_t k, int * bm, int * bk) {
     GGML_ASSERT(bm != NULL && bk != NULL);
@@ -54,7 +65,9 @@ static void ggml_ifairy_init_once(void) {
 
     if (!ifairy_lut_env_checked) {
         const char * disable_env = getenv("GGML_IFAIRY_ARM_LUT_DISABLE");
+        const char * debug_env   = getenv("GGML_IFAIRY_ARM_LUT_DEBUG");
         ifairy_lut_enabled = (disable_env == NULL || disable_env[0] == '\0');
+        ifairy_lut_debug   = (debug_env   != NULL &&  debug_env[0] != '\0');
         ifairy_lut_env_checked = true;
     }
 
@@ -351,21 +364,44 @@ bool ggml_ifairy_can_mul_mat(const struct ggml_tensor * src0, const struct ggml_
     ggml_ifairy_init_once();
 
     if (!ifairy_lut_enabled) {
+        GGML_IFAIRY_DEBUG("ifairy_lut: disabled by env\n");
         return false;
     }
 
-    if (src0->type != GGML_TYPE_IFAIRY || src1->type != GGML_TYPE_IFAIRY_Q16 || dst->type != GGML_TYPE_F32) {
+    const bool act_q16 = src1->type == GGML_TYPE_IFAIRY_Q16;
+    const bool act_f32 = src1->type == GGML_TYPE_F32;
+    if (src0->type != GGML_TYPE_IFAIRY || (!act_q16 && !act_f32) || dst->type != GGML_TYPE_F32) {
+        GGML_IFAIRY_DEBUG("ifairy_lut: type mismatch src0=%s src1=%s dst=%s\n", ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type));
         return false;
     }
 
-    if (src1->ne[1] > 1) {
+    // only support single-column matvec for now
+    if (src1->ne[1] != 1) {
+        GGML_IFAIRY_DEBUG("ifairy_lut: skip because src1->ne[1]=%" PRId64 "\n", src1->ne[1]);
+        return false;
+    }
+
+    if (src0->ne[0] != src1->ne[0]) {
+        GGML_IFAIRY_DEBUG("ifairy_lut: skip because k mismatch src0=%" PRId64 " src1=%" PRId64 "\n", src0->ne[0], src1->ne[0]);
+        return false;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t m = src0->ne[1];
+    GGML_UNUSED(act_f32);
+
+    if ((k % QK_K) != 0) {
+        GGML_IFAIRY_DEBUG("ifairy_lut: skip because k %% QK_K != 0 (k=%" PRId64 ", QK_K=%d)\n", k, QK_K);
         return false;
     }
 
     int bm = 0, bk = 0;
-    if (!ggml_ifairy_select_tile_params(src1->ne[1], src1->ne[0], &bm, &bk)) {
+    if (!ggml_ifairy_select_tile_params(m, k, &bm, &bk)) {
+        GGML_IFAIRY_DEBUG("ifairy_lut: skip because shape (m=%" PRId64 ", k=%" PRId64 ") not supported\n", m, k);
         return false;
     }
+
+    GGML_IFAIRY_DEBUG("ifairy_lut: enable LUT path for m=%" PRId64 " k=%" PRId64 " bm=%d bk=%d\n", m, k, bm, bk);
 
     return true;
 }
@@ -376,8 +412,10 @@ size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const stru
         return 0;
     }
 
-    const int64_t k   = src1->ne[0];
-    const int64_t m   = src1->ne[1];
+    const int64_t k = src0->ne[0];
+    const int64_t m = src0->ne[1];
+    const int64_t n = src1->ne[1];
+    const bool needs_q16 = src1->type == GGML_TYPE_F32;
     int bm = 0, bk = 0;
     const bool ok = ggml_ifairy_select_tile_params(m, k, &bm, &bk);
     GGML_ASSERT(ok);
@@ -385,10 +423,16 @@ size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const stru
 
     GGML_ASSERT((k % 2) == 0);
 
+    size_t wsize = 0;
+    if (needs_q16) {
+        const size_t act_q16_bytes = GGML_PAD((size_t) ggml_row_size(GGML_TYPE_IFAIRY_Q16, k) * (size_t) n, 64);
+        wsize += act_q16_bytes;
+    }
+
     // QLUT layout: real + imag, each k/2*32 bytes per column
     const size_t qlut_bytes_per_chan = (size_t) (k / 2) * 32;
     const size_t lut_scales_bytes   = 2 * sizeof(float);
-    size_t wsize = m * ((2 * qlut_bytes_per_chan) + lut_scales_bytes);
+    wsize += n * ((2 * qlut_bytes_per_chan) + lut_scales_bytes);
 
     // 64B align to match ggml allocator expectations
     wsize = GGML_PAD(wsize, 64);
@@ -502,8 +546,9 @@ void ggml_ifairy_qgemm_lut_ref_slice(const void * w, const int8_t * qlut_r, cons
         const float out_real = scale_wr_r * acc_rr + scale_wi_i * acc_ii;
         const float out_imag = scale_wi_r * acc_ir - scale_wr_i * acc_ri;
 
-        dst[2 * row + 0] = out_real;
-        dst[2 * row + 1] = out_imag;
+        float * dst_row = dst + row;
+        ((ggml_bf16_t *) dst_row)[0] = GGML_FP32_TO_BF16(out_real);
+        ((ggml_bf16_t *) dst_row)[1] = GGML_FP32_TO_BF16(out_imag);
     }
 }
 
@@ -609,8 +654,9 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
         const float scale_wi_r = w_i * inv_lut_r;
         const float scale_wr_i = w_r * inv_lut_i;
 
-        dst[2 * row + 0] = scale_wr_r * (float) acc_rr + scale_wi_i * (float) acc_ii;
-        dst[2 * row + 1] = scale_wi_r * (float) acc_ir - scale_wr_i * (float) acc_ri;
+        float * dst_row = dst + row;
+        ((ggml_bf16_t *) dst_row)[0] = GGML_FP32_TO_BF16(scale_wr_r * (float) acc_rr + scale_wi_i * (float) acc_ii);
+        ((ggml_bf16_t *) dst_row)[1] = GGML_FP32_TO_BF16(scale_wi_r * (float) acc_ir - scale_wr_i * (float) acc_ri);
     }
 }
 

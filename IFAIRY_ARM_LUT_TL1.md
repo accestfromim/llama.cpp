@@ -132,10 +132,11 @@
 
 ### 5.7 调度与入口判定
 - `ggml_ifairy_can_mul_mat`（类似 BitNet）：
-  - `src0->type == GGML_TYPE_IFAIRY`、`src1->type == GGML_TYPE_IFAIRY_Q16` 或 fp32（需转存）、`dst->type == F32`。
-  - `src1->ne[1] <= 1`（仅 matvec），后续再扩展批次。
-  - `(m, k)` 命中已生成的内核组合。
+  - `src0->type == GGML_TYPE_IFAIRY`、`src1->type == GGML_TYPE_IFAIRY_Q16` 或 F32（F32 激活会在 wdata 先量化为 `IFAIRY_Q16`）、`dst->type == F32`，`k % QK_K == 0`。
+  - `src1->ne[1] <= 1`（仅 matvec），后续再扩展批次，tile 选择按权重维度 `(m=src0->ne[1], k=src0->ne[0])`。
+  - `(m, k)` 命中已生成的内核组合；`GGML_IFAIRY_ARM_LUT_DEBUG=1` 可打印首次命中/拒绝原因，`GGML_IFAIRY_ARM_LUT_DISABLE=1` 强制回退。
 - `ggml_mul_mat` 中新增分支：优先检查 ifairy LUT → 回退到现有 `ggml_vec_dot_ifairy_q16_K`。
+- 输出格式与 baseline 对齐：`qgemm_lut_{ref,neon}` 将 real/imag 打包为单个 float 内的两个 bf16（同 `vec_dot_ifairy_q16_K`）。
 
 ## 8. 与现有点积路径的差异与收益
 - 主要差异：激活提前重排到 `QLUT`，主循环不再重复解码权重/激活，降低访存与分支；权重解码通过 `tbl` 共享 LUT。
@@ -149,6 +150,7 @@
 - 性能基准：
   - 在 Apple M 系列或 ARMv8.2+ 平台，对 `ggml_vec_dot_ifairy_q16_K` 与 LUT 路径分别跑 1000 次，记录 tok/s 或 ms。
   - 关注工作区尺寸是否命中 L2（可调 `bm/bbk`）。
+  - 近期实测：`./build-arm64-apple-clang-release/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -b 1 -t 4 -p "I believe life is" -n 128` 启用 LUT 时 eval ≈ 290.8 ms/token（≈3.44 tok/s，参考内核），`GGML_IFAIRY_ARM_LUT_DISABLE=1` 基线 ≈ 31.7 ms/token（≈31.6 tok/s），功能正常但性能尚待优化。
 - 回退验证：关闭 `GGML_IFAIRY_ARM_LUT` 宏应回落到旧实现，结果一致。
 
 ## 10. 后续扩展

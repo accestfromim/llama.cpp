@@ -130,7 +130,7 @@ int main(void) {
         return 1;
     }
 
-    std::vector<float> dst_lut((size_t) m * 2, 0.f);
+    std::vector<float> dst_lut((size_t) m, 0.f);
     ggml_ifairy_qgemm_lut_ref(weights.data(), qlut_r.data(), qlut_i.data(), lut_scales, k, m, dst_lut.data());
 
     // High-precision reference by dequantizing to float and applying conj(activation)
@@ -172,8 +172,11 @@ int main(void) {
 
     const float rel = 2e-2f;
     for (int row = 0; row < m; ++row) {
-        const float dr = std::abs(dst_lut[(size_t) row * 2 + 0] - dst_ref[(size_t) row * 2 + 0]);
-        const float di = std::abs(dst_lut[(size_t) row * 2 + 1] - dst_ref[(size_t) row * 2 + 1]);
+        const ggml_bf16_t * packed = (const ggml_bf16_t *) &dst_lut[row];
+        const float lut_r = GGML_BF16_TO_FP32(packed[0]);
+        const float lut_i = GGML_BF16_TO_FP32(packed[1]);
+        const float dr = std::abs(lut_r - dst_ref[(size_t) row * 2 + 0]);
+        const float di = std::abs(lut_i - dst_ref[(size_t) row * 2 + 1]);
         const float thr_r = rel * std::max(std::abs(dst_ref[(size_t) row * 2 + 0]), 1.0f);
         const float thr_i = rel * std::max(std::abs(dst_ref[(size_t) row * 2 + 1]), 1.0f);
         if (dr > thr_r || di > thr_i) {

@@ -49,16 +49,16 @@
    - 添加 `ggml_ifairy_can_mul_mat` 判定入口（类型/形状/批次/后端），并在 `ggml_mul_mat` ARM 分支优先检查 iFairy LUT，再回退。
    - 在线程 0 调用 `ggml_ifairy_preprocessor` 构造 LUT，`ggml_barrier` 同步后各线程按 tile 调用 `ggml_qgemm_ifairy_lut`。
    - 若 `src1` 为 F32，复用 BitNet 的 fp16 转存逻辑（或保持 F32 路径，注意工作区大小）。
-   - 已接入：`ggml_compute_forward_mul_mat` 在 `GGML_IFAIRY_ARM_LUT` 下优先判定 `ggml_ifairy_can_mul_mat`，线程 0 先触发 `ggml_ifairy_transform_tensor`（填充 extra）与 `ggml_ifairy_preprocessor`（写入 wdata：`qlut_r → qlut_i → lut_scales`），全线程 barrier 后由线程 0 调用 `ggml_ifairy_qgemm_lut_ref` 写回 `dst`，再 barrier 结束，未命中则回退原有路径。当前仍为单列 matvec（`ne1<=1`），wsize/布局与预处理保持一致，后续可替换为 NEON 内核与多线程切分。
+   - 已接入：`ggml_compute_forward_mul_mat` 在 `GGML_IFAIRY_ARM_LUT` 下优先判定 `ggml_ifairy_can_mul_mat`，线程 0 先触发 `ggml_ifairy_transform_tensor`（填充 extra）与 `ggml_ifairy_preprocessor`（写入 wdata：可选 `act_q16` → `qlut_r → qlut_i → lut_scales`），全线程 barrier 后调用 LUT 内核写回 `dst`（输出按 bf16 打包，与 `vec_dot` 写法一致），再 barrier 结束，未命中则回退原有路径。当前仍为单列 matvec（`ne1<=1`），wsize/布局与预处理保持一致，后续可替换为 NEON 内核与多线程切分。
 8. **数值校验与容错**
    - 在内核上加可编译时/运行时开关以强制回退，方便 A/B 对比。
    - 保证未匹配形状或缺少 `extra` 时立即回退旧路径，避免 crash。
-   - 已落地：运行时环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 可整体关闭 LUT；`ggml_ifairy_can_mul_mat` 会拒绝形状/类型不符或宏/环境关闭；`ggml_compute_forward_mul_mat` 若工作区不足则直接回退原路径，避免触发断言。当前参考内核仅线程 0 执行，后续 NEON 内核接入时可保留同样的回退逻辑。
+   - 已落地：运行时环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 可整体关闭 LUT，`GGML_IFAIRY_ARM_LUT_DEBUG=1` 输出首次命中/拒绝原因；`ggml_ifairy_can_mul_mat` 用权重维度判定 tile，允许 F32 激活（在 wdata 先量化为 IFAIRY_Q16），形状/类型不符或宏/环境关闭时直接回退；`ggml_compute_forward_mul_mat` 若工作区不足则直接回退原路径，避免触发断言。当前参考内核仅线程 0 执行，后续 NEON 内核接入时可保留同样的回退逻辑。
 9. **测试计划**
    - 单元/比对：扩展 `tests/test-ifairy-ref.py` 或新增 C 测试，构造固定 seed 的 matvec（1536×4096、1536×1536、4096×1536），比较 LUT on/off 的逐元素误差（real/imag 分开）。
    - 性能：在目标 ARM 设备上运行 `./build/bin/llama-cli ...` 与 `ggml_vec_dot_ifairy_q16_K` baseline，对比 tok/s；若需可加微基准（重复 1000 次）。
    - 工作区验证：在调试模式打印/断言 `wsize` 与偏移，确保无越界。
-   - 现状：新增 `tests/test-ifairy-lut.cpp`（构建标签 `test-ifairy-lut`）固定 seed 生成 ifairy quant 数据，跑 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref` 与高精度浮点解码结果对比（相对误差 1% 容忍，避免二次量化导致的饱和差异）；`ctest -R ifairy-lut` 通过。工作区不足/宏关闭时依赖回退逻辑保证安全。
+   - 现状：新增 `tests/test-ifairy-lut.cpp`（构建标签 `test-ifairy-lut`）固定 seed 生成 ifairy quant 数据，跑 `ggml_ifairy_preprocessor` + `ggml_ifairy_qgemm_lut_ref` 与高精度浮点解码结果对比（相对误差 1% 容忍，避免二次量化导致的饱和差异）；`ctest -R ifairy-lut` 通过（输出已改为 bf16 打包格式）。工作区不足/宏关闭时依赖回退逻辑保证安全。实测：`./build-arm64-apple-clang-release/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -b 1 -t 4 -p "I believe life is" -n 128` 在 LUT 打开时 eval ≈ 290.8 ms/token（≈3.44 tok/s，参考内核仍需性能优化），`GGML_IFAIRY_ARM_LUT_DISABLE=1` 回退基线时 eval ≈ 31.7 ms/token（≈31.6 tok/s）。
 10. **工程化与维护**
     - 构建/配置：新增 CMake 选项 `GGML_IFAIRY_ARM_LUT`（默认 OFF），运行时可用 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 关闭；公共头 `ggml/include/ggml-ifairy.h` 提供 API；前向受宏保护。
     - 测试/验证：新增 `tests/test-ifairy-lut` 覆盖参考 LUT 与浮点解码对比；后续内核变更复用此测试做回归。
