@@ -224,45 +224,85 @@ def repack_ifairy_blocks(data: np.ndarray) -> np.ndarray:
     return blocks.reshape(data.shape)
 
 # 接收key和对应的tensor，返回量化后的tensor
-def quant_and_merge(key, tensor, f, weight_map, verbose: bool = False):
+def _pad_ifairy_ffn_pair(key: str, left: torch.Tensor, right: torch.Tensor, target: int | None, *, verbose: bool = False, pad_dim_down: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
+    if target is None:
+        return left, right
+
+    base_key = key.replace("_real", "").replace("_imag", "")
+    if ".mlp.down_proj.weight" in base_key:
+        dim = pad_dim_down
+    elif ".mlp.up_proj.weight" in base_key or ".mlp.gate_proj.weight" in base_key:
+        dim = 0
+    else:
+        return left, right
+
+    cur = left.shape[dim]
+    if cur == target:
+        return left, right
+    if cur > target:
+        return left, right
+
+    pad = target - cur if cur < target else 0
+    if pad == 0:
+        return left, right
+
+    pad_shape = list(left.shape)
+    pad_shape[dim] = pad
+    zeros_left = torch.zeros(pad_shape, dtype=left.dtype, device=left.device)
+    zeros_right = torch.zeros(pad_shape, dtype=right.dtype, device=right.device)
+
+    if verbose:
+        print(f"gguf: padding '{base_key}' dim {dim} from {cur} to {target} for F16_I2 block size")
+
+    left_padded = torch.cat([left, zeros_left], dim=dim)
+    right_padded = torch.cat([right, zeros_right], dim=dim)
+    return left_padded, right_padded
+
+def quant_and_merge(key, tensor, f, weight_map, verbose: bool = False, *, ffn_pad_to: int | None = None):
     if 'real' in key:
         imag_key = key.replace('real', 'imag')
         imag_tensor = load_tensor_with_weight_map(imag_key, f, weight_map, verbose=verbose)
+        tensor, imag_tensor = _pad_ifairy_ffn_pair(key, tensor, imag_tensor, ffn_pad_to, verbose=verbose)
         q_real, q_imag = forward(tensor, imag_tensor)
         return merge_complex_tensor(q_real, q_imag)
     elif 'imag' in key:
         real_key = key.replace('imag', 'real')
         real_tensor = load_tensor_with_weight_map(real_key, f, weight_map, verbose=verbose)
+        tensor, real_tensor = _pad_ifairy_ffn_pair(key, tensor, real_tensor, ffn_pad_to, verbose=verbose)
         q_real, q_imag = forward(real_tensor, tensor)
         return merge_complex_tensor(q_real, q_imag)
     else:
         return tensor
 
 # 接收key和对应的tensor，返回合并merge后的tensor
-def noquant_and_merge(key, tensor, f, weight_map, verbose: bool = False):
+def noquant_and_merge(key, tensor, f, weight_map, verbose: bool = False, *, ffn_pad_to: int | None = None):
     if 'real' in key:
         imag_key = key.replace('real', 'imag')
         imag_tensor = load_tensor_with_weight_map(imag_key, f, weight_map, verbose=verbose)
+        tensor, imag_tensor = _pad_ifairy_ffn_pair(key, tensor, imag_tensor, ffn_pad_to, verbose=verbose)
         q_real, q_imag = tensor, imag_tensor
         return combine_complex_tensors(q_imag, q_real)
     elif 'imag' in key:
         real_key = key.replace('imag', 'real')
         real_tensor = load_tensor_with_weight_map(real_key, f, weight_map, verbose=verbose)
+        tensor, real_tensor = _pad_ifairy_ffn_pair(key, tensor, real_tensor, ffn_pad_to, verbose=verbose)
         q_real, q_imag = real_tensor, tensor
         return combine_complex_tensors(q_imag, q_real)
     else:
         return tensor
 
 # 接收key和对应的tensor，返回合并concat后的tensor
-def noquant_and_cat(key, tensor, f, weight_map, verbose: bool = False):
+def noquant_and_cat(key, tensor, f, weight_map, verbose: bool = False, *, ffn_pad_to: int | None = None):
     if 'real' in key:
         imag_key = key.replace('real', 'imag')
         imag_tensor = load_tensor_with_weight_map(imag_key, f, weight_map, verbose=verbose)
+        tensor, imag_tensor = _pad_ifairy_ffn_pair(key, tensor, imag_tensor, ffn_pad_to, verbose=verbose)
         q_real, q_imag = tensor, imag_tensor
         return torch.cat([q_real, q_imag], dim=-1)
     elif 'imag' in key:
         real_key = key.replace('imag', 'real')
         real_tensor = load_tensor_with_weight_map(real_key, f, weight_map, verbose=verbose)
+        tensor, real_tensor = _pad_ifairy_ffn_pair(key, tensor, real_tensor, ffn_pad_to, verbose=verbose)
         q_real, q_imag = real_tensor, tensor
         return torch.cat([q_real, q_imag], dim=-1)
     else:
@@ -291,6 +331,13 @@ def main():
         print(f"错误：无法从 {model_dir} 加载 config.json: {e}")
         sys.exit(1)
 
+    ffn_intermediate = int(config["intermediate_size"])
+    ffn_block = GGML_QUANT_SIZES[gguf.GGMLQuantizationType.F16_I2][0]
+    ffn_padded = ((ffn_intermediate + ffn_block - 1) // ffn_block) * ffn_block
+    ffn_pad_to: int | None = ffn_padded if ffn_padded != ffn_intermediate else None
+    if verbose and ffn_pad_to is not None:
+        print(f"gguf: padding FFN dimension from {ffn_intermediate} to {ffn_pad_to} to match F16_I2 block size {ffn_block}")
+
     # 2. 创建 GGUFWriter 并设置基本模型信息
     model_name = config.get("_name_or_path", "complexnet_model")
     writer = gguf.GGUFWriter(str(output_file), arch=gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.IFAIRY])
@@ -301,7 +348,7 @@ def main():
     writer.add_context_length(config["max_position_embeddings"])
     writer.add_embedding_length(config["hidden_size"])
     writer.add_block_count(config["num_hidden_layers"])
-    writer.add_feed_forward_length(config["intermediate_size"])
+    writer.add_feed_forward_length(ffn_padded)
     writer.add_head_count(config["num_attention_heads"])
     writer.add_head_count_kv(config["num_key_value_heads"])
     writer.add_layer_norm_eps(config["rms_norm_eps"])
@@ -349,7 +396,7 @@ def main():
                     # 对于embedding，直接在这里转换成激活的格式imag16 real16合一个32位的格式
                     if 'embeddings' in key and 'real' in key:
                         tensor_data = f.get_tensor(key).to(torch.float32)
-                        tensor_data = noquant_and_merge(key, tensor_data, f, weight_map, verbose=verbose)
+                        tensor_data = noquant_and_merge(key, tensor_data, f, weight_map, verbose=verbose, ffn_pad_to=ffn_pad_to)
                         numpy_array = tensor_data.cpu().numpy()
                         #tensor_back = torch.from_numpy(numpy_array)
                         #tensor_imag, tensor_real = split_complex_tensors(tensor_back)
@@ -395,7 +442,7 @@ def main():
                     # 这个直接concat，实部在前虚部在后，不量化
                     if 'norm' in key and 'real' in key:
                         tensor_data = f.get_tensor(key).to(torch.float32)
-                        tensor_data = noquant_and_cat(key, tensor_data, f, weight_map, verbose=verbose)
+                        tensor_data = noquant_and_cat(key, tensor_data, f, weight_map, verbose=verbose, ffn_pad_to=ffn_pad_to)
                         numpy_array = tensor_data.cpu().numpy().astype(np.float32) # f32这个要求源自 llama.cpp/ggml/src/ggml-cpu/binary-ops.cpp的binary_op，不支持第一个参数是F32而第二个不是。但是完全没有这个必要吧，感觉以后可以改到都支持，这样这里就可以用bf16了
                         if '_real' in key or '_imag' in key:
                             key = key.replace('_real', '').replace('_imag', '')
@@ -418,7 +465,7 @@ def main():
                         continue
                     # 对于一般的权重，需要量化，然后直接拼起来
                     tensor_data = f.get_tensor(key).to(torch.float32)
-                    tensor_data = quant_and_merge(key, tensor_data, f, weight_map, verbose=verbose)
+                    tensor_data = quant_and_merge(key, tensor_data, f, weight_map, verbose=verbose, ffn_pad_to=ffn_pad_to)
                     raw_numpy = tensor_data.cpu().numpy()
                     tensor_dtype = gguf.GGMLQuantizationType.F16_I2
                     try:
@@ -427,7 +474,7 @@ def main():
                     except gguf.QuantError as err:
                         if verbose:
                             print(f"F16_I2 quantization skipped for '{key}' due to: {err}. Falling back to F32 storage.")
-                        fallback_tensor = noquant_and_merge(key, f.get_tensor(key).to(torch.float32), f, weight_map, verbose=verbose)
+                        fallback_tensor = noquant_and_merge(key, f.get_tensor(key).to(torch.float32), f, weight_map, verbose=verbose, ffn_pad_to=ffn_pad_to)
                         numpy_array = fallback_tensor.cpu().numpy().astype(np.float32, copy=False)
                         tensor_dtype = gguf.GGMLQuantizationType.F32
 
