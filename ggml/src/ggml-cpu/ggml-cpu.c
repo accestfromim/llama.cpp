@@ -1260,7 +1260,7 @@ void ggml_compute_forward_mul_mat(
 
             const int m = (int) ne01;
             const int k = (int) ne00;
-            const size_t qlut_bytes = (size_t) k * 32;
+            const size_t qlut_bytes = (size_t) (k / 2) * 32;
 
             char * wdata = params->wdata;
             int8_t * qlut_r = (int8_t *) wdata;

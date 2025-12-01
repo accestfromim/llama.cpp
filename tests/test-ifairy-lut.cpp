@@ -73,8 +73,8 @@ int main(void) {
     block_ifairy_q16 act = {};
     fill_random_activation(rng, act);
 
-    std::vector<int8_t> qlut_r((size_t) k * 32);
-    std::vector<int8_t> qlut_i((size_t) k * 32);
+    std::vector<int8_t> qlut_r((size_t) (k / 2) * 32);
+    std::vector<int8_t> qlut_i((size_t) (k / 2) * 32);
     float lut_scales[2] = {0.f, 0.f};
 
     ggml_ifairy_preprocessor(m, k, &act, lut_scales, qlut_r.data(), qlut_i.data());
