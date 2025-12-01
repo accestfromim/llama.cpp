@@ -1595,7 +1595,15 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_rms_eps);
 
                 switch (hparams.n_layer) {
-                    case 24: type = LLM_TYPE_700M; break;
+                    case 24:
+                        if (hparams.n_embd == 1536 || hparams.n_head(0) == 16) {
+                            type = LLM_TYPE_700M;
+                        } else if (hparams.n_embd == 2048 || hparams.n_head(0) == 32) {
+                            type = LLM_TYPE_1_3B;
+                        } else {
+                            type = LLM_TYPE_UNKNOWN;
+                        }
+                        break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;

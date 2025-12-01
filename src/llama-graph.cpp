@@ -696,7 +696,30 @@ ggml_tensor * llm_graph_context::ifairy_build_ffn(
     cb(cur, "ffn_up", il);
     cur = ggml_ifairy_mul(ctx0, cur, gate_res);
     cur = ifairy_build_norm(cur, norm_weight, il);
-    cur = build_lora_mm(down, cur);
+    if (!ggml_is_quantized(down->type)) {
+        ggml_tensor * cur_f32 = cur->type == GGML_TYPE_F32 ? cur : ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        ggml_tensor * cur_split = ggml_ifairy_split(ctx0, cur_f32);
+        const int64_t cur_half = cur_split->ne[0]/2;
+        ggml_tensor * cur_real = ggml_view_2d(ctx0, cur_split, cur_half, cur_split->ne[1], cur_split->nb[1], 0);
+        ggml_tensor * cur_imag = ggml_view_2d(ctx0, cur_split, cur_half, cur_split->ne[1], cur_split->nb[1], cur_half * cur_split->nb[0]);
+
+        ggml_tensor * down_split = ggml_ifairy_split(ctx0, down);
+        const int64_t down_half = down_split->ne[0]/2;
+        ggml_tensor * down_real = ggml_view_2d(ctx0, down_split, down_half, down_split->ne[1], down_split->nb[1], 0);
+        ggml_tensor * down_imag = ggml_view_2d(ctx0, down_split, down_half, down_split->ne[1], down_split->nb[1], down_half * down_split->nb[0]);
+
+        ggml_tensor * out_real = ggml_sub(ctx0,
+                ggml_mul_mat(ctx0, down_real, cur_real),
+                ggml_mul_mat(ctx0, down_imag, cur_imag));
+        ggml_tensor * out_imag = ggml_add(ctx0,
+                ggml_mul_mat(ctx0, down_real, cur_imag),
+                ggml_mul_mat(ctx0, down_imag, cur_real));
+
+        ggml_tensor * stacked = ggml_concat(ctx0, out_real, out_imag, 0);
+        cur = ggml_ifairy_merge(ctx0, stacked);
+    } else {
+        cur = build_lora_mm(down, cur);
+    }
     cb(cur, "ffn_down", il);
     return cur;
 }
