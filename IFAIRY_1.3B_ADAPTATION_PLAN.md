@@ -50,3 +50,30 @@
 - 确认仓库中不残留临时生成物（中间 gguf/日志），仅保留最终 `ifairy.gguf`。
 
 完成上述步骤后，再根据需要扩展性能基准（`build/bin/llama-bench`, `llama-perplexity`）与多后端验证。***
+
+## 性能瓶颈分析（1.3B, CPU 单线程基线）
+
+- Profiling 命令：`./build/bin/llama-cli -m models/Fairy-plus-minus-i-1.3B/ifairy.gguf --gpu-layers 0 -t 1 -p "I believe the meaning of life is" -n 256 -no-cnv`
+- 观测：`ggml_vec_dot_f32` ~55%、`ggml_compute_forward_ifairy_split` ~25%（time profiler）。
+- 可能原因：
+  - `ggml_vec_dot_f32`：单线程 F32 点积成为所有 matmul 的主瓶颈；若构建时未启用 `GGML_SIMD`/`GGML_NATIVE`/Accelerate/BLAS，会落入标量路径；iFairy 复数 matmul会将同一输入做两次 dot（实/虚），且每层多次 split/merge 导致重复读写。
+  - `ggml_compute_forward_ifairy_split`：逐元素 BF16→F32 解包 + 分离实/虚的标量循环，内层未向量化且 i0 维串行；每层多次调用（norm、FFN、QKV）导致频繁内存搬运/缓存未命中。
+
+## 1.3B 性能提升方案（优先级从易到难）
+
+1. **构建验证与基线复测**
+   - 重新构建启用 CPU 向量化：`cmake -B build -DGGML_NATIVE=ON -DGGML_ACCELERATE=ON`（或对应 BLAS 后端），确认日志中 `GGML_SIMD`/NEON/SVE/AVX512 已开启。
+   - 保持 `--gpu-layers 0 -t 1` 重跑上面命令记录 tok/s，作为后续优化对照。
+2. **ggml_vec_dot_f32 内核优化**
+   - 对 2048 维常见长度增加专用内核（对齐/预取/更深 unroll），确保在 AArch64 触发 NEON/SVE/FMA 路径而非标量；必要时为大于阈值的 n 调用 vDSP/CBLAS `sdot`。
+   - 复数 matmul 融合：为 iFairy 增加“成对 dot”的复数 GEMV/GEMM 内核，减少实部/虚部两次遍历以及重复加载 activations。
+   - 检查 F16_I2 解码是否在内层重复展开；若是，考虑增加量化专用 dot（直接读量化位宽，减少 F32 展开）。
+3. **降低 split/merge 频次与向量化**
+   - 将 `ifairy_build_norm` / FFN 路径改为以 split 后的张量为中间格式，避免层内反复 split→merge→split；只在需要与通用算子交互时再 merge。
+   - 在 `ggml_compute_forward_ifairy_split` 中使用批量 BF16→F32 转换（如以 16 或 32 宽度的 NEON/SVE load + F32 store），并让并行划分同时覆盖 i0 维，提升 L1/L2 利用率。
+   - 评估将 split 与 RoPE/RMSNorm 融合为单核，减少一次内存往返（当前分离后又立即做旋转/归一）。
+4. **调度与线程利用**
+   - 将 `ggml_compute_forward_ifairy_split` 采用 `ggml_parallelize` 或扩展分片策略，使 `-t N` 能在 i0/i1 维同时并行（当前仅按行均分）。
+   - 评估在 matmul 前后增加简易 prefetch/缓存对齐，减少 split 输出被后续 dot 再次读入时的缓存抖动。
+5. **验证与回归检查**
+   - 每完成一个优化点，固定 prompt 复测 tok/s、`llama-bench`，并对比 `ctest -R ifairy` 确认数值一致；记录是否仍是 CPU 热点、火焰图是否迁移到其他算子。

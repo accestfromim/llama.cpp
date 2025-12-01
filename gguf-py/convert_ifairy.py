@@ -4,10 +4,10 @@
 此脚本使用修改后的 gguf-py 库，支持自定义的 I2 数据类型映射。
 """
 import sys
-import os
 import json
 import argparse
 from pathlib import Path
+from typing import Any
 
 import gguf
 import torch
@@ -33,42 +33,42 @@ def load_tensor_with_weight_map(key: str, f, weight_map: dict[str, str], *, verb
 
     return f.get_tensor(key).to(dtype)
 
-def set_vocab_llama_hf(gguf_writer):
-        vocab = gguf.LlamaHfVocab(Path('.'))
-        tokens = []
-        scores = []
-        toktypes = []
+def set_vocab_llama_hf(gguf_writer, tokenizer_dir: Path):
+    vocab = gguf.LlamaHfVocab(tokenizer_dir)
+    tokens = []
+    scores = []
+    toktypes = []
 
-        for text, score, toktype in vocab.all_tokens():
-            tokens.append(text)
-            scores.append(score)
-            toktypes.append(toktype)
+    for text, score, toktype in vocab.all_tokens():
+        tokens.append(text)
+        scores.append(score)
+        toktypes.append(toktype)
 
-        assert len(tokens) == vocab.vocab_size
+    assert len(tokens) == vocab.vocab_size
 
-        gguf_writer.add_tokenizer_model("llama")
-        gguf_writer.add_tokenizer_pre("default")
-        gguf_writer.add_token_list(tokens)
-        gguf_writer.add_token_scores(scores)
-        gguf_writer.add_token_types(toktypes)
+    gguf_writer.add_tokenizer_model("llama")
+    gguf_writer.add_tokenizer_pre("default")
+    gguf_writer.add_token_list(tokens)
+    gguf_writer.add_token_scores(scores)
+    gguf_writer.add_token_types(toktypes)
 
-        special_vocab = gguf.SpecialVocab(Path('.'), n_vocab=len(tokens))
-        special_vocab.add_to_gguf(gguf_writer)
+    special_vocab = gguf.SpecialVocab(tokenizer_dir, n_vocab=len(tokens))
+    special_vocab.add_to_gguf(gguf_writer)
 
-def set_vocab(gguf_writer):
-        path_tokenizer_json = Path('.') / "tokenizer.json"
-        if not path_tokenizer_json.is_file():
-            raise FileNotFoundError("tokenizer.json not found")
+def set_vocab(gguf_writer, tokenizer_dir: Path):
+    path_tokenizer_json = tokenizer_dir / "tokenizer.json"
+    if not path_tokenizer_json.is_file():
+        raise FileNotFoundError("tokenizer.json not found")
 
-        set_vocab_llama_hf(gguf_writer)
+    set_vocab_llama_hf(gguf_writer, tokenizer_dir)
 
 
-        tokenizer_config_file = Path('.') / 'tokenizer_config.json'
-        if tokenizer_config_file.is_file():
-            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
-                tokenizer_config_json = json.load(f)
-                if "add_prefix_space" in tokenizer_config_json:
-                    gguf_writer.add_add_space_prefix(tokenizer_config_json["add_prefix_space"])
+    tokenizer_config_file = tokenizer_dir / 'tokenizer_config.json'
+    if tokenizer_config_file.is_file():
+        with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+            tokenizer_config_json = json.load(f)
+            if "add_prefix_space" in tokenizer_config_json:
+                gguf_writer.add_add_space_prefix(tokenizer_config_json["add_prefix_space"])
             
 # 从hf上直接扒下来的
 def forward(w_real: torch.Tensor, w_imag: torch.Tensor):
@@ -276,12 +276,12 @@ def main():
 
     args = parser.parse_args()
 
-    model_dir = args.model_dir
-    output_file = args.output_file
+    model_dir = Path(args.model_dir).expanduser()
+    output_file = Path(args.output_file).expanduser()
     verbose = args.verbose
 
     # 1. 加载模型配置
-    config_path = os.path.join(model_dir, 'config.json')
+    config_path = model_dir / 'config.json'
     try:
         with open(config_path, 'r') as f:
             config = json.load(f)
@@ -293,7 +293,7 @@ def main():
 
     # 2. 创建 GGUFWriter 并设置基本模型信息
     model_name = config.get("_name_or_path", "complexnet_model")
-    writer = gguf.GGUFWriter(output_file, arch=gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.IFAIRY])
+    writer = gguf.GGUFWriter(str(output_file), arch=gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.IFAIRY])
 
     # 3. 根据 config.json 添加关键元数据
     # 模型架构和基本信息
@@ -312,10 +312,10 @@ def main():
     writer.add_vocab_size(config["vocab_size"])
 
     index_name = "model.safetensors.index.json"
-    index_file = Path(model_dir) / index_name
+    index_file = model_dir / index_name
 
     # 4. 处理并添加张量
-    model_files = list(Path(model_dir).glob("*.safetensors"))
+    model_files = list(model_dir.glob("*.safetensors"))
     if not model_files:
         print(f"在 {model_dir} 中未找到 .safetensors 文件。")
         sys.exit(1)
@@ -326,9 +326,14 @@ def main():
             print(f"gguf: loading model weight map from '{index_name}'")
         with open(index_file, "r", encoding="utf-8") as f:
             index: dict[str, Any] = json.load(f)
-            weight_map = index.get("weight_map")
-            if weight_map is None or not isinstance(weight_map, dict):
+            weight_map_raw = index.get("weight_map")
+            if weight_map_raw is None or not isinstance(weight_map_raw, dict):
                 raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
+            for tensor_name, mapped_file in weight_map_raw.items():
+                mapped_path = Path(mapped_file)
+                if not mapped_path.is_absolute():
+                    mapped_path = model_dir / mapped_path
+                weight_map[tensor_name] = str(mapped_path)
 
     try:
         for model_file_path in model_files:
@@ -454,7 +459,7 @@ def main():
 
     # 5. 写入文件
     try:
-        set_vocab(writer)
+        set_vocab(writer, model_dir)
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
         writer.write_tensors_to_file()
