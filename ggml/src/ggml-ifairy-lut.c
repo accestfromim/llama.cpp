@@ -26,6 +26,11 @@ static struct ggml_ifairy_tensor_extra * ifairy_tensor_extras = NULL;
 static size_t ifairy_tensor_extras_index = 0;
 static int ifairy_lut_debug_reports = 0;
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+static const uint8_t IFARY_EVEN_IDX[16] = { 0, 2, 4, 6, 8, 10, 12, 14, 0, 0, 0, 0, 0, 0, 0, 0 };
+static const uint8_t IFARY_ODD_IDX [16] = { 1, 3, 5, 7, 9, 11, 13, 15, 1, 1, 1, 1, 1, 1, 1, 1 };
+#endif
+
 #define GGML_IFAIRY_DEBUG(...) \
     do { \
         if (ifairy_lut_debug && ifairy_lut_debug_reports < 8) { \
@@ -33,6 +38,23 @@ static int ifairy_lut_debug_reports = 0;
             ++ifairy_lut_debug_reports; \
         } \
     } while (0)
+
+static size_t ggml_ifairy_act_q16_bytes(int64_t k, int64_t ncols) {
+    if (ncols == 0) {
+        return 0;
+    }
+    const size_t row_sz = ggml_row_size(GGML_TYPE_IFAIRY_Q16, k);
+    return GGML_PAD(row_sz * (size_t) ncols, 64);
+}
+
+static size_t ggml_ifairy_qlut_bytes(int64_t k) {
+    GGML_ASSERT((k % 2) == 0);
+    return (size_t) (k / 2) * 32;
+}
+
+static size_t ggml_ifairy_packed_bytes(int64_t k) {
+    return (size_t) (k / 2) * 4; // real/imag × even/odd, contiguous per pair
+}
 
 static bool ggml_ifairy_select_tile_params(const int64_t m, const int64_t k, int * bm, int * bk) {
     GGML_ASSERT(bm != NULL && bk != NULL);
@@ -423,16 +445,12 @@ size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const stru
 
     GGML_ASSERT((k % 2) == 0);
 
-    size_t wsize = 0;
-    if (needs_q16) {
-        const size_t act_q16_bytes = GGML_PAD((size_t) ggml_row_size(GGML_TYPE_IFAIRY_Q16, k) * (size_t) n, 64);
-        wsize += act_q16_bytes;
-    }
-
-    // QLUT layout: real + imag, each k/2*32 bytes per column
-    const size_t qlut_bytes_per_chan = (size_t) (k / 2) * 32;
+    const size_t act_q16_bytes      = needs_q16 ? ggml_ifairy_act_q16_bytes(k, n) : 0;
+    const size_t qlut_bytes_per_col = 2 * ggml_ifairy_qlut_bytes(k);
+    const size_t packed_bytes       = ggml_ifairy_packed_bytes(k);
     const size_t lut_scales_bytes   = 2 * sizeof(float);
-    wsize += n * ((2 * qlut_bytes_per_chan) + lut_scales_bytes);
+
+    size_t wsize = act_q16_bytes + n * (qlut_bytes_per_col + packed_bytes + lut_scales_bytes);
 
     // 64B align to match ggml allocator expectations
     wsize = GGML_PAD(wsize, 64);
@@ -444,10 +462,27 @@ void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, v
     GGML_ASSERT(k % QK_K == 0);
 
     const block_ifairy_q16 * act_blocks = (const block_ifairy_q16 *) B;
+    const size_t qlut_bytes = ggml_ifairy_qlut_bytes(k);
+    const int64_t pairs_total = k / 2;
+
+    int8_t * packed_r_even = (int8_t *) qlut_imag + qlut_bytes;
+    int8_t * packed_r_odd  = packed_r_even + pairs_total;
+    int8_t * packed_i_even = packed_r_odd  + pairs_total;
+    int8_t * packed_i_odd  = packed_i_even + pairs_total;
+
     float inv_scales[2] = {0.0f, 0.0f};
 
     ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
     ggml_ifairy_lut_ctor(act_blocks, k, inv_scales, (int8_t *) qlut_real, (int8_t *) qlut_imag);
+
+    // compact view for cache-friendly dot products (real/imag × even/odd)
+    for (int64_t pair = 0; pair < pairs_total; ++pair) {
+        const size_t base = (size_t) pair * 32;
+        packed_r_even[pair] = ((int8_t *) qlut_real)[base + 0];
+        packed_r_odd [pair] = ((int8_t *) qlut_real)[base + 16];
+        packed_i_even[pair] = ((int8_t *) qlut_imag)[base + 0];
+        packed_i_odd [pair] = ((int8_t *) qlut_imag)[base + 16];
+    }
 }
 
 static inline void ggml_ifairy_decode_weight_block(const block_ifairy * blk, int8_t * wr, int8_t * wi) {
@@ -557,27 +592,70 @@ void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8
 }
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static inline uint8_t ggml_ifairy_get_code(const block_ifairy * blk, int j) {
-    const int chunk    = j >> 6;          // 0..3 blocks of 64
-    const int lane     = j & 0xF;         // 0..15 within each 16-lane stripe
-    const int part     = (j >> 4) & 0x3;  // which 16-lane group inside the chunk
-    const int byte_idx = (chunk << 4) + lane;
-    const int bit_off  = part * 2;
-    return (blk->qs[byte_idx] >> bit_off) & 0x3;
+static const int8_t IFARY_WR_TBL[16] = { -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0 };
+static const int8_t IFARY_WI_TBL[16] = { 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1 };
+
+static inline void ggml_ifairy_unpack_block_codes(const block_ifairy * blk, int8_t * wr_even, int8_t * wr_odd, int8_t * wi_even, int8_t * wi_odd) {
+    const uint8x16_t mask2 = vdupq_n_u8(0x3);
+    const uint8x16_t idx_even = vld1q_u8(IFARY_EVEN_IDX);
+    const uint8x16_t idx_odd  = vld1q_u8(IFARY_ODD_IDX);
+
+    const int8x16_t wr_tbl = vld1q_s8(IFARY_WR_TBL);
+    const int8x16_t wi_tbl = vld1q_s8(IFARY_WI_TBL);
+
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const uint8x16_t packed = vld1q_u8(blk->qs + chunk * 16);
+        for (int part = 0; part < 4; ++part) {
+            uint8x16_t shifted;
+            switch (part) {
+                case 0: shifted = packed; break;
+                case 1: shifted = vshrq_n_u8(packed, 2); break;
+                case 2: shifted = vshrq_n_u8(packed, 4); break;
+                default: shifted = vshrq_n_u8(packed, 6); break;
+            }
+
+            const uint8x16_t codes = vandq_u8(shifted, mask2);
+            const int8x16_t wr_all = vqtbl1q_s8(wr_tbl, codes);
+            const int8x16_t wi_all = vqtbl1q_s8(wi_tbl, codes);
+
+            const int8x16_t wr_even_v = vqtbl1q_s8(wr_all, idx_even);
+            const int8x16_t wr_odd_v  = vqtbl1q_s8(wr_all, idx_odd);
+            const int8x16_t wi_even_v = vqtbl1q_s8(wi_all, idx_even);
+            const int8x16_t wi_odd_v  = vqtbl1q_s8(wi_all, idx_odd);
+
+            const int pair_base = chunk * 32 + part * 8;
+            vst1_s8(wr_even + pair_base, vget_low_s8(wr_even_v));
+            vst1_s8(wr_odd  + pair_base, vget_low_s8(wr_odd_v));
+            vst1_s8(wi_even + pair_base, vget_low_s8(wi_even_v));
+            vst1_s8(wi_odd  + pair_base, vget_low_s8(wi_odd_v));
+        }
+    }
 }
 
-// NEON + DOTPROD matvec over nibble QLUT layout
+// NEON + DOTPROD matvec over packed activation tables (real/imag × even/odd)
 void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
     GGML_ASSERT(k % QK_K == 0);
     const block_ifairy * w_blocks = (const block_ifairy *) w;
 
-    static const int8_t wr_tbl_arr[16] = { -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0 };
-    static const int8_t wi_tbl_arr[16] = { 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1 };
-    const int8x16_t wr_tbl = vld1q_s8(wr_tbl_arr);
-    const int8x16_t wi_tbl = vld1q_s8(wi_tbl_arr);
+    GGML_UNUSED(qlut_r);
 
-    const int64_t blocks_per_row = k / QK_K;
+    const size_t qlut_bytes = ggml_ifairy_qlut_bytes(k);
+    const int64_t pairs_total = k / 2;
     const int64_t pairs_per_block = QK_K / 2;
+    const int64_t blocks_per_row = k / QK_K;
+
+    const int8_t * ar_even = qlut_i + qlut_bytes;
+    const int8_t * ar_odd  = ar_even + pairs_total;
+    const int8_t * ai_even = ar_odd  + pairs_total;
+    const int8_t * ai_odd  = ai_even + pairs_total;
+
+    const float inv_lut_r = lut_scales[0] != 0.0f ? 1.0f / lut_scales[0] : 0.0f;
+    const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
+
+    int8_t wr_even_buf[QK_K / 2];
+    int8_t wr_odd_buf [QK_K / 2];
+    int8_t wi_even_buf[QK_K / 2];
+    int8_t wi_odd_buf [QK_K / 2];
 
     for (int64_t row = row_start; row < row_end; ++row) {
         int32x4_t acc_rr_v = vdupq_n_s32(0);
@@ -587,54 +665,34 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
 
         const block_ifairy * row_w = w_blocks + row * blocks_per_row;
 
-        uint8_t codes_even[16];
-        uint8_t codes_odd [16];
-        int8_t  ar_even[16];
-        int8_t  ar_odd [16];
-        int8_t  ai_even[16];
-        int8_t  ai_odd [16];
-
         for (int64_t b = 0; b < blocks_per_row; ++b) {
-            const int64_t base_pair = b * pairs_per_block;
+            ggml_ifairy_unpack_block_codes(row_w + b, wr_even_buf, wr_odd_buf, wi_even_buf, wi_odd_buf);
 
-            for (int pair_base = 0; pair_base < pairs_per_block; pair_base += 16) {
-                for (int p = 0; p < 16; ++p) {
-                    const int j_even = (pair_base + p) * 2;
-                    const int j_odd  = j_even + 1;
-                    codes_even[p] = ggml_ifairy_get_code(&row_w[b], j_even);
-                    codes_odd[p]  = ggml_ifairy_get_code(&row_w[b], j_odd);
+            const size_t pair_base = (size_t) b * pairs_per_block;
+            for (int pair = 0; pair < pairs_per_block; pair += 16) {
+                const size_t off = pair_base + (size_t) pair;
 
-                    const size_t pair_index = (size_t) base_pair + (size_t) pair_base + (size_t) p;
-                    const size_t lut_base   = pair_index * 32;
-                    ar_even[p] = qlut_r[lut_base + 0];
-                    ar_odd [p] = qlut_r[lut_base + 16];
-                    ai_even[p] = qlut_i[lut_base + 0];
-                    ai_odd [p] = qlut_i[lut_base + 16];
-                }
+                const int8x16_t wr_e_v = vld1q_s8(wr_even_buf + pair);
+                const int8x16_t wr_o_v = vld1q_s8(wr_odd_buf  + pair);
+                const int8x16_t wi_e_v = vld1q_s8(wi_even_buf + pair);
+                const int8x16_t wi_o_v = vld1q_s8(wi_odd_buf  + pair);
 
-                const uint8x16_t code_even_v = vld1q_u8(codes_even);
-                const uint8x16_t code_odd_v  = vld1q_u8(codes_odd);
-                const int8x16_t wr_even = vqtbl1q_s8(wr_tbl, code_even_v);
-                const int8x16_t wr_odd  = vqtbl1q_s8(wr_tbl, code_odd_v);
-                const int8x16_t wi_even = vqtbl1q_s8(wi_tbl, code_even_v);
-                const int8x16_t wi_odd  = vqtbl1q_s8(wi_tbl, code_odd_v);
+                const int8x16_t ar_e_v = vld1q_s8(ar_even + off);
+                const int8x16_t ar_o_v = vld1q_s8(ar_odd  + off);
+                const int8x16_t ai_e_v = vld1q_s8(ai_even + off);
+                const int8x16_t ai_o_v = vld1q_s8(ai_odd  + off);
 
-                const int8x16_t ar_even_v = vld1q_s8(ar_even);
-                const int8x16_t ar_odd_v  = vld1q_s8(ar_odd);
-                const int8x16_t ai_even_v = vld1q_s8(ai_even);
-                const int8x16_t ai_odd_v  = vld1q_s8(ai_odd);
+                acc_rr_v = vdotq_s32(acc_rr_v, wr_e_v, ar_e_v);
+                acc_rr_v = vdotq_s32(acc_rr_v, wr_o_v, ar_o_v);
 
-                acc_rr_v = vdotq_s32(acc_rr_v, wr_even, ar_even_v);
-                acc_rr_v = vdotq_s32(acc_rr_v, wr_odd,  ar_odd_v);
+                acc_ii_v = vdotq_s32(acc_ii_v, wi_e_v, ai_e_v);
+                acc_ii_v = vdotq_s32(acc_ii_v, wi_o_v, ai_o_v);
 
-                acc_ii_v = vdotq_s32(acc_ii_v, wi_even, ai_even_v);
-                acc_ii_v = vdotq_s32(acc_ii_v, wi_odd,  ai_odd_v);
+                acc_ri_v = vdotq_s32(acc_ri_v, wr_e_v, ai_e_v);
+                acc_ri_v = vdotq_s32(acc_ri_v, wr_o_v, ai_o_v);
 
-                acc_ri_v = vdotq_s32(acc_ri_v, wr_even, ai_even_v);
-                acc_ri_v = vdotq_s32(acc_ri_v, wr_odd,  ai_odd_v);
-
-                acc_ir_v = vdotq_s32(acc_ir_v, wi_even, ar_even_v);
-                acc_ir_v = vdotq_s32(acc_ir_v, wi_odd,  ar_odd_v);
+                acc_ir_v = vdotq_s32(acc_ir_v, wi_e_v, ar_e_v);
+                acc_ir_v = vdotq_s32(acc_ir_v, wi_o_v, ar_o_v);
             }
         }
 
@@ -643,11 +701,8 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
         const int32_t acc_ri = vaddvq_s32(acc_ri_v);
         const int32_t acc_ir = vaddvq_s32(acc_ir_v);
 
-        const float w_r = GGML_FP16_TO_FP32(w_blocks[row * blocks_per_row].d_real);
-        const float w_i = GGML_FP16_TO_FP32(w_blocks[row * blocks_per_row].d_imag);
-
-        const float inv_lut_r = lut_scales[0] != 0.0f ? 1.0f / lut_scales[0] : 0.0f;
-        const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
+        const float w_r = GGML_FP16_TO_FP32(row_w[0].d_real);
+        const float w_i = GGML_FP16_TO_FP32(row_w[0].d_imag);
 
         const float scale_wr_r = w_r * inv_lut_r;
         const float scale_wi_i = w_i * inv_lut_i;

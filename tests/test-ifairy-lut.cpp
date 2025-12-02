@@ -20,6 +20,8 @@ void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <chrono>
 #include <iostream>
 #include <random>
 #include <vector>
@@ -73,11 +75,25 @@ int main(void) {
     block_ifairy_q16 act = {};
     fill_random_activation(rng, act);
 
-    std::vector<int8_t> qlut_r((size_t) (k / 2) * 32);
-    std::vector<int8_t> qlut_i((size_t) (k / 2) * 32);
-    float lut_scales[2] = {0.f, 0.f};
+    const size_t pairs = (size_t) k / 2;
+    const size_t qlut_bytes = pairs * 32;
+    const size_t packed_bytes = pairs * 4;
+    const size_t lut_scales_bytes = 2 * sizeof(float);
+    const size_t workspace_bytes = GGML_PAD(2 * qlut_bytes + packed_bytes + lut_scales_bytes, 64);
 
-    ggml_ifairy_preprocessor(m, k, &act, lut_scales, qlut_r.data(), qlut_i.data());
+    int8_t * workspace = (int8_t *) ggml_aligned_malloc(workspace_bytes);
+    assert(workspace != nullptr);
+
+    int8_t * qlut_r = workspace;
+    int8_t * qlut_i = qlut_r + qlut_bytes;
+    int8_t * packed_r_even = qlut_i + qlut_bytes;
+    int8_t * packed_r_odd  = packed_r_even + pairs;
+    int8_t * packed_i_even = packed_r_odd  + pairs;
+    int8_t * packed_i_odd  = packed_i_even + pairs;
+    float  * lut_scales    = (float *) (packed_i_odd + pairs);
+    lut_scales[0] = lut_scales[1] = 0.0f;
+
+    ggml_ifairy_preprocessor(m, k, &act, lut_scales, qlut_r, qlut_i);
 
     // Scalar reference for LUT construction to validate NEON path
     auto clamp_s8 = [](float v) -> int8_t {
@@ -98,9 +114,13 @@ int main(void) {
         lut_scales_ref[1] = max_i > 0.0 ? (float) (127.0 / max_i) : 0.0f;
     }
 
-    std::vector<int8_t> qlut_r_ref((size_t) (k / 2) * 32);
-    std::vector<int8_t> qlut_i_ref((size_t) (k / 2) * 32);
-    for (int pair = 0; pair < k / 2; ++pair) {
+    std::vector<int8_t> qlut_r_ref(qlut_bytes);
+    std::vector<int8_t> qlut_i_ref(qlut_bytes);
+    std::vector<int8_t> packed_r_even_ref(pairs);
+    std::vector<int8_t> packed_r_odd_ref(pairs);
+    std::vector<int8_t> packed_i_even_ref(pairs);
+    std::vector<int8_t> packed_i_odd_ref(pairs);
+    for (size_t pair = 0; pair < pairs; ++pair) {
         const int j0 = pair * 2;
         const int j1 = j0 + 1;
         const float d_r = GGML_FP16_TO_FP32(act.d_real);
@@ -116,22 +136,37 @@ int main(void) {
         std::fill_n(qlut_r_ref.data() + base + 16, 16, qr1);
         std::fill_n(qlut_i_ref.data() + base + 0,  16, qi0);
         std::fill_n(qlut_i_ref.data() + base + 16, 16, qi1);
+
+        packed_r_even_ref[pair] = qr0;
+        packed_r_odd_ref [pair] = qr1;
+        packed_i_even_ref[pair] = qi0;
+        packed_i_odd_ref [pair] = qi1;
     }
 
     const float tol_scale = 1e-5f;
     if (std::abs(lut_scales[0] - lut_scales_ref[0]) > tol_scale || std::abs(lut_scales[1] - lut_scales_ref[1]) > tol_scale) {
         std::cerr << "lut_scales mismatch: got (" << lut_scales[0] << ", " << lut_scales[1] << ")"
                   << " ref (" << lut_scales_ref[0] << ", " << lut_scales_ref[1] << ")\n";
+        ggml_aligned_free(workspace, workspace_bytes);
         return 1;
     }
-    if (!std::equal(qlut_r.begin(), qlut_r.end(), qlut_r_ref.begin()) ||
-        !std::equal(qlut_i.begin(), qlut_i.end(), qlut_i_ref.begin())) {
+    if (!std::equal(qlut_r, qlut_r + qlut_bytes, qlut_r_ref.begin()) ||
+        !std::equal(qlut_i, qlut_i + qlut_bytes, qlut_i_ref.begin())) {
         std::cerr << "qlut mismatch\n";
+        ggml_aligned_free(workspace, workspace_bytes);
+        return 1;
+    }
+    if (!std::equal(packed_r_even, packed_r_even + pairs, packed_r_even_ref.begin()) ||
+        !std::equal(packed_r_odd,  packed_r_odd  + pairs, packed_r_odd_ref.begin()) ||
+        !std::equal(packed_i_even, packed_i_even + pairs, packed_i_even_ref.begin()) ||
+        !std::equal(packed_i_odd,  packed_i_odd  + pairs, packed_i_odd_ref.begin())) {
+        std::cerr << "packed qlut mismatch\n";
+        ggml_aligned_free(workspace, workspace_bytes);
         return 1;
     }
 
     std::vector<float> dst_lut((size_t) m, 0.f);
-    ggml_ifairy_qgemm_lut_ref(weights.data(), qlut_r.data(), qlut_i.data(), lut_scales, k, m, dst_lut.data());
+    ggml_ifairy_qgemm_lut_ref(weights.data(), qlut_r, qlut_i, lut_scales, k, m, dst_lut.data());
 
     // High-precision reference by dequantizing to float and applying conj(activation)
     std::vector<float> dst_ref((size_t) m * 2, 0.f);
@@ -182,10 +217,44 @@ int main(void) {
         if (dr > thr_r || di > thr_i) {
             std::cerr << "Mismatch at row " << row << " dr=" << dr << " di=" << di
                       << " thr_r=" << thr_r << " thr_i=" << thr_i << std::endl;
+            ggml_aligned_free(workspace, workspace_bytes);
             return 1;
         }
     }
 
+    const char * bench_env = std::getenv("IFAIRY_LUT_BENCH");
+    if (bench_env && bench_env[0] != '\0') {
+        const int iters = 5000;
+        float * dst_tmp = (float *) ggml_aligned_malloc(sizeof(float) * (size_t) m);
+        assert(dst_tmp != nullptr);
+
+        auto bench = [&](auto fn) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                fn();
+            }
+            const auto end = std::chrono::steady_clock::now();
+            const double us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+            return us / iters;
+        };
+
+        const double ref_us = bench([&]() {
+            ggml_ifairy_qgemm_lut_ref(weights.data(), qlut_r, qlut_i, lut_scales, k, m, dst_tmp);
+        });
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+        const double neon_us = bench([&]() {
+            ggml_ifairy_qgemm_lut_neon(weights.data(), qlut_r, qlut_i, lut_scales, k, m, dst_tmp);
+        });
+        std::cout << "bench(us/call): ref=" << ref_us << " neon=" << neon_us << std::endl;
+#else
+        std::cout << "bench(us/call): ref=" << ref_us << " neon=N/A" << std::endl;
+#endif
+
+        ggml_aligned_free(dst_tmp, sizeof(float) * (size_t) m);
+    }
+
+    ggml_aligned_free(workspace, workspace_bytes);
     std::cout << "ok\n";
     return 0;
 }

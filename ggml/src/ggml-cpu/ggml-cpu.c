@@ -1262,13 +1262,21 @@ void ggml_compute_forward_mul_mat(
             const int k = (int) ne00;
             const int64_t ncols = ne11;
             const bool needs_q16 = src1->type == GGML_TYPE_F32;
-            const size_t act_q16_bytes = needs_q16 ? GGML_PAD((size_t) ggml_row_size(GGML_TYPE_IFAIRY_Q16, k) * (size_t) ncols, 64) : 0;
-            const size_t qlut_bytes = (size_t) (k / 2) * 32;
 
             char * wdata = params->wdata;
+            const size_t act_q16_bytes = needs_q16 ? GGML_PAD((size_t) ggml_row_size(GGML_TYPE_IFAIRY_Q16, k) * (size_t) ncols, 64) : 0;
+            const size_t pairs = (size_t) k / 2;
+            const size_t qlut_bytes = pairs * 32;
+
             int8_t * qlut_r = (int8_t *) (wdata + act_q16_bytes);
-            int8_t * qlut_i = (int8_t *) (wdata + act_q16_bytes + qlut_bytes);
-            float  * lut_scales = (float *) (wdata + act_q16_bytes + 2 * qlut_bytes);
+            int8_t * qlut_i = qlut_r + qlut_bytes;
+            int8_t * packed_r_even = qlut_i + qlut_bytes;
+            int8_t * packed_r_odd  = packed_r_even + pairs;
+            int8_t * packed_i_even = packed_r_odd + pairs;
+            int8_t * packed_i_odd  = packed_i_even + pairs;
+            float  * lut_scales    = (float *) (packed_i_odd + pairs);
+
+            GGML_ASSERT((char *) (lut_scales + 2) <= wdata + params->wsize);
 
             if (ith == 0) {
                 ggml_ifairy_transform_tensor((struct ggml_tensor *) src0);
