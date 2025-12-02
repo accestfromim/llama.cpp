@@ -464,23 +464,30 @@ void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, v
     const size_t qlut_bytes = ggml_ifairy_qlut_bytes(k);
     const int64_t pairs_total = k / 2;
 
-    int8_t * packed_r_even = (int8_t *) qlut_imag + qlut_bytes;
-    int8_t * packed_r_odd  = packed_r_even + pairs_total;
-    int8_t * packed_i_even = packed_r_odd  + pairs_total;
-    int8_t * packed_i_odd  = packed_i_even + pairs_total;
+    int8_t * ar_pack = (int8_t *) qlut_imag + qlut_bytes; // k bytes: [even0..7 | odd0..7] per 8 pairs
+    int8_t * ai_pack = ar_pack + pairs_total * 2;         // k bytes
 
     float inv_scales[2] = {0.0f, 0.0f};
 
     ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
     ggml_ifairy_lut_ctor(act_blocks, k, inv_scales, (int8_t *) qlut_real, (int8_t *) qlut_imag);
 
-    // compact view for cache-friendly dot products (real/imag × even/odd)
-    for (int64_t pair = 0; pair < pairs_total; ++pair) {
-        const size_t base = (size_t) pair * 32;
-        packed_r_even[pair] = ((int8_t *) qlut_real)[base + 0];
-        packed_r_odd [pair] = ((int8_t *) qlut_real)[base + 16];
-        packed_i_even[pair] = ((int8_t *) qlut_imag)[base + 0];
-        packed_i_odd [pair] = ((int8_t *) qlut_imag)[base + 16];
+    // compact view: store even/odd for 8 pairs into one 16B pack to avoid vcombine in the kernel
+    for (int64_t pair = 0; pair < pairs_total; pair += 8) {
+        const size_t pack_base_bytes = (size_t) pair * 2; // 16 bytes per 8 pairs
+        for (int idx = 0; idx < 8; ++idx) {
+            const size_t qbase = ((size_t) pair + (size_t) idx) * 32;
+            const int8_t ar_even = ((int8_t *) qlut_real)[qbase + 0];
+            const int8_t ar_odd  = ((int8_t *) qlut_real)[qbase + 16];
+            const int8_t ai_even = ((int8_t *) qlut_imag)[qbase + 0];
+            const int8_t ai_odd  = ((int8_t *) qlut_imag)[qbase + 16];
+
+            const size_t pack_off = pack_base_bytes + (size_t) idx;
+            ar_pack[pack_off]       = ar_even;
+            ar_pack[pack_off + 8]   = ar_odd;
+            ai_pack[pack_off]       = ai_even;
+            ai_pack[pack_off + 8]   = ai_odd;
+        }
     }
 }
 
@@ -623,22 +630,20 @@ static inline void ggml_ifairy_unpack_block_codes(
     }
 }
 
-// NEON + DOTPROD matvec over packed activation tables (real/imag × even/odd)
+// NEON + DOTPROD matvec over packed activation tables ([even|odd] per 8 pairs)
 void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
     GGML_ASSERT(k % QK_K == 0);
     const block_ifairy * w_blocks = (const block_ifairy *) w;
 
     GGML_UNUSED(qlut_r);
 
-    const size_t qlut_bytes = ggml_ifairy_qlut_bytes(k);
-    const int64_t pairs_total = k / 2;
+    const size_t qlut_bytes      = ggml_ifairy_qlut_bytes(k);
+    const int64_t pairs_total    = k / 2;
     const int64_t pairs_per_block = QK_K / 2;
     const int64_t blocks_per_row = k / QK_K;
 
-    const int8_t * ar_even = qlut_i + qlut_bytes;
-    const int8_t * ar_odd  = ar_even + pairs_total;
-    const int8_t * ai_even = ar_odd  + pairs_total;
-    const int8_t * ai_odd  = ai_even + pairs_total;
+    const int8_t * ar_pack = qlut_i + qlut_bytes;           // k bytes, [even0..7 | odd0..7] per 8 pairs
+    const int8_t * ai_pack = ar_pack + pairs_total * 2;     // k bytes, same layout for imag
 
     const float inv_lut_r = lut_scales[0] != 0.0f ? 1.0f / lut_scales[0] : 0.0f;
     const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
@@ -662,25 +667,22 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
         for (int64_t b = 0; b < blocks_per_row; ++b) {
             ggml_ifairy_unpack_block_codes(row_w + b, wr_pack_buf, wi_pack_buf, mask2, idx_pack, wr_tbl, wi_tbl);
 
-            const size_t pair_base = (size_t) b * pairs_per_block;
+            const size_t pair_base      = (size_t) b * pairs_per_block;
+            const size_t pack_base_bytes = pair_base * 2;
             if (b + 1 < blocks_per_row) {
                 __builtin_prefetch(row_w + b + 1, 0, 1);
             }
-            __builtin_prefetch(ar_even + pair_base + 32, 0, 1);
-            __builtin_prefetch(ai_even + pair_base + 32, 0, 1);
+            __builtin_prefetch(ar_pack + pack_base_bytes + 64, 0, 1);
+            __builtin_prefetch(ai_pack + pack_base_bytes + 64, 0, 1);
 
             for (size_t pack_off = 0; pack_off < (size_t) QK_K; pack_off += 16) {
-                const size_t pair_off = pair_base + (pack_off >> 1); // 8 pairs per 16-byte pack
+                const size_t off_bytes = pack_base_bytes + pack_off; // 8 pairs per 16-byte pack
 
                 const int8x16_t wr_pack_v = vld1q_s8(wr_pack_buf + pack_off);
                 const int8x16_t wi_pack_v = vld1q_s8(wi_pack_buf + pack_off);
 
-                const int8x16_t ar_pack_v = vcombine_s8(
-                        vld1_s8(ar_even + pair_off),
-                        vld1_s8(ar_odd  + pair_off));
-                const int8x16_t ai_pack_v = vcombine_s8(
-                        vld1_s8(ai_even + pair_off),
-                        vld1_s8(ai_odd  + pair_off));
+                const int8x16_t ar_pack_v = vld1q_s8(ar_pack + off_bytes);
+                const int8x16_t ai_pack_v = vld1q_s8(ai_pack + off_bytes);
 
                 acc_rr_v = vdotq_s32(acc_rr_v, wr_pack_v, ar_pack_v);
                 acc_ii_v = vdotq_s32(acc_ii_v, wi_pack_v, ai_pack_v);

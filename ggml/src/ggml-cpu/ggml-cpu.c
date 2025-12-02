@@ -1270,11 +1270,9 @@ void ggml_compute_forward_mul_mat(
 
             int8_t * qlut_r = (int8_t *) (wdata + act_q16_bytes);
             int8_t * qlut_i = qlut_r + qlut_bytes;
-            int8_t * packed_r_even = qlut_i + qlut_bytes;
-            int8_t * packed_r_odd  = packed_r_even + pairs;
-            int8_t * packed_i_even = packed_r_odd + pairs;
-            int8_t * packed_i_odd  = packed_i_even + pairs;
-            float  * lut_scales    = (float *) (packed_i_odd + pairs);
+            int8_t * ar_pack = qlut_i + qlut_bytes;      // k bytes
+            int8_t * ai_pack = ar_pack + k;              // k bytes
+            float  * lut_scales = (float *) (ai_pack + k);
 
             GGML_ASSERT((char *) (lut_scales + 2) <= wdata + params->wsize);
 

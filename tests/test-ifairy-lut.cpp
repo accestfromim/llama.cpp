@@ -77,7 +77,7 @@ int main(void) {
 
     const size_t pairs = (size_t) k / 2;
     const size_t qlut_bytes = pairs * 32;
-    const size_t packed_bytes = pairs * 4;
+    const size_t packed_bytes = pairs * 4; // remains 2*k bytes
     const size_t lut_scales_bytes = 2 * sizeof(float);
     const size_t workspace_bytes = GGML_PAD(2 * qlut_bytes + packed_bytes + lut_scales_bytes, 64);
 
@@ -86,11 +86,9 @@ int main(void) {
 
     int8_t * qlut_r = workspace;
     int8_t * qlut_i = qlut_r + qlut_bytes;
-    int8_t * packed_r_even = qlut_i + qlut_bytes;
-    int8_t * packed_r_odd  = packed_r_even + pairs;
-    int8_t * packed_i_even = packed_r_odd  + pairs;
-    int8_t * packed_i_odd  = packed_i_even + pairs;
-    float  * lut_scales    = (float *) (packed_i_odd + pairs);
+    int8_t * ar_pack = qlut_i + qlut_bytes; // k bytes
+    int8_t * ai_pack = ar_pack + k;         // k bytes
+    float  * lut_scales = (float *) (ai_pack + k);
     lut_scales[0] = lut_scales[1] = 0.0f;
 
     ggml_ifairy_preprocessor(m, k, &act, lut_scales, qlut_r, qlut_i);
@@ -116,10 +114,6 @@ int main(void) {
 
     std::vector<int8_t> qlut_r_ref(qlut_bytes);
     std::vector<int8_t> qlut_i_ref(qlut_bytes);
-    std::vector<int8_t> packed_r_even_ref(pairs);
-    std::vector<int8_t> packed_r_odd_ref(pairs);
-    std::vector<int8_t> packed_i_even_ref(pairs);
-    std::vector<int8_t> packed_i_odd_ref(pairs);
     for (size_t pair = 0; pair < pairs; ++pair) {
         const int j0 = pair * 2;
         const int j1 = j0 + 1;
@@ -137,10 +131,21 @@ int main(void) {
         std::fill_n(qlut_i_ref.data() + base + 0,  16, qi0);
         std::fill_n(qlut_i_ref.data() + base + 16, 16, qi1);
 
-        packed_r_even_ref[pair] = qr0;
-        packed_r_odd_ref [pair] = qr1;
-        packed_i_even_ref[pair] = qi0;
-        packed_i_odd_ref [pair] = qi1;
+    }
+
+    std::vector<int8_t> ar_pack_ref((size_t) k);
+    std::vector<int8_t> ai_pack_ref((size_t) k);
+    for (size_t pair = 0; pair < pairs; pair += 8) {
+        const size_t pack_base = pair * 2;
+        for (int idx = 0; idx < 8; ++idx) {
+            const size_t p = pair + (size_t) idx;
+            const size_t base_pack = pack_base + (size_t) idx;
+            const size_t qbase = p * 32;
+            ar_pack_ref[base_pack]       = qlut_r_ref[qbase + 0];
+            ar_pack_ref[base_pack + 8]   = qlut_r_ref[qbase + 16];
+            ai_pack_ref[base_pack]       = qlut_i_ref[qbase + 0];
+            ai_pack_ref[base_pack + 8]   = qlut_i_ref[qbase + 16];
+        }
     }
 
     const float tol_scale = 1e-5f;
@@ -156,11 +161,17 @@ int main(void) {
         ggml_aligned_free(workspace, workspace_bytes);
         return 1;
     }
-    if (!std::equal(packed_r_even, packed_r_even + pairs, packed_r_even_ref.begin()) ||
-        !std::equal(packed_r_odd,  packed_r_odd  + pairs, packed_r_odd_ref.begin()) ||
-        !std::equal(packed_i_even, packed_i_even + pairs, packed_i_even_ref.begin()) ||
-        !std::equal(packed_i_odd,  packed_i_odd  + pairs, packed_i_odd_ref.begin())) {
-        std::cerr << "packed qlut mismatch\n";
+    if (!std::equal(ar_pack, ar_pack + k, ar_pack_ref.begin()) ||
+        !std::equal(ai_pack, ai_pack + k, ai_pack_ref.begin())) {
+        for (int idx = 0; idx < k; ++idx) {
+            if (ar_pack[idx] != ar_pack_ref[(size_t) idx] || ai_pack[idx] != ai_pack_ref[(size_t) idx]) {
+                std::cerr << "packed qlut mismatch at idx " << idx
+                          << " ar=" << (int) ar_pack[idx] << " ref_ar=" << (int) ar_pack_ref[(size_t) idx]
+                          << " ai=" << (int) ai_pack[idx] << " ref_ai=" << (int) ai_pack_ref[(size_t) idx]
+                          << std::endl;
+                break;
+            }
+        }
         ggml_aligned_free(workspace, workspace_bytes);
         return 1;
     }

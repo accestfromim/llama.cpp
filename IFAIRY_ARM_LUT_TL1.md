@@ -15,9 +15,10 @@
   - 激活压缩为偶/奇 4 份 packed 缓冲，内核需多次 gather/组合才能参与点积，cache pressure 偏高。
 - 优化思路（本轮落地）：
   1) **权重解码瘦身**：`ggml_ifairy_unpack_block_codes` 改为直接生成“偶→奇”拼接的 16-lane 向量（`[e0..e7|o0..o7]`），wr/wi 各 1 次 `vqtbl1` 完成映射和重排，减少 tbl 次数并删掉 4 路写回。
-  2) **qgemm 融合偶/奇**：内核按 8 对为单位加载 `[even|odd]` 激活向量（`vcombine_s8`），将偶/奇 dot 合并为单次 `vdot`，rr/ii/ri/ir 各 1 条指令，指令/访存减半，常量表保持寄存器驻留并加权重/QLUT 预取。
-  3) **形状专门化**：保持 256 权重块的步长，按 k=4096/1536 的固定块数量展开循环，利于编译器展开与寄存器复用。
-  4) **实测**：`./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0`（Apple M4，Metal+BLAS，4 线程）得到 pp512 49.06 tok/s、tg128 22.77 tok/s。
+  2) **qgemm 融合偶/奇**：内核按 8 对为单位加载 `[even|odd]` 激活向量，将偶/奇 dot 合并为单次 `vdot`，rr/ii/ri/ir 各 1 条指令，指令/访存减半，常量表保持寄存器驻留并加权重/QLUT 预取。
+  3) **激活预打包**：预处理阶段直接写出 `[even|odd]` 16B pack，内核不再做 `vcombine` 重组；打包同时利用权重取值的对称性（±1/±i）共享同一权重查表和 pack 布局。
+  4) **形状专门化**：保持 256 权重块的步长，按 k=4096/1536 的固定块数量展开循环，利于编译器展开与寄存器复用。
+  4) **实测**：`./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0`（Apple M4，Metal+BLAS，4 线程）得到 pp512 51.41 tok/s、tg128 27.87 tok/s。
 
 ## 2. 现有量化与计算路径回顾
 - 权重量化（`ggml/src/ggml-quants.c:quantize_row_ifairy_ref`）
