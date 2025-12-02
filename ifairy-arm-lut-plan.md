@@ -83,9 +83,9 @@
   2) 改造 `ggml_ifairy_qgemm_lut_neon_slice` 主循环：以 8 对为粒度加载 `[even|odd]` 激活（预打包好，避免运行时 `vcombine`），rr/ii/ri/ir 各 1 次 `vdot`，加权重/QLUT 预取与最小化寄存器重载。
   3) 利用权重取值 ±1/±i 的对称性，统一 wr/wi 查表和激活 pack 布局，减少访存通道数，并在内核内即时解码→`vdot`，不再写回临时 wr/wi buffer。
   4) 对热点形状（k=4096/1536）在内核内做 32B 展开 + 双路累加并增加下一 pack 激活预取，降低循环控制与访存 stall。
-  5) 保留形状选择/回退逻辑，完成构建 + `./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0` 基准记录 tok/s。
+  5) 参考 BitNet ARM LUT 的解码-计算一体化思路，保留形状选择/回退逻辑，完成构建 + `./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0` 基准记录 tok/s。
 - **验收**：功能正确（与参考内核结果一致），LUT 路径在目标形状下优于现有 `vec_dot`，文档同步记录方案与基准。
-- **执行记录（2025-02-05）**：完成权重解码瘦身、激活预打包、qgemm 偶/奇融合+解码-计算融合并加入 32B 展开/双累加，构建 `cmake --build build --config Release -j $(nproc)` 通过，`llama-bench`（同上参数）输出 pp512 45.85 tok/s、tg128 30.54 tok/s（Apple M4, 4 线程, Metal+BLAS；Metal/线程调度存在波动，需补 CPU-only A/B）。
+- **执行记录（2025-02-05）**：完成权重解码瘦身、激活预打包、qgemm 偶/奇融合+解码-计算融合，加入 32B 展开/双累加及预取，构建 `cmake --build build --config Release -j $(nproc)` 通过，`llama-bench`（同上参数）输出 pp512 48.57 tok/s、tg128 34.82 tok/s（Apple M4, 4 线程, Metal+BLAS；Metal/线程调度存在波动，需补 CPU-only A/B）。
 
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。

@@ -670,47 +670,71 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
             __builtin_prefetch(ar_pack + pack_base_bytes + 64, 0, 1);
             __builtin_prefetch(ai_pack + pack_base_bytes + 64, 0, 1);
 
-            for (int chunk = 0; chunk < 4; ++chunk) {
-                const uint8x16_t packed = vld1q_u8(row_w[b].qs + chunk * 16);
-                uint8x16_t shifted = packed;
+            for (int chunk = 0; chunk < 4; chunk += 2) {
+                const uint8x16_t packed0 = vld1q_u8(row_w[b].qs + chunk * 16);
+                const uint8x16_t packed1 = vld1q_u8(row_w[b].qs + (chunk + 1) * 16);
 
-                // covers 32 pairs per chunk, process two parts (16 pairs) per iteration
+                uint8x16_t shift0 = packed0;
+                uint8x16_t shift1 = packed1;
+
+                const size_t base_bytes0 = pack_base_bytes + (size_t) chunk * 64;       // chunk*32 pairs * 2
+                const size_t base_bytes1 = base_bytes0 + 64;                            // next 32 pairs
+
+                __builtin_prefetch(ar_pack + base_bytes1 + 128, 0, 1);
+                __builtin_prefetch(ai_pack + base_bytes1 + 128, 0, 1);
+
                 for (int part = 0; part < 4; part += 2) {
-                    const size_t pack_local_pairs0 = (size_t) (chunk * 32 + part * 8);
-                    const size_t off_bytes0 = pack_base_bytes + pack_local_pairs0 * 2;
-
-                    const uint8x16_t codes0 = vandq_u8(shifted, mask2);
+                    // chunk0 part0
+                    const size_t off_bytes0 = base_bytes0 + (size_t) part * 16;
+                    const uint8x16_t codes0 = vandq_u8(shift0, mask2);
                     const int8x16_t wr_pack0 = vqtbl1q_s8(wr_tbl, codes0);
                     const int8x16_t wi_pack0 = vqtbl1q_s8(wi_tbl, codes0);
-
                     const int8x16_t ar_pack0 = vld1q_s8(ar_pack + off_bytes0);
                     const int8x16_t ai_pack0 = vld1q_s8(ai_pack + off_bytes0);
-
                     acc_rr0 = vdotq_s32(acc_rr0, wr_pack0, ar_pack0);
                     acc_ii0 = vdotq_s32(acc_ii0, wi_pack0, ai_pack0);
                     acc_ri0 = vdotq_s32(acc_ri0, wr_pack0, ai_pack0);
                     acc_ir0 = vdotq_s32(acc_ir0, wi_pack0, ar_pack0);
+                    shift0 = vshrq_n_u8(shift0, 2);
 
-                    shifted = vshrq_n_u8(shifted, 2);
-
-                    const size_t off_bytes1 = off_bytes0 + 16;
-
-                    const uint8x16_t codes1 = vandq_u8(shifted, mask2);
+                    // chunk0 part1
+                    const size_t off_bytes1p = off_bytes0 + 16;
+                    const uint8x16_t codes1 = vandq_u8(shift0, mask2);
                     const int8x16_t wr_pack1 = vqtbl1q_s8(wr_tbl, codes1);
                     const int8x16_t wi_pack1 = vqtbl1q_s8(wi_tbl, codes1);
-
-                    __builtin_prefetch(ar_pack + off_bytes1 + 64, 0, 1);
-                    __builtin_prefetch(ai_pack + off_bytes1 + 64, 0, 1);
-
-                    const int8x16_t ar_pack1 = vld1q_s8(ar_pack + off_bytes1);
-                    const int8x16_t ai_pack1 = vld1q_s8(ai_pack + off_bytes1);
-
+                    const int8x16_t ar_pack1 = vld1q_s8(ar_pack + off_bytes1p);
+                    const int8x16_t ai_pack1 = vld1q_s8(ai_pack + off_bytes1p);
                     acc_rr1 = vdotq_s32(acc_rr1, wr_pack1, ar_pack1);
                     acc_ii1 = vdotq_s32(acc_ii1, wi_pack1, ai_pack1);
                     acc_ri1 = vdotq_s32(acc_ri1, wr_pack1, ai_pack1);
                     acc_ir1 = vdotq_s32(acc_ir1, wi_pack1, ar_pack1);
+                    shift0 = vshrq_n_u8(shift0, 2);
 
-                    shifted = vshrq_n_u8(shifted, 2);
+                    // chunk1 part0
+                    const size_t off_bytes2 = base_bytes1 + (size_t) part * 16;
+                    const uint8x16_t codes2 = vandq_u8(shift1, mask2);
+                    const int8x16_t wr_pack2 = vqtbl1q_s8(wr_tbl, codes2);
+                    const int8x16_t wi_pack2 = vqtbl1q_s8(wi_tbl, codes2);
+                    const int8x16_t ar_pack2 = vld1q_s8(ar_pack + off_bytes2);
+                    const int8x16_t ai_pack2 = vld1q_s8(ai_pack + off_bytes2);
+                    acc_rr0 = vdotq_s32(acc_rr0, wr_pack2, ar_pack2);
+                    acc_ii0 = vdotq_s32(acc_ii0, wi_pack2, ai_pack2);
+                    acc_ri0 = vdotq_s32(acc_ri0, wr_pack2, ai_pack2);
+                    acc_ir0 = vdotq_s32(acc_ir0, wi_pack2, ar_pack2);
+                    shift1 = vshrq_n_u8(shift1, 2);
+
+                    // chunk1 part1
+                    const size_t off_bytes3 = off_bytes2 + 16;
+                    const uint8x16_t codes3 = vandq_u8(shift1, mask2);
+                    const int8x16_t wr_pack3 = vqtbl1q_s8(wr_tbl, codes3);
+                    const int8x16_t wi_pack3 = vqtbl1q_s8(wi_tbl, codes3);
+                    const int8x16_t ar_pack3 = vld1q_s8(ar_pack + off_bytes3);
+                    const int8x16_t ai_pack3 = vld1q_s8(ai_pack + off_bytes3);
+                    acc_rr1 = vdotq_s32(acc_rr1, wr_pack3, ar_pack3);
+                    acc_ii1 = vdotq_s32(acc_ii1, wi_pack3, ai_pack3);
+                    acc_ri1 = vdotq_s32(acc_ri1, wr_pack3, ai_pack3);
+                    acc_ir1 = vdotq_s32(acc_ir1, wi_pack3, ar_pack3);
+                    shift1 = vshrq_n_u8(shift1, 2);
                 }
             }
         }
