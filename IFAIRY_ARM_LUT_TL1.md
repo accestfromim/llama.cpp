@@ -17,9 +17,9 @@
   1) **权重解码瘦身**：`ggml_ifairy_unpack_block_codes` 改为直接生成“偶→奇”拼接的 16-lane 向量（`[e0..e7|o0..o7]`），wr/wi 各 1 次 `vqtbl1` 完成映射和重排，减少 tbl 次数并删掉 4 路写回。
   2) **qgemm 融合偶/奇**：内核按 8 对为单位加载 `[even|odd]` 激活向量，将偶/奇 dot 合并为单次 `vdot`，rr/ii/ri/ir 各 1 条指令，指令/访存减半，常量表保持寄存器驻留并加权重/QLUT 预取。
   3) **激活预打包**：预处理阶段直接写出 `[even|odd]` 16B pack，内核不再做 `vcombine` 重组；打包同时利用权重取值的对称性（±1/±i）共享同一权重查表和 pack 布局。
-  4) **解码-计算融合**：`qgemm` 内核在解码 2-bit 权重时即时查表并 `vdot`，不再把 wr/wi 写回临时 buffer，降低 L1 读写，重用对称查表。
+  4) **解码-计算融合 + 32B 展开**：`qgemm` 内核在解码 2-bit 权重时即时查表并 `vdot`，移除 wr/wi 临时 buffer；按 32B 展开同时维护双路累加（交替流水）并预取下一 pack 的激活，减小循环/访存开销。
   5) **形状专门化**：保持 256 权重块的步长，按 k=4096/1536 的固定块数量展开循环，利于编译器展开与寄存器复用。
-  6) **实测**：`./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0`（Apple M4，Metal+BLAS，4 线程）得到 pp512 45.83 tok/s、tg128 29.68 tok/s（受 Metal/线程调度波动，需进一步 CPU-only A/B）。
+  6) **实测**：`./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0`（Apple M4，Metal+BLAS，4 线程）得到 pp512 45.85 tok/s、tg128 30.54 tok/s（受 Metal/线程调度波动，需进一步 CPU-only A/B）。
 
 ## 2. 现有量化与计算路径回顾
 - 权重量化（`ggml/src/ggml-quants.c:quantize_row_ifairy_ref`）
