@@ -75,6 +75,16 @@
   4. **TL1 内核封装**（已完成）：添加行区间版本的 NEON/标量 LUT 内核，前向按线程切分 `row_start/row_end` 并调用 DOTPROD 内核（不支持则回退标量），保持 BM/BK 选择与回退逻辑一致；当前仍是单列 matvec，后续可特化 `(m,k)` 内核进一步提速。
   5. **验证与基准**（已完成）：扩展 `tests/test-ifairy-lut` 校验 LUT 构造（NEON vs 标量）与参考解码对齐（2% 容忍），当前 `ctest -R ifairy-lut --test-dir build --output-on-failure` 通过；性能对比待在目标设备上补充 tok/s。
 
+## 近期性能优化计划（NEON LUT 热点）
+- **现状复盘**：Xcode profiler 显示 `ggml_ifairy_unpack_block_codes`（37%）和 `ggml_ifairy_qgemm_lut_neon_slice`（33.6%）吞吐落后 `ggml_vec_dot_ifairy_q16_K`。瓶颈集中在 4 路权重解码写回 + 偶/奇拆分后 8 次 `vdot`。
+- **目标**：在不改动 QLUT 布局的前提下，将解码/点积访存次数减半，针对 k=4096/1536 常见形状展开，力争让 LUT 路径超越 `vec_dot` 基线。
+- **执行步骤**：
+  1) 重写 `ggml_ifairy_unpack_block_codes`：输出 `[even|odd]` 拼接的 16B 向量（wr/wi 各一份），单次 `vqtbl1` 完成重排，移除对 4 个 buffer 的写入。
+  2) 改造 `ggml_ifairy_qgemm_lut_neon_slice` 主循环：以 8 对为粒度加载 `[even|odd]` 激活（`vcombine_s8`），rr/ii/ri/ir 各 1 次 `vdot`，加权重/QLUT 预取与最小化寄存器重载。
+  3) 保留形状选择/回退逻辑，完成构建 + `./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0` 基准记录 tok/s。
+- **验收**：功能正确（与参考内核结果一致），LUT 路径在目标形状下优于现有 `vec_dot`，文档同步记录方案与基准。
+- **执行记录（2025-02-05）**：完成权重解码瘦身与 qgemm 偶/奇融合，构建 `cmake --build build --config Release -j $(nproc)` 通过，`llama-bench`（同上参数）输出 pp512 49.06 tok/s、tg128 22.77 tok/s（Apple M4, 4 线程, Metal+BLAS）。
+
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。
 - `ggml_mul_mat` 路径能在匹配形状时使用 LUT，未匹配时保持旧行为，数值一致。

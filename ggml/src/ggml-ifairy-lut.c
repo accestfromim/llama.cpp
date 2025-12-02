@@ -27,8 +27,7 @@ static size_t ifairy_tensor_extras_index = 0;
 static int ifairy_lut_debug_reports = 0;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-static const uint8_t IFARY_EVEN_IDX[16] = { 0, 2, 4, 6, 8, 10, 12, 14, 0, 0, 0, 0, 0, 0, 0, 0 };
-static const uint8_t IFARY_ODD_IDX [16] = { 1, 3, 5, 7, 9, 11, 13, 15, 1, 1, 1, 1, 1, 1, 1, 1 };
+static const uint8_t IFARY_PACK_IDX[16] = { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 };
 #endif
 
 #define GGML_IFAIRY_DEBUG(...) \
@@ -595,39 +594,31 @@ void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8
 static const int8_t IFARY_WR_TBL[16] = { -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0 };
 static const int8_t IFARY_WI_TBL[16] = { 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1 };
 
-static inline void ggml_ifairy_unpack_block_codes(const block_ifairy * blk, int8_t * wr_even, int8_t * wr_odd, int8_t * wi_even, int8_t * wi_odd) {
-    const uint8x16_t mask2 = vdupq_n_u8(0x3);
-    const uint8x16_t idx_even = vld1q_u8(IFARY_EVEN_IDX);
-    const uint8x16_t idx_odd  = vld1q_u8(IFARY_ODD_IDX);
-
-    const int8x16_t wr_tbl = vld1q_s8(IFARY_WR_TBL);
-    const int8x16_t wi_tbl = vld1q_s8(IFARY_WI_TBL);
-
+static inline void ggml_ifairy_unpack_block_codes(
+        const block_ifairy * blk,
+        int8_t * wr_packed,
+        int8_t * wi_packed,
+        const uint8x16_t mask2,
+        const uint8x16_t idx_pack,
+        const int8x16_t wr_tbl,
+        const int8x16_t wi_tbl) {
     for (int chunk = 0; chunk < 4; ++chunk) {
         const uint8x16_t packed = vld1q_u8(blk->qs + chunk * 16);
-        for (int part = 0; part < 4; ++part) {
-            uint8x16_t shifted;
-            switch (part) {
-                case 0: shifted = packed; break;
-                case 1: shifted = vshrq_n_u8(packed, 2); break;
-                case 2: shifted = vshrq_n_u8(packed, 4); break;
-                default: shifted = vshrq_n_u8(packed, 6); break;
-            }
+        uint8x16_t shifted = packed;
 
+        for (int part = 0; part < 4; ++part) {
             const uint8x16_t codes = vandq_u8(shifted, mask2);
             const int8x16_t wr_all = vqtbl1q_s8(wr_tbl, codes);
             const int8x16_t wi_all = vqtbl1q_s8(wi_tbl, codes);
 
-            const int8x16_t wr_even_v = vqtbl1q_s8(wr_all, idx_even);
-            const int8x16_t wr_odd_v  = vqtbl1q_s8(wr_all, idx_odd);
-            const int8x16_t wi_even_v = vqtbl1q_s8(wi_all, idx_even);
-            const int8x16_t wi_odd_v  = vqtbl1q_s8(wi_all, idx_odd);
+            const int8x16_t wr_pack = vqtbl1q_s8(wr_all, idx_pack); // [even0..7 | odd0..7]
+            const int8x16_t wi_pack = vqtbl1q_s8(wi_all, idx_pack);
 
-            const int pair_base = chunk * 32 + part * 8;
-            vst1_s8(wr_even + pair_base, vget_low_s8(wr_even_v));
-            vst1_s8(wr_odd  + pair_base, vget_low_s8(wr_odd_v));
-            vst1_s8(wi_even + pair_base, vget_low_s8(wi_even_v));
-            vst1_s8(wi_odd  + pair_base, vget_low_s8(wi_odd_v));
+            const size_t pair_base = (size_t) (chunk * 32 + part * 8) * 2; // 2 bytes per pair
+            vst1q_s8(wr_packed + pair_base, wr_pack);
+            vst1q_s8(wi_packed + pair_base, wi_pack);
+
+            shifted = vshrq_n_u8(shifted, 2);
         }
     }
 }
@@ -652,10 +643,13 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
     const float inv_lut_r = lut_scales[0] != 0.0f ? 1.0f / lut_scales[0] : 0.0f;
     const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
 
-    int8_t wr_even_buf[QK_K / 2];
-    int8_t wr_odd_buf [QK_K / 2];
-    int8_t wi_even_buf[QK_K / 2];
-    int8_t wi_odd_buf [QK_K / 2];
+    const uint8x16_t mask2    = vdupq_n_u8(0x3);
+    const uint8x16_t idx_pack = vld1q_u8(IFARY_PACK_IDX);
+    const int8x16_t wr_tbl    = vld1q_s8(IFARY_WR_TBL);
+    const int8x16_t wi_tbl    = vld1q_s8(IFARY_WI_TBL);
+
+    int8_t wr_pack_buf[QK_K];
+    int8_t wi_pack_buf[QK_K];
 
     for (int64_t row = row_start; row < row_end; ++row) {
         int32x4_t acc_rr_v = vdupq_n_s32(0);
@@ -666,33 +660,32 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
         const block_ifairy * row_w = w_blocks + row * blocks_per_row;
 
         for (int64_t b = 0; b < blocks_per_row; ++b) {
-            ggml_ifairy_unpack_block_codes(row_w + b, wr_even_buf, wr_odd_buf, wi_even_buf, wi_odd_buf);
+            ggml_ifairy_unpack_block_codes(row_w + b, wr_pack_buf, wi_pack_buf, mask2, idx_pack, wr_tbl, wi_tbl);
 
             const size_t pair_base = (size_t) b * pairs_per_block;
-            for (int pair = 0; pair < pairs_per_block; pair += 16) {
-                const size_t off = pair_base + (size_t) pair;
+            if (b + 1 < blocks_per_row) {
+                __builtin_prefetch(row_w + b + 1, 0, 1);
+            }
+            __builtin_prefetch(ar_even + pair_base + 32, 0, 1);
+            __builtin_prefetch(ai_even + pair_base + 32, 0, 1);
 
-                const int8x16_t wr_e_v = vld1q_s8(wr_even_buf + pair);
-                const int8x16_t wr_o_v = vld1q_s8(wr_odd_buf  + pair);
-                const int8x16_t wi_e_v = vld1q_s8(wi_even_buf + pair);
-                const int8x16_t wi_o_v = vld1q_s8(wi_odd_buf  + pair);
+            for (size_t pack_off = 0; pack_off < (size_t) QK_K; pack_off += 16) {
+                const size_t pair_off = pair_base + (pack_off >> 1); // 8 pairs per 16-byte pack
 
-                const int8x16_t ar_e_v = vld1q_s8(ar_even + off);
-                const int8x16_t ar_o_v = vld1q_s8(ar_odd  + off);
-                const int8x16_t ai_e_v = vld1q_s8(ai_even + off);
-                const int8x16_t ai_o_v = vld1q_s8(ai_odd  + off);
+                const int8x16_t wr_pack_v = vld1q_s8(wr_pack_buf + pack_off);
+                const int8x16_t wi_pack_v = vld1q_s8(wi_pack_buf + pack_off);
 
-                acc_rr_v = vdotq_s32(acc_rr_v, wr_e_v, ar_e_v);
-                acc_rr_v = vdotq_s32(acc_rr_v, wr_o_v, ar_o_v);
+                const int8x16_t ar_pack_v = vcombine_s8(
+                        vld1_s8(ar_even + pair_off),
+                        vld1_s8(ar_odd  + pair_off));
+                const int8x16_t ai_pack_v = vcombine_s8(
+                        vld1_s8(ai_even + pair_off),
+                        vld1_s8(ai_odd  + pair_off));
 
-                acc_ii_v = vdotq_s32(acc_ii_v, wi_e_v, ai_e_v);
-                acc_ii_v = vdotq_s32(acc_ii_v, wi_o_v, ai_o_v);
-
-                acc_ri_v = vdotq_s32(acc_ri_v, wr_e_v, ai_e_v);
-                acc_ri_v = vdotq_s32(acc_ri_v, wr_o_v, ai_o_v);
-
-                acc_ir_v = vdotq_s32(acc_ir_v, wi_e_v, ar_e_v);
-                acc_ir_v = vdotq_s32(acc_ir_v, wi_o_v, ar_o_v);
+                acc_rr_v = vdotq_s32(acc_rr_v, wr_pack_v, ar_pack_v);
+                acc_ii_v = vdotq_s32(acc_ii_v, wi_pack_v, ai_pack_v);
+                acc_ri_v = vdotq_s32(acc_ri_v, wr_pack_v, ai_pack_v);
+                acc_ir_v = vdotq_s32(acc_ir_v, wi_pack_v, ar_pack_v);
             }
         }
 

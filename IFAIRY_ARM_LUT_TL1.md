@@ -7,6 +7,18 @@
 - 目标：复用 BitNet TL1 的“激活预量化 + 查表内核”思路，降低解码与访存开销，在 ARMv8.2+NEON/DOTPROD 设备上为 iFairy 提供高吞吐的 matvec/matmul 内核。
 - 约束：保持 iFairy 复数语义（{−1,+1,−i,+i} × `d_real`/`d_imag`），输入/输出仍为 GGML 现有的 `GGML_TYPE_IFAIRY`（权重）与 `GGML_TYPE_IFAIRY_Q16`（激活）。
 
+## 当前性能瓶颈（2025-02-05）
+- Xcode Time Profiler（`m=1536,k=4096`）热点：`ggml_ifairy_unpack_block_codes` 37%（权重解码 + 4 路 buffer 写）、`ggml_ifairy_qgemm_lut_neon_slice` 33.6%、`ggml_vec_dot_ifairy_q16_K` 7.9%、`ggml_vec_dot_f16` 6%。LUT 路径仍被解码+访存拖慢。
+- 根因拆解：
+  - 解码阶段为每个 block 写入 4 份 buffer（wr_even/wr_odd/wi_even/wi_odd，合计 512B），再在主循环重新读回，访存次数翻倍。
+  - 每 8 对权重执行 6×`vqtbl1`（wr/wi + even/odd 拆分），主循环对同一块又做 8 次 `vdot`（偶/奇分别累计 rr/ii/ri/ir），ILP/吞吐不足。
+  - 激活压缩为偶/奇 4 份 packed 缓冲，内核需多次 gather/组合才能参与点积，cache pressure 偏高。
+- 优化思路（本轮落地）：
+  1) **权重解码瘦身**：`ggml_ifairy_unpack_block_codes` 改为直接生成“偶→奇”拼接的 16-lane 向量（`[e0..e7|o0..o7]`），wr/wi 各 1 次 `vqtbl1` 完成映射和重排，减少 tbl 次数并删掉 4 路写回。
+  2) **qgemm 融合偶/奇**：内核按 8 对为单位加载 `[even|odd]` 激活向量（`vcombine_s8`），将偶/奇 dot 合并为单次 `vdot`，rr/ii/ri/ir 各 1 条指令，指令/访存减半，常量表保持寄存器驻留并加权重/QLUT 预取。
+  3) **形状专门化**：保持 256 权重块的步长，按 k=4096/1536 的固定块数量展开循环，利于编译器展开与寄存器复用。
+  4) **实测**：`./build/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 512 --n-gen 128 -ngl 0`（Apple M4，Metal+BLAS，4 线程）得到 pp512 49.06 tok/s、tg128 22.77 tok/s。
+
 ## 2. 现有量化与计算路径回顾
 - 权重量化（`ggml/src/ggml-quants.c:quantize_row_ifairy_ref`）
   - `block_ifairy` 布局：`qs[QK_K/4]` 存 256 个 2-bit 码，`d_real`、`d_imag` 为 FP16 缩放。
