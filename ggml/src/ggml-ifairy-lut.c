@@ -653,9 +653,6 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
     const int8x16_t wr_tbl    = vld1q_s8(IFARY_WR_TBL);
     const int8x16_t wi_tbl    = vld1q_s8(IFARY_WI_TBL);
 
-    int8_t wr_pack_buf[QK_K];
-    int8_t wi_pack_buf[QK_K];
-
     for (int64_t row = row_start; row < row_end; ++row) {
         int32x4_t acc_rr_v = vdupq_n_s32(0);
         int32x4_t acc_ii_v = vdupq_n_s32(0);
@@ -665,8 +662,6 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
         const block_ifairy * row_w = w_blocks + row * blocks_per_row;
 
         for (int64_t b = 0; b < blocks_per_row; ++b) {
-            ggml_ifairy_unpack_block_codes(row_w + b, wr_pack_buf, wi_pack_buf, mask2, idx_pack, wr_tbl, wi_tbl);
-
             const size_t pair_base      = (size_t) b * pairs_per_block;
             const size_t pack_base_bytes = pair_base * 2;
             if (b + 1 < blocks_per_row) {
@@ -675,19 +670,29 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
             __builtin_prefetch(ar_pack + pack_base_bytes + 64, 0, 1);
             __builtin_prefetch(ai_pack + pack_base_bytes + 64, 0, 1);
 
-            for (size_t pack_off = 0; pack_off < (size_t) QK_K; pack_off += 16) {
-                const size_t off_bytes = pack_base_bytes + pack_off; // 8 pairs per 16-byte pack
+            for (int chunk = 0; chunk < 4; ++chunk) {
+                const uint8x16_t packed = vld1q_u8(row_w[b].qs + chunk * 16);
+                uint8x16_t shifted = packed;
 
-                const int8x16_t wr_pack_v = vld1q_s8(wr_pack_buf + pack_off);
-                const int8x16_t wi_pack_v = vld1q_s8(wi_pack_buf + pack_off);
+                // covers 32 pairs per chunk, 8 pairs per part
+                for (int part = 0; part < 4; ++part) {
+                    const uint8x16_t codes   = vandq_u8(shifted, mask2);
+                    const int8x16_t wr_pack_v = vqtbl1q_s8(wr_tbl, codes);
+                    const int8x16_t wi_pack_v = vqtbl1q_s8(wi_tbl, codes);
 
-                const int8x16_t ar_pack_v = vld1q_s8(ar_pack + off_bytes);
-                const int8x16_t ai_pack_v = vld1q_s8(ai_pack + off_bytes);
+                    const size_t pack_local_pairs = (size_t) (chunk * 32 + part * 8);
+                    const size_t off_bytes = pack_base_bytes + pack_local_pairs * 2;
 
-                acc_rr_v = vdotq_s32(acc_rr_v, wr_pack_v, ar_pack_v);
-                acc_ii_v = vdotq_s32(acc_ii_v, wi_pack_v, ai_pack_v);
-                acc_ri_v = vdotq_s32(acc_ri_v, wr_pack_v, ai_pack_v);
-                acc_ir_v = vdotq_s32(acc_ir_v, wi_pack_v, ar_pack_v);
+                    const int8x16_t ar_pack_v = vld1q_s8(ar_pack + off_bytes);
+                    const int8x16_t ai_pack_v = vld1q_s8(ai_pack + off_bytes);
+
+                    acc_rr_v = vdotq_s32(acc_rr_v, wr_pack_v, ar_pack_v);
+                    acc_ii_v = vdotq_s32(acc_ii_v, wi_pack_v, ai_pack_v);
+                    acc_ri_v = vdotq_s32(acc_ri_v, wr_pack_v, ai_pack_v);
+                    acc_ir_v = vdotq_s32(acc_ir_v, wi_pack_v, ar_pack_v);
+
+                    shifted = vshrq_n_u8(shifted, 2);
+                }
             }
         }
 
