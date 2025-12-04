@@ -87,6 +87,16 @@
 - **验收**：功能正确（与参考内核结果一致），LUT 路径在目标形状下优于现有 `vec_dot`，文档同步记录方案与基准。
 - **执行记录（2025-02-05）**：完成权重解码瘦身、激活预打包、qgemm 偶/奇融合+解码-计算融合，加入 32B 展开/双累加及预取，构建 `cmake --build build --config Release -j $(nproc)` 通过，`llama-bench`（同上参数）输出 pp512 48.57 tok/s、tg128 34.82 tok/s（Apple M4, 4 线程, Metal+BLAS；Metal/线程调度存在波动，需补 CPU-only A/B）。
 
+## 多权重组合/对称压缩探索（新增方向）
+- 背景：当前 LUT 粒度为偶/奇两权重，`ggml_ifairy_fill_pair_tables` 填常量，内核运行时逐权重 `vqtbl`+`vdot`；未覆盖“三权重同查表”。BitNet TL1 同样只做两权重。
+- 目标：验证三权重/6bit LUT（或轴/符号分离压缩）的收益与成本，决定是否在 TL1 内核中加入 gated 路径。
+- 计划任务：
+  1) 设计 3 权重组 QLUT 布局（6bit 索引，`k/3*64` 单通道估算）与 k%3 尾块处理，更新 `mul_mat_get_wsize` 与工作区偏移计算。
+  2) 评估权重跨字节 6bit 拼接的实现方式：A) 在 `ggml_ifairy_transform_tensor` 预先 repack；B) 内核动态拼 6bit；比对访存/指令成本。
+  3) 原型化预处理/内核：先实现参考标量版本（折叠 wr/wi 后一次累加 3 权重，表项写回前 int16/32 累加再 clip 到 int8），再接 NEON 版测 ILP 与 tok/s；同时加入 `GGML_IFAIRY_ARM_LUT_3W` 等编译/运行时开关。
+  4) 研究轴/符号分离压缩（仅存 3bit 轴表、运行时符号翻转）的尺寸/指令折衷，确认是否能在减少 wsize 的同时保留吞吐收益；内核符号翻转用 `veor`/`vbsl`/`vnegq_s8`，保持现有权重布局；参考 BitNet TL2 `three_lut_ctor/three_tbl_impl_*` 的“无符号 LUT + sign buffer”流程。
+  5) 基准与验证：对比 wsize、预处理耗时、内核 tok/s 与数值偏差（与现有 TL1/vec_dot）；补充文档记录方案、假设与风险。
+
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。
 - `ggml_mul_mat` 路径能在匹配形状时使用 LUT，未匹配时保持旧行为，数值一致。

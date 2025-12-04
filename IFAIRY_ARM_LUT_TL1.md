@@ -171,3 +171,25 @@
 - 支持批量（`src1->ne[1] > 1`）：参考 BitNet TL2 的双 LUT（two/three 分支）做批量 LUT 构造。
 - Metal/GPU：当前设计 CPU-only，后续可在 Metal Backend 复用同样的 LUT 逻辑。
 - 自动生成内核：仿照 `preset_kernels/bitnet-lut-kernels-tl1.h`，根据模型维度脚本化生成 `ifairy-lut-kernels-tl1.h`，减少手写汇编。
+
+## 11. 多权重组合 LUT 可行性（3 权重示例）
+- 现状：TL1 的 nibble 表只覆盖“偶/奇”两权重，`ggml_ifairy_fill_pair_tables` 对 16 项表填同一常量，内核运行时用 `wr_tbl/wi_tbl` 展开 2-bit 权重后逐权重做 4 路 `vdot`；BitNet TL1 亦是两权重粒度，没有 3 权重同查表。
+- 方案 A（6bit/三权重查表）：每 3 个激活构成一组，预处理生成 `4^3=64` 项查表并提前折叠 wr/wi 符号，运行时按 6bit 直接 `vqtbl` → 4×`vdot` 覆盖三权重，可减少约 1/3 的 `vqtbl`/`vdot` 次数。
+  - 代价：QLUT 单通道从 `k/2*32` 增到 `k/3*64`（k=4096 时 real+imag ≈ 342 KB，约 +33%），预处理写表与访存同样上升；权重仍以 4 权重/byte 存储，三权重跨字节，需在 `ggml_ifairy_transform_tensor` 侧额外 repack（或内核内拼 6bit，可能吞掉收益）；需处理 k%3 尾块。
+  - 风险：工作集变大影响 L2 命中，预处理耗时上升；需为 LUT/非 LUT 路径补充一致性测试与基准。
+- 方案 B（轴/符号分离压缩，建议优先验证）：将三权重拆为 `(axis, sign)`，其中 `axis ∈ {R,I}` 决定是 wr 还是 wi，sign 仍为 ±1。预处理仅按 3bit 轴组合生成 8 项“无符号”表（单通道约 `k/3*16`，低于现有 wsize），内核再用 3bit 符号 mask 做 `eor/bsl` 翻转。
+  - BitNet TL2 参考：`three_lut_ctor` 每 24 激活输出 8×32B 表（覆盖 6bit 组合），先将三路量化值以 int32 求和再转置/pack，额外维护 `sign` 缓冲（3 权重 1bit，8 权重/byte），`three_tbl_impl_*` 用 LUT + sign 翻转。我们的轴/符号拆分可沿用“无符号表 + sign buffer”结构，轴表对应 BitNet LUT，sign buffer 对应其 sign 流。
+  - 内核思路：解码 6bit（低 3bit sign，高 3bit axis）→ `axis_pack = vqtbl1(axis_tbl, axis_codes)`（axis_tbl 两份 real/imag 互斥掩码），`sign_pack` 来自 sign buffer 或 codes 衍生，`wr_pack = vbsl(axis_is_r, sign_pack, vzero)`，`wi_pack = vbsl(axis_is_i, sign_pack, vzero)`，随后与 `[even|odd]` 激活做 4 路 `vdot`。符号翻转用 `veor`/`vbsl`/`vnegq_s8`，避免额外访存。
+  - 工作区/接口：`ggml_ifairy_qlut_bytes_3w(k) = k/3*16`（单通道轴表），可选 `sign_bytes = k/3/8`（每 3 权重 1bit，向 16B 对齐）；工作区布局改为 `qlut_axis_r/qlut_axis_i[/sign] → lut_scales`，`mul_mat_get_wsize` 按列累加上述大小；尾部 k%3 可回退到两权重或补零。
+  - 权重处理：保持 4 权重/byte 原布局，内核用 `vext`/`tbl` 拼 6bit（2 个 byte 覆盖 3 组；用移位/与掩码方式裁出 6bit 序列），或在 `ggml_ifairy_transform_tensor` 侧预先写一个 6bit 索引 buffer（仅在 `GGML_IFAIRY_ARM_LUT_3W` 打开时分配）。
+  - Gate：新增编译/运行时开关（如 `GGML_IFAIRY_ARM_LUT_3W=1` 或 env）控制 3 权重路径；默认沿用两权重，确保未验证设备不受影响。
+  - 风险：符号翻转仍有 3 次 mask，但访存/表尺寸低于方案 A；吞吐增益需以实测 tok/s 验证；需扩展单测覆盖 3 权重 LUT 构造与标量/NEON 一致性。
+- 结论：当前实现仅支持两权重粒度。三权重/对称压缩可作为后续 gated 实验方向，推进时需同步更新 QLUT 布局、`mul_mat_get_wsize` 估算、预处理构表、权重转换或 repack 缓冲、NEON 内核与单测/基准记录；方案 B 先行，方案 A 作为备选。
+
+## 12. LUT 构建的溢出/截断处理
+- 现状：`ggml_ifairy_lut_ctor` 在量化偶/奇激活时使用 `vcvtn` + `vmin/vmax` 把每个 int16 结果夹到 `[-127,127]`，写入 nibble 表；`ggml_ifairy_fill_pair_tables` 将单值复制为 16 项，不存在多值求和。多权重 LUT（3 权重）若提前折叠激活/符号，可能出现 3×int8 相加溢出。
+- 设计：预处理中的每个表项在写入前先用 int16/32 累加，再统一 clip 到 int8。NEON 路径可用 `vqaddq_s16`/`vqmovn_s16` 或在构表时用 `vaddl_s8`→`vqmovn_s16` 实现饱和；标量路径用 `ggml_ifairy_clamp_s8`（`MAX(-127, MIN(127, val))`）。
+- 代码落点建议：
+  - 在未来的 3 权重 LUT 构造函数里，对同一表项的 3 路贡献使用 int16 累加，最终经 `vqmovn_s16`（或标量 clamp）写回。
+  - 现有两权重路径保持不变（每表项单值），但在文档中明确 clip 策略，避免后续改动时遗漏饱和处理。
+  - 若构表需要预乘 `lut_scales`，确保乘法结果先转换为 int16/32，再饱和下采样到 int8，避免中间 int8 溢出。
