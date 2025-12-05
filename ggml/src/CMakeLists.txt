@@ -400,6 +400,12 @@ if (GGML_IFAIRY_ARM_LUT)
     endforeach()
 endif()
 
+if (GGML_IFAIRY_ARM_LUT_3W)
+    foreach (target ggml-base ggml)
+        target_compile_definitions(${target} PUBLIC GGML_IFAIRY_ARM_LUT_3W)
+    endforeach()
+endif()
+
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 
 find_library(MATH_LIBRARY m)

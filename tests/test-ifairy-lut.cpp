@@ -13,6 +13,7 @@ extern "C" {
 #endif
 void ggml_vec_dot_ifairy_q16_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
+void ggml_ifairy_qgemm_lut3_ref(const void * w, const int16_t * qlut3, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 void ggml_ifairy_qgemm_lut_neon(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #endif
@@ -94,7 +95,7 @@ int main(void) {
     float  * lut_scales = (float *) (ai_pack + k);
     lut_scales[0] = lut_scales[1] = 0.0f;
 
-    ggml_ifairy_preprocessor(m, k, &act, lut_scales, qlut_r, qlut_i);
+    ggml_ifairy_preprocessor(m, k, &act, lut_scales, qlut_r, qlut_i, /*use_three_weight=*/false, ar_pack);
 
     // Scalar reference for LUT construction to validate NEON path
     auto clamp_s8 = [](float v) -> int8_t {
@@ -179,6 +180,25 @@ int main(void) {
         return 1;
     }
 
+#if defined(GGML_IFAIRY_ARM_LUT_3W)
+    const size_t qlut3_bytes = (size_t) (k / QK_K) * (size_t) (QK_K / 3) * 64u * 4u * sizeof(int16_t);
+    const size_t packed3_bytes = (size_t) k * 2u;
+    const size_t workspace3_bytes = GGML_PAD(qlut3_bytes + packed3_bytes + lut_scales_bytes, 64);
+    int8_t * workspace3 = (int8_t *) ggml_aligned_malloc(workspace3_bytes);
+    assert(workspace3 != nullptr);
+
+    int16_t * qlut3 = (int16_t *) workspace3;
+    int8_t  * qr_seq = (int8_t *) ((char *) workspace3 + qlut3_bytes);
+    int8_t  * qi_seq = qr_seq + k;
+    float   * lut_scales3 = (float *) (qi_seq + k);
+    lut_scales3[0] = lut_scales3[1] = 0.0f;
+
+    ggml_ifairy_preprocessor(m, k, &act, lut_scales3, qlut3, nullptr, /*use_three_weight=*/true, qr_seq);
+
+    std::vector<float> dst_lut3((size_t) m, 0.f);
+    ggml_ifairy_qgemm_lut3_ref(weights.data(), qlut3, qr_seq, qi_seq, lut_scales3, k, m, dst_lut3.data());
+#endif
+
     std::vector<float> dst_lut((size_t) m, 0.f);
     ggml_ifairy_qgemm_lut_ref(weights.data(), qlut_r, qlut_i, lut_scales, k, m, dst_lut.data());
 
@@ -236,6 +256,26 @@ int main(void) {
         }
     }
 
+#if defined(GGML_IFAIRY_ARM_LUT_3W)
+    const float rel3w = 4e-2f;
+    for (int row = 0; row < m; ++row) {
+        const ggml_bf16_t * packed = (const ggml_bf16_t *) &dst_lut3[row];
+        const float lut_r = GGML_BF16_TO_FP32(packed[0]);
+        const float lut_i = GGML_BF16_TO_FP32(packed[1]);
+        const float dr = std::abs(lut_r - dst_ref[(size_t) row * 2 + 0]);
+        const float di = std::abs(lut_i - dst_ref[(size_t) row * 2 + 1]);
+        const float thr_r = rel3w * std::max(std::abs(dst_ref[(size_t) row * 2 + 0]), 1.0f);
+        const float thr_i = rel3w * std::max(std::abs(dst_ref[(size_t) row * 2 + 1]), 1.0f);
+        if (dr > thr_r || di > thr_i) {
+            std::cerr << "3W mismatch at row " << row << " dr=" << dr << " di=" << di
+                      << " thr_r=" << thr_r << " thr_i=" << thr_i << std::endl;
+            ggml_aligned_free(workspace3, workspace3_bytes);
+            ggml_aligned_free(workspace, workspace_bytes);
+            return 1;
+        }
+    }
+#endif
+
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     std::vector<float> dst_neon((size_t) m, 0.f);
     ggml_ifairy_qgemm_lut_neon(weights.data(), qlut_r, qlut_i, lut_scales, k, m, dst_neon.data());
@@ -289,15 +329,10 @@ int main(void) {
         ggml_aligned_free(dst_tmp, sizeof(float) * (size_t) m);
     }
 
+#if defined(GGML_IFAIRY_ARM_LUT_3W)
+    ggml_aligned_free(workspace3, workspace3_bytes);
+#endif
     ggml_aligned_free(workspace, workspace_bytes);
     std::cout << "ok\n";
     return 0;
 }
-#ifdef __cplusplus
-extern "C" {
-#endif
-void ggml_vec_dot_ifairy_q16_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
-void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
-#ifdef __cplusplus
-}
-#endif

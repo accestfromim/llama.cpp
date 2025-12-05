@@ -1262,16 +1262,15 @@ void ggml_compute_forward_mul_mat(
             const int k = (int) ne00;
             const int64_t ncols = ne11;
             const bool needs_q16 = src1->type == GGML_TYPE_F32;
+            const bool use_three_weight = ggml_ifairy_use_three_weight(k);
 
             char * wdata = params->wdata;
             const size_t act_q16_bytes = needs_q16 ? GGML_PAD((size_t) ggml_row_size(GGML_TYPE_IFAIRY_Q16, k) * (size_t) ncols, 64) : 0;
-            const size_t pairs = (size_t) k / 2;
-            const size_t qlut_bytes = pairs * 32;
-
+            const size_t qlut_bytes = use_three_weight ? ggml_ifairy_qlut3_bytes(k) : ggml_ifairy_qlut_bytes(k);
             int8_t * qlut_r = (int8_t *) (wdata + act_q16_bytes);
-            int8_t * qlut_i = qlut_r + qlut_bytes;
-            int8_t * ar_pack = qlut_i + qlut_bytes;      // k bytes
-            int8_t * ai_pack = ar_pack + k;              // k bytes
+            int8_t * qlut_i = use_three_weight ? qlut_r : qlut_r + qlut_bytes;
+            int8_t * ar_pack = use_three_weight ? qlut_r + qlut_bytes : qlut_i + qlut_bytes; // k bytes
+            int8_t * ai_pack = ar_pack + k;                                                  // k bytes
             float  * lut_scales = (float *) (ai_pack + k);
 
             GGML_ASSERT((char *) (lut_scales + 2) <= wdata + params->wsize);
@@ -1286,7 +1285,7 @@ void ggml_compute_forward_mul_mat(
                     quant((const float *) src1->data, wdata, k);
                     act_src = wdata;
                 }
-                ggml_ifairy_preprocessor(m, k, act_src, lut_scales, qlut_r, qlut_i);
+                ggml_ifairy_preprocessor(m, k, act_src, lut_scales, qlut_r, qlut_i, use_three_weight, ar_pack);
             }
 
             ggml_barrier(params->threadpool);
@@ -1298,11 +1297,19 @@ void ggml_compute_forward_mul_mat(
 
             if (row_start < row_end) {
                 const block_ifairy * w = (const block_ifairy *) src0->data;
-    #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-                ggml_ifairy_qgemm_lut_neon_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
-    #else
-                ggml_ifairy_qgemm_lut_ref_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
-    #endif
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+                if (use_three_weight) {
+                    ggml_ifairy_qgemm_lut3_ref_slice(w, (const int16_t *) qlut_r, ar_pack, ai_pack, lut_scales, k, row_start, row_end, (float *) dst->data);
+                } else {
+                    ggml_ifairy_qgemm_lut_neon_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
+                }
+#else
+                if (use_three_weight) {
+                    ggml_ifairy_qgemm_lut3_ref_slice(w, (const int16_t *) qlut_r, ar_pack, ai_pack, lut_scales, k, row_start, row_end, (float *) dst->data);
+                } else {
+                    ggml_ifairy_qgemm_lut_ref_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
+                }
+#endif
             }
 
             ggml_barrier(params->threadpool);

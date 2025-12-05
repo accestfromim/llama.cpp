@@ -97,6 +97,12 @@
   3) 原型化预处理/内核：先实现参考标量版本（折叠 wr/wi 后一次累加 3 权重，表项写回前 int16/32 累加再 clip 到 int8），再接 NEON 版测 ILP 与 tok/s；同时加入 `GGML_IFAIRY_ARM_LUT_3W` 等编译/运行时开关。
   4) 研究轴/符号分离压缩（仅存 3bit 轴表、运行时符号翻转）的尺寸/指令折衷，确认是否能在减少 wsize 的同时保留吞吐收益；内核符号翻转用 `veor`/`vbsl`/`vnegq_s8`，保持现有权重布局；参考 BitNet TL2 `three_lut_ctor/three_tbl_impl_*` 的“无符号 LUT + sign buffer”流程。
   5) 基准与验证：对比 wsize、预处理耗时、内核 tok/s 与数值偏差（与现有 TL1/vec_dot）；补充文档记录方案、假设与风险。
+- **执行记录（2025-02-??）**：落地 6bit 三权重参考路径，新增 CMake 选项 `GGML_IFAIRY_ARM_LUT_3W`（默认 OFF）与运行时开关 `GGML_IFAIRY_ARM_LUT_3W=1`。预处理将 Q16 激活按行量化为顺序 `qr/qi`（复用 pack 区），按 block 内 `3` 权重一组构建 int16 QLUT（条目 `{wr·ar, wr·ai, wi·ar, wi·ai}`，大小 `(k/QK_K)*(QK_K/3)*64*4*2` 字节），尾部每 block 1 个剩余权重在 qgemm 中直接用顺序 `qr/qi` 累加。前向在启用 3W 时走新 LUT+尾块回退，未启用仍用偶/奇 LUT。`tests/test-ifairy-lut` 增加 3W 对比（4% 容忍）通过；`GGML_IFAIRY_ARM_LUT_3W=1 ./build/bin/llama-cli ... -n 128` 在本机 CPU 输出 eval ≈ 147.4 ms/token（≈6.78 tok/s），对照默认 2W LUT ≈19.7 ms/token（≈50.8 tok/s），当前为正确性原型，性能需继续沿轴/符号压缩或 NEON 化优化。
+- **最新结论（2025-02-XX）**：
+  - 256%3 尾块：仍保留 1 个剩余权重直接用顺序 `qr/qi` 累加（不进 6bit LUT），功能正确但拖慢吞吐，需后续在轴/符号分离时一起处理尾块逻辑。
+  - 对称压缩：尚未做轴/符号分离或 sign buffer，当前 LUT 直接存 {wr,wi}×{ar,ai} 的 int16 求和，wsize 与访存压力大。
+  - 路线建议：优先推进方案 B（轴/符号分离+sign buffer）验证与 NEON 化，先缩小工作区与访存；方案 A 的 NEON 优化作为备选，若轴/符号分离收益有限再补充。
+  - fish 环境需 `set -x GGML_IFAIRY_ARM_LUT_3W 1` 让子进程继承；未导出时 `llama-cli` 会回落到 2W LUT，因而看到 ~50-65 tok/s 的速度。
 
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。
