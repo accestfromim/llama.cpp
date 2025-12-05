@@ -185,13 +185,10 @@
   - Gate：新增编译/运行时开关（如 `GGML_IFAIRY_ARM_LUT_3W=1` 或 env）控制 3 权重路径；默认沿用两权重，确保未验证设备不受影响。
 - 风险：符号翻转仍有 3 次 mask，但访存/表尺寸低于方案 A；吞吐增益需以实测 tok/s 验证；需扩展单测覆盖 3 权重 LUT 构造与标量/NEON 一致性。
 - 结论：当前实现仅支持两权重粒度。三权重/对称压缩可作为后续 gated 实验方向，推进时需同步更新 QLUT 布局、`mul_mat_get_wsize` 估算、预处理构表、权重转换或 repack 缓冲、NEON 内核与单测/基准记录；方案 B 先行，方案 A 作为备选。
-- **现状（2025-02-??）**：实现了方案 A 的标量参考版并接入 gated 前向：`GGML_IFAIRY_ARM_LUT_3W`（默认 OFF）+ `GGML_IFAIRY_ARM_LUT_3W=1` 时启用 6bit 三权重 LUT。预处理复用顺序量化的 `qr/qi`，每 block 以 3 权重为组生成 64 项 int16 表（条目存 `{wr·ar, wr·ai, wi·ar, wi·ai}`，大小 `(k/QK_K)*(QK_K/3)*64*4*2`），每 block 余下 1 权重在 qgemm 内直接用顺序 `qr/qi` 累加。`test-ifairy-lut` 增加 3W 对齐（4% 容忍）通过；性能上 `GGML_IFAIRY_ARM_LUT_3W=1 ./build/bin/llama-cli ... -n 128` 在本机 CPU 仅 ~6.78 tok/s，较默认 2W LUT (~50.8 tok/s) 明显回退，需后续轴/符号压缩或 NEON 版优化。
-- **新的结论与路线**（2025-02-XX 更新）：
-  - **256 % 3 尾块处理**：当前参考实现按 block（256 权重）构 3 权重组，尾部不足 3 的 1 个权重直接使用顺序量化的 `qr/qi` 在 qgemm 中累加（不进入 6bit LUT），功能正确但吞吐受影响。
-  - **对称压缩进展**：已改为方案 B 雏形：预处理仅输出顺序 `qr/qi`（无 64×表），内核按 axis/sign 解包 3 个权重并逐项累加，工作区降为 2*k + 2*sizeof(float)。未引入 sign buffer 之外的表，仍为标量参考路径。
-  - **优先级建议**：继续在方案 B 上做 NEON 化 / sign buffer 打包（每组 3 sign bit）以恢复吞吐；方案 A 的 NEON 优化作为备选（若轴/符号分离收益有限再补充）。
-  - **环境变量说明**：在 fish 中需 `set -x GGML_IFAIRY_ARM_LUT_3W 1` 才会被子进程继承，否则 `llama-cli` 会走默认 2W LUT。
-  - **最新基准**：2W LUT（Metal CPU 路径）`-n 128 -t 4` eval ≈ 19.98 ms/token（~50.0 tok/s）；3W 轴/符号分离参考路径 eval ≈ 247.44 ms/token（~4.04 tok/s），性能倒退，需 NEON/sign 优化。
+- **现状（2025-02-XX）**：方案 B 的轴/符号分离路径已接入并由 `GGML_IFAIRY_ARM_LUT_3W`（默认 OFF，需 env 打开）gating。预处理只顺序量化 `qr/qi`，按 15→16B pack 写入 `ar/ai`，axis/sign 在 `ggml_ifairy_transform_tensor` 中按行预生成（pack_stride = packs_per_row*16，存入 tensor extra），工作区仅需 `2*pack3_bytes + 2*sizeof(float)`。内核 NEON 版用 `vceqq_u8` 生成 axis 掩码、`vbsl` 选择 sign、`vdotq_s32` 累加，标量 fallback 保留。
+- **验证**：`tests/test-ifairy-lut` 补充 axis/sign pack 一致性检查与 3W 标量交叉校验，`ctest -R ifairy-lut` 通过；`ctest -R ifairy` 仍因缺少 `tests/ifairy-test-data/*.json` 未跑。
+- **性能（Apple M4, 4T, -b 1 -n 128 -no-cnv --ignore-eos）**：默认 2W LUT eval ≈ 19.71 ms/token（~50.7 tok/s）。启用 `GGML_IFAIRY_ARM_LUT_3W=1` 后 3W 轴/符号 NEON 路径 eval ≈ 44.21 ms/token（~22.6 tok/s）；正确性 OK，但吞吐下降。
+- **下一步**：压缩 sign/axis（3-bit sign pack 或 pack_stride 共享）、预取 ar/ai、继续提升内核 ILP；若仍不达标再考虑 6bit 方案 A 的 NEON 版。
 
 ## 12. LUT 构建的溢出/截断处理
 - 现状：`ggml_ifairy_lut_ctor` 在量化偶/奇激活时使用 `vcvtn` + `vmin/vmax` 把每个 int16 结果夹到 `[-127,127]`，写入 nibble 表；`ggml_ifairy_fill_pair_tables` 将单值复制为 16 项，不存在多值求和。多权重 LUT（3 权重）若提前折叠激活/符号，可能出现 3×int8 相加溢出。

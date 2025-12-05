@@ -1268,10 +1268,12 @@ void ggml_compute_forward_mul_mat(
             const size_t act_q16_bytes = needs_q16 ? GGML_PAD((size_t) ggml_row_size(GGML_TYPE_IFAIRY_Q16, k) * (size_t) ncols, 64) : 0;
             const size_t qlut_bytes = use_three_weight ? ggml_ifairy_qlut3_bytes(k) : ggml_ifairy_qlut_bytes(k);
             int8_t * qlut_r = (int8_t *) (wdata + act_q16_bytes);
-            int8_t * qlut_i = use_three_weight ? qlut_r + k : qlut_r + qlut_bytes;
-            int8_t * ar_pack = use_three_weight ? qlut_r : qlut_i + qlut_bytes; // k bytes (3W: qr_seq)
-            int8_t * ai_pack = ar_pack + k;                                    // k bytes (3W: qi_seq)
-            float  * lut_scales = (float *) (ai_pack + k);
+            const int64_t packs3 = (k + 14) / 15;
+            const size_t pack3_bytes = (size_t) packs3 * 16;
+            int8_t * qlut_i = use_three_weight ? qlut_r + pack3_bytes : qlut_r + qlut_bytes;
+            int8_t * ar_pack = use_three_weight ? qlut_r : qlut_i + qlut_bytes; // 2*pack3 for 3W
+            int8_t * ai_pack = use_three_weight ? qlut_i : ar_pack + k;         // k bytes
+            float  * lut_scales = (float *) (ai_pack + (use_three_weight ? pack3_bytes : (size_t) k));
 
             GGML_ASSERT((char *) (lut_scales + 2) <= wdata + params->wsize);
 
@@ -1297,15 +1299,16 @@ void ggml_compute_forward_mul_mat(
 
             if (row_start < row_end) {
                 const block_ifairy * w = (const block_ifairy *) src0->data;
+                const struct ggml_ifairy_tensor_extra * extra = (const struct ggml_ifairy_tensor_extra *) src0->extra;
     #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
                 if (use_three_weight) {
-                    ggml_ifairy_qgemm_lut3_ref_slice(w, ar_pack, ai_pack, lut_scales, k, row_start, row_end, (float *) dst->data);
+                    ggml_ifairy_qgemm_lut3_ref_slice(w, ar_pack, ai_pack, extra->axis, extra->sign, lut_scales, k, row_start, row_end, (float *) dst->data);
                 } else {
                     ggml_ifairy_qgemm_lut_neon_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
                 }
 #else
                 if (use_three_weight) {
-                    ggml_ifairy_qgemm_lut3_ref_slice(w, ar_pack, ai_pack, lut_scales, k, row_start, row_end, (float *) dst->data);
+                    ggml_ifairy_qgemm_lut3_ref_slice(w, ar_pack, ai_pack, extra->axis, extra->sign, lut_scales, k, row_start, row_end, (float *) dst->data);
                 } else {
                     ggml_ifairy_qgemm_lut_ref_slice(w, qlut_r, qlut_i, lut_scales, k, row_start, row_end, (float *) dst->data);
                 }

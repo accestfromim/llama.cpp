@@ -97,13 +97,13 @@
   3) 原型化预处理/内核：先实现参考标量版本（折叠 wr/wi 后一次累加 3 权重，表项写回前 int16/32 累加再 clip 到 int8），再接 NEON 版测 ILP 与 tok/s；同时加入 `GGML_IFAIRY_ARM_LUT_3W` 等编译/运行时开关。
   4) 研究轴/符号分离压缩（仅存 3bit 轴表、运行时符号翻转）的尺寸/指令折衷，确认是否能在减少 wsize 的同时保留吞吐收益；内核符号翻转用 `veor`/`vbsl`/`vnegq_s8`，保持现有权重布局；参考 BitNet TL2 `three_lut_ctor/three_tbl_impl_*` 的“无符号 LUT + sign buffer”流程。
   5) 基准与验证：对比 wsize、预处理耗时、内核 tok/s 与数值偏差（与现有 TL1/vec_dot）；补充文档记录方案、假设与风险。
-- **执行记录（2025-02-??）**：落地 6bit 三权重参考路径，新增 CMake 选项 `GGML_IFAIRY_ARM_LUT_3W`（默认 OFF）与运行时开关 `GGML_IFAIRY_ARM_LUT_3W=1`。预处理将 Q16 激活按行量化为顺序 `qr/qi`（复用 pack 区），按 block 内 `3` 权重一组构建 int16 QLUT（条目 `{wr·ar, wr·ai, wi·ar, wi·ai}`，大小 `(k/QK_K)*(QK_K/3)*64*4*2` 字节），尾部每 block 1 个剩余权重在 qgemm 中直接用顺序 `qr/qi` 累加。前向在启用 3W 时走新 LUT+尾块回退，未启用仍用偶/奇 LUT。`tests/test-ifairy-lut` 增加 3W 对比（4% 容忍）通过；`GGML_IFAIRY_ARM_LUT_3W=1 ./build/bin/llama-cli ... -n 128` 在本机 CPU 输出 eval ≈ 147.4 ms/token（≈6.78 tok/s），对照默认 2W LUT ≈19.7 ms/token（≈50.8 tok/s），当前为正确性原型，性能需继续沿轴/符号压缩或 NEON 化优化。
-- **执行记录（2025-02-??）**：切换到方案 B 雏形（轴/符号分离，去掉 64×表）。`GGML_IFAIRY_ARM_LUT_3W`（默认 OFF）+ env 启用后，预处理仅输出顺序 `qr/qi`（工作区 = 2*k + 2*sizeof(float)），内核按 axis/sign 解包 3 权重逐项累加，尾部 1 权重仍直接累加。`tests/test-ifairy-lut` 3W 对比（4% 容忍）通过。基准（M4, 4 线程, -b 1 -n 128）：2W LUT eval ≈ 19.98 ms/token（~50.0 tok/s），3W 轴/符号参考 ≈ 247.44 ms/token（~4.04 tok/s），性能显著倒退，需后续 NEON + sign buffer 优化。
+- **执行记录（2025-02-XX）**：方案 B 轴/符号分离路径接入（gated by `GGML_IFAIRY_ARM_LUT_3W`）。预处理顺序量化 `qr/qi`，按 15→16B pack 写入 `ar/ai`；axis/sign 在 `ggml_ifairy_transform_tensor` 阶段按行预生成（packs_per_row*16），工作区仅 `2*pack3_bytes + 2*sizeof(float)`。内核 NEON 版用 axis 掩码 + sign `vbsl` + `vdot`，标量 fallback 保留；预处理 scratch 使用 aligned malloc，避免与 pack 区重叠。
+- **测试**：`tests/test-ifairy-lut` 覆盖 axis/sign pack 校验与 3W 标量交叉校验，`ctest -R ifairy-lut` 通过；`ctest -R ifairy` 因缺少 `tests/ifairy-test-data/*.json` 报错未跑。
+- **性能**（Apple M4, 4T, -b 1 -n 128 -no-cnv --ignore-eos）：默认 2W ≈ 19.71 ms/token（~50.7 tok/s）；`GGML_IFAIRY_ARM_LUT_3W=1` 3W 轴/符号 NEON 路径 ≈ 44.21 ms/token（~22.6 tok/s），正确性 OK，吞吐下降。
 - **最新结论（2025-02-XX）**：
-  - 256%3 尾块：保留 1 个剩余权重直接用顺序 `qr/qi` 累加（不进 LUT），需在后续 sign buffer/NEON 化时一起优化。
-  - 对称压缩：已去掉 64×表，但尚未加入 sign buffer/轴表压缩；当前纯 axis/sign 解包为标量参考，吞吐不足。
-  - 路线建议：优先推进方案 B 的 sign buffer + NEON 化，进一步压缩工作区、恢复吞吐；方案 A NEON 优化备用。
-  - fish 环境需 `set -x GGML_IFAIRY_ARM_LUT_3W 1` 才会启用 3W，未导出时回落 2W（约 50-65 tok/s）。
+  - 继续压缩 sign/axis（3-bit sign pack 或共享 pack_stride）、预取 ar/ai，优化 k%15 尾部零填充路径。
+  - 若 axis/sign 优化后仍不足，再尝试 6bit 方案 A 的 NEON 版作为备选。
+
 
 ## 交付物与完成判据
 - 新的 LUT 内核头（或源码）与前向接入代码，受 `GGML_IFAIRY_ARM_LUT` 宏控制。

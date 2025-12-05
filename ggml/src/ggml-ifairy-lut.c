@@ -35,6 +35,8 @@ static const int8_t IFAIRY_WI_LUT4[4]    = { 0, 0, -1, 1 };
 static const int8_t IFAIRY_WR_TBL16[16]  = { -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0 };
 static const int8_t IFAIRY_WI_TBL16[16]  = { 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1 };
 
+static void ggml_ifairy_build_axis_sign(const block_ifairy * w_blocks, int64_t m, int64_t k, int8_t * axis_out, int8_t * sign_out);
+
 #define GGML_IFAIRY_DEBUG(...) \
     do { \
         if (ifairy_lut_debug && ifairy_lut_debug_reports < 8) { \
@@ -67,6 +69,11 @@ size_t ggml_ifairy_qlut3_bytes(int64_t k) {
     GGML_UNUSED(k);
     // axis/sign 分离路径不再使用 64 项表，预处理仅需存顺序 qr/qi
     return 0;
+}
+
+static inline size_t ggml_ifairy_axis_sign_pack_bytes(int64_t k) {
+    const int64_t packs = (k + 14) / 15; // 15 weights per 16B pack
+    return (size_t) packs * 16;
 }
 
 bool ggml_ifairy_use_three_weight(int64_t k) {
@@ -145,6 +152,14 @@ void ggml_ifairy_lut_free(void) {
         if (ifairy_tensor_extras[i].scales) {
             ggml_aligned_free(ifairy_tensor_extras[i].scales, ifairy_tensor_extras[i].scales_bytes);
             ifairy_tensor_extras[i].scales = NULL;
+        }
+        if (ifairy_tensor_extras[i].sign) {
+            ggml_aligned_free(ifairy_tensor_extras[i].sign, ifairy_tensor_extras[i].sign_bytes);
+            ifairy_tensor_extras[i].sign = NULL;
+        }
+        if (ifairy_tensor_extras[i].axis) {
+            ggml_aligned_free(ifairy_tensor_extras[i].axis, ifairy_tensor_extras[i].sign_bytes);
+            ifairy_tensor_extras[i].axis = NULL;
         }
     }
 
@@ -546,14 +561,28 @@ void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor) {
         const int64_t blocks_per_row = k / QK_K;
         const int64_t block_count = blocks_per_row * m;
         const size_t scales_bytes = (size_t) block_count * 2 * sizeof(float);
+        const size_t packs_per_row = (size_t) ((k + 14) / 15);
+        const size_t sign_bytes = ifairy_lut_three_weight ? (size_t) m * packs_per_row * 16 : 0;
 
         float * scales = ggml_aligned_malloc(scales_bytes);
         GGML_ASSERT(scales != NULL);
+
+        int8_t * sign_data = NULL;
+        int8_t * axis_data = NULL;
+        if (sign_bytes > 0) {
+            sign_data = ggml_aligned_malloc(sign_bytes);
+            axis_data = ggml_aligned_malloc(sign_bytes);
+            GGML_ASSERT(sign_data != NULL && axis_data != NULL);
+        }
 
         const block_ifairy * weights = (const block_ifairy *) tensor->data;
         for (int64_t i = 0; i < block_count; ++i) {
             scales[2 * i + 0] = GGML_FP16_TO_FP32(weights[i].d_real);
             scales[2 * i + 1] = GGML_FP16_TO_FP32(weights[i].d_imag);
+        }
+
+        if (sign_bytes > 0) {
+            ggml_ifairy_build_axis_sign(weights, m, k, axis_data, sign_data);
         }
 
         const size_t row_size_bytes = (size_t) blocks_per_row * sizeof(block_ifairy);
@@ -568,8 +597,11 @@ void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor) {
             /* .tile_stride     = */ tile_stride,
             /* .c_tile_size     = */ c_tile_size,
             /* .scales_bytes    = */ scales_bytes,
+            /* .sign_bytes      = */ sign_bytes,
             /* .qweights        = */ (uint8_t *) tensor->data,
             /* .scales          = */ scales,
+            /* .sign            = */ sign_data,
+            /* .axis            = */ axis_data,
         };
 
         ifairy_tensor_extras[ifairy_tensor_extras_index] = extra;
@@ -641,11 +673,12 @@ size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const stru
 
     GGML_ASSERT((k % 2) == 0);
 
-    const size_t act_q16_bytes      = needs_q16 ? ggml_ifairy_act_q16_bytes(k, n) : 0;
-    const bool use_three_weight     = ggml_ifairy_use_three_weight(k);
-    const size_t qlut_bytes_per_col = use_three_weight ? ggml_ifairy_qlut3_bytes(k) : 2 * ggml_ifairy_qlut_bytes(k);
-    const size_t packed_bytes       = ggml_ifairy_packed_bytes(k); // reused as qr/qi buffer in 3W
-    const size_t lut_scales_bytes   = 2 * sizeof(float);
+    const size_t act_q16_bytes    = needs_q16 ? ggml_ifairy_act_q16_bytes(k, n) : 0;
+    const bool use_three_weight   = ggml_ifairy_use_three_weight(k);
+    const size_t pack3_bytes      = (size_t) ((k + 14) / 15) * 16; // 15 weights → 16B
+    const size_t qlut_bytes_per_col = use_three_weight ? 0 : 2 * ggml_ifairy_qlut_bytes(k);
+    const size_t packed_bytes     = use_three_weight ? 2 * pack3_bytes : ggml_ifairy_packed_bytes(k); // 2*pack3 for qr/qi
+    const size_t lut_scales_bytes = 2 * sizeof(float);
 
     size_t wsize = act_q16_bytes + n * (qlut_bytes_per_col + packed_bytes + lut_scales_bytes);
 
@@ -659,17 +692,36 @@ void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, v
     GGML_ASSERT(k % QK_K == 0);
 
     const block_ifairy_q16 * act_blocks = (const block_ifairy_q16 *) B;
-    int8_t * pack0 = (int8_t *) packed;      // reused across modes (for 3W: qr_seq/qi_seq)
-    int8_t * pack1 = pack0 + k;
+    int8_t * pack0 = NULL;
+    int8_t * pack1 = NULL;
+    int8_t * scratch_q = NULL;
 
     float inv_scales[2] = {0.0f, 0.0f};
 
     ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
 
     if (use_three_weight) {
-        // 3W 轴/符号分离：仅保留顺序 qr/qi，后续根据权重 axis/sign 做累加
-        ggml_ifairy_quantize_activation_q8(act_blocks, k, inv_scales, (int8_t *) qlut_real, (int8_t *) qlut_imag);
+        scratch_q = ggml_aligned_malloc((size_t) k * 2);
+        GGML_ASSERT(scratch_q != NULL);
+        pack0 = scratch_q;
+        pack1 = scratch_q + k;
+
+        // 3W 轴/符号分离：构建 15→16B 的激活打包，qlut_real/imag 仅作为输出缓冲
+        ggml_ifairy_quantize_activation_q8(act_blocks, k, inv_scales, pack0, pack1);
+        const int64_t packs = (k + 14) / 15;
+        for (int64_t p = 0; p < packs; ++p) {
+            const size_t base_src = (size_t) p * 15;
+            const size_t base_dst = (size_t) p * 16;
+            for (int lane = 0; lane < 16; ++lane) {
+                const size_t idx = base_src + (size_t) lane;
+                ((int8_t *) qlut_real)[base_dst + lane] = (idx < (size_t) k && lane < 15) ? pack0[idx] : 0;
+                ((int8_t *) qlut_imag)[base_dst + lane] = (idx < (size_t) k && lane < 15) ? pack1[idx] : 0;
+            }
+        }
+        ggml_aligned_free(scratch_q, (size_t) k * 2);
     } else {
+        pack0 = (int8_t *) packed;      // reused across modes
+        pack1 = pack0 + k;
         ggml_ifairy_quantize_activation_q8(act_blocks, k, inv_scales, pack0, pack1);
         ggml_ifairy_fill_pair_tables_from_q(pack0, pack1, k, (int8_t *) qlut_real, (int8_t *) qlut_imag, pack0, pack1);
     }
@@ -716,6 +768,35 @@ static inline uint8_t ggml_ifairy_get_weight_code(const block_ifairy * blk, int 
     const int byte_idx = (chunk << 4) + lane;
     const int bit_off  = part * 2;
     return (blk->qs[byte_idx] >> bit_off) & 0x3;
+}
+
+static inline uint8_t ggml_ifairy_get_weight_code_row(const block_ifairy * row_w, int idx) {
+    const int block_id = idx / QK_K;
+    const int inner    = idx % QK_K;
+    return ggml_ifairy_get_weight_code(&row_w[block_id], inner);
+}
+
+static void ggml_ifairy_build_axis_sign(const block_ifairy * w_blocks, int64_t m, int64_t k, int8_t * axis_out, int8_t * sign_out) {
+    const int64_t blocks_per_row = k / QK_K;
+    const int64_t packs_per_row = (k + 14) / 15;
+    const size_t  pack_stride = (size_t) packs_per_row * 16;
+
+    for (int64_t row = 0; row < m; ++row) {
+        const block_ifairy * row_w = w_blocks + row * blocks_per_row;
+        int8_t * axis_row = axis_out + (size_t) row * pack_stride;
+        int8_t * sign_row = sign_out + (size_t) row * pack_stride;
+        memset(axis_row, 0, pack_stride);
+        memset(sign_row, 0, pack_stride);
+
+        for (int64_t j = 0; j < k; ++j) {
+            const uint8_t code = ggml_ifairy_get_weight_code_row(row_w, (int) j);
+            const size_t pack = (size_t) j / 15;
+            const size_t lane = (size_t) j % 15;
+            const size_t base = pack * 16 + lane;
+            axis_row[base] = (code & 0x2) ? 2 : 1;  // 1=real, 2=imag
+            sign_row[base] = (code & 0x1) ? 1 : -1; // ±1
+        }
+    }
 }
 
 // Reference LUT matvec (single-column) using decoded QLUT and per-tensor scales.
@@ -791,11 +872,13 @@ void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8
 }
 
 // 3 权重轴/符号分离参考路径：不使用 64 项表，直接按 axis/sign 解包
-void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
+void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
 #if !defined(GGML_IFAIRY_ARM_LUT_3W)
     GGML_UNUSED(w);
-    GGML_UNUSED(qr);
-    GGML_UNUSED(qi);
+    GGML_UNUSED(ar_pack);
+    GGML_UNUSED(ai_pack);
+    GGML_UNUSED(axis_pack);
+    GGML_UNUSED(sign_pack);
     GGML_UNUSED(lut_scales);
     GGML_UNUSED(k);
     GGML_UNUSED(row_start);
@@ -805,11 +888,12 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * qr, const i
     GGML_ASSERT(k % QK_K == 0);
     const block_ifairy * w_blocks = (const block_ifairy *) w;
     const int64_t blocks_per_row   = k / QK_K;
-    const int64_t groups_per_block = QK_K / 3;
-    const int tail_per_block       = QK_K % 3;
+    const int64_t packs_per_row    = (k + 14) / 15;
 
     const float inv_lut_r = lut_scales[0] != 0.0f ? 1.0f / lut_scales[0] : 0.0f;
     const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
+
+    const size_t pack_stride = (size_t) packs_per_row * 16;
 
     for (int64_t row = row_start; row < row_end; ++row) {
         int32_t acc_rr = 0;
@@ -819,77 +903,52 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * qr, const i
 
         const block_ifairy * row_w = w_blocks + row * blocks_per_row;
 
-        for (int64_t b = 0; b < blocks_per_row; ++b) {
-            const block_ifairy * blk = row_w + b;
-            const int64_t act_base = b * QK_K;
+        const int8_t * axis_row = axis_pack + (size_t) row * pack_stride;
+        const int8_t * sign_row = sign_pack + (size_t) row * pack_stride;
 
-            for (int g = 0; g < groups_per_block; ++g) {
-                const int idx0 = g * 3 + 0;
-                const int idx1 = g * 3 + 1;
-                const int idx2 = g * 3 + 2;
+        for (int64_t pack = 0; pack < packs_per_row; ++pack) {
+            const size_t base = (size_t) pack * 16;
+            const int8_t * axis_vec = axis_row + base;
+            const int8_t * sign_vec = sign_row + base;
+            const int8_t * ar_vec   = ar_pack + base;
+            const int8_t * ai_vec   = ai_pack + base;
 
-                const uint8_t code0 = ggml_ifairy_get_weight_code(blk, idx0);
-                const uint8_t code1 = ggml_ifairy_get_weight_code(blk, idx1);
-                const uint8_t code2 = ggml_ifairy_get_weight_code(blk, idx2);
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+            const uint8x16_t axis_v = vld1q_u8((const uint8_t *) axis_vec);
+            const int8x16_t  sign_v = vld1q_s8(sign_vec);
+            const int8x16_t  ar_v   = vld1q_s8(ar_vec);
+            const int8x16_t  ai_v   = vld1q_s8(ai_vec);
+            const uint8x16_t axis_is_r = vceqq_u8(axis_v, vdupq_n_u8(1));
+            const uint8x16_t axis_is_i = vceqq_u8(axis_v, vdupq_n_u8(2));
+            const int8x16_t wr_v = vbslq_s8(axis_is_r, sign_v, vdupq_n_s8(0));
+            const int8x16_t wi_v = vbslq_s8(axis_is_i, sign_v, vdupq_n_s8(0));
 
-                const int axis0 = (code0 >> 1) & 0x1;
-                const int axis1 = (code1 >> 1) & 0x1;
-                const int axis2 = (code2 >> 1) & 0x1;
-                const int sign0 = (code0 & 0x1) ? 1 : -1;
-                const int sign1 = (code1 & 0x1) ? 1 : -1;
-                const int sign2 = (code2 & 0x1) ? 1 : -1;
-
-                const size_t a0 = (size_t) act_base + (size_t) idx0;
-                const size_t a1 = (size_t) act_base + (size_t) idx1;
-                const size_t a2 = (size_t) act_base + (size_t) idx2;
-
-                const int ar0 = qr[a0];
-                const int ai0 = qi[a0];
-                const int ar1 = qr[a1];
-                const int ai1 = qi[a1];
-                const int ar2 = qr[a2];
-                const int ai2 = qi[a2];
-
-                if (axis0 == 0) {
-                    acc_rr += sign0 * ar0;
-                    acc_ri += sign0 * ai0;
-                } else {
-                    acc_ir += sign0 * ar0;
-                    acc_ii += sign0 * ai0;
+            acc_rr += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), wr_v, ar_v));
+            acc_ri += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), wr_v, ai_v));
+            acc_ir += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), wi_v, ar_v));
+            acc_ii += vaddvq_s32(vdotq_s32(vdupq_n_s32(0), wi_v, ai_v));
+#else
+            for (int lane = 0; lane < 16; ++lane) {
+                if (axis_vec[lane] == 0) {
+                    continue;
                 }
-                if (axis1 == 0) {
-                    acc_rr += sign1 * ar1;
-                    acc_ri += sign1 * ai1;
+                const int8_t axis = axis_vec[lane];
+                const int8_t sgn  = sign_vec[lane];
+                const int8_t ar   = ar_vec[lane];
+                const int8_t ai   = ai_vec[lane];
+                if (axis == 1) {
+                    acc_rr += (int32_t) sgn * (int32_t) ar;
+                    acc_ri += (int32_t) sgn * (int32_t) ai;
                 } else {
-                    acc_ir += sign1 * ar1;
-                    acc_ii += sign1 * ai1;
-                }
-                if (axis2 == 0) {
-                    acc_rr += sign2 * ar2;
-                    acc_ri += sign2 * ai2;
-                } else {
-                    acc_ir += sign2 * ar2;
-                    acc_ii += sign2 * ai2;
+                    acc_ir += (int32_t) sgn * (int32_t) ar;
+                    acc_ii += (int32_t) sgn * (int32_t) ai;
                 }
             }
-
-            if (tail_per_block) {
-                const int idx_tail = groups_per_block * 3;
-                for (int t = 0; t < tail_per_block; ++t) {
-                    const int idx = idx_tail + t;
-                    const uint8_t code = ggml_ifairy_get_weight_code(blk, idx);
-                    const int8_t wr = IFAIRY_WR_LUT4[code];
-                    const int8_t wi = IFAIRY_WI_LUT4[code];
-                    const size_t act_idx = (size_t) act_base + (size_t) idx;
-                    const int8_t ar = qr[act_idx];
-                    const int8_t ai = qi[act_idx];
-                    acc_rr += wr * (int32_t) ar;
-                    acc_ri += wr * (int32_t) ai;
-                    acc_ir += wi * (int32_t) ar;
-                    acc_ii += wi * (int32_t) ai;
-                }
-            }
+#endif
         }
+
+        // tail in block (k not multiple of 3) already zero padded in packs; no extra work
+        // additional tail if k not multiple of 15 handled by zero padding
 
         const float w_r = GGML_FP16_TO_FP32(row_w[0].d_real);
         const float w_i = GGML_FP16_TO_FP32(row_w[0].d_imag);
@@ -906,14 +965,15 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * qr, const i
 #endif
 }
 
-void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t m, float * dst) {
+void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst) {
 #if defined(GGML_IFAIRY_ARM_LUT_3W)
-    ggml_ifairy_qgemm_lut3_ref_slice(w, qr, qi, lut_scales, k, 0, m, dst);
+    ggml_ifairy_qgemm_lut3_ref_slice(w, ar_pack, ai_pack, axis_pack, sign_pack, lut_scales, k, 0, m, dst);
 #else
     GGML_UNUSED(w);
-    GGML_UNUSED(qlut3);
-    GGML_UNUSED(qr);
-    GGML_UNUSED(qi);
+    GGML_UNUSED(ar_pack);
+    GGML_UNUSED(ai_pack);
+    GGML_UNUSED(axis_pack);
+    GGML_UNUSED(sign_pack);
     GGML_UNUSED(lut_scales);
     GGML_UNUSED(k);
     GGML_UNUSED(m);

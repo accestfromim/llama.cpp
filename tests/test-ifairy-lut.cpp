@@ -13,7 +13,7 @@ extern "C" {
 #endif
 void ggml_vec_dot_ifairy_q16_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
-void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t m, float * dst);
+void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 void ggml_ifairy_qgemm_lut_neon(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #endif
@@ -181,20 +181,133 @@ int main(void) {
     }
 
 #if defined(GGML_IFAIRY_ARM_LUT_3W)
-    const size_t packed3_bytes = (size_t) k * 2u; // qr_seq + qi_seq
-    const size_t workspace3_bytes = GGML_PAD(packed3_bytes + lut_scales_bytes, 64);
+    const size_t packs3 = (size_t) (k + 14) / 15;
+    const size_t pack_bytes = packs3 * 16;
+    const size_t axis_bytes = pack_bytes * (size_t) m;
+    const size_t workspace3_bytes = GGML_PAD(pack_bytes * 2 + axis_bytes * 2 + lut_scales_bytes, 64); // ar_pack, ai_pack, axis per row, sign per row
     int8_t * workspace3 = (int8_t *) ggml_aligned_malloc(workspace3_bytes);
     assert(workspace3 != nullptr);
 
-    int8_t  * qr_seq = workspace3;
-    int8_t  * qi_seq = qr_seq + k;
-    float   * lut_scales3 = (float *) (qi_seq + k);
+    int8_t  * ar_pack3 = workspace3;
+    int8_t  * ai_pack3 = ar_pack3 + pack_bytes;
+    int8_t  * axis_pack3 = ai_pack3 + pack_bytes;
+    int8_t  * sign_pack3 = axis_pack3 + axis_bytes;
+    float   * lut_scales3 = (float *) (sign_pack3 + axis_bytes);
     lut_scales3[0] = lut_scales3[1] = 0.0f;
 
-    ggml_ifairy_preprocessor(m, k, &act, lut_scales3, qr_seq, qi_seq, /*use_three_weight=*/true, qr_seq);
+    // build axis/sign from weights
+    auto weight_code = [](const block_ifairy * blk_row, int idx) -> uint8_t {
+        const int block_id = idx / QK_K;
+        const int inner    = idx % QK_K;
+        const block_ifairy * blk = blk_row + block_id;
+        const int chunk    = inner >> 6;
+        const int lane     = inner & 0xF;
+        const int part     = (inner >> 4) & 0x3;
+        const int byte_idx = (chunk << 4) + lane;
+        const int bit_off  = part * 2;
+        return (blk->qs[byte_idx] >> bit_off) & 0x3;
+    };
+
+    for (size_t row = 0; row < (size_t) m; ++row) {
+        const size_t row_base = row * pack_bytes;
+        std::fill(axis_pack3 + row_base, axis_pack3 + row_base + pack_bytes, 0);
+        std::fill(sign_pack3 + row_base, sign_pack3 + row_base + pack_bytes, 0);
+        for (int j = 0; j < k; ++j) {
+            const uint8_t code = weight_code(&weights[row * (size_t) blocks_per_row], j);
+            const size_t pack = (size_t) j / 15;
+            const size_t lane = (size_t) j % 15;
+            const size_t base = row_base + pack * 16 + lane;
+            axis_pack3[base] = (code & 0x2) ? 2 : 1;
+            sign_pack3[base] = (code & 0x1) ? 1 : -1;
+        }
+    }
+
+    std::vector<int8_t> axis_expected_buf(pack_bytes * (size_t) m, 0);
+    std::vector<int8_t> sign_expected_buf(pack_bytes * (size_t) m, 0);
+    for (int row = 0; row < m; ++row) {
+        const size_t row_base = (size_t) row * pack_bytes;
+        for (int j = 0; j < k; ++j) {
+            const uint8_t code = weight_code(&weights[(size_t) row * (size_t) blocks_per_row], j);
+            const size_t pack = (size_t) j / 15;
+            const size_t lane = (size_t) j % 15;
+            const size_t base = row_base + pack * 16 + lane;
+            axis_expected_buf[base] = (code & 0x2) ? 2 : 1;
+            sign_expected_buf[base] = (code & 0x1) ? 1 : -1;
+        }
+    }
+
+    size_t mismatch_idx = pack_bytes * (size_t) m;
+    for (size_t i = 0; i < pack_bytes * (size_t) m; ++i) {
+        if (axis_pack3[i] != axis_expected_buf[i] || sign_pack3[i] != sign_expected_buf[i]) {
+            mismatch_idx = i;
+            break;
+        }
+    }
+
+    if (mismatch_idx != pack_bytes * (size_t) m) {
+        const size_t row = mismatch_idx / pack_bytes;
+        const size_t within = mismatch_idx % pack_bytes;
+        const size_t pack = within / 16;
+        const size_t lane = within % 16;
+        const size_t j = pack * 15 + lane;
+        std::cerr << "axis/sign mismatch row " << row << " j=" << j
+                  << " axis=" << (int) axis_pack3[mismatch_idx] << " axis_exp=" << (int) axis_expected_buf[mismatch_idx]
+                  << " sign=" << (int) sign_pack3[mismatch_idx] << " sign_exp=" << (int) sign_expected_buf[mismatch_idx]
+                  << std::endl;
+        ggml_aligned_free(workspace3, workspace3_bytes);
+        ggml_aligned_free(workspace, workspace_bytes);
+        return 1;
+    }
+
+    ggml_ifairy_preprocessor(m, k, &act, lut_scales3, ar_pack3, ai_pack3, /*use_three_weight=*/true, ar_pack3);
 
     std::vector<float> dst_lut3((size_t) m, 0.f);
-    ggml_ifairy_qgemm_lut3_ref(weights.data(), qr_seq, qi_seq, lut_scales3, k, m, dst_lut3.data());
+    ggml_ifairy_qgemm_lut3_ref(weights.data(), ar_pack3, ai_pack3, axis_pack3, sign_pack3, lut_scales3, k, m, dst_lut3.data());
+
+    // scalar cross-check for 3W axis/sign packing
+    std::vector<float> dst_lut3_scalar((size_t) m, 0.f);
+    const size_t packs3_stride = pack_bytes;
+    for (int row = 0; row < m; ++row) {
+        int32_t acc_rr = 0, acc_ii = 0, acc_ri = 0, acc_ir = 0;
+        const size_t row_base = (size_t) row * packs3_stride;
+        for (size_t p = 0; p < packs3; ++p) {
+            const size_t base = row_base + p * 16;
+            const int8_t * axis_ptr = axis_pack3 + base;
+            const int8_t * sign_ptr = sign_pack3 + base;
+            const int8_t * ar_ptr   = ar_pack3 + p * 16;
+            const int8_t * ai_ptr   = ai_pack3 + p * 16;
+            for (int lane = 0; lane < 16; ++lane) {
+                const int8_t axis = axis_ptr[lane];
+                if (axis == 0) {
+                    continue;
+                }
+                const int8_t sgn = sign_ptr[lane];
+                const int8_t arv = ar_ptr[lane];
+                const int8_t aiv = ai_ptr[lane];
+                if (axis == 1) {
+                    acc_rr += (int32_t) sgn * (int32_t) arv;
+                    acc_ri += (int32_t) sgn * (int32_t) aiv;
+                } else {
+                    acc_ir += (int32_t) sgn * (int32_t) arv;
+                    acc_ii += (int32_t) sgn * (int32_t) aiv;
+                }
+            }
+        }
+
+        const float inv_lut_r = lut_scales3[0] != 0.0f ? 1.0f / lut_scales3[0] : 0.0f;
+        const float inv_lut_i = lut_scales3[1] != 0.0f ? 1.0f / lut_scales3[1] : 0.0f;
+        const float w_r = GGML_FP16_TO_FP32(weights[(size_t) row * (size_t) blocks_per_row].d_real);
+        const float w_i = GGML_FP16_TO_FP32(weights[(size_t) row * (size_t) blocks_per_row].d_imag);
+
+        const float scale_wr_r = w_r * inv_lut_r;
+        const float scale_wi_i = w_i * inv_lut_i;
+        const float scale_wi_r = w_i * inv_lut_r;
+        const float scale_wr_i = w_r * inv_lut_i;
+
+        ggml_bf16_t * packed = (ggml_bf16_t *) &dst_lut3_scalar[(size_t) row];
+        packed[0] = GGML_FP32_TO_BF16(scale_wr_r * (float) acc_rr + scale_wi_i * (float) acc_ii);
+        packed[1] = GGML_FP32_TO_BF16(scale_wi_r * (float) acc_ir - scale_wr_i * (float) acc_ri);
+    }
 #endif
 
     std::vector<float> dst_lut((size_t) m, 0.f);
@@ -256,6 +369,8 @@ int main(void) {
 
 #if defined(GGML_IFAIRY_ARM_LUT_3W)
     const float rel3w = 4e-2f;
+    bool fail3w = false;
+
     for (int row = 0; row < m; ++row) {
         const ggml_bf16_t * packed = (const ggml_bf16_t *) &dst_lut3[row];
         const float lut_r = GGML_BF16_TO_FP32(packed[0]);
@@ -267,10 +382,47 @@ int main(void) {
         if (dr > thr_r || di > thr_i) {
             std::cerr << "3W mismatch at row " << row << " dr=" << dr << " di=" << di
                       << " thr_r=" << thr_r << " thr_i=" << thr_i << std::endl;
-            ggml_aligned_free(workspace3, workspace3_bytes);
-            ggml_aligned_free(workspace, workspace_bytes);
-            return 1;
+            fail3w = true;
         }
+    }
+
+    for (int row = 0; row < m; ++row) {
+        const ggml_bf16_t * packed = (const ggml_bf16_t *) &dst_lut3_scalar[row];
+        const float lut_r = GGML_BF16_TO_FP32(packed[0]);
+        const float lut_i = GGML_BF16_TO_FP32(packed[1]);
+        const float dr = std::abs(lut_r - dst_ref[(size_t) row * 2 + 0]);
+        const float di = std::abs(lut_i - dst_ref[(size_t) row * 2 + 1]);
+        const float thr_r = rel3w * std::max(std::abs(dst_ref[(size_t) row * 2 + 0]), 1.0f);
+        const float thr_i = rel3w * std::max(std::abs(dst_ref[(size_t) row * 2 + 1]), 1.0f);
+        if (dr > thr_r || di > thr_i) {
+            std::cerr << "3W scalar mismatch at row " << row << " dr=" << dr << " di=" << di
+                      << " thr_r=" << thr_r << " thr_i=" << thr_i << std::endl;
+            fail3w = true;
+        }
+    }
+
+    for (int row = 0; row < m; ++row) {
+        const ggml_bf16_t * vec = (const ggml_bf16_t *) &dst_lut3[row];
+        const ggml_bf16_t * sca = (const ggml_bf16_t *) &dst_lut3_scalar[row];
+        const float vr = GGML_BF16_TO_FP32(vec[0]);
+        const float vi = GGML_BF16_TO_FP32(vec[1]);
+        const float sr = GGML_BF16_TO_FP32(sca[0]);
+        const float si = GGML_BF16_TO_FP32(sca[1]);
+        const float dr = std::abs(vr - sr);
+        const float di = std::abs(vi - si);
+        const float thr_r = rel3w * std::max(std::abs(sr), 1.0f);
+        const float thr_i = rel3w * std::max(std::abs(si), 1.0f);
+        if (dr > thr_r || di > thr_i) {
+            std::cerr << "3W vector vs scalar mismatch at row " << row << " dr=" << dr << " di=" << di
+                      << " thr_r=" << thr_r << " thr_i=" << thr_i << std::endl;
+            fail3w = true;
+        }
+    }
+
+    if (fail3w) {
+        ggml_aligned_free(workspace3, workspace3_bytes);
+        ggml_aligned_free(workspace, workspace_bytes);
+        return 1;
     }
 #endif
 
