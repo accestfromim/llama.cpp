@@ -13,6 +13,9 @@ extern "C" {
 #endif
 void ggml_vec_dot_ifairy_q16_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+void ggml_ifairy_qgemm_lut_neon(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
+#endif
 #ifdef __cplusplus
 }
 #endif
@@ -232,6 +235,27 @@ int main(void) {
             return 1;
         }
     }
+
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    std::vector<float> dst_neon((size_t) m, 0.f);
+    ggml_ifairy_qgemm_lut_neon(weights.data(), qlut_r, qlut_i, lut_scales, k, m, dst_neon.data());
+
+    for (int row = 0; row < m; ++row) {
+        const ggml_bf16_t * packed = (const ggml_bf16_t *) &dst_neon[row];
+        const float lut_r = GGML_BF16_TO_FP32(packed[0]);
+        const float lut_i = GGML_BF16_TO_FP32(packed[1]);
+        const float dr = std::abs(lut_r - dst_ref[(size_t) row * 2 + 0]);
+        const float di = std::abs(lut_i - dst_ref[(size_t) row * 2 + 1]);
+        const float thr_r = rel * std::max(std::abs(dst_ref[(size_t) row * 2 + 0]), 1.0f);
+        const float thr_i = rel * std::max(std::abs(dst_ref[(size_t) row * 2 + 1]), 1.0f);
+        if (dr > thr_r || di > thr_i) {
+            std::cerr << "NEON mismatch at row " << row << " dr=" << dr << " di=" << di
+                      << " thr_r=" << thr_r << " thr_i=" << thr_i << std::endl;
+            ggml_aligned_free(workspace, workspace_bytes);
+            return 1;
+        }
+    }
+#endif
 
     const char * bench_env = std::getenv("IFAIRY_LUT_BENCH");
     if (bench_env && bench_env[0] != '\0') {

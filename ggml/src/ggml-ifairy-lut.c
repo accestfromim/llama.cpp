@@ -645,6 +645,7 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
     const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
 
     const uint8x16_t mask2 = vdupq_n_u8(0x3);
+    const uint8x16_t idx_pack = { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 };
     const int8x16_t wr_tbl = vld1q_s8(IFARY_WR_TBL);
     const int8x16_t wi_tbl = vld1q_s8(IFARY_WI_TBL);
 
@@ -687,8 +688,8 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
                     // chunk0 part0
                     const size_t off_bytes0 = base_bytes0 + (size_t) part * 16;
                     const uint8x16_t codes0 = vandq_u8(shift0, mask2);
-                    const int8x16_t wr_pack0 = vqtbl1q_s8(wr_tbl, codes0);
-                    const int8x16_t wi_pack0 = vqtbl1q_s8(wi_tbl, codes0);
+                    const int8x16_t wr_pack0 = vqtbl1q_s8(vqtbl1q_s8(wr_tbl, codes0), idx_pack);
+                    const int8x16_t wi_pack0 = vqtbl1q_s8(vqtbl1q_s8(wi_tbl, codes0), idx_pack);
                     const int8x16_t ar_pack0 = vld1q_s8(ar_pack + off_bytes0);
                     const int8x16_t ai_pack0 = vld1q_s8(ai_pack + off_bytes0);
                     acc_rr0 = vdotq_s32(acc_rr0, wr_pack0, ar_pack0);
@@ -700,8 +701,8 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
                     // chunk0 part1
                     const size_t off_bytes1p = off_bytes0 + 16;
                     const uint8x16_t codes1 = vandq_u8(shift0, mask2);
-                    const int8x16_t wr_pack1 = vqtbl1q_s8(wr_tbl, codes1);
-                    const int8x16_t wi_pack1 = vqtbl1q_s8(wi_tbl, codes1);
+                    const int8x16_t wr_pack1 = vqtbl1q_s8(vqtbl1q_s8(wr_tbl, codes1), idx_pack);
+                    const int8x16_t wi_pack1 = vqtbl1q_s8(vqtbl1q_s8(wi_tbl, codes1), idx_pack);
                     const int8x16_t ar_pack1 = vld1q_s8(ar_pack + off_bytes1p);
                     const int8x16_t ai_pack1 = vld1q_s8(ai_pack + off_bytes1p);
                     acc_rr1 = vdotq_s32(acc_rr1, wr_pack1, ar_pack1);
@@ -713,8 +714,8 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
                     // chunk1 part0
                     const size_t off_bytes2 = base_bytes1 + (size_t) part * 16;
                     const uint8x16_t codes2 = vandq_u8(shift1, mask2);
-                    const int8x16_t wr_pack2 = vqtbl1q_s8(wr_tbl, codes2);
-                    const int8x16_t wi_pack2 = vqtbl1q_s8(wi_tbl, codes2);
+                    const int8x16_t wr_pack2 = vqtbl1q_s8(vqtbl1q_s8(wr_tbl, codes2), idx_pack);
+                    const int8x16_t wi_pack2 = vqtbl1q_s8(vqtbl1q_s8(wi_tbl, codes2), idx_pack);
                     const int8x16_t ar_pack2 = vld1q_s8(ar_pack + off_bytes2);
                     const int8x16_t ai_pack2 = vld1q_s8(ai_pack + off_bytes2);
                     acc_rr0 = vdotq_s32(acc_rr0, wr_pack2, ar_pack2);
@@ -726,8 +727,8 @@ void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, con
                     // chunk1 part1
                     const size_t off_bytes3 = off_bytes2 + 16;
                     const uint8x16_t codes3 = vandq_u8(shift1, mask2);
-                    const int8x16_t wr_pack3 = vqtbl1q_s8(wr_tbl, codes3);
-                    const int8x16_t wi_pack3 = vqtbl1q_s8(wi_tbl, codes3);
+                    const int8x16_t wr_pack3 = vqtbl1q_s8(vqtbl1q_s8(wr_tbl, codes3), idx_pack);
+                    const int8x16_t wi_pack3 = vqtbl1q_s8(vqtbl1q_s8(wi_tbl, codes3), idx_pack);
                     const int8x16_t ar_pack3 = vld1q_s8(ar_pack + off_bytes3);
                     const int8x16_t ai_pack3 = vld1q_s8(ai_pack + off_bytes3);
                     acc_rr1 = vdotq_s32(acc_rr1, wr_pack3, ar_pack3);

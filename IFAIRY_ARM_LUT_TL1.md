@@ -123,11 +123,11 @@
 - 环境变量 `GGML_IFAIRY_ARM_LUT_DISABLE=1` 可强制关闭 LUT 路径；形状/类型不符时自动回退。
 - 若工作区不足（`params->wsize` 小于预估值），前向直接回退原始 mul_mat 路径，避免断言或越界。
 - 参考内核仅线程 0 执行，便于与旧路径做 A/B 数值对比；NEON 版本接入后可继续保留该回退逻辑作为安全网。
-- 自测：`tests/test-ifairy-lut.cpp` 构造随机 ifairy 权重/激活，先比对 LUT 构造结果（NEON vs 标量参考），再调用 `ggml_ifairy_qgemm_lut_ref`，与浮点解码后的复数乘结果对比（2% 相对误差阈值）验证数值正确性。
+- 自测：`tests/test-ifairy-lut.cpp` 构造随机 ifairy 权重/激活，先比对 LUT 构造结果（NEON vs 标量参考），再调用 `ggml_ifairy_qgemm_lut_ref`，与浮点解码后的复数乘结果对比（2% 相对误差阈值）验证数值正确性；DOTPROD 平台额外比对 `ggml_ifairy_qgemm_lut_neon` 与参考输出，防止偶/奇 pack 对齐回归。
 
 ## 6. 标量 LUT → ARM TL1 SIMD 转换拆解
 - 标量现状：`ggml_ifairy_qgemm_lut_ref` 逐 block 标量解码 `wr/wi`，读取 NEON 构表的 nibble 布局 `qlut_r/qlut_i`（偶/奇查表各 16 项），做 4 路累加（`rr/ii/ri/ir`），最后按 `w_r/w_i` 与 `1/lut_scales` 反量化。
-- NEON 现状：`ggml_ifairy_qgemm_lut_neon` 用 `vqtbl1` 查权重码、`vdotq_s32` 累积 `rr/ii/ri/ir`，与参考共享 nibble QLUT；当前仍为单列 matvec，必要时回退标量。
+- NEON 现状：`ggml_ifairy_qgemm_lut_neon` 用 `vqtbl1` 查权重码、`vdotq_s32` 累积 `rr/ii/ri/ir`，与参考共享 nibble QLUT；当前仍为单列 matvec，必要时回退标量。已修复偶/奇错位：权重查表结果按 `idx_pack={0,2,...,14,1,3,...,15}` 重排为 `[even|odd]` 后再参与点积，与预打包激活布局一致。
 - 与 BitNet TL1 差异：QLUT 尺寸/偏移已对齐且构表 NEON 化，权重查表/累加已用 NEON，但尚未做 K/M 特化或批次切分，仍使用行首尺度 `d_real/d_imag`（单 block 场景无误）。
 - 迁移步骤（按依赖排序）：
   1) **QLUT 布局定版**：仿 BitNet TL1，单通道大小 `k/2*32`，real/imag 各占一份；更新 `wsize` 注释与偏移，删除现有 `memset(qlut, k*32)` 占位写，确保构表和内核共享同一 nibble 布局。（已完成：工作区按 nibble 计算，预处理生成偶/奇各一张 16 项表并被参考内核消费）
