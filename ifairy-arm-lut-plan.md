@@ -97,11 +97,12 @@
   3) 原型化预处理/内核：先实现参考标量版本（折叠 wr/wi 后一次累加 3 权重，表项写回前 int16/32 累加再 clip 到 int8），再接 NEON 版测 ILP 与 tok/s；同时加入 `GGML_IFAIRY_ARM_LUT_3W` 等编译/运行时开关。
   4) 研究轴/符号分离压缩（仅存 3bit 轴表、运行时符号翻转）的尺寸/指令折衷，确认是否能在减少 wsize 的同时保留吞吐收益；内核符号翻转用 `veor`/`vbsl`/`vnegq_s8`，保持现有权重布局；参考 BitNet TL2 `three_lut_ctor/three_tbl_impl_*` 的“无符号 LUT + sign buffer”流程。
   5) 基准与验证：对比 wsize、预处理耗时、内核 tok/s 与数值偏差（与现有 TL1/vec_dot）；补充文档记录方案、假设与风险。
-- **执行记录（2025-02-XX）**：方案 B 轴/符号分离路径接入（gated by `GGML_IFAIRY_ARM_LUT_3W`）。预处理顺序量化 `qr/qi`，按 15→16B pack 写入 `ar/ai`；axis/sign 在 `ggml_ifairy_transform_tensor` 阶段按行预生成（packs_per_row*16），工作区仅 `2*pack3_bytes + 2*sizeof(float)`。内核 NEON 版用 axis 掩码 + sign `vbsl` + `vdot`，标量 fallback 保留；预处理 scratch 使用 aligned malloc，避免与 pack 区重叠。
+- **执行记录（2025-02-XX）**：方案 B 轴/符号分离路径接入并 NEON 化 sign 展开（`uint16`→`vceqq`/`vbsl`），三权重 15→16B pack，预取 ar/ai；标量尾块覆盖 k%15。预处理顺序量化 `qr/qi`，axis/sign 预生成（每行 packs_per_row*16 + packs_per_row*2B），工作区仍仅 `2*pack3_bytes + 2*sizeof(float)`；开关 `GGML_IFAIRY_ARM_LUT_3W`，默认 OFF。
 - **测试**：`tests/test-ifairy-lut` 覆盖 axis/sign pack 校验与 3W 标量交叉校验，`ctest -R ifairy-lut` 通过；`ctest -R ifairy` 因缺少 `tests/ifairy-test-data/*.json` 报错未跑。
-- **性能**（Apple M4, 4T, -b 1 -n 128 -no-cnv --ignore-eos）：默认 2W ≈ 19.71 ms/token（~50.7 tok/s）；`GGML_IFAIRY_ARM_LUT_3W=1` 3W 轴/符号 NEON 路径 ≈ 44.21 ms/token（~22.6 tok/s），正确性 OK，吞吐下降。
+- **性能**（Apple M4, 4T, -b 1 -n 128 -no-cnv）：默认 2W ≈ 19.71 ms/token（~50.7 tok/s）；`GGML_IFAIRY_ARM_LUT_3W=1` Metal 路径 ≈ 107.9 ms/token（~9.27 tok/s，较上一版 146.6 ms/token 提升）；`--device blas` CPU-only ≈ 140.8 ms/token（~7.10 tok/s）。输出正常，无明显胡话。
 - **最新结论（2025-02-XX）**：
-  - 继续压缩 sign/axis（3-bit sign pack 或共享 pack_stride）、预取 ar/ai，优化 k%15 尾部零填充路径。
+  - 继续压缩/复用 axis/sign（bit-pack 或查表解码）、加深 sign 展开 SIMD 化与预取；如仍不达标再探索 6bit 方案 A。
+  - 关闭 Metal 观测 CPU：运行时用 `--device blas --gpu-layers 0`（仍会加载 Metal 库但计算落在 CPU/Accelerate），或重配 `cmake -DGGML_METAL=OFF .. && cmake --build ...` 做纯 CPU 版本。
   - 若 axis/sign 优化后仍不足，再尝试 6bit 方案 A 的 NEON 版作为备选。
 
 

@@ -185,10 +185,11 @@
   - Gate：新增编译/运行时开关（如 `GGML_IFAIRY_ARM_LUT_3W=1` 或 env）控制 3 权重路径；默认沿用两权重，确保未验证设备不受影响。
 - 风险：符号翻转仍有 3 次 mask，但访存/表尺寸低于方案 A；吞吐增益需以实测 tok/s 验证；需扩展单测覆盖 3 权重 LUT 构造与标量/NEON 一致性。
 - 结论：当前实现仅支持两权重粒度。三权重/对称压缩可作为后续 gated 实验方向，推进时需同步更新 QLUT 布局、`mul_mat_get_wsize` 估算、预处理构表、权重转换或 repack 缓冲、NEON 内核与单测/基准记录；方案 B 先行，方案 A 作为备选。
-- **现状（2025-02-XX）**：方案 B 的轴/符号分离路径已接入并由 `GGML_IFAIRY_ARM_LUT_3W`（默认 OFF，需 env 打开）gating。预处理只顺序量化 `qr/qi`，按 15→16B pack 写入 `ar/ai`，axis/sign 在 `ggml_ifairy_transform_tensor` 中按行预生成（pack_stride = packs_per_row*16，存入 tensor extra），工作区仅需 `2*pack3_bytes + 2*sizeof(float)`。内核 NEON 版用 `vceqq_u8` 生成 axis 掩码、`vbsl` 选择 sign、`vdotq_s32` 累加，标量 fallback 保留。
-- **验证**：`tests/test-ifairy-lut` 补充 axis/sign pack 一致性检查与 3W 标量交叉校验，`ctest -R ifairy-lut` 通过；`ctest -R ifairy` 仍因缺少 `tests/ifairy-test-data/*.json` 未跑。
-- **性能（Apple M4, 4T, -b 1 -n 128 -no-cnv --ignore-eos）**：默认 2W LUT eval ≈ 19.71 ms/token（~50.7 tok/s）。启用 `GGML_IFAIRY_ARM_LUT_3W=1` 后 3W 轴/符号 NEON 路径 eval ≈ 44.21 ms/token（~22.6 tok/s）；正确性 OK，但吞吐下降。
-- **下一步**：压缩 sign/axis（3-bit sign pack 或 pack_stride 共享）、预取 ar/ai、继续提升内核 ILP；若仍不达标再考虑 6bit 方案 A 的 NEON 版。
+- **现状（2025-02-XX）**：方案 B 轴/符号分离路径已接入并由 `GGML_IFAIRY_ARM_LUT_3W`（默认 OFF，需 env 打开）gating。预处理顺序量化 `qr/qi`，按 15→16B pack 写入 `ar/ai`；axis 按行 16B 对齐存储，sign 压缩为每 pack 1 个 `uint16`（15bit）；内核 NEON 版用 `vceqq`/`vbsl` + 查表 mask 完成 sign 展开，`vdot` 累加并预取 ar/ai；标量 fallback 保留，工作区仍仅 `2*pack3_bytes + 2*sizeof(float)`。
+- **验证**：`tests/test-ifairy-lut` 补充 axis/sign pack 一致性检查、压缩 sign bits 校验与 3W 标量交叉校验，`ctest -R ifairy-lut` 通过；`ctest -R ifairy` 仍因缺少 `tests/ifairy-test-data/*.json` 未跑。
+- **性能（Apple M4, 4T, -b 1 -n 128 -no-cnv）**：默认 2W ≈ 19.71 ms/token（~50.7 tok/s）；`GGML_IFAIRY_ARM_LUT_3W=1` Metal 路径 ≈ 107.9 ms/token（~9.27 tok/s，较上一版 146.6 ms/token 提升）；`--device blas` CPU-only ≈ 140.8 ms/token（~7.10 tok/s）。输出正常，无明显胡话。
+- **CPU-only 测试**：运行时用 `--device blas --gpu-layers 0` 迫使计算落在 CPU/Accelerate（Metal 库仍会加载日志）；完全禁用 Metal 可用 `cmake -DGGML_METAL=OFF .. && cmake --build ...` 重建。
+- **下一步**：继续压缩/复用 axis/sign（bit-pack 或查表解码）、加深 sign 展开 SIMD 化与预取；若仍不达标再考虑 6bit 方案 A 的 NEON 版。
 
 ## 12. LUT 构建的溢出/截断处理
 - 现状：`ggml_ifairy_lut_ctor` 在量化偶/奇激活时使用 `vcvtn` + `vmin/vmax` 把每个 int16 结果夹到 `[-127,127]`，写入 nibble 表；`ggml_ifairy_fill_pair_tables` 将单值复制为 16 项，不存在多值求和。多权重 LUT（3 权重）若提前折叠激活/符号，可能出现 3×int8 相加溢出。

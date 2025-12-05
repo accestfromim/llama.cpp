@@ -35,7 +35,12 @@ static const int8_t IFAIRY_WI_LUT4[4]    = { 0, 0, -1, 1 };
 static const int8_t IFAIRY_WR_TBL16[16]  = { -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0 };
 static const int8_t IFAIRY_WI_TBL16[16]  = { 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1 };
 
-static void ggml_ifairy_build_axis_sign(const block_ifairy * w_blocks, int64_t m, int64_t k, int8_t * axis_out, int8_t * sign_out);
+#if defined(__ARM_NEON)
+static const uint16_t IFAIRY_SIGN_MASK_LO[8] = { 1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u };
+static const uint16_t IFAIRY_SIGN_MASK_HI[8] = { 256u, 512u, 1024u, 2048u, 4096u, 8192u, 16384u, 32768u };
+#endif
+
+static void ggml_ifairy_build_axis_sign(const block_ifairy * w_blocks, int64_t m, int64_t k, int8_t * axis_out, uint16_t * sign_out);
 
 #define GGML_IFAIRY_DEBUG(...) \
     do { \
@@ -72,8 +77,8 @@ size_t ggml_ifairy_qlut3_bytes(int64_t k) {
 }
 
 static inline size_t ggml_ifairy_axis_sign_pack_bytes(int64_t k) {
-    const int64_t packs = (k + 14) / 15; // 15 weights per 16B pack
-    return (size_t) packs * 16;
+    const int64_t packs = (k + 14) / 15; // 15 weights per pack
+    return (size_t) packs * 16; // axis bytes
 }
 
 bool ggml_ifairy_use_three_weight(int64_t k) {
@@ -562,16 +567,16 @@ void ggml_ifairy_transform_tensor(struct ggml_tensor * tensor) {
         const int64_t block_count = blocks_per_row * m;
         const size_t scales_bytes = (size_t) block_count * 2 * sizeof(float);
         const size_t packs_per_row = (size_t) ((k + 14) / 15);
-        const size_t sign_bytes = ifairy_lut_three_weight ? (size_t) m * packs_per_row * 16 : 0;
+        const size_t sign_bytes = ifairy_lut_three_weight ? (size_t) m * packs_per_row * sizeof(uint16_t) : 0;
 
         float * scales = ggml_aligned_malloc(scales_bytes);
         GGML_ASSERT(scales != NULL);
 
-        int8_t * sign_data = NULL;
+        uint16_t * sign_data = NULL;
         int8_t * axis_data = NULL;
         if (sign_bytes > 0) {
             sign_data = ggml_aligned_malloc(sign_bytes);
-            axis_data = ggml_aligned_malloc(sign_bytes);
+            axis_data = ggml_aligned_malloc((size_t) m * packs_per_row * 16);
             GGML_ASSERT(sign_data != NULL && axis_data != NULL);
         }
 
@@ -696,12 +701,12 @@ void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, v
     int8_t * pack1 = NULL;
     int8_t * scratch_q = NULL;
 
-    float inv_scales[2] = {0.0f, 0.0f};
+        float inv_scales[2] = {0.0f, 0.0f};
 
-    ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
+        ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
 
-    if (use_three_weight) {
-        scratch_q = ggml_aligned_malloc((size_t) k * 2);
+        if (use_three_weight) {
+            scratch_q = ggml_aligned_malloc((size_t) k * 2);
         GGML_ASSERT(scratch_q != NULL);
         pack0 = scratch_q;
         pack1 = scratch_q + k;
@@ -776,17 +781,17 @@ static inline uint8_t ggml_ifairy_get_weight_code_row(const block_ifairy * row_w
     return ggml_ifairy_get_weight_code(&row_w[block_id], inner);
 }
 
-static void ggml_ifairy_build_axis_sign(const block_ifairy * w_blocks, int64_t m, int64_t k, int8_t * axis_out, int8_t * sign_out) {
+static void ggml_ifairy_build_axis_sign(const block_ifairy * w_blocks, int64_t m, int64_t k, int8_t * axis_out, uint16_t * sign_out) {
     const int64_t blocks_per_row = k / QK_K;
     const int64_t packs_per_row = (k + 14) / 15;
-    const size_t  pack_stride = (size_t) packs_per_row * 16;
+    const size_t  axis_stride = (size_t) packs_per_row * 16;
 
     for (int64_t row = 0; row < m; ++row) {
         const block_ifairy * row_w = w_blocks + row * blocks_per_row;
-        int8_t * axis_row = axis_out + (size_t) row * pack_stride;
-        int8_t * sign_row = sign_out + (size_t) row * pack_stride;
-        memset(axis_row, 0, pack_stride);
-        memset(sign_row, 0, pack_stride);
+        int8_t * axis_row = axis_out + (size_t) row * axis_stride;
+        uint16_t * sign_row = sign_out + (size_t) row * (size_t) packs_per_row;
+        memset(axis_row, 0, axis_stride);
+        memset(sign_row, 0, (size_t) packs_per_row * sizeof(uint16_t));
 
         for (int64_t j = 0; j < k; ++j) {
             const uint8_t code = ggml_ifairy_get_weight_code_row(row_w, (int) j);
@@ -794,7 +799,9 @@ static void ggml_ifairy_build_axis_sign(const block_ifairy * w_blocks, int64_t m
             const size_t lane = (size_t) j % 15;
             const size_t base = pack * 16 + lane;
             axis_row[base] = (code & 0x2) ? 2 : 1;  // 1=real, 2=imag
-            sign_row[base] = (code & 0x1) ? 1 : -1; // ±1
+            if (code & 0x1) {
+                sign_row[pack] |= (uint16_t) (1u << lane);
+            }
         }
     }
 }
@@ -872,7 +879,7 @@ void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8
 }
 
 // 3 权重轴/符号分离参考路径：不使用 64 项表，直接按 axis/sign 解包
-void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
+void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const uint16_t * sign_pack, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
 #if !defined(GGML_IFAIRY_ARM_LUT_3W)
     GGML_UNUSED(w);
     GGML_UNUSED(ar_pack);
@@ -895,6 +902,15 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, co
 
     const size_t pack_stride = (size_t) packs_per_row * 16;
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    const uint16x8_t sign_mask_lo = vld1q_u16(IFAIRY_SIGN_MASK_LO);
+    const uint16x8_t sign_mask_hi = vld1q_u16(IFAIRY_SIGN_MASK_HI);
+    const uint8x16_t axis_real = vdupq_n_u8(1);
+    const uint8x16_t axis_imag = vdupq_n_u8(2);
+    const int8x16_t sign_pos = vdupq_n_s8(1);
+    const int8x16_t sign_neg = vdupq_n_s8(-1);
+#endif
+
     for (int64_t row = row_start; row < row_end; ++row) {
         int32_t acc_rr = 0;
         int32_t acc_ii = 0;
@@ -904,22 +920,31 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, co
         const block_ifairy * row_w = w_blocks + row * blocks_per_row;
 
         const int8_t * axis_row = axis_pack + (size_t) row * pack_stride;
-        const int8_t * sign_row = sign_pack + (size_t) row * pack_stride;
+        const uint16_t * sign_row = sign_pack + (size_t) row * (size_t) packs_per_row;
 
         for (int64_t pack = 0; pack < packs_per_row; ++pack) {
+            const size_t base_pref = (size_t) pack * 16;
+#if defined(__GNUC__)
+            __builtin_prefetch(ar_pack + base_pref + 64, 0, 1);
+            __builtin_prefetch(ai_pack + base_pref + 64, 0, 1);
+#endif
             const size_t base = (size_t) pack * 16;
             const int8_t * axis_vec = axis_row + base;
-            const int8_t * sign_vec = sign_row + base;
             const int8_t * ar_vec   = ar_pack + base;
             const int8_t * ai_vec   = ai_pack + base;
+            const uint16_t sign_bits = sign_row[pack];
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+            const uint16x8_t sign_bits_v = vdupq_n_u16(sign_bits);
+            const uint8x8_t sign_sel_lo = vmovn_u16(vceqq_u16(vandq_u16(sign_bits_v, sign_mask_lo), sign_mask_lo));
+            const uint8x8_t sign_sel_hi = vmovn_u16(vceqq_u16(vandq_u16(sign_bits_v, sign_mask_hi), sign_mask_hi));
+            const uint8x16_t sign_sel = vcombine_u8(sign_sel_lo, sign_sel_hi);
+            const int8x16_t  sign_v = vbslq_s8(sign_sel, sign_pos, sign_neg);
             const uint8x16_t axis_v = vld1q_u8((const uint8_t *) axis_vec);
-            const int8x16_t  sign_v = vld1q_s8(sign_vec);
             const int8x16_t  ar_v   = vld1q_s8(ar_vec);
             const int8x16_t  ai_v   = vld1q_s8(ai_vec);
-            const uint8x16_t axis_is_r = vceqq_u8(axis_v, vdupq_n_u8(1));
-            const uint8x16_t axis_is_i = vceqq_u8(axis_v, vdupq_n_u8(2));
+            const uint8x16_t axis_is_r = vceqq_u8(axis_v, axis_real);
+            const uint8x16_t axis_is_i = vceqq_u8(axis_v, axis_imag);
             const int8x16_t wr_v = vbslq_s8(axis_is_r, sign_v, vdupq_n_s8(0));
             const int8x16_t wi_v = vbslq_s8(axis_is_i, sign_v, vdupq_n_s8(0));
 
@@ -933,7 +958,7 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, co
                     continue;
                 }
                 const int8_t axis = axis_vec[lane];
-                const int8_t sgn  = sign_vec[lane];
+                const int8_t sgn  = (sign_bits & (1u << lane)) ? 1 : -1;
                 const int8_t ar   = ar_vec[lane];
                 const int8_t ai   = ai_vec[lane];
                 if (axis == 1) {
@@ -965,7 +990,7 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, co
 #endif
 }
 
-void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst) {
+void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const uint16_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst) {
 #if defined(GGML_IFAIRY_ARM_LUT_3W)
     ggml_ifairy_qgemm_lut3_ref_slice(w, ar_pack, ai_pack, axis_pack, sign_pack, lut_scales, k, 0, m, dst);
 #else

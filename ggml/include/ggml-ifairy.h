@@ -24,7 +24,7 @@ struct ggml_ifairy_tensor_extra {
     size_t   sign_bytes;
     uint8_t * qweights;
     float   * scales; // pairs of {d_real, d_imag} per block
-    int8_t  * sign;   // packed sign (15 weights per 16B) per row, 3W only
+    uint16_t* sign;   // packed sign bits (1 bit per weight, 15 weights per pack) per row, 3W only
     int8_t  * axis;   // packed axis indicators (1=real,2=imag) per row, 3W only
 };
 
@@ -39,8 +39,8 @@ GGML_API bool ggml_ifairy_use_three_weight(int64_t k);
 GGML_API void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, void * qlut_real, void * qlut_imag, bool use_three_weight, void * packed);
 GGML_API void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
 GGML_API void ggml_ifairy_qgemm_lut_ref_slice(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst);
-GGML_API void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst);
-GGML_API void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst);
+GGML_API void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const uint16_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst);
+GGML_API void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const uint16_t * sign_pack, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst);
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 GGML_API void ggml_ifairy_qgemm_lut_neon(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
 GGML_API void ggml_ifairy_qgemm_lut_neon_slice(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst);

@@ -13,7 +13,7 @@ extern "C" {
 #endif
 void ggml_vec_dot_ifairy_q16_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
-void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const int8_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst);
+void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * ar_pack, const int8_t * ai_pack, const int8_t * axis_pack, const uint16_t * sign_pack, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 void ggml_ifairy_qgemm_lut_neon(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #endif
@@ -184,15 +184,16 @@ int main(void) {
     const size_t packs3 = (size_t) (k + 14) / 15;
     const size_t pack_bytes = packs3 * 16;
     const size_t axis_bytes = pack_bytes * (size_t) m;
-    const size_t workspace3_bytes = GGML_PAD(pack_bytes * 2 + axis_bytes * 2 + lut_scales_bytes, 64); // ar_pack, ai_pack, axis per row, sign per row
+    const size_t sign_bytes = (size_t) packs3 * sizeof(uint16_t) * (size_t) m;
+    const size_t workspace3_bytes = GGML_PAD(pack_bytes * 2 + axis_bytes + sign_bytes + lut_scales_bytes, 64); // ar_pack, ai_pack, axis per row, sign bits per row
     int8_t * workspace3 = (int8_t *) ggml_aligned_malloc(workspace3_bytes);
     assert(workspace3 != nullptr);
 
     int8_t  * ar_pack3 = workspace3;
     int8_t  * ai_pack3 = ar_pack3 + pack_bytes;
     int8_t  * axis_pack3 = ai_pack3 + pack_bytes;
-    int8_t  * sign_pack3 = axis_pack3 + axis_bytes;
-    float   * lut_scales3 = (float *) (sign_pack3 + axis_bytes);
+    uint16_t* sign_pack3 = (uint16_t *) (axis_pack3 + axis_bytes);
+    float   * lut_scales3 = (float *) (sign_pack3 + (size_t) packs3 * (size_t) m);
     lut_scales3[0] = lut_scales3[1] = 0.0f;
 
     // build axis/sign from weights
@@ -209,37 +210,52 @@ int main(void) {
     };
 
     for (size_t row = 0; row < (size_t) m; ++row) {
-        const size_t row_base = row * pack_bytes;
-        std::fill(axis_pack3 + row_base, axis_pack3 + row_base + pack_bytes, 0);
-        std::fill(sign_pack3 + row_base, sign_pack3 + row_base + pack_bytes, 0);
+        const size_t row_base_axis = row * pack_bytes;
+        const size_t row_base_sign = row * packs3;
+        std::fill(axis_pack3 + row_base_axis, axis_pack3 + row_base_axis + pack_bytes, 0);
+        std::fill(sign_pack3 + row_base_sign, sign_pack3 + row_base_sign + packs3, 0);
         for (int j = 0; j < k; ++j) {
             const uint8_t code = weight_code(&weights[row * (size_t) blocks_per_row], j);
             const size_t pack = (size_t) j / 15;
             const size_t lane = (size_t) j % 15;
-            const size_t base = row_base + pack * 16 + lane;
+            const size_t base = row_base_axis + pack * 16 + lane;
             axis_pack3[base] = (code & 0x2) ? 2 : 1;
-            sign_pack3[base] = (code & 0x1) ? 1 : -1;
+            if (code & 0x1) {
+                sign_pack3[row_base_sign + pack] |= (uint16_t) (1u << lane);
+            }
         }
     }
 
     std::vector<int8_t> axis_expected_buf(pack_bytes * (size_t) m, 0);
-    std::vector<int8_t> sign_expected_buf(pack_bytes * (size_t) m, 0);
+    std::vector<uint16_t> sign_expected_buf((size_t) packs3 * (size_t) m, 0);
     for (int row = 0; row < m; ++row) {
-        const size_t row_base = (size_t) row * pack_bytes;
+        const size_t row_base_axis = (size_t) row * pack_bytes;
+        const size_t row_base_sign = (size_t) row * packs3;
         for (int j = 0; j < k; ++j) {
             const uint8_t code = weight_code(&weights[(size_t) row * (size_t) blocks_per_row], j);
             const size_t pack = (size_t) j / 15;
             const size_t lane = (size_t) j % 15;
-            const size_t base = row_base + pack * 16 + lane;
+            const size_t base = row_base_axis + pack * 16 + lane;
             axis_expected_buf[base] = (code & 0x2) ? 2 : 1;
-            sign_expected_buf[base] = (code & 0x1) ? 1 : -1;
+            if (code & 0x1) {
+                sign_expected_buf[row_base_sign + pack] |= (uint16_t) (1u << lane);
+            }
         }
     }
 
     size_t mismatch_idx = pack_bytes * (size_t) m;
     for (size_t i = 0; i < pack_bytes * (size_t) m; ++i) {
-        if (axis_pack3[i] != axis_expected_buf[i] || sign_pack3[i] != sign_expected_buf[i]) {
+        if (axis_pack3[i] != axis_expected_buf[i]) {
             mismatch_idx = i;
+            break;
+        }
+    }
+
+    bool sign_mismatch = false;
+    for (size_t i = 0; i < (size_t) packs3 * (size_t) m; ++i) {
+        if (sign_pack3[i] != sign_expected_buf[i]) {
+            sign_mismatch = true;
+            mismatch_idx = (size_t) -1;
             break;
         }
     }
@@ -250,10 +266,16 @@ int main(void) {
         const size_t pack = within / 16;
         const size_t lane = within % 16;
         const size_t j = pack * 15 + lane;
-        std::cerr << "axis/sign mismatch row " << row << " j=" << j
+        std::cerr << "axis mismatch row " << row << " j=" << j
                   << " axis=" << (int) axis_pack3[mismatch_idx] << " axis_exp=" << (int) axis_expected_buf[mismatch_idx]
-                  << " sign=" << (int) sign_pack3[mismatch_idx] << " sign_exp=" << (int) sign_expected_buf[mismatch_idx]
                   << std::endl;
+        ggml_aligned_free(workspace3, workspace3_bytes);
+        ggml_aligned_free(workspace, workspace_bytes);
+        return 1;
+    }
+
+    if (sign_mismatch) {
+        std::cerr << "sign bits mismatch\n";
         ggml_aligned_free(workspace3, workspace3_bytes);
         ggml_aligned_free(workspace, workspace_bytes);
         return 1;
@@ -270,18 +292,19 @@ int main(void) {
     for (int row = 0; row < m; ++row) {
         int32_t acc_rr = 0, acc_ii = 0, acc_ri = 0, acc_ir = 0;
         const size_t row_base = (size_t) row * packs3_stride;
+        const size_t sign_row_base = (size_t) row * packs3;
         for (size_t p = 0; p < packs3; ++p) {
             const size_t base = row_base + p * 16;
             const int8_t * axis_ptr = axis_pack3 + base;
-            const int8_t * sign_ptr = sign_pack3 + base;
             const int8_t * ar_ptr   = ar_pack3 + p * 16;
             const int8_t * ai_ptr   = ai_pack3 + p * 16;
+            const uint16_t sign_bits = sign_pack3[sign_row_base + p];
             for (int lane = 0; lane < 16; ++lane) {
                 const int8_t axis = axis_ptr[lane];
                 if (axis == 0) {
                     continue;
                 }
-                const int8_t sgn = sign_ptr[lane];
+                const int8_t sgn = (sign_bits & (1u << lane)) ? 1 : -1;
                 const int8_t arv = ar_ptr[lane];
                 const int8_t aiv = ai_ptr[lane];
                 if (axis == 1) {
