@@ -64,18 +64,9 @@ static size_t ggml_ifairy_packed_bytes(int64_t k) {
 #define GGML_IFAIRY_3W_ENTRY_SIZE (GGML_IFAIRY_3W_ENTRY_ELEMS * (int) sizeof(int16_t))
 
 size_t ggml_ifairy_qlut3_bytes(int64_t k) {
-#if !defined(GGML_IFAIRY_ARM_LUT_3W)
     GGML_UNUSED(k);
+    // axis/sign 分离路径不再使用 64 项表，预处理仅需存顺序 qr/qi
     return 0;
-#else
-    // keep grouping inside each 256-weight block to avoid cross-block mixing
-    const int64_t blocks_per_row  = k / QK_K;
-    const int64_t groups_per_block = QK_K / 3;
-    const int64_t tail_block_elems = k % QK_K;
-    const int64_t tail_groups = tail_block_elems / 3;
-    const int64_t groups_total = blocks_per_row * groups_per_block + tail_groups;
-    return (size_t) groups_total * 64 * GGML_IFAIRY_3W_ENTRY_SIZE;
-#endif
 }
 
 bool ggml_ifairy_use_three_weight(int64_t k) {
@@ -653,7 +644,7 @@ size_t ggml_ifairy_mul_mat_get_wsize(const struct ggml_tensor * src0, const stru
     const size_t act_q16_bytes      = needs_q16 ? ggml_ifairy_act_q16_bytes(k, n) : 0;
     const bool use_three_weight     = ggml_ifairy_use_three_weight(k);
     const size_t qlut_bytes_per_col = use_three_weight ? ggml_ifairy_qlut3_bytes(k) : 2 * ggml_ifairy_qlut_bytes(k);
-    const size_t packed_bytes       = ggml_ifairy_packed_bytes(k);
+    const size_t packed_bytes       = ggml_ifairy_packed_bytes(k); // reused as qr/qi buffer in 3W
     const size_t lut_scales_bytes   = 2 * sizeof(float);
 
     size_t wsize = act_q16_bytes + n * (qlut_bytes_per_col + packed_bytes + lut_scales_bytes);
@@ -668,17 +659,18 @@ void ggml_ifairy_preprocessor(int m, int k, const void * B, void * lut_scales, v
     GGML_ASSERT(k % QK_K == 0);
 
     const block_ifairy_q16 * act_blocks = (const block_ifairy_q16 *) B;
-    int8_t * pack0 = (int8_t *) packed;      // reused across modes
+    int8_t * pack0 = (int8_t *) packed;      // reused across modes (for 3W: qr_seq/qi_seq)
     int8_t * pack1 = pack0 + k;
 
     float inv_scales[2] = {0.0f, 0.0f};
 
     ggml_ifairy_per_tensor_quant(act_blocks, k, (float *) lut_scales, inv_scales);
-    ggml_ifairy_quantize_activation_q8(act_blocks, k, inv_scales, pack0, pack1);
 
     if (use_three_weight) {
-        ggml_ifairy_fill_three_weight_tables(pack0, pack1, k, (int16_t *) qlut_real);
+        // 3W 轴/符号分离：仅保留顺序 qr/qi，后续根据权重 axis/sign 做累加
+        ggml_ifairy_quantize_activation_q8(act_blocks, k, inv_scales, (int8_t *) qlut_real, (int8_t *) qlut_imag);
     } else {
+        ggml_ifairy_quantize_activation_q8(act_blocks, k, inv_scales, pack0, pack1);
         ggml_ifairy_fill_pair_tables_from_q(pack0, pack1, k, (int8_t *) qlut_real, (int8_t *) qlut_imag, pack0, pack1);
     }
 }
@@ -798,10 +790,10 @@ void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8
     ggml_ifairy_qgemm_lut_ref_slice(w, qlut_r, qlut_i, lut_scales, k, 0, m, dst);
 }
 
-void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int16_t * qlut3, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
+// 3 权重轴/符号分离参考路径：不使用 64 项表，直接按 axis/sign 解包
+void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t row_start, int64_t row_end, float * dst) {
 #if !defined(GGML_IFAIRY_ARM_LUT_3W)
     GGML_UNUSED(w);
-    GGML_UNUSED(qlut3);
     GGML_UNUSED(qr);
     GGML_UNUSED(qi);
     GGML_UNUSED(lut_scales);
@@ -815,7 +807,6 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int16_t * qlut3, con
     const int64_t blocks_per_row   = k / QK_K;
     const int64_t groups_per_block = QK_K / 3;
     const int tail_per_block       = QK_K % 3;
-    const size_t block_stride_elems = (size_t) groups_per_block * 64 * GGML_IFAIRY_3W_ENTRY_ELEMS;
 
     const float inv_lut_r = lut_scales[0] != 0.0f ? 1.0f / lut_scales[0] : 0.0f;
     const float inv_lut_i = lut_scales[1] != 0.0f ? 1.0f / lut_scales[1] : 0.0f;
@@ -831,7 +822,6 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int16_t * qlut3, con
         for (int64_t b = 0; b < blocks_per_row; ++b) {
             const block_ifairy * blk = row_w + b;
             const int64_t act_base = b * QK_K;
-            const size_t tbl_base_elems = block_stride_elems * (size_t) b;
 
             for (int g = 0; g < groups_per_block; ++g) {
                 const int idx0 = g * 3 + 0;
@@ -841,15 +831,46 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int16_t * qlut3, con
                 const uint8_t code0 = ggml_ifairy_get_weight_code(blk, idx0);
                 const uint8_t code1 = ggml_ifairy_get_weight_code(blk, idx1);
                 const uint8_t code2 = ggml_ifairy_get_weight_code(blk, idx2);
-                const int tbl_idx = (code0 & 0x3) | ((code1 & 0x3) << 2) | ((code2 & 0x3) << 4);
 
-                const size_t entry_base = tbl_base_elems + (size_t) g * 64 * GGML_IFAIRY_3W_ENTRY_ELEMS + (size_t) tbl_idx * GGML_IFAIRY_3W_ENTRY_ELEMS;
-                const int16_t * entry = qlut3 + entry_base;
+                const int axis0 = (code0 >> 1) & 0x1;
+                const int axis1 = (code1 >> 1) & 0x1;
+                const int axis2 = (code2 >> 1) & 0x1;
+                const int sign0 = (code0 & 0x1) ? 1 : -1;
+                const int sign1 = (code1 & 0x1) ? 1 : -1;
+                const int sign2 = (code2 & 0x1) ? 1 : -1;
 
-                acc_rr += (int32_t) entry[0];
-                acc_ri += (int32_t) entry[1];
-                acc_ir += (int32_t) entry[2];
-                acc_ii += (int32_t) entry[3];
+                const size_t a0 = (size_t) act_base + (size_t) idx0;
+                const size_t a1 = (size_t) act_base + (size_t) idx1;
+                const size_t a2 = (size_t) act_base + (size_t) idx2;
+
+                const int ar0 = qr[a0];
+                const int ai0 = qi[a0];
+                const int ar1 = qr[a1];
+                const int ai1 = qi[a1];
+                const int ar2 = qr[a2];
+                const int ai2 = qi[a2];
+
+                if (axis0 == 0) {
+                    acc_rr += sign0 * ar0;
+                    acc_ri += sign0 * ai0;
+                } else {
+                    acc_ir += sign0 * ar0;
+                    acc_ii += sign0 * ai0;
+                }
+                if (axis1 == 0) {
+                    acc_rr += sign1 * ar1;
+                    acc_ri += sign1 * ai1;
+                } else {
+                    acc_ir += sign1 * ar1;
+                    acc_ii += sign1 * ai1;
+                }
+                if (axis2 == 0) {
+                    acc_rr += sign2 * ar2;
+                    acc_ri += sign2 * ai2;
+                } else {
+                    acc_ir += sign2 * ar2;
+                    acc_ii += sign2 * ai2;
+                }
             }
 
             if (tail_per_block) {
@@ -885,9 +906,9 @@ void ggml_ifairy_qgemm_lut3_ref_slice(const void * w, const int16_t * qlut3, con
 #endif
 }
 
-void ggml_ifairy_qgemm_lut3_ref(const void * w, const int16_t * qlut3, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t m, float * dst) {
+void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t m, float * dst) {
 #if defined(GGML_IFAIRY_ARM_LUT_3W)
-    ggml_ifairy_qgemm_lut3_ref_slice(w, qlut3, qr, qi, lut_scales, k, 0, m, dst);
+    ggml_ifairy_qgemm_lut3_ref_slice(w, qr, qi, lut_scales, k, 0, m, dst);
 #else
     GGML_UNUSED(w);
     GGML_UNUSED(qlut3);

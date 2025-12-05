@@ -13,7 +13,7 @@ extern "C" {
 #endif
 void ggml_vec_dot_ifairy_q16_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_ifairy_qgemm_lut_ref(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
-void ggml_ifairy_qgemm_lut3_ref(const void * w, const int16_t * qlut3, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t m, float * dst);
+void ggml_ifairy_qgemm_lut3_ref(const void * w, const int8_t * qr, const int8_t * qi, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 void ggml_ifairy_qgemm_lut_neon(const void * w, const int8_t * qlut_r, const int8_t * qlut_i, const float * lut_scales, int64_t k, int64_t m, float * dst);
 #endif
@@ -181,22 +181,20 @@ int main(void) {
     }
 
 #if defined(GGML_IFAIRY_ARM_LUT_3W)
-    const size_t qlut3_bytes = (size_t) (k / QK_K) * (size_t) (QK_K / 3) * 64u * 4u * sizeof(int16_t);
-    const size_t packed3_bytes = (size_t) k * 2u;
-    const size_t workspace3_bytes = GGML_PAD(qlut3_bytes + packed3_bytes + lut_scales_bytes, 64);
+    const size_t packed3_bytes = (size_t) k * 2u; // qr_seq + qi_seq
+    const size_t workspace3_bytes = GGML_PAD(packed3_bytes + lut_scales_bytes, 64);
     int8_t * workspace3 = (int8_t *) ggml_aligned_malloc(workspace3_bytes);
     assert(workspace3 != nullptr);
 
-    int16_t * qlut3 = (int16_t *) workspace3;
-    int8_t  * qr_seq = (int8_t *) ((char *) workspace3 + qlut3_bytes);
+    int8_t  * qr_seq = workspace3;
     int8_t  * qi_seq = qr_seq + k;
     float   * lut_scales3 = (float *) (qi_seq + k);
     lut_scales3[0] = lut_scales3[1] = 0.0f;
 
-    ggml_ifairy_preprocessor(m, k, &act, lut_scales3, qlut3, nullptr, /*use_three_weight=*/true, qr_seq);
+    ggml_ifairy_preprocessor(m, k, &act, lut_scales3, qr_seq, qi_seq, /*use_three_weight=*/true, qr_seq);
 
     std::vector<float> dst_lut3((size_t) m, 0.f);
-    ggml_ifairy_qgemm_lut3_ref(weights.data(), qlut3, qr_seq, qi_seq, lut_scales3, k, m, dst_lut3.data());
+    ggml_ifairy_qgemm_lut3_ref(weights.data(), qr_seq, qi_seq, lut_scales3, k, m, dst_lut3.data());
 #endif
 
     std::vector<float> dst_lut((size_t) m, 0.f);

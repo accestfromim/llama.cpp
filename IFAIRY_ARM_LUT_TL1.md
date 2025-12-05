@@ -188,9 +188,10 @@
 - **现状（2025-02-??）**：实现了方案 A 的标量参考版并接入 gated 前向：`GGML_IFAIRY_ARM_LUT_3W`（默认 OFF）+ `GGML_IFAIRY_ARM_LUT_3W=1` 时启用 6bit 三权重 LUT。预处理复用顺序量化的 `qr/qi`，每 block 以 3 权重为组生成 64 项 int16 表（条目存 `{wr·ar, wr·ai, wi·ar, wi·ai}`，大小 `(k/QK_K)*(QK_K/3)*64*4*2`），每 block 余下 1 权重在 qgemm 内直接用顺序 `qr/qi` 累加。`test-ifairy-lut` 增加 3W 对齐（4% 容忍）通过；性能上 `GGML_IFAIRY_ARM_LUT_3W=1 ./build/bin/llama-cli ... -n 128` 在本机 CPU 仅 ~6.78 tok/s，较默认 2W LUT (~50.8 tok/s) 明显回退，需后续轴/符号压缩或 NEON 版优化。
 - **新的结论与路线**（2025-02-XX 更新）：
   - **256 % 3 尾块处理**：当前参考实现按 block（256 权重）构 3 权重组，尾部不足 3 的 1 个权重直接使用顺序量化的 `qr/qi` 在 qgemm 中累加（不进入 6bit LUT），功能正确但吞吐受影响。
-  - **对称压缩进展**：尚未做 3 权重轴/符号分离压缩，现有 6bit LUT 直接存 {wr,wi}×{ar,ai} 的 int16 求和，没有额外压缩或 sign buffer；下阶段应优先验证方案 B 的轴/符号分离以缩小工作区并减少访存。
-  - **优先级建议**：先推进方案 B（轴/符号分离 + sign buffer）的原型与 NEON 路径，目标是降低 wsize 和表访存，再评估 tok/s；方案 A 的 NEON 优化可作为备选（若轴/符号分离收益有限再补充），避免在当前膨胀的表尺寸上做 SIMD 化而收益有限。
-  - **环境变量说明**：在 fish 中需 `set -x GGML_IFAIRY_ARM_LUT_3W 1` 才会被子进程继承，否则 `llama-cli` 仍走 2 权重 LUT，出现 ~65 tok/s 的速度是因为未实际启用 3W 路径（回落到 2W NEON LUT）。***
+  - **对称压缩进展**：已改为方案 B 雏形：预处理仅输出顺序 `qr/qi`（无 64×表），内核按 axis/sign 解包 3 个权重并逐项累加，工作区降为 2*k + 2*sizeof(float)。未引入 sign buffer 之外的表，仍为标量参考路径。
+  - **优先级建议**：继续在方案 B 上做 NEON 化 / sign buffer 打包（每组 3 sign bit）以恢复吞吐；方案 A 的 NEON 优化作为备选（若轴/符号分离收益有限再补充）。
+  - **环境变量说明**：在 fish 中需 `set -x GGML_IFAIRY_ARM_LUT_3W 1` 才会被子进程继承，否则 `llama-cli` 会走默认 2W LUT。
+  - **最新基准**：2W LUT（Metal CPU 路径）`-n 128 -t 4` eval ≈ 19.98 ms/token（~50.0 tok/s）；3W 轴/符号分离参考路径 eval ≈ 247.44 ms/token（~4.04 tok/s），性能倒退，需 NEON/sign 优化。
 
 ## 12. LUT 构建的溢出/截断处理
 - 现状：`ggml_ifairy_lut_ctor` 在量化偶/奇激活时使用 `vcvtn` + `vmin/vmax` 把每个 int16 结果夹到 `[-127,127]`，写入 nibble 表；`ggml_ifairy_fill_pair_tables` 将单值复制为 16 项，不存在多值求和。多权重 LUT（3 权重）若提前折叠激活/符号，可能出现 3×int8 相加溢出。
