@@ -15,6 +15,10 @@
 #include "ops.h"
 #include "ggml.h"
 
+#if defined(__AVX2__)
+#include "ifairy-lut-kernels-avx2-v3.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -1244,6 +1248,76 @@ void ggml_compute_forward_mul_mat(
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
+
+#if defined(__AVX2__)
+    if (src0->type == GGML_TYPE_IFAIRY) {
+        // Verify we have enough workspace
+        const int K = ne00;
+        const int num_act_blocks = (K + QK_K - 1) / QK_K;
+        const size_t lut_size = num_act_blocks * 16384;
+        const size_t needed_per_thread = lut_size + 2 * K * sizeof(float);
+        const size_t needed_total = needed_per_thread * nth;
+        
+        if (params->wsize >= needed_total) {
+            uint8_t * thread_wdata = (uint8_t *)params->wdata + ith * needed_per_thread;
+            uint8_t * my_lut = thread_wdata;
+            float * my_real = (float *)(thread_wdata + lut_size);
+            float * my_imag = my_real + K;
+            
+            // Trace back to find the real source op
+            const struct ggml_tensor * s = src1;
+            while (s->op == GGML_OP_VIEW || s->op == GGML_OP_RESHAPE || 
+                   s->op == GGML_OP_CPY || s->op == GGML_OP_PERMUTE || 
+                   s->op == GGML_OP_TRANSPOSE || s->op == GGML_OP_CONT) {
+                s = s->src[0];
+            }
+            
+            // Check if src1 is likely F32 (Real) or Packed BF16 (Complex)
+            bool src1_is_f32 = false;
+            if (s->op == GGML_OP_GET_ROWS) {
+                src1_is_f32 = true;
+            }
+
+            // Loop over columns (tokens)
+            for (int64_t j = 0; j < ne11; ++j) {
+                const float * src1_col = (const float *)((char *)src1->data + j * nb11);
+                float * dst_col = (float *)((char *)dst->data + j * nb1);
+
+                if (src1_is_f32) {
+                    // Treat as Real + 0j
+                    for (int i = 0; i < K; ++i) {
+                        my_real[i] = src1_col[i];
+                        my_imag[i] = 0.0f;
+                    }
+                } else {
+                    // Treat as Packed BF16
+                    for (int i = 0; i < K; ++i) {
+                        float val = src1_col[i];
+                        ggml_bf16_t * p = (ggml_bf16_t *)&val;
+                        my_real[i] = GGML_BF16_TO_FP32(p[0]);
+                        my_imag[i] = GGML_BF16_TO_FP32(p[1]);
+                    }
+                }
+                
+                ggml_ifairy_preprocessor(0, K, my_real, my_imag, NULL, my_lut);
+
+                ggml_ifairy_qgemm_lut_v3(
+                ne01, K, // M, K
+                src0->data, // weights
+                my_lut, // luts
+                dst_col, // dst
+                ith, nth // threading
+                );
+            }
+
+            // Kernel outputs packed BF16 into dst (which is F32 tensor).
+            // This matches the expected format for subsequent IFAIRY ops.
+            // No conversion needed.
+            return;
+        }
+        
+    }
+#endif
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
@@ -2702,6 +2776,9 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+// Forward declaration for testing
+void quantize_row_ifairy_ref(const float * x_real, const float * x_imag, void * vy, int64_t k);
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -2768,8 +2845,19 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
+                        if (node->src[0]->type == GGML_TYPE_IFAIRY) {
+                             const int K_dim = node->src[0]->ne[0];
+                             const int QK_K_val = 256;
+                             const int num_act_blocks = (K_dim + QK_K_val - 1) / QK_K_val;
+                             const size_t lut_size = num_act_blocks * 16384;
+                             const size_t needed_per_thread = lut_size + 2 * K_dim * sizeof(float);
+                             size_t needed = needed_per_thread * n_threads;
+                             if (needed > cur) cur = needed;
+                        }
+
                         if (node->src[1]->type != vec_dot_type) {
-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            size_t needed = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            if (needed > cur) cur = needed;
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:

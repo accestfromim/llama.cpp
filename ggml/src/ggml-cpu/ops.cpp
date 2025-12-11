@@ -3588,6 +3588,32 @@ void ggml_compute_forward_rms_norm(
     }
 }
 
+static bool is_ifairy_real_f32_ops(const struct ggml_tensor * t) {
+    const struct ggml_tensor * s = t;
+    while (s->op == GGML_OP_VIEW || s->op == GGML_OP_RESHAPE || 
+           s->op == GGML_OP_CPY || s->op == GGML_OP_PERMUTE || 
+           s->op == GGML_OP_TRANSPOSE || s->op == GGML_OP_CONT) {
+        s = s->src[0];
+    }
+    
+    if (s->op == GGML_OP_IFAIRY_ROPE ||
+        s->op == GGML_OP_IFAIRY_SPLIT ||
+        s->op == GGML_OP_IFAIRY_MERGE ||
+        s->op == GGML_OP_IFAIRY_ADD ||
+        s->op == GGML_OP_IFAIRY_RMSNORM ||
+        s->op == GGML_OP_IFAIRY_MUL) {
+        return false;
+    }
+    
+    if (s->op == GGML_OP_MUL_MAT) {
+        if (s->src[0]->type == GGML_TYPE_IFAIRY) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
 static void ggml_compute_forward_rms_norm_ifairy(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -3608,32 +3634,56 @@ static void ggml_compute_forward_rms_norm_ifairy(
 
     GGML_ASSERT(eps >= 0.0f);
 
+    bool is_real = is_ifairy_real_f32_ops(src0);
+
     // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
+                    float val = x[i00];
+                    float re, im;
+                    if (is_real) {
+                        re = val;
+                        im = 0.0f;
+                    } else {
+                        ggml_bf16_t * p = (ggml_bf16_t *)&val;
+                        re = GGML_BF16_TO_FP32(p[0]);
+                        im = GGML_BF16_TO_FP32(p[1]);
+                    }
+                    sum += (ggml_float)(re * re + im * im);
                 }
 
-                const float mean = sum/(ne00 / 2);
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
-                memcpy(y, x, ne00 * sizeof(float));
-                // for (int i00 = 0; i00 < ne00; i00++) {
-                //     y[i00] = x[i00];
-                // }
-
+                const float mean = sum/(ne00 * 2);
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
 
-                ggml_vec_scale_f32(ne00, y, scale);
+                for (int64_t i00 = 0; i00 < ne00; i00++) {
+                    float val = x[i00];
+                    float re, im;
+                    if (is_real) {
+                        re = val;
+                        im = 0.0f;
+                    } else {
+                        ggml_bf16_t * p = (ggml_bf16_t *)&val;
+                        re = GGML_BF16_TO_FP32(p[0]);
+                        im = GGML_BF16_TO_FP32(p[1]);
+                    }
+                    
+                    re *= scale;
+                    im *= scale;
+                    
+                    float res;
+                    ((ggml_bf16_t *)&res)[0] = GGML_FP32_TO_BF16(re);
+                    ((ggml_bf16_t *)&res)[1] = GGML_FP32_TO_BF16(im);
+                    y[i00] = res;
+                }
             }
         }
     }
@@ -8392,7 +8442,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 s = logit_softcap*tanhf(s);
             }
 
+            if (isnan(s)) {
+                GGML_ABORT("NaN discovered in score before mask. scale=%f, mv=%f", scale, mv);
+            }
+
             s += mv; // apply mask
+
+            if (isnan(s)) {
+                GGML_ABORT("NaN discovered in score after mask. mv=%f", mv);
+            }
 
             const float Mold = M;
 

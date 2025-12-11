@@ -152,3 +152,6 @@ poetry.toml
 # Code Workspace
 *.code-workspace
 
+
+gguf-py/
+BitNet/

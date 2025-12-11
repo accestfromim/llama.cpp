@@ -128,6 +128,11 @@ void quantize_row_ifairy(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy,
     free(x_imag);
 }
 
+void quantize_row_ifairy_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    block_ifairy_q16 * GGML_RESTRICT y = vy;
+    quantize_row_ifairy_q16_ref(x, y, k);
+}
+
 //===================================== Q8_K ==============================================
 
 void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {

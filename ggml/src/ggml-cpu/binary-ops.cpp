@@ -59,6 +59,72 @@ static inline float op_ifairy_mul(float a, float b) {
     return ret;
 }
 
+static inline float op_ifairy_add_f32_f32(float a, float b) {
+    float r = a + b;
+    float ret;
+    ((ggml_bf16_t*)(&ret))[0] = GGML_FP32_TO_BF16(r);
+    ((ggml_bf16_t*)(&ret))[1] = GGML_FP32_TO_BF16(0.0f);
+    return ret;
+}
+
+static inline float op_ifairy_add_f32_packed(float a, float b) {
+    float br = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&b))[0]);
+    float bi = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&b))[1]);
+    float r = a + br;
+    float i = bi;
+    float ret;
+    ((ggml_bf16_t*)(&ret))[0] = GGML_FP32_TO_BF16(r);
+    ((ggml_bf16_t*)(&ret))[1] = GGML_FP32_TO_BF16(i);
+    return ret;
+}
+
+static inline float op_ifairy_add_packed_f32(float a, float b) {
+    float ar = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&a))[0]);
+    float ai = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&a))[1]);
+    float r = ar + b;
+    float i = ai;
+    float ret;
+    ((ggml_bf16_t*)(&ret))[0] = GGML_FP32_TO_BF16(r);
+    ((ggml_bf16_t*)(&ret))[1] = GGML_FP32_TO_BF16(i);
+    return ret;
+}
+
+static inline float op_ifairy_mul_f32_f32(float a, float b) {
+    float r = a * b;
+    float ret;
+    ((ggml_bf16_t*)(&ret))[0] = GGML_FP32_TO_BF16(r);
+    ((ggml_bf16_t*)(&ret))[1] = GGML_FP32_TO_BF16(0.0f);
+    return ret;
+}
+
+static inline float op_ifairy_mul_f32_packed(float a, float b) {
+    float br = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&b))[0]);
+    float bi = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&b))[1]);
+    // a * conj(b) where a is real: a * (br - i bi) = a*br - i a*bi
+    // Wait, original op: i = ia*rg - ra*ig.
+    // If a is real (ia=0, ra=a): i = -a*ig.
+    float r = a * br;
+    float i = -a * bi;
+    float ret;
+    ((ggml_bf16_t*)(&ret))[0] = GGML_FP32_TO_BF16(r);
+    ((ggml_bf16_t*)(&ret))[1] = GGML_FP32_TO_BF16(i);
+    return ret;
+}
+
+static inline float op_ifairy_mul_packed_f32(float a, float b) {
+    float ar = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&a))[0]);
+    float ai = GGML_BF16_TO_FP32(((ggml_bf16_t*)(&a))[1]);
+    // a * conj(b) where b is real: (ar + i ai) * b = ar*b + i ai*b
+    // Original op: i = ia*rg - ra*ig.
+    // If b is real (ig=0, rg=b): i = ai*b.
+    float r = ar * b;
+    float i = ai * b;
+    float ret;
+    ((ggml_bf16_t*)(&ret))[0] = GGML_FP32_TO_BF16(r);
+    ((ggml_bf16_t*)(&ret))[1] = GGML_FP32_TO_BF16(i);
+    return ret;
+}
+
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
 static inline void vec_binary_op_contiguous(const int64_t n, dst_t * z, const src0_t * x, const src1_t * y) {
     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
@@ -68,6 +134,11 @@ static inline void vec_binary_op_contiguous(const int64_t n, dst_t * z, const sr
     for (int i = 0; i < n; i++) {
         z[i] = f32_to_dst(op(src0_to_f32(x[i]), src1_to_f32(y[i])));
         if(op(src0_to_f32(x[i]), src1_to_f32(y[i])) != op(src0_to_f32(x[i]), src1_to_f32(y[i]))){
+            float v0 = src0_to_f32(x[i]);
+            float v1 = src1_to_f32(y[i]);
+            uint32_t u0 = *(uint32_t*)&v0;
+            uint32_t u1 = *(uint32_t*)&v1;
+            printf("DEBUG: NaN discovered in binary op at index %d. Inputs: %f (0x%08x), %f (0x%08x)\n", i, v0, u0, v1, u1);
             GGML_ABORT("nan discovered in binary op");
         }
     }
@@ -197,10 +268,64 @@ void ggml_compute_forward_div(const ggml_compute_params * params, ggml_tensor * 
     binary_op<op_div>(params, dst);
 }
 
+static bool is_ifairy_real_f32(const struct ggml_tensor * t) {
+    const struct ggml_tensor * s = t;
+    while (s->op == GGML_OP_VIEW || s->op == GGML_OP_RESHAPE || 
+           s->op == GGML_OP_CPY || s->op == GGML_OP_PERMUTE || 
+           s->op == GGML_OP_TRANSPOSE || s->op == GGML_OP_CONT) {
+        s = s->src[0];
+    }
+    
+    if (s->op == GGML_OP_IFAIRY_ROPE ||
+        s->op == GGML_OP_IFAIRY_SPLIT ||
+        s->op == GGML_OP_IFAIRY_MERGE ||
+        s->op == GGML_OP_IFAIRY_ADD ||
+        s->op == GGML_OP_IFAIRY_RMSNORM ||
+        s->op == GGML_OP_IFAIRY_MUL) {
+        return false;
+    }
+    
+    if (s->op == GGML_OP_MUL_MAT) {
+        if (s->src[0]->type == GGML_TYPE_IFAIRY) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
 void ggml_compute_forward_ifairy_add(const ggml_compute_params * params, ggml_tensor * dst) {
-    binary_op<op_ifairy_add>(params, dst);
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    
+    bool src0_real = is_ifairy_real_f32(src0);
+    bool src1_real = is_ifairy_real_f32(src1);
+    
+    if (src0_real && src1_real) {
+        binary_op<op_ifairy_add_f32_f32>(params, dst);
+    } else if (src0_real && !src1_real) {
+        binary_op<op_ifairy_add_f32_packed>(params, dst);
+    } else if (!src0_real && src1_real) {
+        binary_op<op_ifairy_add_packed_f32>(params, dst);
+    } else {
+        binary_op<op_ifairy_add>(params, dst);
+    }
 }
 
 void ggml_compute_forward_ifairy_mul(const ggml_compute_params * params, ggml_tensor * dst) {
-    binary_op<op_ifairy_mul>(params, dst);
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    
+    bool src0_real = is_ifairy_real_f32(src0);
+    bool src1_real = is_ifairy_real_f32(src1);
+    
+    if (src0_real && src1_real) {
+        binary_op<op_ifairy_mul_f32_f32>(params, dst);
+    } else if (src0_real && !src1_real) {
+        binary_op<op_ifairy_mul_f32_packed>(params, dst);
+    } else if (!src0_real && src1_real) {
+        binary_op<op_ifairy_mul_packed_f32>(params, dst);
+    } else {
+        binary_op<op_ifairy_mul>(params, dst);
+    }
 }

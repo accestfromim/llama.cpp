@@ -2284,8 +2284,8 @@ void quantize_row_ifairy_ref(const float * GGML_RESTRICT x_real, const float * G
     }
 
     for (int64_t i = 0; i < nb; i++) {
-        y[i].d_real = GGML_FP32_TO_FP16(d_real);
-        y[i].d_imag = GGML_FP32_TO_FP16(d_imag);
+        y[i].d_real = d_real;
+        y[i].d_imag = d_imag;
 
         for (size_t j = 0; j < sizeof(y->qs); j += 32) {
             for (size_t m = 0; m < 32; ++m) {
