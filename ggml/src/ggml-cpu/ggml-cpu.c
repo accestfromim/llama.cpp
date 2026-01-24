@@ -1464,246 +1464,10 @@ void ggml_compute_forward_mul_mat(
                     const block_ifairy * w_row       = (const block_ifairy *) src0->data + row0 * blocks_per_col;
                     float *              dst_f       = (float *) (dst_base + (size_t) row0 * nb0);
                     ggml_ifairy_lut_qgemm_ex((int) nrows, (int) K, (int) N, w_row, row_indexes, lut, scales, act_src,
-                                             act_stride, dst_f, nb1, nb0, true, strict, false);
+                                                act_stride, dst_f, nb1, nb0, true, strict, false);
                 }
                 return;
             }
-
-            if (fullacc) {
-                // BK tiling over 256-element blocks with a full shared accumulator:
-                // preprocess each K-tile once, then all threads accumulate their rows into acc_all.
-                GGML_ASSERT(acc_all != NULL);
-
-                // zero accumulators in parallel (per-row)
-                for (int64_t row = ith; row < M; row += nth) {
-                    float * acc_row = acc_all + (size_t) row * (size_t) (4 * N);
-                    memset(acc_row, 0, (size_t) (4 * N) * sizeof(float));
-                }
-                ggml_barrier(params->threadpool);
-
-                if (use_lut_double_buffer) {
-                    int     buf_idx = 0;
-                    int64_t blk0    = 0;
-
-                    int64_t         blks     = MIN(blocks_tile, blocks_per_col - blk0);
-                    int64_t         tile_k   = blks * QK_K;
-                    int64_t         tile_g0  = blk0 * groups_per_block;
-                    const uint8_t * act_tile = (const uint8_t *) act_src + (size_t) blk0 * sizeof(block_ifairy_q16);
-
-                    uint8_t * lut_buf   = shared_lut + (size_t) buf_idx * shared_lut_bytes;
-                    void *    lut_local = (void *) lut_buf;
-                    float *   scale_buf = (float *) (lut_buf + lut_bytes);
-
-                    ggml_ifairy_lut_preprocess_ex((int) M, (int) tile_k, (int) N, act_tile, act_stride, scale_buf,
-                                                  lut_local, ith, nth);
-                    ggml_barrier(params->threadpool);
-
-                    for (;;) {
-                        for (int64_t row = ith; row < M; row += nth) {
-                            const uint8_t * row_indexes = indexes + (size_t) row * index_stride + (size_t) tile_g0;
-                            float *         acc_row     = acc_all + (size_t) row * (size_t) (4 * N);
-                            ggml_ifairy_lut_accum4_ex((int) tile_k, (int) N, row_indexes, lut_local, scale_buf, acc_row,
-                                                      4 * sizeof(float), true);
-                        }
-
-                        const int64_t next_blk0 = blk0 + blocks_tile;
-                        if (next_blk0 < blocks_per_col && ith == 0) {
-                            const int64_t   next_blks = MIN(blocks_tile, blocks_per_col - next_blk0);
-                            const int64_t   next_k    = next_blks * QK_K;
-                            const uint8_t * next_act =
-                                (const uint8_t *) act_src + (size_t) next_blk0 * sizeof(block_ifairy_q16);
-
-                            const int next_buf    = buf_idx ^ 1;
-                            uint8_t * next_lut    = shared_lut + (size_t) next_buf * shared_lut_bytes;
-                            float *   next_scales = (float *) (next_lut + lut_bytes);
-
-                            ggml_ifairy_lut_preprocess_ex((int) M, (int) next_k, (int) N, next_act, act_stride,
-                                                          next_scales, next_lut, 0, 1);
-                        }
-                        ggml_barrier(params->threadpool);
-
-                        if (next_blk0 >= blocks_per_col) {
-                            break;
-                        }
-
-                        blk0    = next_blk0;
-                        blks    = MIN(blocks_tile, blocks_per_col - blk0);
-                        tile_k  = blks * QK_K;
-                        tile_g0 = blk0 * groups_per_block;
-                        buf_idx ^= 1;
-
-                        lut_buf   = shared_lut + (size_t) buf_idx * shared_lut_bytes;
-                        lut_local = (void *) lut_buf;
-                        scale_buf = (float *) (lut_buf + lut_bytes);
-                    }
-                } else {
-                    for (int64_t blk0 = 0; blk0 < blocks_per_col; blk0 += blocks_tile) {
-                        const int64_t blks    = MIN(blocks_tile, blocks_per_col - blk0);
-                        const int64_t tile_k  = blks * QK_K;
-                        const int64_t tile_g0 = blk0 * groups_per_block;
-
-                        const uint8_t * act_tile = (const uint8_t *) act_src + (size_t) blk0 * sizeof(block_ifairy_q16);
-
-                        ggml_ifairy_lut_preprocess_ex((int) M, (int) tile_k, (int) N, act_tile, act_stride, scales, lut,
-                                                      ith, nth);
-                        ggml_barrier(params->threadpool);
-
-                        for (int64_t row = ith; row < M; row += nth) {
-                            const uint8_t * row_indexes = indexes + (size_t) row * index_stride + (size_t) tile_g0;
-                            float *         acc_row     = acc_all + (size_t) row * (size_t) (4 * N);
-                            ggml_ifairy_lut_accum4_ex((int) tile_k, (int) N, row_indexes, lut, scales, acc_row,
-                                                      4 * sizeof(float), true);
-                        }
-                        ggml_barrier(params->threadpool);
-                    }
-                }
-
-                for (int64_t row = ith; row < M; row += nth) {
-                    const float *        acc_row      = acc_all + (size_t) row * (size_t) (4 * N);
-                    const block_ifairy * w_row        = (const block_ifairy *) src0->data + row * blocks_per_col;
-                    const float          coeff_w_real = GGML_FP16_TO_FP32(w_row[0].d_real);
-                    const float          coeff_w_imag = GGML_FP16_TO_FP32(w_row[0].d_imag);
-                    for (int64_t col = 0; col < N; ++col) {
-                        uint8_t *   dst_elem = dst_base + (size_t) col * nb1 + (size_t) row * nb0;
-                        const float ac       = acc_row[col * 4 + 0];
-                        const float ad       = acc_row[col * 4 + 1];
-                        const float bc       = acc_row[col * 4 + 2];
-                        const float bd       = acc_row[col * 4 + 3];
-
-                        const float out_r = coeff_w_real * ac + coeff_w_imag * bd;
-                        const float out_i = coeff_w_imag * bc - coeff_w_real * ad;
-
-                        const ggml_bf16_t br          = GGML_FP32_TO_BF16(out_r);
-                        const ggml_bf16_t bi          = GGML_FP32_TO_BF16(out_i);
-                        ((ggml_bf16_t *) dst_elem)[0] = br;
-                        ((ggml_bf16_t *) dst_elem)[1] = bi;
-                    }
-                }
-                return;
-            }
-
-            // BK tiling over 256-element blocks, with BM row-blocking.
-            // Threads stay in lockstep over (row-block, K-tile) pairs via barriers,
-            // amortizing barrier overhead across BM rows.
-            const int64_t row_step = (int64_t) nth * (int64_t) bm;
-            for (int64_t row_base = 0; row_base < M; row_base += row_step) {
-                const int64_t row0  = row_base + (int64_t) ith * (int64_t) bm;
-                const int64_t nrows = row0 < M ? MIN((int64_t) bm, M - row0) : 0;
-
-                float * acc = (float *) row_tmp_bytes;
-                if (nrows > 0) {
-                    memset(acc, 0, (size_t) nrows * (size_t) (4 * N) * sizeof(float));
-                }
-
-                if (use_lut_double_buffer) {
-                    int     buf_idx = 0;
-                    int64_t blk0    = 0;
-
-                    int64_t         blks     = MIN(blocks_tile, blocks_per_col - blk0);
-                    int64_t         tile_k   = blks * QK_K;
-                    int64_t         tile_g0  = blk0 * groups_per_block;
-                    const uint8_t * act_tile = (const uint8_t *) act_src + (size_t) blk0 * sizeof(block_ifairy_q16);
-
-                    uint8_t * lut_buf   = shared_lut + (size_t) buf_idx * shared_lut_bytes;
-                    void *    lut_local = (void *) lut_buf;
-                    float *   scale_buf = (float *) (lut_buf + lut_bytes);
-
-                    ggml_ifairy_lut_preprocess_ex((int) M, (int) tile_k, (int) N, act_tile, act_stride, scale_buf,
-                                                  lut_local, ith, nth);
-                    ggml_barrier(params->threadpool);
-
-                    for (;;) {
-                        if (nrows > 0) {
-                            for (int64_t r = 0; r < nrows; ++r) {
-                                const int64_t   row         = row0 + r;
-                                const uint8_t * row_indexes = indexes + (size_t) row * index_stride + (size_t) tile_g0;
-                                float *         acc_row     = acc + (size_t) r * (size_t) (4 * N);
-                                ggml_ifairy_lut_accum4_ex((int) tile_k, (int) N, row_indexes, lut_local, scale_buf,
-                                                          acc_row, 4 * sizeof(float), true);
-                            }
-                        }
-
-                        const int64_t next_blk0 = blk0 + blocks_tile;
-                        if (next_blk0 < blocks_per_col && ith == 0) {
-                            const int64_t   next_blks = MIN(blocks_tile, blocks_per_col - next_blk0);
-                            const int64_t   next_k    = next_blks * QK_K;
-                            const uint8_t * next_act =
-                                (const uint8_t *) act_src + (size_t) next_blk0 * sizeof(block_ifairy_q16);
-
-                            const int next_buf    = buf_idx ^ 1;
-                            uint8_t * next_lut    = shared_lut + (size_t) next_buf * shared_lut_bytes;
-                            float *   next_scales = (float *) (next_lut + lut_bytes);
-
-                            ggml_ifairy_lut_preprocess_ex((int) M, (int) next_k, (int) N, next_act, act_stride,
-                                                          next_scales, next_lut, 0, 1);
-                        }
-                        ggml_barrier(params->threadpool);
-
-                        if (next_blk0 >= blocks_per_col) {
-                            break;
-                        }
-
-                        blk0    = next_blk0;
-                        blks    = MIN(blocks_tile, blocks_per_col - blk0);
-                        tile_k  = blks * QK_K;
-                        tile_g0 = blk0 * groups_per_block;
-                        buf_idx ^= 1;
-
-                        lut_buf   = shared_lut + (size_t) buf_idx * shared_lut_bytes;
-                        lut_local = (void *) lut_buf;
-                        scale_buf = (float *) (lut_buf + lut_bytes);
-                    }
-                } else {
-                    for (int64_t blk0 = 0; blk0 < blocks_per_col; blk0 += blocks_tile) {
-                        const int64_t blks    = MIN(blocks_tile, blocks_per_col - blk0);
-                        const int64_t tile_k  = blks * QK_K;
-                        const int64_t tile_g0 = blk0 * groups_per_block;
-
-                        const uint8_t * act_tile = (const uint8_t *) act_src + (size_t) blk0 * sizeof(block_ifairy_q16);
-
-                        ggml_ifairy_lut_preprocess_ex((int) M, (int) tile_k, (int) N, act_tile, act_stride, scales, lut,
-                                                      ith, nth);
-                        ggml_barrier(params->threadpool);
-
-                        if (nrows > 0) {
-                            for (int64_t r = 0; r < nrows; ++r) {
-                                const int64_t   row         = row0 + r;
-                                const uint8_t * row_indexes = indexes + (size_t) row * index_stride + (size_t) tile_g0;
-                                float *         acc_row     = acc + (size_t) r * (size_t) (4 * N);
-                                ggml_ifairy_lut_accum4_ex((int) tile_k, (int) N, row_indexes, lut, scales, acc_row,
-                                                          4 * sizeof(float), true);
-                            }
-                        }
-                        ggml_barrier(params->threadpool);
-                    }
-                }
-
-                if (nrows > 0) {
-                    for (int64_t r = 0; r < nrows; ++r) {
-                        const int64_t        row          = row0 + r;
-                        const float *        acc_row      = acc + (size_t) r * (size_t) (4 * N);
-                        const block_ifairy * w_row        = (const block_ifairy *) src0->data + row * blocks_per_col;
-                        const float          coeff_w_real = GGML_FP16_TO_FP32(w_row[0].d_real);
-                        const float          coeff_w_imag = GGML_FP16_TO_FP32(w_row[0].d_imag);
-                        for (int64_t col = 0; col < N; ++col) {
-                            uint8_t *   dst_elem = dst_base + (size_t) col * nb1 + (size_t) row * nb0;
-                            const float ac       = acc_row[col * 4 + 0];
-                            const float ad       = acc_row[col * 4 + 1];
-                            const float bc       = acc_row[col * 4 + 2];
-                            const float bd       = acc_row[col * 4 + 3];
-
-                            const float out_r = coeff_w_real * ac + coeff_w_imag * bd;
-                            const float out_i = coeff_w_imag * bc - coeff_w_real * ad;
-
-                            const ggml_bf16_t br          = GGML_FP32_TO_BF16(out_r);
-                            const ggml_bf16_t bi          = GGML_FP32_TO_BF16(out_i);
-                            ((ggml_bf16_t *) dst_elem)[0] = br;
-                            ((ggml_bf16_t *) dst_elem)[1] = bi;
-                        }
-                    }
-                }
-            }
-            return;
         }
     }
 #endif
@@ -1720,16 +1484,16 @@ void ggml_compute_forward_mul_mat(
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
-                                     ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
-                                     (const char *)src1->data + i12*nb12 + i13*nb13,
-                                     nb11/ggml_type_size(src1->type),
-                                     (char *)dst->data + i12*nb2 + i13*nb3,
-                                     nb1/ggml_type_size(dst->type),
-                                     src0->type,
-                                     src1->type,
-                                     dst->type))
+                                        ne01, ne11, ne00/ggml_blck_size(src0->type),
+                                        (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                        nb01/ggml_type_size(src0->type),
+                                        (const char *)src1->data + i12*nb12 + i13*nb13,
+                                        nb11/ggml_type_size(src1->type),
+                                        (char *)dst->data + i12*nb2 + i13*nb3,
+                                        nb1/ggml_type_size(dst->type),
+                                        src0->type,
+                                        src1->type,
+                                        dst->type))
                     goto UseGgmlGemm1;
         return;
     }

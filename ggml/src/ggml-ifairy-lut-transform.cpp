@@ -102,8 +102,7 @@ bool ggml_ifairy_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_t
     const int64_t rows = tensor->ne[1];
     if (k % QK_K != 0 || rows <= 0) {
         if (dbg) {
-            GGML_LOG_WARN("ifairy_lut: transform_tensor: invalid shape k=%lld rows=%lld QK_K=%d\n", (long long) k,
-                          (long long) rows, QK_K);
+            GGML_LOG_WARN("ifairy_lut: transform_tensor: invalid shape k=%lld rows=%lld QK_K=%d\n", (long long) k, (long long) rows, QK_K);
         }
         return false;
     }
@@ -112,8 +111,7 @@ bool ggml_ifairy_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_t
     const size_t                           index_bytes = ggml_ifairy_3w_index_buffer_size(&info, rows);
     if (index_bytes == 0) {
         if (dbg) {
-            GGML_LOG_WARN("ifairy_lut: transform_tensor: index_bytes==0 (k=%lld rows=%lld)\n", (long long) k,
-                          (long long) rows);
+            GGML_LOG_WARN("ifairy_lut: transform_tensor: index_bytes==0 (k=%lld rows=%lld)\n", (long long) k, (long long) rows);
         }
         return false;
     }
@@ -194,7 +192,7 @@ bool ggml_ifairy_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_t
                                                           /* .buffer = */ index_buffer,
                                                           /* .base   = */ buf,
                                                           /* .size   = */ index_bytes,
-                                                      });
+                                                        });
             } else {
                 // Another thread may have populated the cache meanwhile; reuse it and free ours.
                 ggml_backend_buffer_free(index_buffer);

@@ -142,9 +142,9 @@ bool ggml_ifairy_lut_can_mul_mat(const struct ggml_tensor * src0,
 }
 
 size_t ggml_ifairy_lut_get_wsize(const struct ggml_tensor * src0,
-                                 const struct ggml_tensor * src1,
-                                 const struct ggml_tensor * dst,
-                                 int                        n_threads) {
+                                    const struct ggml_tensor * src1,
+                                    const struct ggml_tensor * dst,
+                                    int                        n_threads) {
     if (!ggml_ifairy_lut_can_mul_mat(src0, src1, dst)) {
         return 0;
     }
