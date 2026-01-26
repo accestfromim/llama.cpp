@@ -481,6 +481,12 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
     }
 }
 
+template <typename dst_t>
+static __global__ void dequantize_block_ifairy(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    // trae-todo: Implement dequantize block kernel for ifairy
+    // This kernel should dequantize a whole block
+}
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static void dequantize_block_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -596,6 +602,13 @@ template<typename dst_t>
 static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
     dequantize_block_iq1_m<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
+static void dequantize_row_ifairy_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    // trae-todo: Launch dequantize_block_ifairy kernel
+    const int nb = k / QK_K;
+    dequantize_block_ifairy<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
@@ -819,6 +832,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
+        case GGML_TYPE_IFAIRY:
+            return dequantize_row_ifairy_cuda<float>;
         default:
             return nullptr;
     }

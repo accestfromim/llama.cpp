@@ -28,6 +28,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
+        case GGML_TYPE_IFAIRY:  return vec_dot_ifairy_ifairy_q16;
         default:                return nullptr;
     }
 }
@@ -52,6 +53,7 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
+        case GGML_TYPE_IFAIRY:  return VDR_IFAIRY_Q8_1_MMVQ;
         default:                return 1;
     }
 }
@@ -477,6 +479,13 @@ static void mul_mat_vec_q_switch_type(
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
                  stream);
             break;
+        case GGML_TYPE_IFAIRY:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IFAIRY>
+                (vx, vy, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                 stream);
+            break;
         default:
             GGML_ABORT("fatal error");
             break;
@@ -520,16 +529,37 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    
+    size_t alloc_size;
+    if (src0->type == GGML_TYPE_IFAIRY) {
+        alloc_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_ifairy_q16) / QK_K;
+    } else {
+        alloc_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1) / QK8_1;
+    }
+    
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), alloc_size);
+    
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        
+        if (src0->type == GGML_TYPE_IFAIRY) {
+            quantize_row_ifairy_q16_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
-    const int64_t s11 = ne10_padded / QK8_1;
+    
+    int64_t s11;
+    if (src0->type == GGML_TYPE_IFAIRY) {
+        s11 = ne10_padded / QK_K;
+    } else {
+        s11 = ne10_padded / QK8_1;
+    }
+    
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;

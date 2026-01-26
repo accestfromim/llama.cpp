@@ -344,6 +344,23 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
     return dm2f.x*sumf_d - dm2f.y*sumf_m;
 }
 
+#define VDR_IFAIRY_Q8_1_MMVQ 2
+#define VDR_IFAIRY_Q8_1_MMQ  2
+
+static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    // trae-todo: Implement vec_dot for ifairy with ifairy_q16 activations.
+    // Inputs:
+    //   vbq: pointer to quantized weights block (block_ifairy)
+    //   bq8_1: pointer to quantized activations block (block_ifairy_q16) - cast it!
+    
+    const block_ifairy_q16 * bq16 = (const block_ifairy_q16 *) bq8_1;
+    const block_ifairy * b = (const block_ifairy *) vbq + kbx;
+    
+    // Implementation details...
+    return 0.0f;
+}
+
 // contiguous v/x + u/y values
 template <int ns8>
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
@@ -1011,6 +1028,8 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
     return d * sumi;
 }
+
+
 
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2

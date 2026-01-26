@@ -50,11 +50,11 @@ static const int8_t k_ifairy_wi2[64] = { 0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 
 
 // sym16 canonical patterns (idx16 = (u1_exp<<2)|u2_exp), with w0 fixed to +1.
 // u_exp -> (wr, wi): 0 -> (+1,0), 1 -> (0,+1), 2 -> (-1,0), 3 -> (0,-1)
+#endif
 static const int8_t k_ifairy_sym16_wr1[16] = { 1, 1, 1, 1, 0, 0, 0, 0, -1, -1, -1, -1, 0, 0, 0, 0 };
 static const int8_t k_ifairy_sym16_wi1[16] = { 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, -1, -1, -1, -1 };
 static const int8_t k_ifairy_sym16_wr2[16] = { 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1, 0 };
 static const int8_t k_ifairy_sym16_wi2[16] = { 0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1, 0, 1, 0, -1 };
-#endif
 
 static inline int8_t ggml_ifairy_lut_sat_s8(int v) {
     if (v > INT8_MAX) {

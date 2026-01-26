@@ -75,3 +75,16 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+static __device__ __forceinline__ void dequantize_ifairy(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    // trae-todo: Implement dequantization for ifairy
+    // The structure is:
+    // typedef struct {
+    //     uint8_t qs[QK_K/4]; // 2 bits per element
+    //     ggml_half d_real, d_imag;
+    // } block_ifairy;
+    
+    // Stub implementation
+    v.x = 0.0f;
+    v.y = 0.0f;
+}

@@ -145,6 +145,28 @@ static __global__ void quantize_mmq_q8_1(
     }
 }
 
+void quantize_row_ifairy_q16_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    // trae-todo: Implement quantize_row_ifairy_q16_cuda
+    // This should launch a kernel to quantize FP32 activations to block_ifairy_q16
+    
+    GGML_UNUSED(x);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(vy);
+    GGML_UNUSED(type_src0);
+    GGML_UNUSED(ne00);
+    GGML_UNUSED(s01);
+    GGML_UNUSED(s02);
+    GGML_UNUSED(s03);
+    GGML_UNUSED(ne0);
+    GGML_UNUSED(ne1);
+    GGML_UNUSED(ne2);
+    GGML_UNUSED(ne3);
+    GGML_UNUSED(stream);
+}
+
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
