@@ -47,6 +47,88 @@ static __device__ float block_reduce_max(float local_val) {
     return shared_mem[0];
 }
 
+// Kernel to quantize complex fp32 values to block_ifairy_q16 format
+// Each block processes 256 complex numbers (512 float values)
+__launch_bounds__(256, 1)
+static __global__ void quantize_ifairy_q16_kernel(
+        const float * __restrict__ x, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+    const int64_t i0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i3 = fastdiv(blockIdx.z, ne2);
+    const int64_t i2 = blockIdx.z - i3*ne2.z;
+    const int64_t i1 = blockIdx.y;
+
+    const int64_t & i00 = i0;
+    const int64_t & i01 = i1;
+    const int64_t & i02 = i2;
+    const int64_t & i03 = i3;
+
+    const int64_t i_cont = ((i3*ne2.z + i2) * ne1 + i1) * ne0 + i0;
+
+    block_ifairy_q16 * y = (block_ifairy_q16 *) vy;
+
+    const int64_t ib  = i_cont / QK_K; // block index
+    const int64_t iqs = i_cont % QK_K; // quant index
+
+    // Read packed bf16 values (each float contains real in high 16 bits, imag in low 16 bits)
+    const int64_t idx = i03*s03 + i02*s02 + i01*s01 + i00;
+
+    float real_val = 0.0f;
+    float imag_val = 0.0f;
+
+    if (i00 < ne00) {
+        // Unpack bf16 values from fp32
+        const uint32_t packed = __float_as_uint(x[idx]);
+        const uint16_t real_bf16 = (packed >> 16) & 0xFFFF;
+        const uint16_t imag_bf16 = packed & 0xFFFF;
+
+        real_val = __bfloat162float(__ushort_as_bfloat16(real_bf16));
+        imag_val = __bfloat162float(__ushort_as_bfloat16(imag_bf16));
+    }
+
+    // Compute absolute values for reduction
+    const float real_abs = fabsf(real_val);
+    const float imag_abs = fabsf(imag_val);
+
+    // Block-level reduction to find max values
+    const float max_real = block_reduce_max(real_abs);
+    const float max_imag = block_reduce_max(imag_abs);
+
+    // Thread 0 writes scale metadata to fp16
+    __shared__ float shared_scale[2];
+    if (threadIdx.x == 0) {
+        const float d_real = max_real / 127.0f;
+        const float d_imag = max_imag / 127.0f;
+
+        y[ib].d_real = __float2half_rn(d_real);
+        y[ib].d_imag = __float2half_rn(d_imag);
+
+        shared_scale[0] = d_real;
+        shared_scale[1] = d_imag;
+    }
+    __syncthreads();
+
+    // All threads quantize and store values as uint8
+    const float d_real = shared_scale[0];
+    const float d_imag = shared_scale[1];
+
+    const float id_real = d_real != 0.0f ? 1.0f / d_real : 0.0f;
+    const float id_imag = d_imag != 0.0f ? 1.0f / d_imag : 0.0f;
+
+#define clamp_to_uint8(v) (v < 0.0f ? 0 : (v > 255.0f ? 255 : v))
+
+    const uint8_t q_real = d_real != 0.0f ? clamp_to_uint8((uint8_t)rintf(real_val * id_real + 128.0f)) : 128;
+    const uint8_t q_imag = d_imag != 0.0f ? clamp_to_uint8((uint8_t)rintf(imag_val * id_imag + 128.0f)) : 128;
+
+    y[ib].x_real[iqs] = q_real;
+    y[ib].x_imag[iqs] = q_imag;
+}
 
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
