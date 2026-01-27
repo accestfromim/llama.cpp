@@ -1,6 +1,53 @@
 #include "quantize.cuh"
 #include <cstdint>
 
+
+// Device function: Two-level reduction to find maximum value across 256 threads
+static __device__ float block_reduce_max(float local_val) {
+    // Warp-level reduction using shuffle
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+
+    // Reduce within warp
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_val = fmaxf(local_val, __shfl_xor_sync(0xFFFFFFFF, local_val, offset));
+    }
+
+    // Shared memory: 8 values for 8 warps
+    __shared__ float shared_mem[8];
+
+    // Each warp's first thread writes its warp's max to shared memory
+    if (lane_id == 0) {
+        shared_mem[warp_id] = local_val;
+    }
+
+    // Synchronize to ensure all warps finish writing
+    __syncthreads();
+
+    // Only the first warp performs the final reduction
+    float block_max = 0.0f;
+    if (warp_id == 0) {
+        block_max = lane_id < 8 ? shared_mem[lane_id] : 0.0f;
+
+        // Reduce within the first warp
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            block_max = fmaxf(block_max, __shfl_xor_sync(0xFFFFFFFF, block_max, offset));
+        }
+    }
+
+    // First thread writes the final block max to shared memory
+    if (warp_id == 0 && lane_id == 0) {
+        shared_mem[0] = block_max;
+    }
+
+    __syncthreads();
+
+    return shared_mem[0];
+}
+
+
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * __restrict__ x, void * __restrict__ vy,
