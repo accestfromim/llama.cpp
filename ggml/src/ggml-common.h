@@ -271,7 +271,7 @@ static_assert(sizeof(block_ifairy) == 2 * sizeof(ggml_half) + QK_K / 4, "wrong i
 
 
 typedef struct {
-    int8_t x_real[QK_K], x_imag[QK_K];
+    uint8_t x_real[QK_K], x_imag[QK_K];
     ggml_half d_real, d_imag;
 } block_ifairy_q16;
 static_assert(sizeof(block_ifairy_q16) == 2 * sizeof(ggml_half) + QK_K * 2, "wrong ifairy_q16 block size/padding");
