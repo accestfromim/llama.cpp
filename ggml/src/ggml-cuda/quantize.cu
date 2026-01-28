@@ -85,8 +85,8 @@ static __global__ void quantize_ifairy_q16_kernel(
     if (i00 < ne00) {
         // Unpack bf16 values from fp32
         const uint32_t packed = __float_as_uint(x[idx]);
-        const uint16_t real_bf16 = (packed >> 16) & 0xFFFF;
-        const uint16_t imag_bf16 = packed & 0xFFFF;
+        const uint16_t real_bf16 = packed & 0xFFFF;
+        const uint16_t imag_bf16 = (packed >> 16) & 0xFFFF;
 
         real_val = __bfloat162float(__ushort_as_bfloat16(real_bf16));
         imag_val = __bfloat162float(__ushort_as_bfloat16(imag_bf16));
