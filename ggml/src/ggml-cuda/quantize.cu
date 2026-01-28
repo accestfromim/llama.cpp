@@ -121,10 +121,10 @@ static __global__ void quantize_ifairy_q16_kernel(
     const float id_real = d_real != 0.0f ? 1.0f / d_real : 0.0f;
     const float id_imag = d_imag != 0.0f ? 1.0f / d_imag : 0.0f;
 
-#define clamp_to_uint8(v) (v < 0.0f ? 0 : (v > 255.0f ? 255 : v))
+#define clamp_to_int8(v) (v < -127.0f ? -127 : (v > 127.0f ? 127 : v))
 
-    const uint8_t q_real = d_real != 0.0f ? clamp_to_uint8((uint8_t)rintf(real_val * id_real + 128.0f)) : 128;
-    const uint8_t q_imag = d_imag != 0.0f ? clamp_to_uint8((uint8_t)rintf(imag_val * id_imag + 128.0f)) : 128;
+    const int8_t q_real = d_real != 0.0f ? clamp_to_int8((int8_t)rintf(real_val * id_real)) : 0;
+    const int8_t q_imag = d_imag != 0.0f ? clamp_to_int8((int8_t)rintf(imag_val * id_imag)) : 0;
 
     y[ib].x_real[iqs] = q_real;
     y[ib].x_imag[iqs] = q_imag;
