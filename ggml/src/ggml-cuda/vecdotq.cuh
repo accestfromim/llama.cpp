@@ -772,7 +772,7 @@ static __device__ __forceinline__ float vec_dot_q5_1_q8_1(
 static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
-    const bloccck_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
 
     int v[VDR_Q8_0_Q8_1_MMVQ];
     int u[VDR_Q8_0_Q8_1_MMVQ];
