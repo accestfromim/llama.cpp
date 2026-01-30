@@ -349,17 +349,65 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
 
 static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
-    // trae-todo: Implement vec_dot for ifairy with ifairy_q16 activations.
     // Inputs:
     //   vbq: pointer to quantized weights block (block_ifairy)
     //   bq8_1: pointer to quantized activations block (block_ifairy_q16) - cast it!
-    
+
     const block_ifairy_q16 * bq16 = (const block_ifairy_q16 *) bq8_1;
     const block_ifairy * b = (const block_ifairy *) vbq + kbx;
     
-    // Implementation details...
-    return 0.0f;
+    const int v = get_int_b4(b->qs, iqs);
+
+    int    u[QR2_K*2];
+    float d8[QR2_K];
+
+    d8[0] = __bfloat162float(b->d_real) * __bfloat162float(bq16->d_real);
+    d8[1] = __bfloat162float(b->d_real) * __bfloat162float(bq16->d_imag);
+    d8[2] = __bfloat162float(b->d_imag) * __bfloat162float(bq16->d_real);
+    d8[3] = __bfloat162float(b->d_imag) * __bfloat162float(bq16->d_imag);
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++ i) {
+        u[i]  = get_int_b4(bq16->x_real, iqs + i);
+        u[i+QR2_K] = -get_int_b4(bq16->x_imag, iqs + i);
+    }
+
+    return vec_dot_ifairy_ifairy_q16_impl_mmvq(v, u, d8);
 }
+
+static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16_impl_mmvq(
+    const int & v, const int * __restrict__ u, const float * __restrict__ d8) {
+
+    int sumi_realreal = 0;
+    int sumi_realimag = 0;
+    int sumi_imagreal = 0;
+    int sumi_imagimag = 0;
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i ) {  // 每次处理4个元素
+    // 约定编码：00(-1) 01(1) 10(-i) 11(i)
+    int weight = (v >>(2 *i))& 0x03;//提取2位权重weight val=(weight val == 0x00)?-d real :
+    int weight_real = (weight_real == 0x00)? -1:
+                  (weight_real == 0x01)? 1:0;
+    int weight_imag = (weight_imag == 0x10)? -1:
+                  (weight_imag == 0x11)? 1:0;
+
+    sumi_realreal += ggml_cuda_dp4a(u[i],weight_real,sumi_realreal);
+    sumi_realimag += ggml_cuda_dp4a(u[i+QR2_K],weight_real,sumi_realimag);
+    sumi_imagreal += ggml_cuda_dp4a(u[i],weight_imag,sumi_imagreal);
+    sumi_imagimag += ggml_cuda_dp4a(u[i+QR2_K],weight_imag,sumi_imagimag);
+    //计算埃尔米特内积    
+    }
+
+    // 计算缩放因子
+    float result_real = sumi_realreal*d8[0]+sumi_imagimag*d8[3];
+    float result_imag = sumi_realimag*d8[1]+sumi_imagreal*d8[2];
+    // 将结果打包为32位整型并返回
+    int result = ((int)(result_real) & 0xFFFF) | ((int)(result_imag) << 16);
+    return __int_as_float(result); 
+
+}
+
 
 // contiguous v/x + u/y values
 template <int ns8>
