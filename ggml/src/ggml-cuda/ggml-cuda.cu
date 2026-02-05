@@ -51,6 +51,7 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
+#include "ggml-cuda/ifairy.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2333,6 +2334,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_ELU:
                     ggml_cuda_op_elu(ctx, dst);
                     break;
+                case GGML_UNARY_OP_IFAIRY_RELU2:
+                    ggml_cuda_op_ifairy_relu2(ctx, dst);
+                    break;
                 default:
                     return false;
             }
@@ -2516,6 +2520,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_OPT_STEP_SGD:
             ggml_cuda_opt_step_sgd(ctx, dst);
+            break;
+        case GGML_OP_IFAIRY_RMSNORM:
+            ggml_cuda_op_ifairy_rmsnorm(ctx, dst);
+            break;
+        case GGML_OP_IFAIRY_ROPE:
+            ggml_cuda_op_ifairy_rope(ctx, dst);
+            break;
+        case GGML_OP_IFAIRY_ADD:
+            ggml_cuda_op_ifairy_add(ctx, dst);
+            break;
+        case GGML_OP_IFAIRY_MUL:
+            ggml_cuda_op_ifairy_mul(ctx, dst);
+            break;
+        case GGML_OP_IFAIRY_SPLIT:
+            ggml_cuda_op_ifairy_split(ctx, dst);
+            break;
+        case GGML_OP_IFAIRY_MERGE:
+            ggml_cuda_op_ifairy_merge(ctx, dst);
             break;
         default:
             return false;
@@ -3315,6 +3337,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_EXP:
                 case GGML_UNARY_OP_ELU:
+                case GGML_UNARY_OP_IFAIRY_RELU2:
                     return ggml_is_contiguous(op->src[0]);
                 default:
                     return false;
@@ -3609,6 +3632,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+            return true;
+        case GGML_OP_IFAIRY_RMSNORM:
+        case GGML_OP_IFAIRY_ROPE:
+        case GGML_OP_IFAIRY_ADD:
+        case GGML_OP_IFAIRY_MUL:
+        case GGML_OP_IFAIRY_SPLIT:
+        case GGML_OP_IFAIRY_MERGE:
             return true;
         default:
             return false;
