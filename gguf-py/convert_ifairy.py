@@ -434,7 +434,7 @@ def main():
                     tensor_dtype = gguf.GGMLQuantizationType.F16_I2
                     try:
                         numpy_array = gguf.quants.quantize(raw_numpy, tensor_dtype)
-                        numpy_array = repack_ifairy_blocks(numpy_array)
+                        # numpy_array = repack_ifairy_blocks(numpy_array)
                     except gguf.QuantError as err:
                         if verbose:
                             print(f"F16_I2 quantization skipped for '{key}' due to: {err}. Falling back to F32 storage.")
