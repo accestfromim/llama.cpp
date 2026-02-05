@@ -77,14 +77,31 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
 }
 
 static __device__ __forceinline__ void dequantize_ifairy(const void * vx, const int64_t ib, const int iqs, float2 & v){
-    // trae-todo: Implement dequantization for ifairy
-    // The structure is:
-    // typedef struct {
-    //     uint8_t qs[QK_K/4]; // 2 bits per element
-    //     ggml_half d_real, d_imag;
-    // } block_ifairy;
-    
-    // Stub implementation
-    v.x = 0.0f;
-    v.y = 0.0f;
+    const block_ifairy * x = (const block_ifairy *) vx;
+
+    // Interpret stored values as bf16
+    const float d_real = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x[ib].d_real));
+    const float d_imag = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&x[ib].d_imag));
+
+    const int chunk = iqs / 64;
+    const int rem   = iqs % 64;
+    const int part  = rem / 16;
+    const int lane  = rem % 16;
+
+    const uint8_t q = x[ib].qs[chunk * 16 + lane];
+    const int code = (q >> (2 * part)) & 3;
+
+    if (code == 1) {
+        v.x = d_real;
+        v.y = 0.0f;
+    } else if (code == 0) {
+        v.x = -d_real;
+        v.y = 0.0f;
+    } else if (code == 3) {
+        v.x = 0.0f;
+        v.y = d_imag;
+    } else { // code == 2
+        v.x = 0.0f;
+        v.y = -d_imag;
+    }
 }

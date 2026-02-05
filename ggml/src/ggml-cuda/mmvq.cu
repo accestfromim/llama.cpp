@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "vecdotq.cuh"
 
+#include <cuda_bf16.h>
 #include <cstdint>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -155,7 +156,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int nwarps = calc_nwarps(ncols_dst, table_id);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-
+    //printf("ncols_dst = %d, rows_per_cuda_block = %d, nwarps = %d, warp_size = %d\n", ncols_dst, rows_per_cuda_block, nwarps, warp_size);
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
@@ -174,11 +175,20 @@ static __global__ void mul_mat_vec_q(
     // partial sum for each thread
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    const block_q8_1 * y_q8 = nullptr;
+    const block_ifairy_q16 * y_ifairy = nullptr;
+
+    if constexpr (type == GGML_TYPE_IFAIRY) {
+        y_ifairy = ((const block_ifairy_q16 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    } else {
+        y_q8 = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+    }
+
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+        //const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+        const int kby = kbx * (qk/QK_K); // y block index that aligns with kbx
 
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
@@ -187,8 +197,36 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                const void * y_ptr;
+                if constexpr (type == GGML_TYPE_IFAIRY) {
+                    y_ptr = &y_ifairy[j*stride_col_y + kby];
+                } else {
+                    y_ptr = &y_q8[j*stride_col_y + kby];
+                }
+
+                float val = vec_dot_q_cuda(
+                    vx, (const block_q8_1 *)y_ptr, kbx_offset + i*stride_row_x + kbx, kqs);
+
+                if constexpr (type == GGML_TYPE_IFAIRY) {
+                    __nv_bfloat162 val_bf = *reinterpret_cast<__nv_bfloat162*>(&val);
+                    __nv_bfloat162 tmp_bf = *reinterpret_cast<__nv_bfloat162*>(&tmp[j][i]);
+                    
+                    __nv_bfloat16 * val_parts = reinterpret_cast<__nv_bfloat16*>(&val_bf);
+                    __nv_bfloat16 * tmp_parts = reinterpret_cast<__nv_bfloat16*>(&tmp_bf);
+                    
+                    float2 val_f2 = make_float2(__bfloat162float(val_parts[0]), __bfloat162float(val_parts[1]));
+                    float2 tmp_f2 = make_float2(__bfloat162float(tmp_parts[0]), __bfloat162float(tmp_parts[1]));
+
+                    tmp_f2.x += val_f2.x;
+                    tmp_f2.y += val_f2.y;
+                    
+                    tmp_parts[0] = __float2bfloat16(tmp_f2.x);
+                    tmp_parts[1] = __float2bfloat16(tmp_f2.y);
+                    
+                    tmp[j][i] = *reinterpret_cast<float*>(&tmp_bf);
+                } else {
+                    tmp[j][i] += val;
+                }
             }
         }
     }
@@ -217,9 +255,53 @@ static __global__ void mul_mat_vec_q(
         for (int i = 0; i < rows_per_cuda_block; ++i) {
 #pragma unroll
             for (int l = 0; l < nwarps-1; ++l) {
-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                float val = tmp_shared[l][j][i][threadIdx.x];
+                if constexpr (type == GGML_TYPE_IFAIRY) {
+                    float val = tmp_shared[l][j][i][threadIdx.x];
+                    __nv_bfloat162 val_bf = *reinterpret_cast<__nv_bfloat162*>(&val);
+                    __nv_bfloat162 tmp_bf = *reinterpret_cast<__nv_bfloat162*>(&tmp[j][i]);
+                    
+                    __nv_bfloat16 * val_parts = reinterpret_cast<__nv_bfloat16*>(&val_bf);
+                    __nv_bfloat16 * tmp_parts = reinterpret_cast<__nv_bfloat16*>(&tmp_bf);
+                    
+                    float2 val_f2 = make_float2(__bfloat162float(val_parts[0]), __bfloat162float(val_parts[1]));
+                    float2 tmp_f2 = make_float2(__bfloat162float(tmp_parts[0]), __bfloat162float(tmp_parts[1]));
+                    
+                    tmp_f2.x += val_f2.x;
+                    tmp_f2.y += val_f2.y;
+                    
+                    tmp_parts[0] = __float2bfloat16(tmp_f2.x);
+                    tmp_parts[1] = __float2bfloat16(tmp_f2.y);
+                    
+                    tmp[j][i] = *reinterpret_cast<float*>(&tmp_bf);
+                } else {
+                    tmp[j][i] += val;
+                }
             }
-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            
+            if constexpr (type == GGML_TYPE_IFAIRY) {
+                     __nv_bfloat162 val_bf = *reinterpret_cast<__nv_bfloat162*>(&tmp[j][i]);
+                     // Manual warp reduce for packed bf16
+                     for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+                         float shfl_val = __shfl_xor_sync(0xffffffff, *reinterpret_cast<float*>(&val_bf), offset, warp_size);
+                         __nv_bfloat162 shfl_bf = *reinterpret_cast<__nv_bfloat162*>(&shfl_val);
+                         
+                         __nv_bfloat16 * val_parts = reinterpret_cast<__nv_bfloat16*>(&val_bf);
+                         __nv_bfloat16 * shfl_parts = reinterpret_cast<__nv_bfloat16*>(&shfl_bf);
+                         
+                         float2 val_f2 = make_float2(__bfloat162float(val_parts[0]), __bfloat162float(val_parts[1]));
+                         float2 shfl_f2 = make_float2(__bfloat162float(shfl_parts[0]), __bfloat162float(shfl_parts[1]));
+                         
+                         val_f2.x += shfl_f2.x;
+                         val_f2.y += shfl_f2.y;
+                         
+                         val_parts[0] = __float2bfloat16(val_f2.x);
+                         val_parts[1] = __float2bfloat16(val_f2.y);
+                     }
+                     tmp[j][i] = *reinterpret_cast<float*>(&val_bf);
+                } else {
+                 tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+            }
         }
 
         if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || row0 + int(threadIdx.x) < stride_col_dst)) {

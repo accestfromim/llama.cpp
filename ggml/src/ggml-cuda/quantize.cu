@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include <cuda_bf16.h>
 #include <cstdint>
 
 
@@ -88,8 +89,8 @@ static __global__ void quantize_ifairy_q16_kernel(
         const uint16_t real_bf16 = packed & 0xFFFF;
         const uint16_t imag_bf16 = (packed >> 16) & 0xFFFF;
 
-        real_val = __bfloat162float(__ushort_as_bfloat16(real_bf16));
-        imag_val = __bfloat162float(__ushort_as_bfloat16(imag_bf16));
+        real_val = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&real_bf16));
+        imag_val = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&imag_bf16));
     }
 
     // Compute absolute values for reduction
@@ -100,14 +101,14 @@ static __global__ void quantize_ifairy_q16_kernel(
     const float max_real = block_reduce_max(real_abs);
     const float max_imag = block_reduce_max(imag_abs);
 
-    // Thread 0 writes scale metadata to fp16
+    // Thread 0 writes scale metadata to fp16 (actually bf16 for stability)
     __shared__ float shared_scale[2];
     if (threadIdx.x == 0) {
         const float d_real = max_real / 127.0f;
         const float d_imag = max_imag / 127.0f;
 
-        y[ib].d_real = __float2half_rn(d_real);
-        y[ib].d_imag = __float2half_rn(d_imag);
+        y[ib].d_real = __float2half(d_real);
+        y[ib].d_imag = __float2half(d_imag);
 
         shared_scale[0] = d_real;
         shared_scale[1] = d_imag;

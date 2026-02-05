@@ -483,8 +483,22 @@ static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_
 
 template <typename dst_t>
 static __global__ void dequantize_block_ifairy(const void * __restrict__ vx, dst_t * __restrict__ yy) {
-    // trae-todo: Implement dequantize block kernel for ifairy
-    // This kernel should dequantize a whole block
+    const int64_t ib = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    const block_ifairy * x = (const block_ifairy *) vx + ib;
+    dst_t * y_blk = yy + ib * 2 * QK_K; // Output pointer for this block
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        int iqs = tid * 8 + i; // 0..255
+        
+        float2 v;
+        dequantize_ifairy(x, 0, iqs, v);
+        
+        y_blk[2 * iqs + 0] = ggml_cuda_cast<dst_t>(v.x);
+        y_blk[2 * iqs + 1] = ggml_cuda_cast<dst_t>(v.y);
+    }
 }
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -606,8 +620,7 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
 
 template<typename dst_t>
 static void dequantize_row_ifairy_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    // trae-todo: Launch dequantize_block_ifairy kernel
-    const int nb = k / QK_K;
+    const int nb = k / (2 * QK_K);
     dequantize_block_ifairy<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -718,6 +731,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_IFAIRY:
+            return dequantize_row_ifairy_cuda;
         default:
             return nullptr;
     }
@@ -769,6 +784,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
             return convert_unary_cont_cuda<half>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_IFAIRY:
+            return dequantize_row_ifairy_cuda;
         default:
             return nullptr;
     }
@@ -833,7 +850,7 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16, float>;
         case GGML_TYPE_IFAIRY:
-            return dequantize_row_ifairy_cuda<float>;
+            //return dequantize_row_ifairy_cuda<float>;
         default:
             return nullptr;
     }

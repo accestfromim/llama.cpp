@@ -430,7 +430,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
-        case GGML_TYPE_IFAIRY:
+        //case GGML_TYPE_IFAIRY:
             mmq_supported = true;
             break;
         default:

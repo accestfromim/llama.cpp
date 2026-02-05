@@ -3046,6 +3046,14 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ4_XS> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
+template <int mmq_x, int mmq_y, bool need_check>
+struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IFAIRY> {
+    static constexpr int              vdr          = VDR_IFAIRY_Q8_1_MMQ;
+    static constexpr load_tiles_mmq_t load_tiles   = nullptr;
+    static constexpr vec_dot_mmq_t    vec_dot_mma  = nullptr;
+    static constexpr vec_dot_mmq_t    vec_dot_dp4a = nullptr;
+};
+
 template <ggml_type type, int mmq_x, bool need_check, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
