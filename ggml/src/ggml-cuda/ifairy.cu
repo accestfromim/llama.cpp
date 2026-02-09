@@ -151,6 +151,21 @@ void ggml_cuda_op_ifairy_rmsnorm(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // TODO: Implement using rope/norm patterns
 }
 
+// rope_yarn_ifairy: Simplified RoPE calculation for IFAIRY
+// Only applies basic frequency scaling without YaRN complex logic
+template<bool forward>
+static __device__ void rope_yarn_ifairy(
+        const float theta_extrap, const float freq_scale,
+        float & cos_theta, float & sin_theta) {
+    // Standard RoPE: theta = inv_freq * position_id
+    const float theta = theta_extrap * freq_scale;
+    cos_theta = cosf(theta);
+    sin_theta = sinf(theta);
+    if (!forward) {
+        sin_theta *= -1.0f;  // Backward pass uses inverse rotation
+    }
+}
+
 void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static bool warned = false;
     if (!warned) {
