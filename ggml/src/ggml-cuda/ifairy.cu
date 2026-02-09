@@ -227,6 +227,22 @@ static __global__ void ifairy_rope_kernel(
     dst[idst + 1] = __float2bfloat16(y1);
 }
 
+template<bool forward>
+static void ifairy_rope_cuda(
+        const nv_bfloat16 * x, nv_bfloat16 * dst,
+        const int ne0, const int ne1, const int s1, const int s2,
+        const int n_dims, const int nr, const int32_t * pos,
+        const float freq_scale, const float theta_scale, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % 2 == 0);  // Must be even for interleaved format
+
+    const dim3 block_dims(1, CUDA_IFAIRY_BLOCK_SIZE, 1);
+    const int n_blocks_y = (ne0 + 2 * CUDA_IFAIRY_BLOCK_SIZE - 1) / (2 * CUDA_IFAIRY_BLOCK_SIZE);
+    const dim3 block_nums(nr, n_blocks_y, 1);
+
+    ifairy_rope_kernel<forward><<<block_nums, block_dims, 0, stream>>>(
+            x, dst, ne0, ne1, s1, s2, n_dims, pos, freq_scale, theta_scale);
+}
+
 void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static bool warned = false;
     if (!warned) {
