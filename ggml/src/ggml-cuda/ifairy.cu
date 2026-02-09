@@ -244,11 +244,62 @@ static void ifairy_rope_cuda(
 }
 
 void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static bool warned = false;
-    if (!warned) {
-        fprintf(stderr, "%s: not implemented yet\n", __func__);
-        warned = true;
-    }
+    const ggml_tensor * src0 = dst->src[0];  // Input BF16 complex tensor
+    const ggml_tensor * src1 = dst->src[1];  // Position tensor (I32)
+
+    GGML_ASSERT(src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_BF16);
+
+    // Extract operation parameters
+    const int n_dims     = ((int32_t *) dst->op_params)[1] / 2;  // Actual dimension count
+    const int mode       = ((int32_t *) dst->op_params)[2];
+    const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   (int32_t *) dst->op_params + 5,  sizeof(float));
+    memcpy(&freq_scale,  (int32_t *) dst->op_params + 6,  sizeof(float));
+    memcpy(&ext_factor,  (int32_t *) dst->op_params + 7,  sizeof(float));
+    memcpy(&attn_factor, (int32_t *) dst->op_params + 8,  sizeof(float));
+    memcpy(&beta_fast,   (int32_t *) dst->op_params + 9,  sizeof(float));
+    memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
+
+    // Tensor dimensions for BF16 interleaved format
+    const int64_t ne00 = src0->ne[0];  // Dimension with interleaved real/imag (2 * complex_dim)
+    const int64_t ne01 = src0->ne[1];  // Number of attention heads
+    const int64_t ne02 = src0->ne[2];  // Sequence length or other dimension
+    const int64_t nr   = ggml_nrows(src0);
+
+    // Strides in elements
+    const size_t s01 = src0->nb[1] / ggml_type_size(src0->type);
+    const size_t s02 = src0->nb[2] / ggml_type_size(src0->type);
+
+    // Position data
+    const int32_t * pos = (const int32_t *) src1->data;
+
+    // Calculate theta_scale for frequency calculation
+    // theta_scale = base^(-2/n_dims_total) where n_dims_total = n_dims * 2
+    const float theta_scale = powf(freq_base, -2.0f / (n_dims * 2));
+
+    // Forward pass flag
+    const bool forward = true;
+
+    // Launch kernel
+    cudaStream_t stream = ctx.stream();
+    ifairy_rope_cuda<true>(
+        (const nv_bfloat16 *) src0->data,
+        (nv_bfloat16 *) dst->data,
+        ne00, ne01, s01, s02,
+        n_dims, nr, pos,
+        freq_scale, theta_scale, stream
+    );
+
+    GGML_UNUSED(ext_factor);
+    GGML_UNUSED(attn_factor);
+    GGML_UNUSED(beta_fast);
+    GGML_UNUSED(beta_slow);
+    GGML_UNUSED(mode);
+    GGML_UNUSED(n_ctx_orig);
 }
 
 void ggml_cuda_op_ifairy_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
