@@ -151,147 +151,94 @@ void ggml_cuda_op_ifairy_rmsnorm(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // TODO: Implement using rope/norm patterns
 }
 
-// rope_yarn_ifairy: Simplified RoPE calculation for IFAIRY
-// Only applies basic frequency scaling without YaRN complex logic
-template<bool forward>
-static __device__ void rope_yarn_ifairy(
-        const float theta_extrap, const float freq_scale,
-        float & cos_theta, float & sin_theta) {
-    // Standard RoPE: theta = inv_freq * position_id
-    const float theta = theta_extrap * freq_scale;
-    cos_theta = cosf(theta);
-    sin_theta = sinf(theta);
-    if (!forward) {
-        sin_theta *= -1.0f;  // Backward pass uses inverse rotation
-    }
-}
-
-// ifairy_rope_kernel: Applies RoPE to complex numbers in BF16 interleaved format
-// src and dst are in BF16 format with interleaved complex numbers: [real0, imag0, real1, imag1, ...]
-// Each thread processes a pair of real and imaginary components using vectorized loads/stores
-// gridDim.x: number of rows (ne1*ne2*ne3)
-// gridDim.y: blocks for column dimension (covers ne0/2 complex pairs)
+// iFairy RoPE: applies rotation to complex numbers
+// src0: packed BF16 (uint32_t: lower=real, upper=imag)
+// dst: split FP32 [real: 0..n_dims-1, imag: n_dims..2*n_dims-1]
 template<bool forward>
 static __global__ void ifairy_rope_kernel(
-        const nv_bfloat16 * __restrict__ x, nv_bfloat16 * __restrict__ dst,
-        const int ne0, const int ne1, const int s1, const int s2,
+        const uint32_t * __restrict__ x, float * __restrict__ dst,
+        const int ne0, const int ne1, const int ne2, const int s1, const int s2,
         const int n_dims, const int32_t * __restrict__ pos,
-        const float freq_scale, const float * __restrict__ freq_factors) {
-    // i0 is the index in complex pairs (0..ne0/2-1)
-    const int i0_complex = blockDim.y * blockIdx.y + threadIdx.y;
-    const int i0 = i0_complex * 2;  // Convert to BF16 index
+        const float freq_scale, const float freq_base) {
 
-    if (i0 >= ne0) {
-        return;
-    }
+    const int i0_complex = blockDim.y * blockIdx.y + threadIdx.y;
+    if (i0_complex >= n_dims) return;
 
     const int row_dst = blockDim.x * blockIdx.x + threadIdx.x;
 
-    const int row_x     = row_dst % ne1;
-    const int channel_x = row_dst / ne1;
+    // row_dst = i1 + i2*ne1 + i3*ne1*ne2
+    const int i1 = row_dst % ne1;
+    const int i2 = (row_dst / ne1) % ne2;
+    const int i3 = row_dst / (ne1 * ne2);
 
-    // Calculate indices for interleaved BF16 format - note that i0 is already multiplied by 2
-    const int idst = row_dst * ne0 + i0;      // Destination index for this complex pair
-    const int ix   = channel_x * s2 + row_x * s1 + i0;  // Source index
+    const int p = pos[i2];
 
-    // Return early if beyond n_dims (no rotation needed, just copy)
-    if (i0_complex >= n_dims) {
-        // Use vectorized load/store for better memory bandwidth
-        nv_bfloat162 val = *reinterpret_cast<const nv_bfloat162*>(&x[ix]);
-        *reinterpret_cast<nv_bfloat162*>(&dst[idst]) = val;
-        return;
+    const int idst_real = row_dst * 2 * n_dims + i0_complex;
+    const int idst_imag = row_dst * 2 * n_dims + n_dims + i0_complex;
+    const int ix = i3 * s2 + i2 * s1 + i1 * ne0 + i0_complex;
+
+    const float inv_freq = powf(freq_base, -(float)i0_complex / n_dims);
+    const float theta = p * inv_freq * freq_scale;
+
+    float cos_theta = cosf(theta);
+    float sin_theta = sinf(theta);
+    if (!forward) {
+        sin_theta = -sin_theta;
     }
 
-    // Get position ID
-    const int64_t p = pos[channel_x];
+    const uint32_t packed = x[ix];
+    const float real_val = __bfloat162float(reinterpret_cast<const nv_bfloat16*>(&packed)[0]);
+    const float imag_val = __bfloat162float(reinterpret_cast<const nv_bfloat16*>(&packed)[1]);
 
-    // Get precomputed frequency factor
-    const float theta = p * freq_factors[i0_complex];
-
-    // Calculate cos and sin values
-    float cos_theta, sin_theta;
-    rope_yarn_ifairy<forward>(theta, freq_scale, cos_theta, sin_theta);
-
-    // Read BF16 values using vectorized load
-    nv_bfloat162 val2 = *reinterpret_cast<const nv_bfloat162*>(&x[ix]);
-    float2 val = __bfloat1622float2(val2);
-
-    // Apply rotation: (real + i*imag) * (cos + i*sin)
-    const float y0 = val.x * cos_theta - val.y * sin_theta;  // New real part
-    const float y1 = val.x * sin_theta + val.y * cos_theta;  // New imaginary part
-
-    // Write result using vectorized store
-    *reinterpret_cast<nv_bfloat162*>(&dst[idst]) = __float22bfloat162_rn(make_float2(y0, y1));
+    dst[idst_real] = real_val * cos_theta - imag_val * sin_theta;
+    dst[idst_imag] = real_val * sin_theta + imag_val * cos_theta;
 }
 
+
 void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];  // Input BF16 complex tensor
-    const ggml_tensor * src1 = dst->src[1];  // Position tensor (I32)
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
-    // Extract operation parameters
-    const int n_dims     = ((int32_t *) dst->op_params)[1] / 2;  // Actual dimension count
+    // op_params layout matches CPU (ops.cpp)
+    const int n_dims     = ((int32_t *) dst->op_params)[1] / 2;
     const int mode       = ((int32_t *) dst->op_params)[2];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
 
-    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
-    memcpy(&freq_base,   (int32_t *) dst->op_params + 5,  sizeof(float));
+    float freq_base = 10000.0f;  // Fixed per CPU implementation
+    float freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
     memcpy(&freq_scale,  (int32_t *) dst->op_params + 6,  sizeof(float));
     memcpy(&ext_factor,  (int32_t *) dst->op_params + 7,  sizeof(float));
     memcpy(&attn_factor, (int32_t *) dst->op_params + 8,  sizeof(float));
     memcpy(&beta_fast,   (int32_t *) dst->op_params + 9,  sizeof(float));
     memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
 
-    // Tensor dimensions for BF16 interleaved format
-    const int64_t ne00 = src0->ne[0];  // Dimension with interleaved real/imag (2 * complex_dim)
-    const int64_t ne01 = src0->ne[1];  // Number of attention heads
-    const int64_t ne02 = src0->ne[2];  // Sequence length or other dimension
+    // ne00 = complex_dim, ne01 = heads, ne02 = seq_len
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
     const int64_t nr   = ggml_nrows(src0);
 
-    // Strides in elements
-    const size_t s01 = src0->nb[1] / ggml_type_size(src0->type);
-    const size_t s02 = src0->nb[2] / ggml_type_size(src0->type);
+    const size_t s01 = src0->nb[1] / sizeof(uint32_t);
+    const size_t s02 = src0->nb[2] / sizeof(uint32_t);
 
-    // Position data
     const int32_t * pos = (const int32_t *) src1->data;
 
-    // Precompute frequency factors on host using optimized multiplicative accumulation
-    // freq_factor[i] = powf(theta_scale, i) where theta_scale = base^(-2/n_dims_total)
-    // This allows kernel to compute theta = p * freq_factor[i] with just a multiply
-    const float theta_scale = powf(freq_base, -2.0f / (n_dims * 2));
-    float * freq_factors_host = (float *) alloca(n_dims * sizeof(float));
-    float cur_factor = 1.0f;  // Start with powf(theta_scale, 0) = 1
-    for (int i = 0; i < n_dims; i++) {
-        freq_factors_host[i] = cur_factor;
-        cur_factor *= theta_scale;  // Multiply by theta_scale for next iteration (no powf)
-    }
-
-    // Use ggml_cuda_pool_alloc for efficient device memory management
-    // This automatically handles memory pooling and avoids cudaMalloc/cudaFree overhead
-    ggml_cuda_pool_alloc<float> freq_factors_device(ctx.pool(), n_dims);
-    CUDA_CHECK(cudaMemcpyAsync(freq_factors_device.get(), freq_factors_host, n_dims * sizeof(float),
-                                 cudaMemcpyHostToDevice, ctx.stream()));
-
-    // Forward pass flag
-    const bool forward = true;
-
-    // Launch kernel
     cudaStream_t stream = ctx.stream();
 
-    // Configure kernel launch parameters
     const dim3 block_dims(1, CUDA_IFAIRY_BLOCK_SIZE, 1);
-    const int n_blocks_y = (ne00 + 2 * CUDA_IFAIRY_BLOCK_SIZE - 1) / (2 * CUDA_IFAIRY_BLOCK_SIZE);
+    const int n_blocks_y = (n_dims + CUDA_IFAIRY_BLOCK_SIZE - 1) / CUDA_IFAIRY_BLOCK_SIZE;
     const dim3 block_nums(nr, n_blocks_y, 1);
 
     ifairy_rope_kernel<true><<<block_nums, block_dims, 0, stream>>>(
-        (const nv_bfloat16 *) src0->data,
-        (nv_bfloat16 *) dst->data,
-        ne00, ne01, s01, s02,
+        (const uint32_t *) src0->data,
+        (float *) dst->data,
+        ne00, ne01, ne02, s01, s02,
         n_dims, pos,
-        freq_scale, freq_factors_device.get()
+        freq_scale, freq_base
     );
 
     GGML_UNUSED(ext_factor);
