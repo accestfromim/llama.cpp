@@ -151,12 +151,102 @@ void ggml_cuda_op_ifairy_rmsnorm(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // TODO: Implement using rope/norm patterns
 }
 
-void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static bool warned = false;
-    if (!warned) {
-        fprintf(stderr, "%s: not implemented yet\n", __func__);
-        warned = true;
+// iFairy RoPE: applies rotation to complex numbers
+// src0: packed BF16 (uint32_t: lower=real, upper=imag)
+// dst: split FP32 [real: 0..n_dims-1, imag: n_dims..2*n_dims-1]
+template<bool forward>
+static __global__ void ifairy_rope_kernel(
+        const uint32_t * __restrict__ x, float * __restrict__ dst,
+        const int ne0, const int ne1, const int ne2, const int s1, const int s2,
+        const int n_dims, const int32_t * __restrict__ pos,
+        const float freq_scale, const float freq_base) {
+
+    const int i0_complex = blockDim.y * blockIdx.y + threadIdx.y;
+    if (i0_complex >= n_dims) return;
+
+    const int row_dst = blockDim.x * blockIdx.x + threadIdx.x;
+
+    // row_dst = i1 + i2*ne1 + i3*ne1*ne2
+    const int i1 = row_dst % ne1;
+    const int i2 = (row_dst / ne1) % ne2;
+    const int i3 = row_dst / (ne1 * ne2);
+
+    const int p = pos[i2];
+
+    const int idst_real = row_dst * 2 * n_dims + i0_complex;
+    const int idst_imag = row_dst * 2 * n_dims + n_dims + i0_complex;
+    const int ix = i3 * s2 + i2 * s1 + i1 * ne0 + i0_complex;
+
+    const float inv_freq = powf(freq_base, -(float)i0_complex / n_dims);
+    const float theta = p * inv_freq * freq_scale;
+
+    float cos_theta = cosf(theta);
+    float sin_theta = sinf(theta);
+    if (!forward) {
+        sin_theta = -sin_theta;
     }
+
+    const uint32_t packed = x[ix];
+    const float real_val = __bfloat162float(reinterpret_cast<const nv_bfloat16*>(&packed)[0]);
+    const float imag_val = __bfloat162float(reinterpret_cast<const nv_bfloat16*>(&packed)[1]);
+
+    dst[idst_real] = real_val * cos_theta - imag_val * sin_theta;
+    dst[idst_imag] = real_val * sin_theta + imag_val * cos_theta;
+}
+
+
+void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    // op_params layout matches CPU (ops.cpp)
+    const int n_dims     = ((int32_t *) dst->op_params)[1] / 2;
+    const int mode       = ((int32_t *) dst->op_params)[2];
+    const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    float freq_base = 10000.0f;  // Fixed per CPU implementation
+    float freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_scale,  (int32_t *) dst->op_params + 6,  sizeof(float));
+    memcpy(&ext_factor,  (int32_t *) dst->op_params + 7,  sizeof(float));
+    memcpy(&attn_factor, (int32_t *) dst->op_params + 8,  sizeof(float));
+    memcpy(&beta_fast,   (int32_t *) dst->op_params + 9,  sizeof(float));
+    memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
+
+    // ne00 = complex_dim, ne01 = heads, ne02 = seq_len
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t nr   = ggml_nrows(src0);
+
+    const size_t s01 = src0->nb[1] / sizeof(uint32_t);
+    const size_t s02 = src0->nb[2] / sizeof(uint32_t);
+
+    const int32_t * pos = (const int32_t *) src1->data;
+
+    cudaStream_t stream = ctx.stream();
+
+    const dim3 block_dims(1, CUDA_IFAIRY_BLOCK_SIZE, 1);
+    const int n_blocks_y = (n_dims + CUDA_IFAIRY_BLOCK_SIZE - 1) / CUDA_IFAIRY_BLOCK_SIZE;
+    const dim3 block_nums(nr, n_blocks_y, 1);
+
+    ifairy_rope_kernel<true><<<block_nums, block_dims, 0, stream>>>(
+        (const uint32_t *) src0->data,
+        (float *) dst->data,
+        ne00, ne01, ne02, s01, s02,
+        n_dims, pos,
+        freq_scale, freq_base
+    );
+
+    GGML_UNUSED(ext_factor);
+    GGML_UNUSED(attn_factor);
+    GGML_UNUSED(beta_fast);
+    GGML_UNUSED(beta_slow);
+    GGML_UNUSED(mode);
+    GGML_UNUSED(n_ctx_orig);
 }
 
 void ggml_cuda_op_ifairy_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
