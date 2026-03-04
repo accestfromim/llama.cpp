@@ -143,149 +143,29 @@ void ggml_cuda_op_ifairy_merge(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     );
 }
 
-static __global__ void k_ifairy_rmsnorm_f32_packed(
-    const char * src0,      // packed complex input
-    const float * w_real,   // [hidden_size]
-    const float * w_imag,   // [hidden_size]
-    char * dst,             // packed complex output
-
-    const int64_t ne00,     // hidden_size
-    const int64_t ne01,
-    const int64_t ne02,
-    const int64_t ne03,
-
-    const size_t  nb01,
-    const size_t  nb02,
-    const size_t  nb03,
-
-    const size_t  db01,
-    const size_t  db02,
-    const size_t  db03,
-
-    const float eps
-) {
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    const int64_t rows_per_plane = ne01 * ne02;
-    const int64_t i03 = row / rows_per_plane;
-    const int64_t rem = row % rows_per_plane;
-    const int64_t i02 = rem / ne01;
-    const int64_t i01 = rem % ne01;
-
-    const uint32_t * x_row = (const uint32_t *)(
-        src0 + i01 * nb01 + i02 * nb02 + i03 * nb03
-    );
-
-    uint32_t * y_row = (uint32_t *)(
-        dst + i01 * db01 + i02 * db02 + i03 * db03
-    );
-
-    extern __shared__ float sdata[];
-    float local_sum = 0.0f;
-
-    // pass 1: sum(real^2 + imag^2)
-    for (int64_t i = tid; i < ne00; i += blockDim.x) {
-        const ifairy_t xi = x_row[i];
-        const float r  = ifairy_real(xi);
-        const float im = ifairy_imag(xi);
-        local_sum += r*r + im*im;
-    }
-
-    sdata[tid] = local_sum;
-    __syncthreads();
-
-    // block reduction
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            sdata[tid] += sdata[tid + stride];
-        }
-        __syncthreads();
-    }
-
-    const float inv_rms = rsqrtf(sdata[0] / (float)ne00 + eps);
-    __syncthreads();
-
-    // pass 2: normalize + scale + repack
-    for (int64_t i = tid; i < ne00; i += blockDim.x) {
-        const ifairy_t xi = x_row[i];
-        float r  = ifairy_real(xi);
-        float im = ifairy_imag(xi);
-
-        r  = r  * inv_rms * w_real[i];
-        im = im * inv_rms * w_imag[i];
-
-        y_row[i] = make_ifairy(r, im);
-    }
-}
 
 void ggml_cuda_op_ifairy_rmsnorm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1]; // weight_real
-    const ggml_tensor * src2 = dst->src[2]; // weight_imag
+    const float * src0_d = (const float *) src0->data;
+    float * dst_d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0 != nullptr);
-    GGML_ASSERT(src1 != nullptr);
-    GGML_ASSERT(src2 != nullptr);
-
-    // 关键：按 CPU 既有 iFairy 语义，这里应该是 packed-BF16-in-F32
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst ->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(src2->type == GGML_TYPE_F32);
+    GGML_TENSOR_UNARY_OP_LOCALS;
 
-    // 每个 packed 元素占 4 字节
-    GGML_ASSERT(src0->nb[0] == sizeof(float));
-    GGML_ASSERT(dst ->nb[0] == sizeof(float));
-
-    const int64_t ne00 = src0->ne[0];
-    const int64_t ne01 = src0->ne[1];
-    const int64_t ne02 = src0->ne[2];
-    const int64_t ne03 = src0->ne[3];
-
-    GGML_ASSERT(src1->ne[0] == ne00);
-    GGML_ASSERT(src2->ne[0] == ne00);
-
-    // eps 从 op_params 里读
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
 
-    const int64_t nrows = ne01 * ne02 * ne03;
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
 
-    const int block_size = 256;
-    const dim3 block(block_size);
-    const dim3 grid(nrows);
-    const size_t smem = block_size * sizeof(float);
-
-    const char  * src0_d   = (const char  *) src0->data;
-    const float * w_real_d = (const float *) src1->data;
-    const float * w_imag_d = (const float *) src2->data;
-    char        * dst_d    = (char        *) dst->data;
-
-    k_ifairy_rmsnorm_f32_packed<<<grid, block, smem, ctx.stream()>>>(
-        src0_d,
-        w_real_d,
-        w_imag_d,
-        dst_d,
-
-        ne00,
-        ne01,
-        ne02,
-        ne03,
-
-        src0->nb[1],
-        src0->nb[2],
-        src0->nb[3],
-
-        dst->nb[1],
-        dst->nb[2],
-        dst->nb[3],
-
-        eps
-    );
-
-    CUDA_CHECK(cudaGetLastError());
+    rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
 void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -646,24 +526,13 @@ struct bin_bcast_cuda {
     }
 };
 
-template<class op>
-static void ggml_cuda_op_ifairy_bin_bcast(
-    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-    const void * src0_dd, const void * src1_dd, void * dst_dd, cudaStream_t stream) {
-
-    op()(src0, src1, dst,
-         (const ifairy_t *)src0_dd,
-         (const ifairy_t *)src1_dd,
-         (ifairy_t *)dst_dd,
-         stream);
-}
 
 void ggml_cuda_op_ifairy_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_ifairy_bin_bcast<bin_bcast_cuda<op_ifairy_add_packed>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_ifairy_add_packed>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
 void ggml_cuda_op_ifairy_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_cuda_op_ifairy_bin_bcast<bin_bcast_cuda<op_ifairy_mul_packed>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+    ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_ifairy_mul_packed>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 
 }
 
