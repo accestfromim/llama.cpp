@@ -1,5 +1,8 @@
 #include "ifairy.cuh"
 #include "convert.cuh"
+#include "unary.cuh"
+#include "binbcast.cuh"
+#include "norm.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -448,185 +451,6 @@ static __global__ void k_bin_bcast_unravel_ifairy(const src0_t *         src0,
     dst_row[i0] = bin_op(a, b);
 }
 
-template <ifairy_t (*bin_op)(const ifairy_t, const ifairy_t), typename src0_t, typename src1_t, typename dst_t, size_t... I>
-static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                                  const src0_t * src0_dd, const src1_t * src1_dd, dst_t * dst_dd,
-                                  cudaStream_t stream, std::index_sequence<I...>) {
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    int nr0 = ne10 / ne0;
-    int nr1 = ne11 / ne1;
-    int nr2 = ne12 / ne2;
-    int nr3 = ne13 / ne3;
-
-    int nr[4] = { nr0, nr1, nr2, nr3 };
-
-    int64_t cne[]  = { ne0, ne1, ne2, ne3 };
-    int64_t cne0[] = { ne00, ne01, ne02, ne03 };
-    int64_t cne1[] = { ne10, ne11, ne12, ne13 };
-
-    size_t cnb[]  = { nb0, nb1, nb2, nb3 };
-    size_t cnb0[] = { nb00, nb01, nb02, nb03 };
-    size_t cnb1[] = { nb10, nb11, nb12, nb13 };
-
-    auto collapse = [](int64_t cne[]) {
-        cne[0] *= cne[1];
-        cne[1] = cne[2];
-        cne[2] = cne[3];
-        cne[3] = 1;
-    };
-
-    auto collapse_nb = [](size_t cnb[], const int64_t cne[]) {
-        cnb[1] *= cne[1];
-        cnb[2] *= cne[2];
-        cnb[3] *= cne[3];
-    };
-
-    if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
-        for (int i = 0; i < 4; i++) {
-            if (nr[i] != 1) {
-                break;
-            }
-            if (i > 0) {
-                collapse_nb(cnb, cne);
-                collapse_nb(cnb0, cne0);
-                collapse_nb(cnb1, cne1);
-                collapse(cne);
-                collapse(cne0);
-                collapse(cne1);
-            }
-        }
-    }
-
-    {
-        int64_t ne0 = cne[0];
-        int64_t ne1 = cne[1];
-        int64_t ne2 = cne[2];
-        int64_t ne3 = cne[3];
-
-        //int64_t ne00 = cne0[0]; GGML_UNUSED(ne00);
-        //int64_t ne01 = cne0[1]; GGML_UNUSED(ne01);
-        //int64_t ne02 = cne0[2]; GGML_UNUSED(ne02);
-        //int64_t ne03 = cne0[3]; GGML_UNUSED(ne03);
-
-        size_t nb0 = cnb[0];
-        size_t nb1 = cnb[1];
-        size_t nb2 = cnb[2];
-        size_t nb3 = cnb[3];
-
-        size_t nb00 = cnb0[0];
-        size_t nb01 = cnb0[1];
-        size_t nb02 = cnb0[2];
-        size_t nb03 = cnb0[3];
-
-        size_t nb10 = cnb1[0];
-        size_t nb11 = cnb1[1];
-        size_t nb12 = cnb1[2];
-        size_t nb13 = cnb1[3];
-
-        size_t s0 = nb0 / sizeof(dst_t);
-        size_t s1 = nb1 / sizeof(dst_t);
-        size_t s2 = nb2 / sizeof(dst_t);
-        size_t s3 = nb3 / sizeof(dst_t);
-
-        size_t s10 = nb10 / sizeof(src1_t);
-        size_t s11 = nb11 / sizeof(src1_t);
-        size_t s12 = nb12 / sizeof(src1_t);
-        size_t s13 = nb13 / sizeof(src1_t);
-
-        size_t s00 = nb00 / sizeof(src0_t);
-        size_t s01 = nb01 / sizeof(src0_t);
-        size_t s02 = nb02 / sizeof(src0_t);
-        size_t s03 = nb03 / sizeof(src0_t);
-
-        GGML_ASSERT(nb0 % sizeof(dst_t) == 0);
-        GGML_ASSERT(nb1 % sizeof(dst_t) == 0);
-        GGML_ASSERT(nb2 % sizeof(dst_t) == 0);
-        GGML_ASSERT(nb3 % sizeof(dst_t) == 0);
-
-        GGML_ASSERT(nb00 % sizeof(src0_t) == 0);
-        GGML_ASSERT(nb01 % sizeof(src0_t) == 0);
-        GGML_ASSERT(nb02 % sizeof(src0_t) == 0);
-        GGML_ASSERT(nb03 % sizeof(src0_t) == 0);
-
-        GGML_ASSERT(nb10 % sizeof(src1_t) == 0);
-        GGML_ASSERT(nb11 % sizeof(src1_t) == 0);
-        GGML_ASSERT(nb12 % sizeof(src1_t) == 0);
-        GGML_ASSERT(nb13 % sizeof(src1_t) == 0);
-
-        GGML_ASSERT(s0 == 1);
-        GGML_ASSERT(s00 == 1);
-        GGML_ASSERT(s10 == 1);
-
-        const int block_size = 128;
-
-        int64_t hne0 = std::max(ne0 / 2LL, 1LL);
-
-        dim3 block_dims;
-        block_dims.x = std::min<unsigned int>(hne0, block_size);
-        block_dims.y = std::min<unsigned int>(ne1, block_size / block_dims.x);
-        block_dims.z = std::min(std::min<unsigned int>(ne2 * ne3, block_size / block_dims.x / block_dims.y), 64U);
-
-        dim3 block_nums((hne0 + block_dims.x - 1) / block_dims.x, (ne1 + block_dims.y - 1) / block_dims.y,
-                        (ne2 * ne3 + block_dims.z - 1) / block_dims.z);
-
-        const uint3 ne10 = init_fastdiv_values((uint32_t) cne1[0]);
-        const uint3 ne11 = init_fastdiv_values((uint32_t) cne1[1]);
-        const uint3 ne12 = init_fastdiv_values((uint32_t) cne1[2]);
-        const uint3 ne13 = init_fastdiv_values((uint32_t) cne1[3]);
-
-        if (block_nums.z > 65535) {
-            int         block_num  = (ne0 * ne1 * ne2 * ne3 + block_size - 1) / block_size;
-            const uint3 prod_012    = init_fastdiv_values((uint32_t) (ne0 * ne1 * ne2));
-            const uint3 prod_01     = init_fastdiv_values((uint32_t) (ne0 * ne1));
-            const uint3 ne0_fastdiv = init_fastdiv_values((uint32_t) ne0);
-            const uint3 ne1_fastdiv = init_fastdiv_values((uint32_t) ne1);
-            const uint3 ne2_fastdiv = init_fastdiv_values((uint32_t) ne2);
-
-            if constexpr (sizeof...(I) > 0) {
-                k_bin_bcast_unravel_ifairy<bin_op, src0_t, src1_t, dst_t><<<block_num, block_size, 0, stream>>>(
-                    src0_dd, src1_dd, dst_dd, ne0_fastdiv, ne1_fastdiv, ne2_fastdiv, ne3, prod_012, prod_01, ne10, ne11,
-                    ne12, ne13,
-                    /* s0, */ s1, s2, s3,
-                    /* s00,*/ s01, s02, s03,
-                    /* s10,*/ s11, s12, s13, (const src1_t *) dst->src[I + 1]->data...);
-            } else {
-                k_bin_bcast_unravel_ifairy<bin_op, src0_t, src1_t, dst_t>
-                    <<<block_num, block_size, 0, stream>>>(src0_dd, src1_dd, dst_dd, ne0_fastdiv, ne1_fastdiv,
-                                                           ne2_fastdiv, ne3, prod_012, prod_01, ne10, ne11, ne12, ne13,
-                                                           /* s0, */ s1, s2, s3,
-                                                           /* s00,*/ s01, s02, s03,
-                                                           /* s10,*/ s11, s12, s13);
-            }
-        } else {
-            const uint3 ne3_fastdiv = init_fastdiv_values((uint32_t) ne3);
-            if constexpr (sizeof...(I) > 0) {
-                k_bin_bcast_ifairy<bin_op, src0_t, src1_t, dst_t><<<block_nums, block_dims, 0, stream>>>(
-                    src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3_fastdiv, ne10, ne11, ne12, ne13,
-                    /* s0, */ s1, s2, s3,
-                    /* s00,*/ s01, s02, s03,
-                    /* s10,*/ s11, s12, s13, (const src1_t *) dst->src[I + 1]->data...);
-            } else {
-                k_bin_bcast_ifairy<bin_op, src0_t, src1_t, dst_t><<<block_nums, block_dims, 0, stream>>>(
-                    src0_dd, src1_dd, dst_dd, ne0, ne1, ne2, ne3_fastdiv, ne10, ne11, ne12, ne13,
-                    /* s0, */ s1, s2, s3,
-                    /* s00,*/ s01, s02, s03,
-                    /* s10,*/ s11, s12, s13);
-            }
-        }
-    }
-}
-
-template <ifairy_t (*bin_op)(const ifairy_t, const ifairy_t), int n_fuse = 1>
-struct bin_bcast_cuda {
-    template<typename src0_t, typename src1_t, typename dst_t>
-    void operator()(const struct ggml_tensor * src0, const struct ggml_tensor * src1, struct ggml_tensor * dst,
-            const src0_t * src0_dd, const src1_t * src1_dd, dst_t * dst_dd,
-            cudaStream_t stream) {
-        launch_bin_bcast_pack<bin_op, src0_t, src1_t, dst_t>(
-            src0, src1, dst, src0_dd, src1_dd, dst_dd, stream, std::make_index_sequence<n_fuse>{});
-    }
-};
 
 
 void ggml_cuda_op_ifairy_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -638,26 +462,6 @@ void ggml_cuda_op_ifairy_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
 }
 
-
-template <float (*op)(float)>
-void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const void * src0_d = src0->data;
-    void * dst_d = dst->data;
-    cudaStream_t stream = ctx.stream();
-
-    GGML_ASSERT(ggml_is_contiguous(src0));
-
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
-    GGML_ASSERT(src0->type == dst->type);
-
-    if (src0->type == GGML_TYPE_F16) {
-        unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
-    } else {
-        unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
-    }
-}
 
 
 static __device__ __forceinline__ float op_ifairy_relu2(float x) {
