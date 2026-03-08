@@ -1,4 +1,54 @@
 #include "unary.cuh"
+#include "ifairy.cuh"
+#include <cstdint>
+#include <utility>
+#include "convert.cuh"
+#include <cuda_bf16.h>
+
+union bf16_bits_u {
+    uint16_t       u16;
+    __nv_bfloat16  bf16;
+};
+
+static __device__ __forceinline__ __nv_bfloat16 bits_to_bf16(uint16_t x) {
+    bf16_bits_u v;
+    v.u16 = x;
+    return v.bf16;
+}
+
+static __device__ __forceinline__ uint16_t bf16_to_bits(__nv_bfloat16 x) {
+    bf16_bits_u v;
+    v.bf16 = x;
+    return v.u16;
+}
+
+static __device__ __forceinline__ uint32_t ifairy_to_bits(float x) {
+    return __float_as_uint(x);
+}
+
+static __device__ __forceinline__ float bits_to_ifairy(uint32_t x) {
+    return __uint_as_float(x);
+}
+
+static __device__ __forceinline__ float ifairy_real(float x) {
+    const uint32_t bits  = ifairy_to_bits(x);
+    const uint16_t rbits = (uint16_t)((bits >> 16) & 0xFFFFu);
+    return __bfloat162float(bits_to_bf16(rbits));
+}
+
+static __device__ __forceinline__ float ifairy_imag(float x) {
+    const uint32_t bits  = ifairy_to_bits(x);
+    const uint16_t ibits = (uint16_t)(bits & 0xFFFFu);
+    return __bfloat162float(bits_to_bf16(ibits));
+}
+
+static __device__ __forceinline__ float make_ifairy(float real, float imag) {
+    const uint32_t bits =
+        (uint32_t(bf16_to_bits(__float2bfloat16(real))) << 16) |
+         uint32_t(bf16_to_bits(__float2bfloat16(imag)));
+
+    return bits_to_ifairy(bits);
+}
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -45,6 +95,29 @@ static __device__ __forceinline__ float op_tanh(float x) {
 
 static __device__ __forceinline__ float op_relu(float x) {
     return fmaxf(x, 0);
+}
+
+static __device__ __forceinline__ float op_ifairy_relu2(float x) {
+    const uint32_t bits = ifairy_to_bits(x);
+
+    const uint16_t rbits = (uint16_t)((bits >> 16) & 0xFFFFu);
+    const uint16_t ibits = (uint16_t)(bits & 0xFFFFu);
+
+    const bool neg_r = (rbits & 0x8000u) != 0;
+    const bool neg_i = (ibits & 0x8000u) != 0;
+
+    // real 和 imag 都为负时整体置 0
+    if (neg_r && neg_i) {
+        return 0.0f;
+    }
+
+    float r = ifairy_real(x);
+    float i = ifairy_imag(x);
+
+    r = r * r;
+    i = i * i;
+
+    return make_ifairy(r, i);
 }
 
 static __device__ __forceinline__ float op_sigmoid(float x) {
@@ -162,6 +235,10 @@ void ggml_cuda_op_tanh(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_relu>(ctx, dst);
+}
+
+void ggml_cuda_op_ifairy_relu2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_unary<op_ifairy_relu2>(ctx, dst);
 }
 
 void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
