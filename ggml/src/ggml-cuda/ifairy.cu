@@ -1,5 +1,9 @@
 #include "ifairy.cuh"
 #include "convert.cuh"
+#include "unary.cuh"
+#include "binbcast.cuh"
+#include "norm.cuh"
+#include <cuda_bf16.h>
 #include <cstdint>
 
 #define CUDA_IFAIRY_BLOCK_SIZE 256
@@ -142,13 +146,180 @@ void ggml_cuda_op_ifairy_merge(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     );
 }
 
-void ggml_cuda_op_ifairy_rmsnorm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static bool warned = false;
-    if (!warned) {
-        fprintf(stderr, "%s: not implemented yet\n", __func__);
-        warned = true;
+union bf16_bits_u {
+    uint16_t       u16;
+    __nv_bfloat16  bf16;
+};
+
+static __device__ __forceinline__ __nv_bfloat16 bits_to_bf16(uint16_t x) {
+    bf16_bits_u v;
+    v.u16 = x;
+    return v.bf16;
+}
+
+static __device__ __forceinline__ uint16_t bf16_to_bits(__nv_bfloat16 x) {
+    bf16_bits_u v;
+    v.bf16 = x;
+    return v.u16;
+}
+
+static __device__ __forceinline__ uint32_t ifairy_to_bits(float x) {
+    return __float_as_uint(x);
+}
+
+static __device__ __forceinline__ float bits_to_ifairy(uint32_t x) {
+    return __uint_as_float(x);
+}
+
+static __device__ __forceinline__ float ifairy_real(float x) {
+    const uint32_t bits  = ifairy_to_bits(x);
+    const uint16_t rbits = (uint16_t)((bits >> 16) & 0xFFFFu);
+    return __bfloat162float(bits_to_bf16(rbits));
+}
+
+static __device__ __forceinline__ float ifairy_imag(float x) {
+    const uint32_t bits  = ifairy_to_bits(x);
+    const uint16_t ibits = (uint16_t)(bits & 0xFFFFu);
+    return __bfloat162float(bits_to_bf16(ibits));
+}
+
+static __device__ __forceinline__ float make_ifairy(float real, float imag) {
+    const uint32_t bits =
+        (uint32_t(bf16_to_bits(__float2bfloat16(real))) << 16) |
+         uint32_t(bf16_to_bits(__float2bfloat16(imag)));
+
+    return bits_to_ifairy(bits);
+}
+
+
+static __device__ __forceinline__ float ifairy_pack_to_f32container(float real, float imag) {
+    return make_ifairy(real, imag);
+}
+
+static void rms_norm_f32_cuda_ifairy(
+        const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        rms_norm_f32_ifairy<256, false><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        rms_norm_f32_ifairy<1024, false><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
     }
-    // TODO: Implement using rope/norm patterns
+}
+
+template <int block_size, bool do_multiply = false, bool do_add = false>
+static __global__ void rms_norm_f32_ifairy(const float * x,
+                                    float *       dst,
+                                    const int     ncols,
+                                    const int64_t stride_row,
+                                    const int64_t stride_channel,
+                                    const int64_t stride_sample,
+                                    const float   eps,
+                                    const float * mul                  = nullptr,
+                                    const int64_t mul_stride_row       = 0,
+                                    const int64_t mul_stride_channel   = 0,
+                                    const int64_t mul_stride_sample    = 0,
+                                    const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
+                                    const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
+                                    const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
+                                    const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
+                                    const float * add                  = nullptr,
+                                    const int64_t add_stride_row       = 0,
+                                    const int64_t add_stride_channel   = 0,
+                                    const int64_t add_stride_sample    = 0,
+                                    const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
+                                    const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                    const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_add) {
+        const int add_row     = fastmodulo(row, add_nrows_packed);
+        const int add_channel = fastmodulo(channel, add_nchannels_packed);
+        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        const float r  = ifairy_real(xi);
+        const float im = ifairy_imag(xi);
+        tmp += r * r + im * im;
+    }
+
+    // sum up partial sums
+    tmp = warp_reduce_sum(tmp);
+    if constexpr (block_size > WARP_SIZE) {
+        static_assert((block_size <= 1024) && (block_size % 32 == 0), "unexpected block_size");
+        __shared__ float s_sum[32];
+        const int        warp_id = tid / WARP_SIZE;
+        const int        lane_id = tid % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = tmp;
+        }
+        __syncthreads();
+        tmp = 0.0f;
+        if (lane_id < (block_size / WARP_SIZE)) {
+            tmp = s_sum[lane_id];
+        }
+        tmp = warp_reduce_sum(tmp);
+    }
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        const float rN  = ifairy_real(xi) * scale;
+        const float iN  = ifairy_imag(xi) * scale;
+        dst[col] = ifairy_pack_to_f32container(rN, iN); 
+    }
+}
+
+void ggml_cuda_op_ifairy_rmsnorm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *) src0->data;
+    float * dst_d = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const size_t ts0 = ggml_type_size(src0->type);
+    GGML_ASSERT(nb00 == ts0);
+    const int64_t s01 = nb01 / ts0;
+    const int64_t s02 = nb02 / ts0;
+    const int64_t s03 = nb03 / ts0;
+
+    rms_norm_f32_cuda_ifairy(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
 // iFairy RoPE: applies rotation to complex numbers
@@ -249,26 +420,3 @@ void ggml_cuda_op_ifairy_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_UNUSED(n_ctx_orig);
 }
 
-void ggml_cuda_op_ifairy_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static bool warned = false;
-    if (!warned) {
-        fprintf(stderr, "%s: not implemented yet\n", __func__);
-        warned = true;
-    }
-}
-
-void ggml_cuda_op_ifairy_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static bool warned = false;
-    if (!warned) {
-        fprintf(stderr, "%s: not implemented yet\n", __func__);
-        warned = true;
-    }
-}
-
-void ggml_cuda_op_ifairy_relu2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static bool warned = false;
-    if (!warned) {
-        fprintf(stderr, "%s: not implemented yet\n", __func__);
-        warned = true;
-    }
-}
