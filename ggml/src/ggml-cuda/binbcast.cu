@@ -33,20 +33,20 @@ static __device__ __forceinline__ float bits_to_ifairy(uint32_t x) {
 
 static __device__ __forceinline__ float ifairy_real(float x) {
     const uint32_t bits  = ifairy_to_bits(x);
-    const uint16_t rbits = (uint16_t)((bits >> 16) & 0xFFFFu);
+    const uint16_t rbits = (uint16_t)((bits) & 0xFFFFu);
     return __bfloat162float(bits_to_bf16(rbits));
 }
 
 static __device__ __forceinline__ float ifairy_imag(float x) {
     const uint32_t bits  = ifairy_to_bits(x);
-    const uint16_t ibits = (uint16_t)(bits & 0xFFFFu);
+    const uint16_t ibits = (uint16_t)((bits >> 16) & 0xFFFFu);
     return __bfloat162float(bits_to_bf16(ibits));
 }
 
 static __device__ __forceinline__ float make_ifairy(float real, float imag) {
     const uint32_t bits =
-        (uint32_t(bf16_to_bits(__float2bfloat16(real))) << 16) |
-         uint32_t(bf16_to_bits(__float2bfloat16(imag)));
+        (uint32_t(bf16_to_bits(__float2bfloat16(imag))) << 16) |
+         uint32_t(bf16_to_bits(__float2bfloat16(real)));
 
     return bits_to_ifairy(bits);
 }
@@ -73,7 +73,7 @@ static __device__ __forceinline__ float op_ifairy_mul_packed(const float a, cons
 
     // Hermitian product: conj(a) * b
     const float real = __fmaf_rn(ar, br, ai * bi);       
-    const float imag = __fmaf_rn(ar, bi, -ai * br);
+    const float imag = __fmaf_rn(ai, br, -ar * bi);
 
     return make_ifairy(real, imag);
 }
