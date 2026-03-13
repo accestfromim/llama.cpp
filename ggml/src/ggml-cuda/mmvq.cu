@@ -1,6 +1,7 @@
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "vecdotq.cuh"
+#include "vecdotq_ifairy.cuh"
 
 #include <cuda_bf16.h>
 #include <cstdint>
