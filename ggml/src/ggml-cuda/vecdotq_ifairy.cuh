@@ -18,13 +18,9 @@ static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16_impl_mmvq(
     int sumi_imagreal = 0;
     int sumi_imagimag = 0;
 
-    // LUT for Real weights: 00->-1(FF), 01->1(01), 10->0(00), 11->0(00)
-    // Little-endian: 00, 00, 01, FF -> 0x000001FF
-    const int lut_real = 0x000001FF;
-    
-    // LUT for Imag weights: 00->0(00), 01->0(00), 10->-1(FF), 11->1(01)
-    // Little-endian: 01, FF, 00, 00 -> 0x01FF0000
-    const int lut_imag = 0x01FF0000;
+    // LUT for sign values only: 00->-1(FF), 01->1(01), 10->-1(FF), 11->1(01)
+    // Little-endian: 01, FF, 01, FF -> 0x01FF01FF
+    const int lut_sign = 0x01FF01FF;
 
 #pragma unroll
     for (int i = 0; i < QR2_K; ++i ) {
@@ -53,11 +49,14 @@ static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16_impl_mmvq(
         int weight_real = val & mask_real;
         int weight_imag = val & mask_imag;
 #else
-        // NVIDIA CUDA: Use __byte_perm for register-based LUT lookup (Zero Memory Access)
-        // t contains indices in the lowest 2 bits of each byte.
-        // __byte_perm selects bytes from lut_real/lut_imag based on these indices.
-        int weight_real = __byte_perm(lut_real, 0, t);
-        int weight_imag = __byte_perm(lut_imag, 0, t);
+        // NVIDIA CUDA: use one LUT lookup for the sign, then split real/imag via the high bit.
+        // Each byte in t is a 2-bit code:
+        //   bit0 => sign (0:-1, 1:+1)
+        //   bit1 => axis (0:real, 1:imag)
+        int weight_sign = __byte_perm(lut_sign, 0, t);
+        int mask_imag   = ((t >> 1) & 0x01010101) * 0xFF;
+        int weight_real = weight_sign & ~mask_imag;
+        int weight_imag = weight_sign &  mask_imag;
 #endif
 
         sumi_realreal = ggml_cuda_dp4a(u[i],       weight_real, sumi_realreal);
