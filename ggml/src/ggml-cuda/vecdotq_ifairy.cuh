@@ -18,48 +18,62 @@ static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16_impl_mmvq(
     int sumi_imagreal = 0;
     int sumi_imagimag = 0;
 
-    // LUT for Real weights: 00->-1(FF), 01->1(01), 10->0(00), 11->0(00)
-    // Little-endian: 00, 00, 01, FF -> 0x000001FF
-    const int lut_real = 0x000001FF;
-    
-    // LUT for Imag weights: 00->0(00), 01->0(00), 10->-1(FF), 11->1(01)
-    // Little-endian: 01, FF, 00, 00 -> 0x01FF0000
-    const int lut_imag = 0x01FF0000;
-
 #pragma unroll
-    for (int i = 0; i < QR2_K; ++i ) {
+    for (int i = 0; i < QR2_K; ++i) {
+        // Extract 8 bits containing 4 x 2-bit weights
+        // Layout: [w3, w2, w1, w0] where each w is 2 bits
+        // w0 is at bits [1:0], w1 at [3:2], w2 at [5:4], w3 at [7:6]
         int weight_chunk = (v >> (8 * i)) & 0xFF;
 
-        // Spread 8 bits (4x2 bits) into 4 bytes (4x2 bits at LSB of each byte)
-        // weight_chunk: 00000000 00000000 00000000 dccbbaaa (where a,b,c,d are 2 bits)
-        // Target t:     000000dd 000000cc 000000bb 000000aa
-        
-        unsigned int t = weight_chunk;
-        t = (t | (t << 12)) & 0x000F000F;
-        t = (t | (t << 6)) & 0x03030303;
+        // Decode 4 weights and pack into 32-bit integers for dp4a
+        // Each weight is decoded to an 8-bit value stored in the corresponding byte
+        // Encoding: 00->-1(0xFF), 01->1(0x01), 10->-i(0xFF for imag), 11->i(0x01 for imag)
+        //
+        // Byte layout in 32-bit integer (little-endian):
+        // bits [7:0]   -> weight 0 (corresponds to activation bytes 0-3)
+        // bits [15:8]  -> weight 1
+        // bits [23:16] -> weight 2
+        // bits [31:24] -> weight 3
 
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-        // Fallback for non-NVIDIA GPUs (AMD/Moore Threads)
-        // Calculate value: l=0 -> -1 (0xFF), l=1 -> 1 (0x01)
-        unsigned int l = t & 0x01010101;
-        unsigned int h = (t >> 1) & 0x01010101;
-        
-        unsigned int mask_l = (l ^ 0x01010101) * 0xFF;
-        unsigned int val = mask_l | 0x01010101;
+        int weight_real = 0;
+        int weight_imag = 0;
 
-        unsigned int mask_imag = h * 0xFF;
-        unsigned int mask_real = ~mask_imag;
+        // Weight 0: bits [1:0] of weight_chunk
+        // Shift right 0, mask 0x03 -> position in byte 0 (shift left 0)
+        int w0 = (weight_chunk >> 0) & 0x03;
+        int r0 = (w0 == 0) ? 0xFF : (w0 == 1) ? 0x01 : 0x00;  // 00->-1, 01->1, else 0
+        int i0 = (w0 == 2) ? 0xFF : (w0 == 3) ? 0x01 : 0x00;  // 10->-1, 11->1, else 0
+        weight_real |= (r0 & 0xFF) << 0;
+        weight_imag |= (i0 & 0xFF) << 0;
 
-        int weight_real = val & mask_real;
-        int weight_imag = val & mask_imag;
-#else
-        // NVIDIA CUDA: Use __byte_perm for register-based LUT lookup (Zero Memory Access)
-        // t contains indices in the lowest 2 bits of each byte.
-        // __byte_perm selects bytes from lut_real/lut_imag based on these indices.
-        int weight_real = __byte_perm(lut_real, 0, t);
-        int weight_imag = __byte_perm(lut_imag, 0, t);
-#endif
+        // Weight 1: bits [3:2] of weight_chunk
+        // Shift right 2, mask 0x03 -> position in byte 1 (shift left 8)
+        int w1 = (weight_chunk >> 2) & 0x03;
+        int r1 = (w1 == 0) ? 0xFF : (w1 == 1) ? 0x01 : 0x00;
+        int i1 = (w1 == 2) ? 0xFF : (w1 == 3) ? 0x01 : 0x00;
+        weight_real |= (r1 & 0xFF) << 8;
+        weight_imag |= (i1 & 0xFF) << 8;
 
+        // Weight 2: bits [5:4] of weight_chunk
+        // Shift right 4, mask 0x03 -> position in byte 2 (shift left 16)
+        int w2 = (weight_chunk >> 4) & 0x03;
+        int r2 = (w2 == 0) ? 0xFF : (w2 == 1) ? 0x01 : 0x00;
+        int i2 = (w2 == 2) ? 0xFF : (w2 == 3) ? 0x01 : 0x00;
+        weight_real |= (r2 & 0xFF) << 16;
+        weight_imag |= (i2 & 0xFF) << 16;
+
+        // Weight 3: bits [7:6] of weight_chunk
+        // Shift right 6, mask 0x03 -> position in byte 3 (shift left 24)
+        int w3 = (weight_chunk >> 6) & 0x03;
+        int r3 = (w3 == 0) ? 0xFF : (w3 == 1) ? 0x01 : 0x00;
+        int i3 = (w3 == 2) ? 0xFF : (w3 == 3) ? 0x01 : 0x00;
+        weight_real |= (r3 & 0xFF) << 24;
+        weight_imag |= (i3 & 0xFF) << 24;
+
+        // dp4a computes: sum += dot_product(weight_bytes, activation_bytes)
+        // Each call processes 4 int8 values in parallel
+        // u[i]       = 4 real activations (int8 packed in int32)
+        // u[i+QR2_K] = 4 imag activations (int8 packed in int32)
         sumi_realreal = ggml_cuda_dp4a(u[i],       weight_real, sumi_realreal);
         sumi_realimag = ggml_cuda_dp4a(u[i+QR2_K], weight_real, sumi_realimag);
         sumi_imagreal = ggml_cuda_dp4a(u[i],       weight_imag, sumi_imagreal);
