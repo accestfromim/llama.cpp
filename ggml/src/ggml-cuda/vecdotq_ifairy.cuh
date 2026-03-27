@@ -18,57 +18,61 @@ static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16_impl_mmvq(
     int sumi_imagreal = 0;
     int sumi_imagimag = 0;
 
+    // LUT for __byte_perm:
+    // byte 0..3:
+    // real LUT: 00->FF(-1), 01->01(1), 10->00(0), 11->00(0)
+    // imag LUT: 00->00(0), 01->00(0), 10->FF(-1), 11->01(1)
+    const unsigned int lut_real = 0x000001FFu;
+    const unsigned int lut_imag = 0x01FF0000u;
+
 #pragma unroll
     for (int i = 0; i < QR2_K; ++i) {
-        // Extract 8 bits containing 4 x 2-bit weights
-        // Layout: [w3, w2, w1, w0] where each w is 2 bits
-        // w0 is at bits [1:0], w1 at [3:2], w2 at [5:4], w3 at [7:6]
-        int weight_chunk = (v >> (8 * i)) & 0xFF;
+        const unsigned int weight_chunk = (static_cast<unsigned int>(v) >> (8 * i)) & 0xFFu;
 
-        // Decode 4 weights and pack into 32-bit integers for dp4a
-        // Each weight is decoded to an 8-bit value stored in the corresponding byte
-        // Encoding: 00->-1(0xFF), 01->1(0x01), 10->-i(0xFF for imag), 11->i(0x01 for imag)
-        //
-        // Byte layout in 32-bit integer (little-endian):
-        // bits [7:0]   -> weight 0 (corresponds to activation bytes 0-3)
-        // bits [15:8]  -> weight 1
-        // bits [23:16] -> weight 2
-        // bits [31:24] -> weight 3
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        // Fallback for non-NVIDIA GPUs (AMD/Moore Threads)
+        // Spread 2-bit values into bytes and decode using bit arithmetic
+        // Step 1: Spread bits [7:0] into 4 bytes at positions [1:0] of each byte
+        // t will have: byte0=bits[1:0], byte1=bits[3:2], byte2=bits[5:4], byte3=bits[7:6]
+        unsigned int t = weight_chunk;
+        t = (t | (t << 12)) & 0x000F000F;
+        t = (t | (t << 6)) & 0x03030303;
 
-        int weight_real = 0;
-        int weight_imag = 0;
+        // Extract low bit (l) and high bit (h) of each 2-bit value
+        // l=0,h=0 (val=0): should decode to real=-1, imag=0
+        // l=1,h=0 (val=1): should decode to real=1, imag=0
+        // l=0,h=1 (val=2): should decode to real=0, imag=-1
+        // l=1,h=1 (val=3): should decode to real=0, imag=1
+        unsigned int l = t & 0x01010101;          // low bit of each 2-bit value
+        unsigned int h = (t >> 1) & 0x01010101;   // high bit of each 2-bit value
 
-        // Weight 0: bits [1:0] of weight_chunk
-        // Shift right 0, mask 0x03 -> position in byte 0 (shift left 0)
-        int w0 = (weight_chunk >> 0) & 0x03;
-        int r0 = (w0 == 0) ? 0xFF : (w0 == 1) ? 0x01 : 0x00;  // 00->-1, 01->1, else 0
-        int i0 = (w0 == 2) ? 0xFF : (w0 == 3) ? 0x01 : 0x00;  // 10->-1, 11->1, else 0
-        weight_real |= (r0 & 0xFF) << 0;
-        weight_imag |= (i0 & 0xFF) << 0;
+        // For real part: val=0->-1(0xFF), val=1->1(0x01), val=2,3->0
+        // When l=0: we want -1 (0xFF), when l=1: we want 1 (0x01), when h=1: we want 0
+        // mask_l: l=0 -> 0xFF, l=1 -> 0x00
+        unsigned int mask_l = (l ^ 0x01010101) * 0xFF;
+        // val: when l=0 -> 0xFF, when l=1 -> 0x01
+        unsigned int val = mask_l | 0x01010101;
+        // mask_imag: h=1 -> 0xFF, h=0 -> 0x00 (determines if value goes to imag)
+        unsigned int mask_imag = h * 0xFF;
+        // mask_real: h=0 -> 0xFF, h=1 -> 0x00 (determines if value goes to real)
+        unsigned int mask_real = ~mask_imag;
 
-        // Weight 1: bits [3:2] of weight_chunk
-        // Shift right 2, mask 0x03 -> position in byte 1 (shift left 8)
-        int w1 = (weight_chunk >> 2) & 0x03;
-        int r1 = (w1 == 0) ? 0xFF : (w1 == 1) ? 0x01 : 0x00;
-        int i1 = (w1 == 2) ? 0xFF : (w1 == 3) ? 0x01 : 0x00;
-        weight_real |= (r1 & 0xFF) << 8;
-        weight_imag |= (i1 & 0xFF) << 8;
+        int weight_real = static_cast<int>(val & mask_real);
+        int weight_imag = static_cast<int>(val & mask_imag);
+#else
+        // NVIDIA CUDA: Use __byte_perm for register-based LUT lookup (Zero Memory Access)
+        // Pack w0,w1,w2,w3 into 4 nibbles for __byte_perm selector
+        // nibble0 = w0 (bits [1:0]), nibble1 = w1 (bits [3:2])
+        // nibble2 = w2 (bits [5:4]), nibble3 = w3 (bits [7:6])
+        const unsigned int sel =
+              ((weight_chunk & 0x03u)      )
+            | ((weight_chunk & 0x0Cu) << 2)
+            | ((weight_chunk & 0x30u) << 4)
+            | ((weight_chunk & 0xC0u) << 6);
 
-        // Weight 2: bits [5:4] of weight_chunk
-        // Shift right 4, mask 0x03 -> position in byte 2 (shift left 16)
-        int w2 = (weight_chunk >> 4) & 0x03;
-        int r2 = (w2 == 0) ? 0xFF : (w2 == 1) ? 0x01 : 0x00;
-        int i2 = (w2 == 2) ? 0xFF : (w2 == 3) ? 0x01 : 0x00;
-        weight_real |= (r2 & 0xFF) << 16;
-        weight_imag |= (i2 & 0xFF) << 16;
-
-        // Weight 3: bits [7:6] of weight_chunk
-        // Shift right 6, mask 0x03 -> position in byte 3 (shift left 24)
-        int w3 = (weight_chunk >> 6) & 0x03;
-        int r3 = (w3 == 0) ? 0xFF : (w3 == 1) ? 0x01 : 0x00;
-        int i3 = (w3 == 2) ? 0xFF : (w3 == 3) ? 0x01 : 0x00;
-        weight_real |= (r3 & 0xFF) << 24;
-        weight_imag |= (i3 & 0xFF) << 24;
+        int weight_real = __byte_perm(lut_real, 0, sel);
+        int weight_imag = __byte_perm(lut_imag, 0, sel);
+#endif
 
         // dp4a computes: sum += dot_product(weight_bytes, activation_bytes)
         // Each call processes 4 int8 values in parallel
@@ -80,16 +84,17 @@ static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16_impl_mmvq(
         sumi_imagimag = ggml_cuda_dp4a(u[i+QR2_K], weight_imag, sumi_imagimag);
     }
 
-    float result_real = sumi_realreal*d8[0]+sumi_imagimag*d8[3];
-    float result_imag = sumi_imagreal*d8[2]-sumi_realimag*d8[1];
-    
-    // 将结果打包为32位整型并返回
-    __nv_bfloat16 result_real_bf16 = __float2bfloat16(result_real);
-    __nv_bfloat16 result_imag_bf16 = __float2bfloat16(result_imag);
+    const float result_real = sumi_realreal * d8[0] + sumi_imagimag * d8[3];
+    const float result_imag = sumi_imagreal * d8[2] - sumi_realimag * d8[1];
 
-    int result = (*reinterpret_cast<uint16_t*>(&result_real_bf16)) | 
-                 ((*reinterpret_cast<uint16_t*>(&result_imag_bf16)) << 16);
-    return __int_as_float(result); 
+    const __nv_bfloat16 result_real_bf16 = __float2bfloat16(result_real);
+    const __nv_bfloat16 result_imag_bf16 = __float2bfloat16(result_imag);
+
+    const unsigned int packed =
+          static_cast<unsigned int>(*reinterpret_cast<const uint16_t *>(&result_real_bf16))
+        | (static_cast<unsigned int>(*reinterpret_cast<const uint16_t *>(&result_imag_bf16)) << 16);
+
+    return __int_as_float(static_cast<int>(packed));
 }
 
 static __device__ __forceinline__ float vec_dot_ifairy_ifairy_q16(
