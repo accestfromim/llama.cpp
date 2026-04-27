@@ -1,11 +1,17 @@
 #include <android/log.h>
 #include <jni.h>
+#include <algorithm>
+#include <fstream>
 #include <iomanip>
 #include <math.h>
+#include <sstream>
+#include <stdlib.h>
 #include <string>
 #include <unistd.h>
+#include <vector>
 #include "llama.h"
 #include "common.h"
+#include "ggml-cpu.h"
 
 // Write C++ code here.
 //
@@ -25,15 +31,419 @@
 //      }
 //    }
 
-#define TAG "llama-android.cpp"
-#define LOGi(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-#define LOGe(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define TAG_LLAMA_ANDROID "LLAMA_ANDROID"
+#define TAG_LLAMA_COMPLEX "LLAMA_COMPLEX"
+#define LOGi(...) __android_log_print(ANDROID_LOG_INFO, TAG_LLAMA_ANDROID, __VA_ARGS__)
+#define LOGe(...) __android_log_print(ANDROID_LOG_ERROR, TAG_LLAMA_ANDROID, __VA_ARGS__)
 
 jclass la_int_var;
 jmethodID la_int_var_value;
 jmethodID la_int_var_inc;
 
 std::string cached_token_chars;
+
+struct mobile_profile {
+    uint32_t n_ctx;
+    uint32_t n_batch;
+    uint32_t n_ubatch;
+    bool disable_ifairy_lut;
+    bool enable_ifairy_vecdot_act_tensor;
+    int generation_priority;
+    int batch_priority;
+    int affinity_profile;
+    const char * name;
+};
+
+struct runtime_overrides {
+    int n_ctx = -1;
+    int n_batch = -1;
+    int n_ubatch = -1;
+    int n_threads = -1;
+    int n_threads_batch = -1;
+    int disable_ifairy_lut = -1;
+    int affinity_profile = -1;
+    int enable_ifairy_vecdot_act_tensor = -1;
+    int generation_priority = -99;
+    int batch_priority = -99;
+};
+
+static runtime_overrides g_runtime_overrides;
+
+enum affinity_profile {
+    AFFINITY_PROFILE_NONE = 0,
+    AFFINITY_PROFILE_BIG_CORES = 1,
+    AFFINITY_PROFILE_BIG_GEN_DEFAULT_BATCH = 2,
+    AFFINITY_PROFILE_BIG_GEN_LITTLE_BATCH = 3,
+};
+
+struct cpu_topology {
+    std::vector<int> big_cores;
+    std::vector<int> little_cores;
+    int max_capacity = 0;
+    bool detected = false;
+};
+
+struct android_llama_context {
+    llama_context * context = nullptr;
+    ggml_threadpool_t threadpool = nullptr;
+    ggml_threadpool_t threadpool_batch = nullptr;
+};
+
+static android_llama_context * from_context_handle(jlong handle) {
+    return reinterpret_cast<android_llama_context *>(handle);
+}
+
+static llama_context * unwrap_context(jlong handle) {
+    const auto wrapper = from_context_handle(handle);
+    return wrapper != nullptr ? wrapper->context : nullptr;
+}
+
+static const char * affinity_profile_name(int profile) {
+    switch (profile) {
+        case AFFINITY_PROFILE_NONE:
+            return "none";
+        case AFFINITY_PROFILE_BIG_CORES:
+            return "big-cores";
+        case AFFINITY_PROFILE_BIG_GEN_DEFAULT_BATCH:
+            return "big-gen-default-batch";
+        case AFFINITY_PROFILE_BIG_GEN_LITTLE_BATCH:
+            return "big-gen-little-batch";
+        default:
+            return "default";
+    }
+}
+
+static mobile_profile choose_mobile_profile(const llama_model * model) {
+    const uint64_t n_params = llama_model_n_params(model);
+
+    // Keep the current, more aggressive defaults for small models, but move
+    // larger models onto tighter profiles that fit phone-class memory better.
+    if (n_params >= 6000000000ull) {
+        return {
+                /*.n_ctx    =*/ 2048,
+                /*.n_batch  =*/ 2048,
+                /*.n_ubatch =*/ 512,
+                /*.disable_ifairy_lut =*/ true,
+                /*.enable_ifairy_vecdot_act_tensor =*/ false,
+                /*.generation_priority =*/ GGML_SCHED_PRIO_NORMAL,
+                /*.batch_priority =*/ GGML_SCHED_PRIO_NORMAL,
+                /*.affinity_profile =*/ AFFINITY_PROFILE_BIG_CORES,
+                /*.name     =*/ "very-large-model-lut-disabled",
+        };
+    }
+
+    if (n_params >= 3000000000ull) {
+        return {
+                /*.n_ctx    =*/ 1024,
+                /*.n_batch  =*/ 128,
+                /*.n_ubatch =*/ 64,
+                /*.disable_ifairy_lut =*/ false,
+                /*.enable_ifairy_vecdot_act_tensor =*/ false,
+                /*.generation_priority =*/ GGML_SCHED_PRIO_NORMAL,
+                /*.batch_priority =*/ GGML_SCHED_PRIO_NORMAL,
+                /*.affinity_profile =*/ AFFINITY_PROFILE_NONE,
+                /*.name     =*/ "large-model-conservative",
+        };
+    }
+
+    return {
+            /*.n_ctx    =*/ 2048,
+            /*.n_batch  =*/ 2048,
+            /*.n_ubatch =*/ 512,
+            /*.disable_ifairy_lut =*/ false,
+            /*.enable_ifairy_vecdot_act_tensor =*/ false,
+            /*.generation_priority =*/ GGML_SCHED_PRIO_NORMAL,
+            /*.batch_priority =*/ GGML_SCHED_PRIO_NORMAL,
+            /*.affinity_profile =*/ AFFINITY_PROFILE_NONE,
+            /*.name     =*/ "small-model-default",
+    };
+}
+
+static void apply_mobile_runtime_toggles(const mobile_profile & profile) {
+    const bool disable_ifairy_lut = g_runtime_overrides.disable_ifairy_lut >= 0
+            ? g_runtime_overrides.disable_ifairy_lut != 0
+            : profile.disable_ifairy_lut;
+
+    if (disable_ifairy_lut) {
+        setenv("GGML_IFAIRY_LUT", "0", 1);
+        LOGi("Runtime toggle: GGML_IFAIRY_LUT=0 for profile `%s`", profile.name);
+    } else {
+        unsetenv("GGML_IFAIRY_LUT");
+        LOGi("Runtime toggle: GGML_IFAIRY_LUT unset for profile `%s`", profile.name);
+    }
+
+    const bool enable_ifairy_vecdot_act_tensor = g_runtime_overrides.enable_ifairy_vecdot_act_tensor >= 0
+            ? g_runtime_overrides.enable_ifairy_vecdot_act_tensor != 0
+            : profile.enable_ifairy_vecdot_act_tensor;
+
+    if (enable_ifairy_vecdot_act_tensor) {
+            setenv("GGML_IFAIRY_VEC_DOT_ACT_TENSOR", "1", 1);
+            LOGi("Runtime toggle: GGML_IFAIRY_VEC_DOT_ACT_TENSOR=1 for profile `%s`", profile.name);
+    } else {
+        if (g_runtime_overrides.enable_ifairy_vecdot_act_tensor >= 0) {
+            setenv("GGML_IFAIRY_VEC_DOT_ACT_TENSOR", "0", 1);
+            LOGi("Runtime toggle: GGML_IFAIRY_VEC_DOT_ACT_TENSOR=0 for profile `%s`", profile.name);
+        } else {
+            unsetenv("GGML_IFAIRY_VEC_DOT_ACT_TENSOR");
+            LOGi("Runtime toggle: GGML_IFAIRY_VEC_DOT_ACT_TENSOR unset for profile `%s`", profile.name);
+        }
+    }
+}
+
+static int resolve_priority_override(int override_value, int profile_value) {
+    return override_value != -99 ? override_value : profile_value;
+}
+
+static std::string trim_copy(const std::string & value) {
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return "";
+    }
+
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+static std::string read_proc_value(const char * path, const char * key) {
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        return "unavailable";
+    }
+
+    std::string line;
+    const std::string prefix = std::string(key) + ":";
+    while (std::getline(input, line)) {
+        if (line.rfind(prefix, 0) == 0) {
+            return trim_copy(line.substr(prefix.size()));
+        }
+    }
+
+    return "n/a";
+}
+
+static int read_int_file(const std::string & path) {
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        return -1;
+    }
+
+    int value = -1;
+    input >> value;
+    return input.fail() ? -1 : value;
+}
+
+static cpu_topology detect_cpu_topology() {
+    cpu_topology topology;
+    const int cpu_count = std::max(1, (int) sysconf(_SC_NPROCESSORS_ONLN));
+
+    struct cpu_metric {
+        int index;
+        int capacity;
+    };
+
+    std::vector<cpu_metric> metrics;
+    metrics.reserve(cpu_count);
+
+    for (int cpu = 0; cpu < cpu_count; ++cpu) {
+        const std::string cpu_base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
+        int capacity = read_int_file(cpu_base + "/cpu_capacity");
+        if (capacity < 0) {
+            capacity = read_int_file(cpu_base + "/cpufreq/cpuinfo_max_freq");
+        }
+        if (capacity < 0) {
+            continue;
+        }
+        metrics.push_back({ cpu, capacity });
+        topology.max_capacity = std::max(topology.max_capacity, capacity);
+    }
+
+    if (metrics.empty() || topology.max_capacity <= 0) {
+        return topology;
+    }
+
+    const int threshold = std::max(1, (topology.max_capacity * 80) / 100);
+    for (const auto & metric : metrics) {
+        if (metric.capacity >= threshold) {
+            topology.big_cores.push_back(metric.index);
+        } else {
+            topology.little_cores.push_back(metric.index);
+        }
+    }
+
+    topology.detected = !topology.big_cores.empty();
+    return topology;
+}
+
+static void clear_cpumask(bool (&mask)[GGML_MAX_N_THREADS]) {
+    std::fill(std::begin(mask), std::end(mask), false);
+}
+
+static void apply_cpumask(bool (&mask)[GGML_MAX_N_THREADS], const std::vector<int> & cores) {
+    clear_cpumask(mask);
+    for (const int core : cores) {
+        if (core >= 0 && core < GGML_MAX_N_THREADS) {
+            mask[core] = true;
+        }
+    }
+}
+
+static std::string join_cpu_list(const std::vector<int> & cores) {
+    if (cores.empty()) {
+        return "none";
+    }
+
+    std::ostringstream builder;
+    for (size_t i = 0; i < cores.size(); ++i) {
+        if (i > 0) {
+            builder << ",";
+        }
+        builder << cores[i];
+    }
+    return builder.str();
+}
+
+static void configure_threadpool_params(
+        ggml_threadpool_params & tpp,
+        int n_threads,
+        const std::vector<int> & cores,
+        bool strict_cpu,
+        int priority) {
+    ggml_threadpool_params_init(&tpp, n_threads);
+    if (priority >= GGML_SCHED_PRIO_LOW && priority <= GGML_SCHED_PRIO_REALTIME) {
+        tpp.prio = (ggml_sched_priority) priority;
+    }
+    if (!cores.empty()) {
+        apply_cpumask(tpp.cpumask, cores);
+        tpp.strict_cpu = strict_cpu;
+    }
+}
+
+static bool create_affinity_threadpools(
+        llama_context * context,
+        int n_threads,
+        int n_threads_batch,
+        int generation_priority,
+        int batch_priority,
+        int profile,
+        const cpu_topology & topology,
+        android_llama_context & wrapper) {
+    if (profile == AFFINITY_PROFILE_NONE) {
+        LOGi("Affinity profile: none");
+        return true;
+    }
+
+    if (!topology.detected) {
+        LOGi("Affinity profile `%s` requested but CPU topology detection failed; falling back to default scheduling",
+                affinity_profile_name(profile));
+        return true;
+    }
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        LOGe("No CPU backend found for affinity threadpool setup");
+        return false;
+    }
+
+    auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+    auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+    if (!ggml_threadpool_new_fn || !ggml_threadpool_free_fn) {
+        LOGe("CPU backend does not expose threadpool factory functions");
+        return false;
+    }
+
+    std::vector<int> generation_cores;
+    std::vector<int> batch_cores;
+    bool batch_default = false;
+
+    switch (profile) {
+        case AFFINITY_PROFILE_BIG_CORES:
+            generation_cores = topology.big_cores;
+            batch_cores = topology.big_cores;
+            break;
+        case AFFINITY_PROFILE_BIG_GEN_DEFAULT_BATCH:
+            generation_cores = topology.big_cores;
+            batch_default = true;
+            break;
+        case AFFINITY_PROFILE_BIG_GEN_LITTLE_BATCH:
+            generation_cores = topology.big_cores;
+            batch_cores = topology.little_cores;
+            break;
+        default:
+            LOGi("Unknown affinity profile `%d`; falling back to default scheduling", profile);
+            return true;
+    }
+
+    if (generation_cores.empty()) {
+        LOGi("Affinity profile `%s` has no generation cores after topology detection; falling back to default scheduling",
+                affinity_profile_name(profile));
+        return true;
+    }
+
+    ggml_threadpool_params tpp;
+    ggml_threadpool_params tpp_batch;
+    configure_threadpool_params(tpp, n_threads, generation_cores, true, generation_priority);
+    if (batch_default) {
+        ggml_threadpool_params_init(&tpp_batch, n_threads_batch);
+        if (batch_priority >= GGML_SCHED_PRIO_LOW && batch_priority <= GGML_SCHED_PRIO_REALTIME) {
+            tpp_batch.prio = (ggml_sched_priority) batch_priority;
+        }
+    } else {
+        configure_threadpool_params(tpp_batch, n_threads_batch, batch_cores, true, batch_priority);
+    }
+
+    LOGi("Affinity profile `%s`: generation cores = [%s], batch cores = [%s], generation prio = %d, batch prio = %d",
+            affinity_profile_name(profile),
+            join_cpu_list(generation_cores).c_str(),
+            batch_default ? "default" : join_cpu_list(batch_cores).c_str(),
+            tpp.prio,
+            tpp_batch.prio);
+
+    ggml_threadpool_t threadpool_batch = nullptr;
+    if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+        threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
+        if (!threadpool_batch) {
+            LOGe("Failed to create batch threadpool for affinity profile `%s`", affinity_profile_name(profile));
+            return false;
+        }
+        tpp.paused = true;
+    }
+
+    ggml_threadpool_t threadpool = ggml_threadpool_new_fn(&tpp);
+    if (!threadpool) {
+        if (threadpool_batch) {
+            ggml_threadpool_free_fn(threadpool_batch);
+        }
+        LOGe("Failed to create generation threadpool for affinity profile `%s`", affinity_profile_name(profile));
+        return false;
+    }
+
+    wrapper.threadpool = threadpool;
+    wrapper.threadpool_batch = threadpool_batch;
+    llama_attach_threadpool(context, threadpool, threadpool_batch);
+    return true;
+}
+
+static void log_native_memory_snapshot(const char * stage) {
+    const std::string vm_rss = read_proc_value("/proc/self/status", "VmRSS");
+    const std::string vm_hwm = read_proc_value("/proc/self/status", "VmHWM");
+    const std::string vm_size = read_proc_value("/proc/self/status", "VmSize");
+    const std::string rss_anon = read_proc_value("/proc/self/status", "RssAnon");
+    const std::string rss_file = read_proc_value("/proc/self/status", "RssFile");
+    const std::string mem_available = read_proc_value("/proc/meminfo", "MemAvailable");
+    const std::string mem_free = read_proc_value("/proc/meminfo", "MemFree");
+
+    LOGi(
+            "MEM-NATIVE[%s] VmRSS=%s VmHWM=%s VmSize=%s RssAnon=%s RssFile=%s MemAvailable=%s MemFree=%s",
+            stage,
+            vm_rss.c_str(),
+            vm_hwm.c_str(),
+            vm_size.c_str(),
+            rss_anon.c_str(),
+            rss_file.c_str(),
+            mem_available.c_str(),
+            mem_free.c_str());
+}
 
 bool is_valid_utf8(const char * string) {
     if (!string) {
@@ -73,10 +483,15 @@ bool is_valid_utf8(const char * string) {
 }
 
 static void log_callback(ggml_log_level level, const char * fmt, void * data) {
-    if (level == GGML_LOG_LEVEL_ERROR)     __android_log_print(ANDROID_LOG_ERROR, TAG, fmt, data);
-    else if (level == GGML_LOG_LEVEL_INFO) __android_log_print(ANDROID_LOG_INFO, TAG, fmt, data);
-    else if (level == GGML_LOG_LEVEL_WARN) __android_log_print(ANDROID_LOG_WARN, TAG, fmt, data);
-    else __android_log_print(ANDROID_LOG_DEFAULT, TAG, fmt, data);
+    (void) data;
+
+    const int android_level =
+            level == GGML_LOG_LEVEL_ERROR ? ANDROID_LOG_ERROR :
+            level == GGML_LOG_LEVEL_WARN  ? ANDROID_LOG_WARN  :
+            level == GGML_LOG_LEVEL_INFO  ? ANDROID_LOG_INFO  :
+                                            ANDROID_LOG_DEBUG;
+
+    __android_log_write(android_level, TAG_LLAMA_COMPLEX, fmt);
 }
 
 extern "C"
@@ -86,6 +501,7 @@ Java_android_llama_cpp_LLamaAndroid_load_1model(JNIEnv *env, jobject, jstring fi
 
     auto path_to_model = env->GetStringUTFChars(filename, 0);
     LOGi("Loading model from %s", path_to_model);
+    log_native_memory_snapshot("jni-before-load-model");
 
     auto model = llama_model_load_from_file(path_to_model, model_params);
     env->ReleaseStringUTFChars(filename, path_to_model);
@@ -95,6 +511,11 @@ Java_android_llama_cpp_LLamaAndroid_load_1model(JNIEnv *env, jobject, jstring fi
         env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "load_model() failed");
         return 0;
     }
+
+    LOGi("Model loaded: size = %.2f MiB, params = %.2f B",
+            llama_model_size(model) / 1024.0 / 1024.0,
+            llama_model_n_params(model) / 1e9);
+    log_native_memory_snapshot("jni-after-load-model");
 
     return reinterpret_cast<jlong>(model);
 }
@@ -116,14 +537,52 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
         return 0;
     }
 
-    int n_threads = std::max(1, std::min(8, (int) sysconf(_SC_NPROCESSORS_ONLN) - 2));
-    LOGi("Using %d threads", n_threads);
+    const uint64_t n_params = llama_model_n_params(model);
+    const int cpu_count = std::max(1, (int) sysconf(_SC_NPROCESSORS_ONLN));
+    const int default_threads_batch = cpu_count >= 8 ? 4 : std::max(1, cpu_count - 2);
+    // On Snapdragon 778G-class phones, 7B models benefit from using all four
+    // big cores for token generation once the iFairy LUT path is disabled.
+    const int default_threads = cpu_count >= 8
+            ? (n_params >= 6000000000ull ? 4 : 3)
+            : std::max(1, cpu_count - 2);
+    const int n_threads_batch = g_runtime_overrides.n_threads_batch > 0
+            ? g_runtime_overrides.n_threads_batch
+            : default_threads_batch;
+    const int n_threads = g_runtime_overrides.n_threads > 0
+            ? g_runtime_overrides.n_threads
+            : default_threads;
+    const mobile_profile profile = choose_mobile_profile(model);
+    const int generation_priority = resolve_priority_override(g_runtime_overrides.generation_priority, profile.generation_priority);
+    const int batch_priority = resolve_priority_override(g_runtime_overrides.batch_priority, profile.batch_priority);
+    const int affinity_profile = g_runtime_overrides.affinity_profile >= 0
+            ? g_runtime_overrides.affinity_profile
+            : profile.affinity_profile;
+    LOGi("Using %d generation threads, %d batch threads, affinity profile `%s`, generation prio %d, batch prio %d",
+            n_threads,
+            n_threads_batch,
+            affinity_profile_name(affinity_profile),
+            generation_priority,
+            batch_priority);
 
+    apply_mobile_runtime_toggles(profile);
     llama_context_params ctx_params = llama_context_default_params();
 
-    ctx_params.n_ctx           = 2048;
+    ctx_params.n_ctx           = g_runtime_overrides.n_ctx > 0 ? g_runtime_overrides.n_ctx : profile.n_ctx;
+    ctx_params.n_batch         = g_runtime_overrides.n_batch > 0 ? g_runtime_overrides.n_batch : profile.n_batch;
+    ctx_params.n_ubatch        = g_runtime_overrides.n_ubatch > 0 ? g_runtime_overrides.n_ubatch : profile.n_ubatch;
     ctx_params.n_threads       = n_threads;
-    ctx_params.n_threads_batch = n_threads;
+    ctx_params.n_threads_batch = n_threads_batch;
+    ctx_params.no_perf         = true;
+
+    LOGi("Creating context with profile `%s`: params = %.2f B, n_ctx = %u, n_batch = %u, n_ubatch = %u, type_k = %d, type_v = %d",
+            profile.name,
+            llama_model_n_params(model) / 1e9,
+            ctx_params.n_ctx,
+            ctx_params.n_batch,
+            ctx_params.n_ubatch,
+            (int) ctx_params.type_k,
+            (int) ctx_params.type_v);
+    log_native_memory_snapshot("jni-before-new-context");
 
     llama_context * context = llama_new_context_with_model(model, ctx_params);
 
@@ -134,13 +593,99 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
         return 0;
     }
 
-    return reinterpret_cast<jlong>(context);
+    android_llama_context * wrapper = new android_llama_context {
+        /*.context =*/ context,
+        /*.threadpool =*/ nullptr,
+        /*.threadpool_batch =*/ nullptr,
+    };
+
+    const cpu_topology topology = detect_cpu_topology();
+    if (!create_affinity_threadpools(context, n_threads, n_threads_batch, generation_priority, batch_priority, affinity_profile, topology, *wrapper)) {
+        llama_free(context);
+        delete wrapper;
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                      "failed to configure affinity threadpools");
+        return 0;
+    }
+
+    LOGi("Context created: n_ctx = %u, n_batch = %u, n_ubatch = %u, generation prio = %d, batch prio = %d",
+            llama_n_ctx(context),
+            llama_n_batch(context),
+            llama_n_ubatch(context),
+            generation_priority,
+            batch_priority);
+    log_native_memory_snapshot("jni-after-new-context");
+
+    return reinterpret_cast<jlong>(wrapper);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_android_llama_cpp_LLamaAndroid_configure_1runtime(
+        JNIEnv *,
+        jobject,
+        jint n_ctx,
+        jint n_batch,
+        jint n_ubatch,
+        jint n_threads,
+        jint n_threads_batch,
+        jint disable_ifairy_lut,
+        jint affinity_profile,
+        jint enable_ifairy_vecdot_act_tensor,
+        jint generation_priority,
+        jint batch_priority
+) {
+    g_runtime_overrides.n_ctx = n_ctx;
+    g_runtime_overrides.n_batch = n_batch;
+    g_runtime_overrides.n_ubatch = n_ubatch;
+    g_runtime_overrides.n_threads = n_threads;
+    g_runtime_overrides.n_threads_batch = n_threads_batch;
+    g_runtime_overrides.disable_ifairy_lut = disable_ifairy_lut;
+    g_runtime_overrides.affinity_profile = affinity_profile;
+    g_runtime_overrides.enable_ifairy_vecdot_act_tensor = enable_ifairy_vecdot_act_tensor;
+    g_runtime_overrides.generation_priority = generation_priority;
+    g_runtime_overrides.batch_priority = batch_priority;
+
+    LOGi("Configured runtime overrides: n_ctx=%d n_batch=%d n_ubatch=%d n_threads=%d n_threads_batch=%d disable_ifairy_lut=%d affinity_profile=%d (%s) enable_ifairy_vecdot_act_tensor=%d generation_priority=%d batch_priority=%d",
+            g_runtime_overrides.n_ctx,
+            g_runtime_overrides.n_batch,
+            g_runtime_overrides.n_ubatch,
+            g_runtime_overrides.n_threads,
+            g_runtime_overrides.n_threads_batch,
+            g_runtime_overrides.disable_ifairy_lut,
+            g_runtime_overrides.affinity_profile,
+            affinity_profile_name(g_runtime_overrides.affinity_profile),
+            g_runtime_overrides.enable_ifairy_vecdot_act_tensor,
+            g_runtime_overrides.generation_priority,
+            g_runtime_overrides.batch_priority);
 }
 
 extern "C"
 JNIEXPORT void JNICALL
 Java_android_llama_cpp_LLamaAndroid_free_1context(JNIEnv *, jobject, jlong context) {
-    llama_free(reinterpret_cast<llama_context *>(context));
+    auto * wrapper = from_context_handle(context);
+    if (!wrapper) {
+        return;
+    }
+
+    llama_detach_threadpool(wrapper->context);
+    llama_free(wrapper->context);
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    auto * reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+    auto * ggml_threadpool_free_fn = reg
+            ? (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free")
+            : nullptr;
+    if (ggml_threadpool_free_fn) {
+        if (wrapper->threadpool_batch) {
+            ggml_threadpool_free_fn(wrapper->threadpool_batch);
+        }
+        if (wrapper->threadpool) {
+            ggml_threadpool_free_fn(wrapper->threadpool);
+        }
+    }
+
+    delete wrapper;
 }
 
 extern "C"
@@ -173,7 +718,7 @@ Java_android_llama_cpp_LLamaAndroid_bench_1model(
     auto pp_std = 0.0;
     auto tg_std = 0.0;
 
-    const auto context = reinterpret_cast<llama_context *>(context_pointer);
+    const auto context = unwrap_context(context_pointer);
     const auto model = reinterpret_cast<llama_model *>(model_pointer);
     const auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
 
@@ -294,10 +839,14 @@ Java_android_llama_cpp_LLamaAndroid_new_1batch(JNIEnv *, jobject, jint n_tokens,
     batch->pos      = (llama_pos *)     malloc(sizeof(llama_pos)      * n_tokens);
     batch->n_seq_id = (int32_t *)       malloc(sizeof(int32_t)        * n_tokens);
     batch->seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *) * n_tokens);
+    llama_seq_id * seq_id_storage = (llama_seq_id *) malloc(sizeof(llama_seq_id) * n_tokens * n_seq_max);
     for (int i = 0; i < n_tokens; ++i) {
-        batch->seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id) * n_seq_max);
+        batch->seq_id[i] = seq_id_storage + (i * n_seq_max);
     }
     batch->logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens);
+
+    LOGi("Allocated batch: n_tokens = %d, embd = %d, n_seq_max = %d", n_tokens, embd, n_seq_max);
+    log_native_memory_snapshot("jni-after-new-batch");
 
     return reinterpret_cast<jlong>(batch);
 }
@@ -305,8 +854,22 @@ Java_android_llama_cpp_LLamaAndroid_new_1batch(JNIEnv *, jobject, jint n_tokens,
 extern "C"
 JNIEXPORT void JNICALL
 Java_android_llama_cpp_LLamaAndroid_free_1batch(JNIEnv *, jobject, jlong batch_pointer) {
-    //llama_batch_free(*reinterpret_cast<llama_batch *>(batch_pointer));
     const auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
+    if (!batch) {
+        return;
+    }
+
+    free(batch->token);
+    free(batch->embd);
+    free(batch->pos);
+    free(batch->n_seq_id);
+    if (batch->seq_id) {
+        if (batch->seq_id[0]) {
+            free(batch->seq_id[0]);
+        }
+    }
+    free(batch->seq_id);
+    free(batch->logits);
     delete batch;
 }
 
@@ -354,16 +917,17 @@ Java_android_llama_cpp_LLamaAndroid_completion_1init(
     cached_token_chars.clear();
 
     const auto text = env->GetStringUTFChars(jtext, 0);
-    const auto context = reinterpret_cast<llama_context *>(context_pointer);
+    const auto context = unwrap_context(context_pointer);
     const auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
 
     bool parse_special = (format_chat == JNI_TRUE);
     const auto tokens_list = common_tokenize(context, text, true, parse_special);
 
-    auto n_ctx = llama_n_ctx(context);
-    auto n_kv_req = tokens_list.size() + n_len;
+    const int n_ctx = llama_n_ctx(context);
+    const size_t n_kv_req = tokens_list.size() + static_cast<size_t>(n_len);
 
-    LOGi("n_len = %d, n_ctx = %d, n_kv_req = %d", n_len, n_ctx, n_kv_req);
+    LOGi("n_len = %d, n_ctx = %d, n_kv_req = %zu", n_len, n_ctx, n_kv_req);
+    log_native_memory_snapshot("jni-before-completion-init");
 
     if (n_kv_req > n_ctx) {
         LOGe("error: n_kv_req > n_ctx, the required KV cache size is not big enough");
@@ -373,19 +937,26 @@ Java_android_llama_cpp_LLamaAndroid_completion_1init(
         LOGi("token: `%s`-> %d ", common_token_to_piece(context, id).c_str(), id);
     }
 
-    common_batch_clear(*batch);
+    const uint32_t n_batch = llama_n_batch(context);
+    const size_t n_tokens = tokens_list.size();
+    for (size_t start = 0; start < n_tokens; start += n_batch) {
+        const size_t end = std::min(start + static_cast<size_t>(n_batch), n_tokens);
 
-    // evaluate the initial prompt
-    for (auto i = 0; i < tokens_list.size(); i++) {
-        common_batch_add(*batch, tokens_list[i], i, { 0 }, false);
+        common_batch_clear(*batch);
+        for (size_t i = start; i < end; ++i) {
+            common_batch_add(*batch, tokens_list[i], static_cast<llama_pos>(i), { 0 }, false);
+        }
+
+        // Only ask for logits on the final token of the full prompt.
+        batch->logits[batch->n_tokens - 1] = (end == n_tokens);
+
+        if (llama_decode(context, *batch) != 0) {
+            LOGe("llama_decode() failed while ingesting prompt chunk [%zu, %zu)", start, end);
+            break;
+        }
     }
 
-    // llama_decode will output logits only for the last token of the prompt
-    batch->logits[batch->n_tokens - 1] = true;
-
-    if (llama_decode(context, *batch) != 0) {
-        LOGe("llama_decode() failed");
-    }
+    log_native_memory_snapshot("jni-after-completion-init");
 
     env->ReleaseStringUTFChars(jtext, text);
 
@@ -403,7 +974,7 @@ Java_android_llama_cpp_LLamaAndroid_completion_1loop(
         jint n_len,
         jobject intvar_ncur
 ) {
-    const auto context = reinterpret_cast<llama_context *>(context_pointer);
+    const auto context = unwrap_context(context_pointer);
     const auto batch   = reinterpret_cast<llama_batch   *>(batch_pointer);
     const auto sampler = reinterpret_cast<llama_sampler *>(sampler_pointer);
     const auto model = llama_get_model(context);
@@ -448,5 +1019,16 @@ Java_android_llama_cpp_LLamaAndroid_completion_1loop(
 extern "C"
 JNIEXPORT void JNICALL
 Java_android_llama_cpp_LLamaAndroid_kv_1cache_1clear(JNIEnv *, jobject, jlong context) {
-    llama_memory_clear(llama_get_memory(reinterpret_cast<llama_context *>(context)), true);
+    llama_memory_clear(llama_get_memory(unwrap_context(context)), true);
+    log_native_memory_snapshot("jni-after-kv-cache-clear");
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_android_llama_cpp_LLamaAndroid_log_1native_1memory(JNIEnv *env, jobject, jstring jstage) {
+    const auto stage = env->GetStringUTFChars(jstage, nullptr);
+    log_native_memory_snapshot(stage != nullptr ? stage : "unknown");
+    if (stage != nullptr) {
+        env->ReleaseStringUTFChars(jstage, stage);
+    }
 }

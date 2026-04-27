@@ -41,8 +41,13 @@ extern struct ggml_tensor * ggml_debug_last_node;
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <pthread.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#endif
+
+#if defined(__linux__)
+#include <sys/auxv.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -86,6 +91,30 @@ float ggml_table_f32_f16[1 << 16];
 struct ggml_arm_arch_features_type {
     int sve_cnt;
 } ggml_arm_arch_features = { 0 };
+#endif
+
+#if defined(__aarch64__) && defined(__linux__)
+#ifndef HWCAP_ASIMD
+#define HWCAP_ASIMD (1UL << 1)
+#endif
+#ifndef HWCAP_ASIMDDP
+#define HWCAP_ASIMDDP (1UL << 20)
+#endif
+
+struct ggml_arm_runtime_features_type {
+    int has_neon;
+    int has_dotprod;
+};
+
+static pthread_once_t ggml_arm_runtime_features_once = PTHREAD_ONCE_INIT;
+static struct ggml_arm_runtime_features_type ggml_arm_runtime_features = { 1, 0 };
+
+static void ggml_arm_runtime_features_init(void) {
+    const unsigned long hwcap = getauxval(AT_HWCAP);
+
+    ggml_arm_runtime_features.has_neon    = (hwcap & HWCAP_ASIMD) != 0;
+    ggml_arm_runtime_features.has_dotprod = (hwcap & HWCAP_ASIMDDP) != 0;
+}
 #endif
 
 
@@ -3821,7 +3850,10 @@ int ggml_cpu_has_vxe(void) {
 }
 
 int ggml_cpu_has_neon(void) {
-#if defined(__ARM_ARCH) && defined(__ARM_NEON)
+#if defined(__aarch64__) && defined(__linux__)
+    pthread_once(&ggml_arm_runtime_features_once, ggml_arm_runtime_features_init);
+    return ggml_arm_runtime_features.has_neon;
+#elif defined(__ARM_ARCH) && defined(__ARM_NEON)
     return 1;
 #else
     return 0;
@@ -3829,7 +3861,10 @@ int ggml_cpu_has_neon(void) {
 }
 
 int ggml_cpu_has_dotprod(void) {
-#if defined(__ARM_ARCH) && defined(__ARM_FEATURE_DOTPROD)
+#if defined(__aarch64__) && defined(__linux__)
+    pthread_once(&ggml_arm_runtime_features_once, ggml_arm_runtime_features_init);
+    return ggml_arm_runtime_features.has_dotprod;
+#elif defined(__ARM_ARCH) && defined(__ARM_FEATURE_DOTPROD)
     return 1;
 #else
     return 0;

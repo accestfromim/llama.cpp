@@ -8,20 +8,20 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        minSdk = 33
+        minSdk = 31
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         consumerProguardFiles("consumer-rules.pro")
         ndk {
-            // Add NDK properties if wanted, e.g.
-            // abiFilters += listOf("arm64-v8a")
+            abiFilters += listOf("arm64-v8a")
         }
         externalNativeBuild {
             cmake {
                 arguments += "-DLLAMA_CURL=OFF"
                 arguments += "-DLLAMA_BUILD_COMMON=ON"
                 arguments += "-DGGML_LLAMAFILE=OFF"
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
+                arguments += "-DGGML_NATIVE=OFF"
+                arguments += "-DGGML_OPENMP=OFF"
                 cppFlags += listOf()
                 arguments += listOf()
 
