@@ -2223,6 +2223,7 @@ int main(int argc, char ** argv) {
         bool         verbose     = false;
         bool         lut_only    = false;
         bool         lut_bench   = false;
+        bool         ifairy64_vecdot_only = false;
         const char * vecdot_mode = NULL;
         int64_t      bench_M     = 4096;
         int64_t      bench_N     = 1;
@@ -2241,6 +2242,10 @@ int main(int argc, char ** argv) {
             }
             if (strcmp(argv[i], "--ifairy-lut-only") == 0) {
                 lut_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy64-vecdot-only") == 0) {
+                ifairy64_vecdot_only = true;
                 continue;
             }
             if (strcmp(argv[i], "--ifairy-lut-backend-bench") == 0) {
@@ -2284,6 +2289,10 @@ int main(int argc, char ** argv) {
 
         if (lut_only) {
             return run_ifairy_lut_only_tests();
+        }
+
+        if (ifairy64_vecdot_only) {
+            return test_ifairy64_vecdot_compare() ? 0 : 1;
         }
 
         if (lut_bench) {
