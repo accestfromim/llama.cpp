@@ -725,6 +725,66 @@ void ggml_vec_dot_ifairy64_q16_K(int                        n,
 
     ((ggml_bf16_t *) s)[0] = GGML_FP32_TO_BF16(sum_real_total);
     ((ggml_bf16_t *) s)[1] = GGML_FP32_TO_BF16(sum_imag_total);
+#elif defined(__x86_64__) || defined(_M_X64)
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ifairy64 * GGML_RESTRICT   w = (const block_ifairy64 *) vx;
+    const block_ifairy_q16 * GGML_RESTRICT x = (const block_ifairy_q16 *) vy;
+
+    GGML_ASSERT(n % QK_IFAIRY64 == 0);
+    GGML_ASSERT(n % QK_IFAIRY == 0);
+
+    const int nb = n / QK_IFAIRY64;
+
+    float sum_real_total = 0.0f;
+    float sum_imag_total = 0.0f;
+
+    static const int8_t lut_wr_data[4] = { -1, 1, 0, 0 };
+    static const int8_t lut_wi_data[4] = {  0, 0, -1, 1 };
+
+    for (int i = 0; i < nb; ++i) {
+        const block_ifairy_q16 * x_block = &x[i / 4];
+        const int                x_base  = (i % 4) * QK_IFAIRY64;
+
+        int32_t sum_ac = 0;
+        int32_t sum_ad = 0;
+        int32_t sum_bc = 0;
+        int32_t sum_bd = 0;
+
+        for (int part = 0; part < 4; ++part) {
+            for (int lane = 0; lane < 16; ++lane) {
+                const int     idx    = part * 16 + lane;
+                const uint8_t packed = w[i].qs[lane];
+                const uint8_t code   = (packed >> (2 * part)) & 0x3;
+
+                const int wr = lut_wr_data[code];
+                const int wi = lut_wi_data[code];
+
+                const int xr = (int) ((const int8_t *) x_block->x_real)[x_base + idx];
+                const int xi = (int) ((const int8_t *) x_block->x_imag)[x_base + idx];
+
+                sum_ac += xr * wr;
+                sum_ad += xi * wr;
+                sum_bc += xr * wi;
+                sum_bd += xi * wi;
+            }
+        }
+
+        const float w_real = GGML_CPU_FP16_TO_FP32(w[i].d_real);
+        const float w_imag = GGML_CPU_FP16_TO_FP32(w[i].d_imag);
+        const float x_real = GGML_CPU_FP16_TO_FP32(x_block->d_real);
+        const float x_imag = GGML_CPU_FP16_TO_FP32(x_block->d_imag);
+
+        sum_real_total += w_real * x_real * (float) sum_ac + w_imag * x_imag * (float) sum_bd;
+        sum_imag_total += w_imag * x_real * (float) sum_bc - w_real * x_imag * (float) sum_ad;
+    }
+
+    ((ggml_bf16_t *) s)[0] = GGML_FP32_TO_BF16(sum_real_total);
+    ((ggml_bf16_t *) s)[1] = GGML_FP32_TO_BF16(sum_imag_total);
 #else
     ggml_vec_dot_ifairy64_q16_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
