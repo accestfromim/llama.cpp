@@ -3,6 +3,7 @@ package com.example.llama
 import android.app.ActivityManager
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Intent
 import android.os.Bundle
 import android.text.format.Formatter
 import androidx.activity.ComponentActivity
@@ -73,6 +74,11 @@ class MainActivity(
         }
     }
 
+    private fun handleAutomationIntent(intent: Intent?) {
+        viewModel.applyRuntimeOverrides(intent?.extras)
+        viewModel.requestAutomationAction(intent?.getStringExtra("codex_action"))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -82,9 +88,8 @@ class MainActivity(
         viewModel.log("Current memory: $free / $total")
         viewModel.log("App filesDir: $filesDir")
         viewModel.log("Model import dir: ${filesDir.resolve("models").absolutePath}")
-        viewModel.applyRuntimeOverrides(intent?.extras)
         viewModel.initialize(applicationContext)
-        viewModel.requestAutomationAction(intent?.getStringExtra("codex_action"))
+        handleAutomationIntent(intent)
 
         setContent {
             LlamaAndroidTheme(darkTheme = false, dynamicColor = false) {
@@ -99,6 +104,13 @@ class MainActivity(
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        viewModel.log("Received new automation intent")
+        handleAutomationIntent(intent)
     }
 }
 

@@ -3,6 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val bundledAssetDir = System.getenv("LLAMA_ANDROID_BUNDLED_ASSETS") ?: "/tmp/llama-android-assets"
+
 android {
     namespace = "com.example.llama"
     compileSdk = 34
@@ -48,6 +50,10 @@ android {
     androidResources {
         noCompress += listOf("gguf")
     }
+    sourceSets.getByName("main").assets.srcDirs(
+        "src/main/assets",
+        bundledAssetDir,
+    )
 }
 
 dependencies {

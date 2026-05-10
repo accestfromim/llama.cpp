@@ -1,4 +1,5 @@
 #include <android/log.h>
+#include <chrono>
 #include <jni.h>
 #include <algorithm>
 #include <fstream>
@@ -41,6 +42,15 @@ jmethodID la_int_var_value;
 jmethodID la_int_var_inc;
 
 std::string cached_token_chars;
+
+struct e2e_bench_aggregate {
+    double generated_tokens_avg = 0.0;
+    double prefill_ms_avg = 0.0;
+    double first_token_ms_avg = 0.0;
+    double decode_ms_per_token_avg = 0.0;
+    double tok_s_avg = 0.0;
+    double total_ms_avg = 0.0;
+};
 
 struct mobile_profile {
     uint32_t n_ctx;
@@ -97,6 +107,9 @@ static llama_context * unwrap_context(jlong handle) {
     const auto wrapper = from_context_handle(handle);
     return wrapper != nullptr ? wrapper->context : nullptr;
 }
+
+static void log_native_memory_snapshot(const char * stage);
+bool is_valid_utf8(const char * string);
 
 static const char * affinity_profile_name(int profile) {
     switch (profile) {
@@ -192,6 +205,118 @@ static void apply_mobile_runtime_toggles(const mobile_profile & profile) {
 
 static int resolve_priority_override(int override_value, int profile_value) {
     return override_value != -99 ? override_value : profile_value;
+}
+
+static std::vector<llama_token> build_bench_prompt_tokens(
+        llama_context * context,
+        const int prompt_tokens
+) {
+    std::vector<llama_token> tokens;
+    tokens.reserve(std::max(prompt_tokens, 1));
+
+    const std::string seed = "Summarize the following sentence in a concise way. ";
+    bool add_special = true;
+
+    while ((int) tokens.size() < prompt_tokens) {
+        const auto chunk = common_tokenize(context, seed, add_special, false);
+        if (chunk.empty()) {
+            break;
+        }
+
+        const int remaining = prompt_tokens - (int) tokens.size();
+        const int take = std::min(remaining, (int) chunk.size());
+        tokens.insert(tokens.end(), chunk.begin(), chunk.begin() + take);
+        add_special = false;
+    }
+
+    if ((int) tokens.size() < prompt_tokens) {
+        const llama_model * model = llama_get_model(context);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const llama_token fallback = llama_vocab_bos(vocab);
+        while ((int) tokens.size() < prompt_tokens) {
+            tokens.push_back(fallback);
+        }
+    }
+
+    return tokens;
+}
+
+static int completion_init_tokens(
+        llama_context * context,
+        llama_batch * batch,
+        const std::vector<llama_token> & tokens_list,
+        const int n_len
+) {
+    cached_token_chars.clear();
+
+    const int n_ctx = llama_n_ctx(context);
+    const size_t n_kv_req = tokens_list.size() + static_cast<size_t>(n_len);
+
+    LOGi("n_len = %d, n_ctx = %d, n_kv_req = %zu", n_len, n_ctx, n_kv_req);
+    log_native_memory_snapshot("jni-before-completion-init");
+
+    if (n_kv_req > (size_t) n_ctx) {
+        LOGe("error: n_kv_req > n_ctx, the required KV cache size is not big enough");
+    }
+
+    const uint32_t n_batch = llama_n_batch(context);
+    const size_t n_tokens = tokens_list.size();
+    for (size_t start = 0; start < n_tokens; start += n_batch) {
+        const size_t end = std::min(start + static_cast<size_t>(n_batch), n_tokens);
+
+        common_batch_clear(*batch);
+        for (size_t i = start; i < end; ++i) {
+            common_batch_add(*batch, tokens_list[i], static_cast<llama_pos>(i), { 0 }, false);
+        }
+
+        batch->logits[batch->n_tokens - 1] = (end == n_tokens);
+
+        if (llama_decode(context, *batch) != 0) {
+            LOGe("llama_decode() failed while ingesting prompt chunk [%zu, %zu)", start, end);
+            break;
+        }
+    }
+
+    log_native_memory_snapshot("jni-after-completion-init");
+    return (int) tokens_list.size();
+}
+
+static bool completion_loop_step(
+        llama_context * context,
+        llama_batch * batch,
+        llama_sampler * sampler,
+        const int n_len,
+        int & n_cur,
+        std::string & out_piece
+) {
+    out_piece.clear();
+
+    const auto model = llama_get_model(context);
+    const auto vocab = llama_model_get_vocab(model);
+    const auto new_token_id = llama_sampler_sample(sampler, context, -1);
+
+    if (llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len) {
+        return false;
+    }
+
+    const auto new_token_chars = common_token_to_piece(context, new_token_id);
+    cached_token_chars += new_token_chars;
+
+    if (is_valid_utf8(cached_token_chars.c_str())) {
+        out_piece = cached_token_chars;
+        cached_token_chars.clear();
+    }
+
+    common_batch_clear(*batch);
+    common_batch_add(*batch, new_token_id, n_cur, { 0 }, true);
+
+    ++n_cur;
+
+    if (llama_decode(context, *batch) != 0) {
+        LOGe("llama_decode() returned null");
+    }
+
+    return true;
 }
 
 static std::string trim_copy(const std::string & value) {
@@ -913,54 +1038,14 @@ Java_android_llama_cpp_LLamaAndroid_completion_1init(
         jboolean format_chat,
         jint n_len
     ) {
-
-    cached_token_chars.clear();
-
     const auto text = env->GetStringUTFChars(jtext, 0);
     const auto context = unwrap_context(context_pointer);
     const auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
-
-    bool parse_special = (format_chat == JNI_TRUE);
+    const bool parse_special = (format_chat == JNI_TRUE);
     const auto tokens_list = common_tokenize(context, text, true, parse_special);
 
-    const int n_ctx = llama_n_ctx(context);
-    const size_t n_kv_req = tokens_list.size() + static_cast<size_t>(n_len);
-
-    LOGi("n_len = %d, n_ctx = %d, n_kv_req = %zu", n_len, n_ctx, n_kv_req);
-    log_native_memory_snapshot("jni-before-completion-init");
-
-    if (n_kv_req > n_ctx) {
-        LOGe("error: n_kv_req > n_ctx, the required KV cache size is not big enough");
-    }
-
-    for (auto id : tokens_list) {
-        LOGi("token: `%s`-> %d ", common_token_to_piece(context, id).c_str(), id);
-    }
-
-    const uint32_t n_batch = llama_n_batch(context);
-    const size_t n_tokens = tokens_list.size();
-    for (size_t start = 0; start < n_tokens; start += n_batch) {
-        const size_t end = std::min(start + static_cast<size_t>(n_batch), n_tokens);
-
-        common_batch_clear(*batch);
-        for (size_t i = start; i < end; ++i) {
-            common_batch_add(*batch, tokens_list[i], static_cast<llama_pos>(i), { 0 }, false);
-        }
-
-        // Only ask for logits on the final token of the full prompt.
-        batch->logits[batch->n_tokens - 1] = (end == n_tokens);
-
-        if (llama_decode(context, *batch) != 0) {
-            LOGe("llama_decode() failed while ingesting prompt chunk [%zu, %zu)", start, end);
-            break;
-        }
-    }
-
-    log_native_memory_snapshot("jni-after-completion-init");
-
     env->ReleaseStringUTFChars(jtext, text);
-
-    return batch->n_tokens;
+    return completion_init_tokens(context, batch, tokens_list, n_len);
 }
 
 extern "C"
@@ -977,43 +1062,125 @@ Java_android_llama_cpp_LLamaAndroid_completion_1loop(
     const auto context = unwrap_context(context_pointer);
     const auto batch   = reinterpret_cast<llama_batch   *>(batch_pointer);
     const auto sampler = reinterpret_cast<llama_sampler *>(sampler_pointer);
-    const auto model = llama_get_model(context);
-    const auto vocab = llama_model_get_vocab(model);
 
     if (!la_int_var) la_int_var = env->GetObjectClass(intvar_ncur);
     if (!la_int_var_value) la_int_var_value = env->GetMethodID(la_int_var, "getValue", "()I");
     if (!la_int_var_inc) la_int_var_inc = env->GetMethodID(la_int_var, "inc", "()V");
 
-    // sample the most likely token
-    const auto new_token_id = llama_sampler_sample(sampler, context, -1);
-
     const auto n_cur = env->CallIntMethod(intvar_ncur, la_int_var_value);
-    if (llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len) {
+    int n_cur_mut = n_cur;
+    std::string piece;
+    if (!completion_loop_step(context, batch, sampler, n_len, n_cur_mut, piece)) {
         return nullptr;
     }
 
-    auto new_token_chars = common_token_to_piece(context, new_token_id);
-    cached_token_chars += new_token_chars;
-
-    jstring new_token = nullptr;
-    if (is_valid_utf8(cached_token_chars.c_str())) {
-        new_token = env->NewStringUTF(cached_token_chars.c_str());
-        LOGi("cached: %s, new_token_chars: `%s`, id: %d", cached_token_chars.c_str(), new_token_chars.c_str(), new_token_id);
-        cached_token_chars.clear();
-    } else {
-        new_token = env->NewStringUTF("");
-    }
-
-    common_batch_clear(*batch);
-    common_batch_add(*batch, new_token_id, n_cur, { 0 }, true);
-
     env->CallVoidMethod(intvar_ncur, la_int_var_inc);
+    return env->NewStringUTF(piece.c_str());
+}
 
-    if (llama_decode(context, *batch) != 0) {
-        LOGe("llama_decode() returned null");
+extern "C"
+JNIEXPORT jdoubleArray JNICALL
+Java_android_llama_cpp_LLamaAndroid_e2e_1bench_1model(
+        JNIEnv * env,
+        jobject,
+        jlong context_pointer,
+        jlong batch_pointer,
+        jlong sampler_pointer,
+        jint pp,
+        jint tg,
+        jint nr
+) {
+    const auto context = unwrap_context(context_pointer);
+    const auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
+    const auto sampler = reinterpret_cast<llama_sampler *>(sampler_pointer);
+
+    if (context == nullptr || batch == nullptr || sampler == nullptr) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "e2e_bench_model() received null state");
+        return nullptr;
     }
 
-    return new_token;
+    if (pp <= 0 || tg <= 0 || nr <= 0) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"), "e2e_bench_model() requires positive pp/tg/nr");
+        return nullptr;
+    }
+
+    e2e_bench_aggregate aggregate;
+
+    for (int run = 0; run < nr; ++run) {
+        llama_memory_clear(llama_get_memory(context), true);
+        llama_sampler_reset(sampler);
+        cached_token_chars.clear();
+
+        const auto prompt_tokens = build_bench_prompt_tokens(context, pp);
+
+        using clock = std::chrono::steady_clock;
+        const auto request_start = clock::now();
+        int n_cur = completion_init_tokens(context, batch, prompt_tokens, tg);
+        const int total_len = n_cur + tg;
+        const auto after_prefill = clock::now();
+
+        int generated_tokens = 0;
+        bool first_token_seen = false;
+        std::chrono::steady_clock::time_point first_token_at = after_prefill;
+
+        while (generated_tokens < tg) {
+            std::string piece;
+            if (!completion_loop_step(context, batch, sampler, total_len, n_cur, piece)) {
+                break;
+            }
+
+            ++generated_tokens;
+            if (!first_token_seen) {
+                first_token_seen = true;
+                first_token_at = clock::now();
+            }
+        }
+
+        const auto finished_at = clock::now();
+        llama_memory_clear(llama_get_memory(context), true);
+
+        const double prefill_ms = std::chrono::duration<double, std::milli>(after_prefill - request_start).count();
+        const double first_token_ms = first_token_seen
+                ? std::chrono::duration<double, std::milli>(first_token_at - request_start).count()
+                : prefill_ms;
+        const double total_ms = std::chrono::duration<double, std::milli>(finished_at - request_start).count();
+        const double decode_window_ms = first_token_seen
+                ? std::chrono::duration<double, std::milli>(finished_at - first_token_at).count()
+                : 0.0;
+        const int decode_tail_tokens = std::max(generated_tokens - 1, 0);
+        const double decode_ms_per_token = decode_tail_tokens > 0
+                ? decode_window_ms / (double) decode_tail_tokens
+                : 0.0;
+        const double tok_s = decode_ms_per_token > 0.0
+                ? 1000.0 / decode_ms_per_token
+                : 0.0;
+
+        aggregate.generated_tokens_avg += (double) generated_tokens;
+        aggregate.prefill_ms_avg += prefill_ms;
+        aggregate.first_token_ms_avg += first_token_ms;
+        aggregate.decode_ms_per_token_avg += decode_ms_per_token;
+        aggregate.tok_s_avg += tok_s;
+        aggregate.total_ms_avg += total_ms;
+    }
+
+    aggregate.generated_tokens_avg /= nr;
+    aggregate.prefill_ms_avg /= nr;
+    aggregate.first_token_ms_avg /= nr;
+    aggregate.decode_ms_per_token_avg /= nr;
+    aggregate.tok_s_avg /= nr;
+    aggregate.total_ms_avg /= nr;
+
+    jdouble values[6] = {
+            aggregate.generated_tokens_avg,
+            aggregate.prefill_ms_avg,
+            aggregate.first_token_ms_avg,
+            aggregate.decode_ms_per_token_avg,
+            aggregate.tok_s_avg,
+            aggregate.total_ms_avg,
+    };
+    jdoubleArray result = env->NewDoubleArray(6);
+    env->SetDoubleArrayRegion(result, 0, 6, values);
+    return result;
 }
 
 extern "C"

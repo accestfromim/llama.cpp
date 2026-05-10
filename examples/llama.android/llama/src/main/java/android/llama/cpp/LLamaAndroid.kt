@@ -17,6 +17,16 @@ import kotlin.concurrent.thread
 class LLamaAndroid {
     companion object {
         private const val LOG_TAG = "LLAMA_ANDROID"
+
+        data class E2eBenchResult(
+            val generatedTokensAvg: Double,
+            val prefillMs: Double,
+            val firstTokenMs: Double,
+            val decodeMsPerToken: Double,
+            val tokS: Double,
+            val totalMs: Double,
+        )
+
         private class IntVar(value: Int) {
             @Volatile
             var value: Int = value
@@ -104,6 +114,14 @@ class LLamaAndroid {
         pl: Int,
         nr: Int
     ): String
+    private external fun e2e_bench_model(
+        context: Long,
+        batch: Long,
+        sampler: Long,
+        pp: Int,
+        tg: Int,
+        nr: Int
+    ): DoubleArray
 
     private external fun system_info(): String
 
@@ -157,6 +175,26 @@ class LLamaAndroid {
         return withContext(runLoop) {
             when (val current = state) {
                 is State.Loaded -> bench_model(current.context, current.model, current.batch, pp, tg, pl, nr)
+                State.Idle -> throw IllegalStateException("No model loaded")
+            }
+        }
+    }
+
+    suspend fun e2eBench(pp: Int, tg: Int, nr: Int = 1): E2eBenchResult {
+        return withContext(runLoop) {
+            when (val current = state) {
+                is State.Loaded -> {
+                    val values = e2e_bench_model(current.context, current.batch, current.sampler, pp, tg, nr)
+                    require(values.size >= 6) { "Unexpected e2e_bench_model() result length: ${values.size}" }
+                    E2eBenchResult(
+                        generatedTokensAvg = values[0],
+                        prefillMs = values[1],
+                        firstTokenMs = values[2],
+                        decodeMsPerToken = values[3],
+                        tokS = values[4],
+                        totalMs = values[5],
+                    )
+                }
                 State.Idle -> throw IllegalStateException("No model loaded")
             }
         }
@@ -220,11 +258,13 @@ class LLamaAndroid {
             Log.i(LOG_TAG, "Starting generation")
             logMemorySnapshot("before-completion-init")
 
-            val ncur = IntVar(completion_init(current.context, current.batch, message, formatChat, maxTokens))
+            val promptTokens = completion_init(current.context, current.batch, message, formatChat, maxTokens)
+            val totalBudget = promptTokens + maxTokens
+            val ncur = IntVar(promptTokens)
             logMemorySnapshot("after-completion-init")
             var emittedAnyToken = false
 
-            while (ncur.value <= maxTokens) {
+            while (ncur.value <= totalBudget) {
                 currentCoroutineContext().ensureActive()
 
                 if (stopRequested) {
@@ -232,7 +272,7 @@ class LLamaAndroid {
                     break
                 }
 
-                val piece = completion_loop(current.context, current.batch, current.sampler, maxTokens, ncur) ?: break
+                val piece = completion_loop(current.context, current.batch, current.sampler, totalBudget, ncur) ?: break
                 if (piece.isNotEmpty() && !emittedAnyToken) {
                     emittedAnyToken = true
                     Log.i(LOG_TAG, "Received first token")
