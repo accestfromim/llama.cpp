@@ -1214,6 +1214,15 @@ static bool test_ifairy64_vecdot_compare() {
         }
     }
 
+    for (int ib = 0; ib < nb64; ++ib) {
+        block_ifairy64 & blk = w[(size_t) ib];
+        blk.d_real           = GGML_FP32_TO_FP16(0.75f);
+        blk.d_imag           = GGML_FP32_TO_FP16(1.25f);
+        for (int j = 0; j < QK_IFAIRY64; ++j) {
+            set_ifairy64_code(blk, j, (uint8_t) (j & 3));
+        }
+    }
+
     std::vector<block_ifairy_q16> x((size_t) nbq);
     for (int ib = 0; ib < nbq; ++ib) {
         x[ib].d_real = GGML_FP32_TO_FP16(scale_dist(rng));
@@ -1224,6 +1233,16 @@ static bool test_ifairy64_vecdot_compare() {
         for (int j = 0; j < QK_IFAIRY; ++j) {
             xr[j] = (int8_t) act_dist(rng);
             xi[j] = (int8_t) act_dist(rng);
+        }
+    }
+
+    static const int8_t edge_vals[] = { -127, -1, 0, 1, 127 };
+    for (int ib = 0; ib < nbq; ++ib) {
+        int8_t * xr = (int8_t *) x[ib].x_real;
+        int8_t * xi = (int8_t *) x[ib].x_imag;
+        for (int j = 0; j < QK_IFAIRY; ++j) {
+            xr[j] = edge_vals[j % 5];
+            xi[j] = edge_vals[(j + 2) % 5];
         }
     }
 
