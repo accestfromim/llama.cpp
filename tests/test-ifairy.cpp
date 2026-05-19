@@ -449,6 +449,144 @@ static inline void set_ifairy64_code(block_ifairy64 & blk, int idx, uint8_t code
     blk.qs[lane]    = (uint8_t) ((blk.qs[lane] & ~(0x3u << shift)) | ((code & 0x3u) << shift));
 }
 
+
+static void fill_ifairy64_wide_linear_weights(std::vector<block_ifairy64> & weights, int64_t M, int64_t K, int variant) {
+    const int64_t blocks_per_row = K / QK_IFAIRY64;
+    weights.assign((size_t) M * (size_t) blocks_per_row, block_ifairy64{});
+
+    for (int64_t r = 0; r < M; ++r) {
+        for (int64_t b = 0; b < blocks_per_row; ++b) {
+            block_ifairy64 blk{};
+            const bool zero_scale = ((r + 2 * b + variant) % 11) == 0;
+            const float d_real = zero_scale ? 0.0f : (float) (0.03125 * (1 + ((r + b + variant) % 5)));
+            const float d_imag = ((r + b + variant) % 7) == 0 ? 0.0f : (float) (0.015625 * (1 + ((2 * r + b + variant) % 7)));
+            blk.d_real = GGML_FP32_TO_FP16(d_real);
+            blk.d_imag = GGML_FP32_TO_FP16(d_imag);
+            for (int j = 0; j < QK_IFAIRY64; ++j) {
+                const int k_idx = (int) (b * QK_IFAIRY64 + j);
+                set_ifairy64_code(blk, j, (uint8_t) ((k_idx + 3 * (int) r + 5 * variant) & 0x3));
+            }
+            weights[(size_t) r * (size_t) blocks_per_row + (size_t) b] = blk;
+        }
+    }
+}
+
+static void fill_ifairy64_wide_linear_act(std::vector<float> & x, std::vector<float> & x_conj, int64_t K) {
+    x.resize((size_t) K);
+    x_conj.resize((size_t) K);
+    for (int64_t i = 0; i < K; ++i) {
+        const float real = (float) (((i * 7) % 31) - 15) / 5.0f;
+        const float imag = (float) (((i * 11) % 29) - 14) / 6.0f;
+        x[(size_t) i]      = pack_bf16_pair(real, imag);
+        x_conj[(size_t) i] = pack_bf16_pair(real, -imag);
+    }
+}
+
+static bool test_ifairy64_wide_linear_fused() {
+    printf("\n=== Test 1.4: iFairy64 fused wide-linear exact compare ===\n");
+
+    const int64_t M = 19;
+    const int64_t N = 1;
+    const int64_t K = QK_IFAIRY * 4;
+
+    std::vector<block_ifairy64> u0_weights;
+    std::vector<block_ifairy64> u1_weights;
+    std::vector<block_ifairy64> w0_weights;
+    std::vector<block_ifairy64> w1_weights;
+    fill_ifairy64_wide_linear_weights(u0_weights, M, K, 1);
+    fill_ifairy64_wide_linear_weights(u1_weights, M, K, 2);
+    fill_ifairy64_wide_linear_weights(w0_weights, M, K, 3);
+    fill_ifairy64_wide_linear_weights(w1_weights, M, K, 4);
+
+    std::vector<float> x;
+    std::vector<float> x_conj;
+    fill_ifairy64_wide_linear_act(x, x_conj, K);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        fprintf(stderr, "Failed to init CPU backend\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, 4);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "Failed to init ggml context\n");
+        return false;
+    }
+
+    ggml_tensor * u0 = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * u1 = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w0 = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * a  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * ac = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+
+    ggml_tensor * u = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, u0, ac), ggml_mul_mat(ctx, u1, ac));
+    ggml_tensor * w = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, w0, a), ggml_mul_mat(ctx, w1, a));
+    ggml_tensor * ref = ggml_ifairy_add(ctx, u, w);
+    ggml_tensor * opt = ggml_ifairy_wide_linear(ctx, u0, u1, w0, w1, a, ac);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, ref);
+    ggml_build_forward_expand(gf, opt);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        fprintf(stderr, "Failed to alloc backend buffer\n");
+        return false;
+    }
+
+    ggml_backend_tensor_set(u0, u0_weights.data(), 0, u0_weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(u1, u1_weights.data(), 0, u1_weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w0, w0_weights.data(), 0, w0_weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w1, w1_weights.data(), 0, w1_weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(a, x.data(), 0, x.size() * sizeof(float));
+    ggml_backend_tensor_set(ac, x_conj.data(), 0, x_conj.size() * sizeof(float));
+
+    bool ok = true;
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "backend graph compute failed\n");
+        ok = false;
+    }
+
+    std::vector<uint32_t> ref_words((size_t) M * (size_t) N);
+    std::vector<uint32_t> opt_words((size_t) M * (size_t) N);
+    if (ok) {
+        ggml_backend_tensor_get(ref, ref_words.data(), 0, ggml_nbytes(ref));
+        ggml_backend_tensor_get(opt, opt_words.data(), 0, ggml_nbytes(opt));
+        for (size_t i = 0; i < ref_words.size(); ++i) {
+            if (ref_words[i] != opt_words[i]) {
+                const ggml_bf16_t rr{ (uint16_t) (ref_words[i] & 0xffffu) };
+                const ggml_bf16_t ri{ (uint16_t) (ref_words[i] >> 16) };
+                const ggml_bf16_t orr{ (uint16_t) (opt_words[i] & 0xffffu) };
+                const ggml_bf16_t ori{ (uint16_t) (opt_words[i] >> 16) };
+                fprintf(stderr,
+                        "ifairy64 fused wide-linear mismatch: idx=%zu ref=(%.7g, %.7g) opt=(%.7g, %.7g) ref_word=0x%08x opt_word=0x%08x\n",
+                        i, GGML_BF16_TO_FP32(rr), GGML_BF16_TO_FP32(ri), GGML_BF16_TO_FP32(orr),
+                        GGML_BF16_TO_FP32(ori), ref_words[i], opt_words[i]);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    printf("  ifairy64 fused wide-linear exact compare - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool test_ifairy_lut_index() {
     printf("\n=== Test 2: iFairy 2-weight index encoding ===\n");
 
@@ -2261,10 +2399,11 @@ int main(int argc, char ** argv) {
         printf("iFairy Model Unit Tests\n");
         printf("========================================\n");
 
-        bool         verbose     = false;
-        bool         lut_only    = false;
-        bool         lut_bench   = false;
-        const char * vecdot_mode = NULL;
+        bool         verbose          = false;
+        bool         lut_only         = false;
+        bool         lut_bench        = false;
+        bool         wide_linear_only = false;
+        const char * vecdot_mode      = NULL;
         int64_t      bench_M     = 4096;
         int64_t      bench_N     = 1;
         int64_t      bench_K     = 1536;
@@ -2282,6 +2421,10 @@ int main(int argc, char ** argv) {
             }
             if (strcmp(argv[i], "--ifairy-lut-only") == 0) {
                 lut_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-wide-linear-only") == 0) {
+                wide_linear_only = true;
                 continue;
             }
             if (strcmp(argv[i], "--ifairy-lut-backend-bench") == 0) {
@@ -2327,6 +2470,10 @@ int main(int argc, char ** argv) {
             return run_ifairy_lut_only_tests();
         }
 
+        if (wide_linear_only) {
+            return test_ifairy64_wide_linear_fused() ? 0 : 1;
+        }
+
         if (lut_bench) {
             return run_ifairy_lut_backend_bench(bench_M, bench_N, bench_K, bench_t, bench_warm, bench_iters) ? 0 : 1;
         }
@@ -2351,6 +2498,11 @@ int main(int argc, char ** argv) {
 
         if (!test_ifairy64_vecdot_compare()) {
             fprintf(stderr, "Test 1.3 FAILED\n");
+            num_failed++;
+        }
+
+        if (!test_ifairy64_wide_linear_fused()) {
+            fprintf(stderr, "Test 1.4 FAILED\n");
             num_failed++;
         }
 

@@ -1207,6 +1207,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ifairy_split(x)",
     "ifairy_merge(x)",
     "ifairy_add(x, y)",
+    "ifairy_wide_linear(u0,u1,w0,w1,x,x_conj)",
     "ifairy_rms_norm(x)",
     "ifairy_mul(x,y)",
 };
@@ -4044,6 +4045,37 @@ static struct ggml_tensor * ggml_ifairy_add_impl(struct ggml_context * ctx,
     return result;
 }
 
+static struct ggml_tensor * ggml_ifairy_wide_linear_impl(struct ggml_context * ctx,
+                                                         struct ggml_tensor *  u0,
+                                                         struct ggml_tensor *  u1,
+                                                         struct ggml_tensor *  w0,
+                                                         struct ggml_tensor *  w1,
+                                                         struct ggml_tensor *  x,
+                                                         struct ggml_tensor *  x_conj) {
+    GGML_ASSERT(u0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(u1->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w1->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x_conj->type == GGML_TYPE_F32);
+    GGML_ASSERT(u0->ne[0] == u1->ne[0] && u0->ne[0] == w0->ne[0] && u0->ne[0] == w1->ne[0]);
+    GGML_ASSERT(u0->ne[1] == u1->ne[1] && u0->ne[1] == w0->ne[1] && u0->ne[1] == w1->ne[1]);
+    GGML_ASSERT(x->ne[0] == u0->ne[0] && x_conj->ne[0] == u0->ne[0]);
+    GGML_ASSERT(x->ne[1] == x_conj->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, u0->ne[1], x->ne[1]);
+
+    result->op     = GGML_OP_IFAIRY_WIDE_LINEAR;
+    result->src[0] = u0;
+    result->src[1] = u1;
+    result->src[2] = w0;
+    result->src[3] = w1;
+    result->src[4] = x;
+    result->src[5] = x_conj;
+
+    return result;
+}
+
 static struct ggml_tensor * ggml_ifairy_mul_impl(struct ggml_context * ctx,
                                                  struct ggml_tensor *  a,
                                                  struct ggml_tensor *  b,
@@ -4130,6 +4162,16 @@ struct ggml_tensor * ggml_ifairy_rope(struct ggml_context * ctx,
 
 struct ggml_tensor * ggml_ifairy_add(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
     return ggml_ifairy_add_impl(ctx, a, b, false);
+}
+
+struct ggml_tensor * ggml_ifairy_wide_linear(struct ggml_context * ctx,
+                                             struct ggml_tensor *  u0,
+                                             struct ggml_tensor *  u1,
+                                             struct ggml_tensor *  w0,
+                                             struct ggml_tensor *  w1,
+                                             struct ggml_tensor *  x,
+                                             struct ggml_tensor *  x_conj) {
+    return ggml_ifairy_wide_linear_impl(ctx, u0, u1, w0, w1, x, x_conj);
 }
 
 struct ggml_tensor * ggml_ifairy_mul(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {

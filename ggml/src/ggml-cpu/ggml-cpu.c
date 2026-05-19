@@ -2141,6 +2141,145 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+
+static uint32_t ggml_ifairy_add_bf16_pair_word(uint32_t a, uint32_t b) {
+    const ggml_bf16_t ar = { (uint16_t) (a & 0xffffu) };
+    const ggml_bf16_t ai = { (uint16_t) (a >> 16) };
+    const ggml_bf16_t br = { (uint16_t) (b & 0xffffu) };
+    const ggml_bf16_t bi = { (uint16_t) (b >> 16) };
+
+    ggml_bf16_t out[2];
+    out[0] = GGML_FP32_TO_BF16(GGML_BF16_TO_FP32(ar) + GGML_BF16_TO_FP32(br));
+    out[1] = GGML_FP32_TO_BF16(GGML_BF16_TO_FP32(ai) + GGML_BF16_TO_FP32(bi));
+
+    uint32_t word;
+    memcpy(&word, out, sizeof(word));
+    return word;
+}
+
+static uint32_t ggml_ifairy64_vec_dot_word(int64_t n, const char * w, const void * x) {
+    float out = 0.0f;
+    ggml_vec_dot_ifairy64_q16_K((int) n, &out, 0, w, 0, x, 0, 1);
+
+    uint32_t word;
+    memcpy(&word, &out, sizeof(word));
+    return word;
+}
+
+void ggml_compute_forward_ifairy_wide_linear(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    const struct ggml_tensor * u0     = dst->src[0];
+    const struct ggml_tensor * u1     = dst->src[1];
+    const struct ggml_tensor * w0     = dst->src[2];
+    const struct ggml_tensor * w1     = dst->src[3];
+    const struct ggml_tensor * x      = dst->src[4];
+    const struct ggml_tensor * x_conj = dst->src[5];
+
+    GGML_ASSERT(u0 && u1 && w0 && w1 && x && x_conj);
+    GGML_ASSERT(u0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(u1->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w1->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x_conj->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t K = u0->ne[0];
+    const int64_t M = u0->ne[1];
+    const int64_t N = x->ne[1];
+
+    GGML_ASSERT(N == 1);
+    GGML_ASSERT(dst->ne[0] == M && dst->ne[1] == N);
+    GGML_ASSERT(u1->ne[0] == K && w0->ne[0] == K && w1->ne[0] == K);
+    GGML_ASSERT(u1->ne[1] == M && w0->ne[1] == M && w1->ne[1] == M);
+    GGML_ASSERT(x->ne[0] == K && x_conj->ne[0] == K && x_conj->ne[1] == N);
+    GGML_ASSERT(K % QK_IFAIRY64 == 0);
+    GGML_ASSERT(K % QK_IFAIRY == 0);
+    GGML_ASSERT(x->nb[0] == (int64_t) sizeof(float));
+    GGML_ASSERT(x_conj->nb[0] == (int64_t) sizeof(float));
+
+    const size_t q_row_size   = ggml_row_size(GGML_TYPE_IFAIRY_Q16, K);
+    const size_t q_row_stride = GGML_PAD(q_row_size, 64);
+    GGML_ASSERT(params->wdata != NULL);
+    GGML_ASSERT(params->wsize >= 2 * q_row_stride);
+
+    block_ifairy_q16 * x_conj_q = (block_ifairy_q16 *) params->wdata;
+    block_ifairy_q16 * x_q      = (block_ifairy_q16 *) ((char *) params->wdata + q_row_stride);
+
+    const int64_t q_block_size = ggml_blck_size(GGML_TYPE_IFAIRY_Q16);
+    const size_t  q_type_size  = ggml_type_size(GGML_TYPE_IFAIRY_Q16);
+    const int64_t q_blocks     = K / q_block_size;
+    const int64_t qb0          = (q_blocks * params->ith) / params->nth;
+    const int64_t qb1          = (q_blocks * (params->ith + 1)) / params->nth;
+
+    if (qb1 > qb0) {
+        quantize_row_ifairy_q16((const float *) x_conj->data + qb0 * q_block_size,
+                                (char *) x_conj_q + (size_t) qb0 * q_type_size,
+                                (qb1 - qb0) * q_block_size);
+        quantize_row_ifairy_q16((const float *) x->data + qb0 * q_block_size,
+                                (char *) x_q + (size_t) qb0 * q_type_size,
+                                (qb1 - qb0) * q_block_size);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    const int64_t tiles  = (M + 3) / 4;
+    const int64_t tile0  = (tiles * params->ith) / params->nth;
+    const int64_t tile1  = (tiles * (params->ith + 1)) / params->nth;
+    const size_t  u0_nb1 = u0->nb[1];
+    const size_t  u1_nb1 = u1->nb[1];
+    const size_t  w0_nb1 = w0->nb[1];
+    const size_t  w1_nb1 = w1->nb[1];
+
+    for (int64_t tile = tile0; tile < tile1; ++tile) {
+        const int64_t row  = tile * 4;
+        const int64_t rows = MIN(4, M - row);
+
+        float u0_out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float u1_out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float w0_out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float w1_out[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+        if (rows == 4) {
+            ggml_vec_dot_ifairy64_q16_K_4x((int) K, u0_out, (const char *) u0->data + row * u0_nb1, u0_nb1,
+                                           x_conj_q);
+            ggml_vec_dot_ifairy64_q16_K_4x((int) K, u1_out, (const char *) u1->data + row * u1_nb1, u1_nb1,
+                                           x_conj_q);
+            ggml_vec_dot_ifairy64_q16_K_4x((int) K, w0_out, (const char *) w0->data + row * w0_nb1, w0_nb1,
+                                           x_q);
+            ggml_vec_dot_ifairy64_q16_K_4x((int) K, w1_out, (const char *) w1->data + row * w1_nb1, w1_nb1,
+                                           x_q);
+        } else {
+            for (int64_t r = 0; r < rows; ++r) {
+                uint32_t word;
+                word = ggml_ifairy64_vec_dot_word(K, (const char *) u0->data + (row + r) * u0_nb1, x_conj_q);
+                memcpy(&u0_out[r], &word, sizeof(word));
+                word = ggml_ifairy64_vec_dot_word(K, (const char *) u1->data + (row + r) * u1_nb1, x_conj_q);
+                memcpy(&u1_out[r], &word, sizeof(word));
+                word = ggml_ifairy64_vec_dot_word(K, (const char *) w0->data + (row + r) * w0_nb1, x_q);
+                memcpy(&w0_out[r], &word, sizeof(word));
+                word = ggml_ifairy64_vec_dot_word(K, (const char *) w1->data + (row + r) * w1_nb1, x_q);
+                memcpy(&w1_out[r], &word, sizeof(word));
+            }
+        }
+
+        for (int64_t r = 0; r < rows; ++r) {
+            uint32_t u0_word;
+            uint32_t u1_word;
+            uint32_t w0_word;
+            uint32_t w1_word;
+            memcpy(&u0_word, &u0_out[r], sizeof(u0_word));
+            memcpy(&u1_word, &u1_out[r], sizeof(u1_word));
+            memcpy(&w0_word, &w0_out[r], sizeof(w0_word));
+            memcpy(&w1_word, &w1_out[r], sizeof(w1_word));
+
+            const uint32_t u_word = ggml_ifairy_add_bf16_pair_word(u0_word, u1_word);
+            const uint32_t w_word = ggml_ifairy_add_bf16_pair_word(w0_word, w1_word);
+            const uint32_t y_word = ggml_ifairy_add_bf16_pair_word(u_word, w_word);
+            memcpy((char *) dst->data + (row + r) * dst->nb[0], &y_word, sizeof(y_word));
+        }
+    }
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -2363,6 +2502,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_IFAIRY_ADD:
             {
                 ggml_compute_forward_ifairy_add(params, tensor);
+            }
+            break;
+        case GGML_OP_IFAIRY_WIDE_LINEAR:
+            {
+                ggml_compute_forward_ifairy_wide_linear(params, tensor);
             }
             break;
         case GGML_OP_IFAIRY_MUL:
@@ -2764,6 +2908,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_IFAIRY_ADD:
+        case GGML_OP_IFAIRY_WIDE_LINEAR:
         case GGML_OP_IFAIRY_MUL:
         case GGML_OP_IFAIRY_SPLIT:
         case GGML_OP_IFAIRY_ROPE:
@@ -3290,6 +3435,11 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_IFAIRY_RMSNORM:
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                    } break;
+                case GGML_OP_IFAIRY_WIDE_LINEAR:
+                    {
+                        const int64_t K = node->src[0]->ne[0];
+                        cur = 2 * GGML_PAD(ggml_row_size(GGML_TYPE_IFAIRY_Q16, K), 64);
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
