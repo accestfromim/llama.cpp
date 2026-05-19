@@ -1070,6 +1070,111 @@ void ggml_vec_dot_ifairy64_q16_K(int                        n,
 #endif
 }
 
+void ggml_vec_dot_ifairy64_q16_K_4x(int                        n,
+                                    float * GGML_RESTRICT      s,
+                                    const void * GGML_RESTRICT vx,
+                                    size_t                     bx,
+                                    const void * GGML_RESTRICT vy) {
+#if defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX2__)
+    const block_ifairy64 * GGML_RESTRICT w0 = (const block_ifairy64 *) vx;
+    const block_ifairy64 * GGML_RESTRICT w1 = (const block_ifairy64 *) ((const char *) vx + bx);
+    const block_ifairy64 * GGML_RESTRICT w2 = (const block_ifairy64 *) ((const char *) vx + 2 * bx);
+    const block_ifairy64 * GGML_RESTRICT w3 = (const block_ifairy64 *) ((const char *) vx + 3 * bx);
+    const block_ifairy_q16 * GGML_RESTRICT x = (const block_ifairy_q16 *) vy;
+
+    GGML_ASSERT(n % QK_IFAIRY64 == 0);
+    GGML_ASSERT(n % QK_IFAIRY == 0);
+
+    const int nb = n / QK_IFAIRY64;
+
+    const __m128i v_mask = _mm_set1_epi8(0x03);
+    const __m128i v_lut_wr_128 =
+        _mm_setr_epi8(-1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i v_lut_wi_128 =
+        _mm_setr_epi8(0, 0, -1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m256i v_lut_wr = _mm256_broadcastsi128_si256(v_lut_wr_128);
+    const __m256i v_lut_wi = _mm256_broadcastsi128_si256(v_lut_wi_128);
+
+    __m256 sum_real_v0 = _mm256_setzero_ps();
+    __m256 sum_imag_v0 = _mm256_setzero_ps();
+    __m256 sum_real_v1 = _mm256_setzero_ps();
+    __m256 sum_imag_v1 = _mm256_setzero_ps();
+    __m256 sum_real_v2 = _mm256_setzero_ps();
+    __m256 sum_imag_v2 = _mm256_setzero_ps();
+    __m256 sum_real_v3 = _mm256_setzero_ps();
+    __m256 sum_imag_v3 = _mm256_setzero_ps();
+
+#define GGML_IFAIRY64_ACC_ROW(W, SUM_REAL, SUM_IMAG)                                               \
+    do {                                                                                            \
+        const __m128i packed = _mm_loadu_si128((const __m128i *) (W)[i].qs);                        \
+        __m256i       acc_ac = _mm256_setzero_si256();                                             \
+        __m256i       acc_ad = _mm256_setzero_si256();                                             \
+        __m256i       acc_bc = _mm256_setzero_si256();                                             \
+        __m256i       acc_bd = _mm256_setzero_si256();                                             \
+        const __m128i codes0 = _mm_and_si128(packed, v_mask);                                      \
+        const __m128i codes1 = _mm_and_si128(_mm_srli_epi16(packed, 2), v_mask);                    \
+        const __m128i codes2 = _mm_and_si128(_mm_srli_epi16(packed, 4), v_mask);                    \
+        const __m128i codes3 = _mm_and_si128(_mm_srli_epi16(packed, 6), v_mask);                    \
+        ggml_ifairy64_dot_part_avx512vnni_x(_mm256_set_m128i(codes1, codes0), v_lut_wr, v_lut_wi,  \
+                                            xr8_0, xi8_0, xr_abs_0, xi_abs_0, &acc_ac, &acc_ad,     \
+                                            &acc_bc, &acc_bd);                                      \
+        ggml_ifairy64_dot_part_avx512vnni_x(_mm256_set_m128i(codes3, codes2), v_lut_wr, v_lut_wi,  \
+                                            xr8_1, xi8_1, xr_abs_1, xi_abs_1, &acc_ac, &acc_ad,     \
+                                            &acc_bc, &acc_bd);                                      \
+        const float w_real = GGML_CPU_FP16_TO_FP32((W)[i].d_real);                                  \
+        const float w_imag = GGML_CPU_FP16_TO_FP32((W)[i].d_imag);                                  \
+        (SUM_REAL) = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc_ac), _mm256_set1_ps(w_real * x_real),   \
+                                     (SUM_REAL));                                                   \
+        (SUM_REAL) = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc_bd), _mm256_set1_ps(w_imag * x_imag),   \
+                                     (SUM_REAL));                                                   \
+        (SUM_IMAG) = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc_bc), _mm256_set1_ps(w_imag * x_real),   \
+                                     (SUM_IMAG));                                                   \
+        (SUM_IMAG) = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(acc_ad), _mm256_set1_ps(w_real * x_imag),  \
+                                      (SUM_IMAG));                                                  \
+    } while (0)
+
+    for (int i = 0; i < nb; ++i) {
+        const block_ifairy_q16 * x_block = &x[i / 4];
+        const int                x_base  = (i % 4) * QK_IFAIRY64;
+
+        const int8_t * GGML_RESTRICT x_r_ptr = (const int8_t *) x_block->x_real + x_base;
+        const int8_t * GGML_RESTRICT x_i_ptr = (const int8_t *) x_block->x_imag + x_base;
+
+        const __m256i xr8_0    = _mm256_loadu_si256((const __m256i *) (x_r_ptr + 0));
+        const __m256i xi8_0    = _mm256_loadu_si256((const __m256i *) (x_i_ptr + 0));
+        const __m256i xr_abs_0 = _mm256_abs_epi8(xr8_0);
+        const __m256i xi_abs_0 = _mm256_abs_epi8(xi8_0);
+        const __m256i xr8_1    = _mm256_loadu_si256((const __m256i *) (x_r_ptr + 32));
+        const __m256i xi8_1    = _mm256_loadu_si256((const __m256i *) (x_i_ptr + 32));
+        const __m256i xr_abs_1 = _mm256_abs_epi8(xr8_1);
+        const __m256i xi_abs_1 = _mm256_abs_epi8(xi8_1);
+
+        const float x_real = GGML_CPU_FP16_TO_FP32(x_block->d_real);
+        const float x_imag = GGML_CPU_FP16_TO_FP32(x_block->d_imag);
+
+        GGML_IFAIRY64_ACC_ROW(w0, sum_real_v0, sum_imag_v0);
+        GGML_IFAIRY64_ACC_ROW(w1, sum_real_v1, sum_imag_v1);
+        GGML_IFAIRY64_ACC_ROW(w2, sum_real_v2, sum_imag_v2);
+        GGML_IFAIRY64_ACC_ROW(w3, sum_real_v3, sum_imag_v3);
+    }
+
+#undef GGML_IFAIRY64_ACC_ROW
+
+    ((ggml_bf16_t *) (s + 0))[0] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_real_v0));
+    ((ggml_bf16_t *) (s + 0))[1] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_imag_v0));
+    ((ggml_bf16_t *) (s + 1))[0] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_real_v1));
+    ((ggml_bf16_t *) (s + 1))[1] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_imag_v1));
+    ((ggml_bf16_t *) (s + 2))[0] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_real_v2));
+    ((ggml_bf16_t *) (s + 2))[1] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_imag_v2));
+    ((ggml_bf16_t *) (s + 3))[0] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_real_v3));
+    ((ggml_bf16_t *) (s + 3))[1] = GGML_FP32_TO_BF16(ggml_ifairy64_hsum_f32_avx2(sum_imag_v3));
+#else
+    for (int row = 0; row < 4; ++row) {
+        ggml_vec_dot_ifairy64_q16_K(n, s + row, 0, (const char *) vx + row * bx, 0, vy, 0, 1);
+    }
+#endif
+}
+
 void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
                                          float * GGML_RESTRICT      s,
                                          size_t                     bs,

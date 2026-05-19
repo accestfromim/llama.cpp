@@ -37,6 +37,11 @@ void ggml_vec_dot_ifairy64_q16_K(int                        n,
                                  const void * GGML_RESTRICT vy,
                                  size_t                     by,
                                  int                        nrc);
+void ggml_vec_dot_ifairy64_q16_K_4x(int                        n,
+                                    float * GGML_RESTRICT      s,
+                                    const void * GGML_RESTRICT vx,
+                                    size_t                     bx,
+                                    const void * GGML_RESTRICT vy);
 void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
                                          float * GGML_RESTRICT      s,
                                          size_t                     bs,
@@ -1073,7 +1078,7 @@ static bool run_ifairy_vecdot_compare_case(int k, uint32_t seed, bool tensor_sca
     }
 
     const int nb   = k / QK_IFAIRY;
-    const int rows = 3;
+    const int rows = 4;
 
     std::mt19937                          rng(seed);
     std::uniform_int_distribution<int>    code_dist(0, 3);
@@ -1247,6 +1252,10 @@ static bool test_ifairy64_vecdot_compare() {
     }
 
     bool ok = true;
+    alignas(4) uint32_t out_4x[4] = {};
+    ggml_vec_dot_ifairy64_q16_K_4x(k, reinterpret_cast<float *>(out_4x), w.data(),
+                                   (size_t) nb64 * sizeof(block_ifairy64), x.data());
+
     for (int r = 0; r < rows; ++r) {
         alignas(4) uint32_t out_ref = 0;
         alignas(4) uint32_t out_opt = 0;
@@ -1267,6 +1276,19 @@ static bool test_ifairy64_vecdot_compare() {
                     "opt_word=0x%08x\n",
                     r, GGML_BF16_TO_FP32(rr), GGML_BF16_TO_FP32(ri), GGML_BF16_TO_FP32(orr), GGML_BF16_TO_FP32(ori),
                     out_ref, out_opt);
+            ok = false;
+        }
+        if (out_ref != out_4x[r]) {
+            const ggml_bf16_t rr{ (uint16_t) (out_ref & 0xFFFFu) };
+            const ggml_bf16_t ri{ (uint16_t) (out_ref >> 16) };
+            const ggml_bf16_t orr{ (uint16_t) (out_4x[r] & 0xFFFFu) };
+            const ggml_bf16_t ori{ (uint16_t) (out_4x[r] >> 16) };
+
+            fprintf(stderr,
+                    "ifairy64 4x vecdot mismatch: row=%d ref=(%.7g, %.7g) opt=(%.7g, %.7g) ref_word=0x%08x "
+                    "opt_word=0x%08x\n",
+                    r, GGML_BF16_TO_FP32(rr), GGML_BF16_TO_FP32(ri), GGML_BF16_TO_FP32(orr), GGML_BF16_TO_FP32(ori),
+                    out_ref, out_4x[r]);
             ok = false;
         }
     }
