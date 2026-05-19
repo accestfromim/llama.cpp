@@ -1236,13 +1236,13 @@ static bool test_ifairy64_vecdot_compare() {
         }
     }
 
-    static const int8_t edge_vals[] = { -127, -1, 0, 1, 127 };
+    static const int8_t edge_vals[] = { -128, -127, -1, 0, 1, 127 };
     for (int ib = 0; ib < nbq; ++ib) {
         int8_t * xr = (int8_t *) x[ib].x_real;
         int8_t * xi = (int8_t *) x[ib].x_imag;
         for (int j = 0; j < QK_IFAIRY; ++j) {
-            xr[j] = edge_vals[j % 5];
-            xi[j] = edge_vals[(j + 2) % 5];
+            xr[j] = edge_vals[j % (int) (sizeof(edge_vals) / sizeof(edge_vals[0]))];
+            xi[j] = edge_vals[(j + 2) % (int) (sizeof(edge_vals) / sizeof(edge_vals[0]))];
         }
     }
 
