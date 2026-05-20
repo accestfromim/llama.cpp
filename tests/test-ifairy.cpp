@@ -323,8 +323,7 @@ static bool compare_packed_complex_outputs(const uint32_t * a, const uint32_t * 
         ggml_bf16_t b_pair[2];
         memcpy(a_pair, a + max_diff_idx, sizeof(uint32_t));
         memcpy(b_pair, b + max_diff_idx, sizeof(uint32_t));
-        fprintf(stderr,
-                "  Packed compare mismatch at index %zu channel=%s diff=%.6f (a=(%.6f,%.6f) b=(%.6f,%.6f))\n",
+        fprintf(stderr, "  Packed compare mismatch at index %zu channel=%s diff=%.6f (a=(%.6f,%.6f) b=(%.6f,%.6f))\n",
                 max_diff_idx, max_diff_ch == 0 ? "real" : "imag", max_diff, GGML_BF16_TO_FP32(a_pair[0]),
                 GGML_BF16_TO_FP32(a_pair[1]), GGML_BF16_TO_FP32(b_pair[0]), GGML_BF16_TO_FP32(b_pair[1]));
         return false;
@@ -573,7 +572,7 @@ static bool test_ifairy64_lut_transform_pack() {
     const int64_t k              = QK_IFAIRY;
     const int64_t rows           = 18;
     const int64_t blocks_per_row = k / QK_IFAIRY64;
-    ggml_tensor *  w             = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, rows);
+    ggml_tensor * w              = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, rows);
     if (!w || !w->data) {
         fprintf(stderr, "Failed to allocate ifairy64 tensor\n");
         ggml_free(ctx);
@@ -612,7 +611,7 @@ static bool test_ifairy64_lut_transform_pack() {
     }
 
     const ifairy_lut_extra * extra = (const ifairy_lut_extra *) w->extra;
-    const size_t expected_packed =
+    const size_t             expected_packed =
         (size_t) ((rows + 15) / 16) * (size_t) blocks_per_row * sizeof(ifairy64_lut_wtile_16);
     if (!extra || !extra->packed_w || extra->packed_w_size != expected_packed) {
         fprintf(stderr, "transform_tensor produced invalid iFairy64 extra (packed=%zu expected=%zu)\n",
@@ -621,9 +620,9 @@ static bool test_ifairy64_lut_transform_pack() {
         return false;
     }
 
-    const int64_t                    tiles    = (rows + 15) / 16;
+    const int64_t                 tiles    = (rows + 15) / 16;
     const ifairy64_lut_wtile_16 * packed_w = (const ifairy64_lut_wtile_16 *) extra->packed_w;
-    bool                             pass     = true;
+    bool                          pass     = true;
 
     for (int64_t tile = 0; tile < tiles && pass; ++tile) {
         for (int64_t blk = 0; blk < blocks_per_row && pass; ++blk) {
@@ -635,7 +634,8 @@ static bool test_ifairy64_lut_transform_pack() {
                 }
 
                 const block_ifairy64 & src = weights[(size_t) row * (size_t) blocks_per_row + (size_t) blk];
-                if (t->d_real[lane] != src.d_real || t->d_imag[lane] != src.d_imag) {
+                if (t->d_real[lane] != GGML_FP16_TO_FP32(src.d_real) ||
+                    t->d_imag[lane] != GGML_FP16_TO_FP32(src.d_imag)) {
                     fprintf(stderr, "transform packed scale mismatch at row=%lld blk=%lld lane=%d\n", (long long) row,
                             (long long) blk, lane);
                     pass = false;
@@ -649,9 +649,9 @@ static bool test_ifairy64_lut_transform_pack() {
                         (blk_idx[byte_idx * 2 + 0] & 0x0fu) | (uint8_t) ((blk_idx[byte_idx * 2 + 1] & 0x0fu) << 4);
                     if (t->qs[byte_idx][lane] != expected_byte) {
                         fprintf(stderr,
-                                "transform packed byte mismatch at row=%lld blk=%lld lane=%d byte_idx=%d (got=%02x expected=%02x)\n",
-                                (long long) row, (long long) blk, lane, byte_idx, t->qs[byte_idx][lane],
-                                expected_byte);
+                                "transform packed byte mismatch at row=%lld blk=%lld lane=%d byte_idx=%d (got=%02x "
+                                "expected=%02x)\n",
+                                (long long) row, (long long) blk, lane, byte_idx, t->qs[byte_idx][lane], expected_byte);
                         pass = false;
                         break;
                     }
@@ -899,8 +899,8 @@ static bool test_ifairy_lut_env_semantics() {
     const size_t wsize_disabled = ggml_ifairy_lut_get_wsize(w, a, dst, 1);
 
     env_lut.set("1");
-    const bool   can_enabled   = ggml_ifairy_lut_can_mul_mat(w, a, dst);
-    const size_t wsize_enabled = ggml_ifairy_lut_get_wsize(w, a, dst, 1);
+    const bool   can_enabled            = ggml_ifairy_lut_can_mul_mat(w, a, dst);
+    const size_t wsize_enabled          = ggml_ifairy_lut_get_wsize(w, a, dst, 1);
     const bool   can_ifairy64_enabled   = ggml_ifairy_lut_can_mul_mat(w64, a, dst);
     const size_t wsize_ifairy64_enabled = ggml_ifairy_lut_get_wsize(w64, a, dst, 1);
 
@@ -909,7 +909,8 @@ static bool test_ifairy_lut_env_semantics() {
     if (can_disabled || !can_enabled || wsize_disabled != 0 || wsize_enabled == 0 || can_ifairy64_default ||
         wsize_ifairy64_default != 0 || !can_ifairy64_enabled || wsize_ifairy64_enabled == 0) {
         fprintf(stderr,
-                "env semantics mismatch: legacy(off=%d on=%d w0=%zu w1=%zu) ifairy64(default=%d explicit=%d wdef=%zu wexp=%zu)\n",
+                "env semantics mismatch: legacy(off=%d on=%d w0=%zu w1=%zu) ifairy64(default=%d explicit=%d wdef=%zu "
+                "wexp=%zu)\n",
                 (int) can_disabled, (int) can_enabled, wsize_disabled, wsize_enabled, (int) can_ifairy64_default,
                 (int) can_ifairy64_enabled, wsize_ifairy64_default, wsize_ifairy64_enabled);
         return false;
@@ -1234,8 +1235,8 @@ static bool test_ifairy64_vecdot_compare() {
 
         ggml_vec_dot_ifairy64_q16_K_generic(k, reinterpret_cast<float *>(&out_ref), 0,
                                             w.data() + (size_t) r * (size_t) nb64, 0, x.data(), 0, 1);
-        ggml_vec_dot_ifairy64_q16_K(k, reinterpret_cast<float *>(&out_opt), 0,
-                                    w.data() + (size_t) r * (size_t) nb64, 0, x.data(), 0, 1);
+        ggml_vec_dot_ifairy64_q16_K(k, reinterpret_cast<float *>(&out_opt), 0, w.data() + (size_t) r * (size_t) nb64, 0,
+                                    x.data(), 0, 1);
 
         if (out_ref != out_opt) {
             const ggml_bf16_t rr{ (uint16_t) (out_ref & 0xFFFFu) };
@@ -1854,32 +1855,40 @@ static bool test_ifairy64_lut_backend_compare() {
 #else
     printf("\n=== Test 5.3: iFairy64 LUT backend compare ===\n");
 
-    const int64_t M = 8;
-    const int64_t N = 2;
     const int64_t K = 2 * QK_IFAIRY;
 
     std::vector<float>            act_f32;
     std::vector<block_ifairy_q16> act_q16;
-    fill_ifairy_backend_act_f32(act_f32, N, K);
-    quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
+    const int64_t                 m_cases[] = { 8, 16, 17 };
+    const int64_t                 n_cases[] = { 1, 2 };
+    for (int64_t M : m_cases) {
+        for (int64_t N : n_cases) {
+            fill_ifairy_backend_act_f32(act_f32, N, K);
+            quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
 
-    std::vector<uint32_t> out_off;
-    std::vector<uint32_t> out_on;
-    if (!run_ifairy64_backend_mul_mat_shape(out_off, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
-                                            /*lut_env*/ "0")) {
-        return false;
+            std::vector<uint32_t> out_off;
+            std::vector<uint32_t> out_on;
+            if (!run_ifairy64_backend_mul_mat_shape(out_off, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
+                                                    act_q16.size() * sizeof(block_ifairy_q16),
+                                                    /*lut_env*/ "0")) {
+                return false;
+            }
+            if (!run_ifairy64_backend_mul_mat_shape(out_on, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
+                                                    act_q16.size() * sizeof(block_ifairy_q16),
+                                                    /*lut_env*/ "1")) {
+                return false;
+            }
+            if (out_off.size() != out_on.size()) {
+                fprintf(stderr, "Size mismatch (ifairy64 LUT off/on M=%lld N=%lld): %zu vs %zu\n", (long long) M,
+                        (long long) N, out_off.size(), out_on.size());
+                return false;
+            }
+            if (!compare_packed_complex_outputs(out_on.data(), out_off.data(), out_off.size(), 1e-2f)) {
+                return false;
+            }
+        }
     }
-    if (!run_ifairy64_backend_mul_mat_shape(out_on, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
-                                            /*lut_env*/ "1")) {
-        return false;
-    }
-    if (out_off.size() != out_on.size()) {
-        fprintf(stderr, "Size mismatch (ifairy64 LUT off/on): %zu vs %zu\n", out_off.size(), out_on.size());
-        return false;
-    }
-    return compare_packed_complex_outputs(out_on.data(), out_off.data(), out_off.size(), 1e-2f);
+    return true;
 #endif
 }
 
@@ -1890,32 +1899,40 @@ static bool test_ifairy64_lut_backend_f32_vs_q16() {
 #else
     printf("\n=== Test 5.4: iFairy64 LUT backend F32 vs Q16 ===\n");
 
-    const int64_t M = 8;
-    const int64_t N = 2;
     const int64_t K = 2 * QK_IFAIRY;
 
     std::vector<float>            act_f32;
     std::vector<block_ifairy_q16> act_q16;
-    fill_ifairy_backend_act_f32(act_f32, N, K);
-    quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
+    const int64_t                 m_cases[] = { 8, 16, 17 };
+    const int64_t                 n_cases[] = { 1, 2 };
+    for (int64_t M : m_cases) {
+        for (int64_t N : n_cases) {
+            fill_ifairy_backend_act_f32(act_f32, N, K);
+            quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
 
-    std::vector<uint32_t> out_f32;
-    std::vector<uint32_t> out_q16;
-    if (!run_ifairy64_backend_mul_mat_shape(out_f32, M, N, K, GGML_TYPE_F32, act_f32.data(),
-                                            act_f32.size() * sizeof(float),
-                                            /*lut_env*/ "1")) {
-        return false;
+            std::vector<uint32_t> out_f32;
+            std::vector<uint32_t> out_q16;
+            if (!run_ifairy64_backend_mul_mat_shape(out_f32, M, N, K, GGML_TYPE_F32, act_f32.data(),
+                                                    act_f32.size() * sizeof(float),
+                                                    /*lut_env*/ "1")) {
+                return false;
+            }
+            if (!run_ifairy64_backend_mul_mat_shape(out_q16, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
+                                                    act_q16.size() * sizeof(block_ifairy_q16),
+                                                    /*lut_env*/ "1")) {
+                return false;
+            }
+            if (out_f32.size() != out_q16.size()) {
+                fprintf(stderr, "Size mismatch (ifairy64 F32 vs Q16 M=%lld N=%lld): %zu vs %zu\n", (long long) M,
+                        (long long) N, out_f32.size(), out_q16.size());
+                return false;
+            }
+            if (!compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size())) {
+                return false;
+            }
+        }
     }
-    if (!run_ifairy64_backend_mul_mat_shape(out_q16, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
-                                            /*lut_env*/ "1")) {
-        return false;
-    }
-    if (out_f32.size() != out_q16.size()) {
-        fprintf(stderr, "Size mismatch (ifairy64 F32 vs Q16): %zu vs %zu\n", out_f32.size(), out_q16.size());
-        return false;
-    }
-    return compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size());
+    return true;
 #endif
 }
 
@@ -1931,6 +1948,7 @@ static bool run_ifairy_backend_bench_case(ifairy_backend_bench_result & result,
                                           int64_t                       N,
                                           int64_t                       K,
                                           int                           threads,
+                                          bool                          ifairy64,
                                           bool                          lut_enabled,
                                           int                           warmup,
                                           int                           iters) {
@@ -1939,28 +1957,26 @@ static bool run_ifairy_backend_bench_case(ifairy_backend_bench_result & result,
     env_lut.set(lut_enabled ? "1" : "0");
     env_impl.set("lut16");
 
-    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY) != 0 || threads <= 0 || warmup < 0 || iters <= 0) {
+    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY) != 0 || threads <= 0 || warmup < 0 || iters <= 0 ||
+        (ifairy64 && (K % QK_IFAIRY64) != 0)) {
         fprintf(stderr, "Invalid backend bench params: M=%lld N=%lld K=%lld threads=%d warmup=%d iters=%d\n",
                 (long long) M, (long long) N, (long long) K, threads, warmup, iters);
         return false;
     }
 
-    const int64_t blocks_per_row = K / QK_IFAIRY;
-    const float   w_scale        = 1.0f / 8.0f;
-
-    std::vector<block_ifairy> weights((size_t) M * (size_t) blocks_per_row);
-    for (int64_t r = 0; r < M; ++r) {
-        for (int64_t b = 0; b < blocks_per_row; ++b) {
-            block_ifairy blk{};
-            blk.d_real = GGML_FP32_TO_FP16(w_scale);
-            blk.d_imag = GGML_FP32_TO_FP16(w_scale);
-            for (int j = 0; j < QK_IFAIRY; ++j) {
-                const int     k_idx = (int) (b * QK_IFAIRY + j);
-                const uint8_t code  = (uint8_t) ((k_idx + 3 * (int) r + 1) & 0x3);
-                set_ifairy_code(blk, j, code);
-            }
-            weights[(size_t) r * (size_t) blocks_per_row + (size_t) b] = blk;
-        }
+    std::vector<block_ifairy>   weights;
+    std::vector<block_ifairy64> weights64;
+    const void *                weight_data  = nullptr;
+    size_t                      weight_bytes = 0;
+    const enum ggml_type        weight_type  = ifairy64 ? GGML_TYPE_IFAIRY64 : GGML_TYPE_IFAIRY;
+    if (ifairy64) {
+        fill_ifairy64_backend_weights(weights64, M, K);
+        weight_data  = weights64.data();
+        weight_bytes = weights64.size() * sizeof(block_ifairy64);
+    } else {
+        fill_ifairy_backend_weights(weights, M, K);
+        weight_data  = weights.data();
+        weight_bytes = weights.size() * sizeof(block_ifairy);
     }
 
     std::vector<float>            act_f32;
@@ -1987,7 +2003,7 @@ static bool run_ifairy_backend_bench_case(ifairy_backend_bench_result & result,
         return false;
     }
 
-    struct ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY, K, M);
+    struct ggml_tensor * w   = ggml_new_tensor_2d(ctx, weight_type, K, M);
     struct ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY_Q16, K, N);
     struct ggml_tensor * out = ggml_mul_mat(ctx, w, a);
 
@@ -2002,7 +2018,7 @@ static bool run_ifairy_backend_bench_case(ifairy_backend_bench_result & result,
         return false;
     }
 
-    ggml_backend_tensor_set(w, weights.data(), 0, ggml_nbytes(w));
+    ggml_backend_tensor_set(w, weight_data, 0, weight_bytes);
     ggml_backend_tensor_set(a, act_q16.data(), 0, ggml_nbytes(a));
 
     for (int i = 0; i < warmup; ++i) {
@@ -2052,15 +2068,16 @@ static uint64_t ifairy_hash_u32(const std::vector<uint32_t> & values) {
     return h;
 }
 
-static bool run_ifairy_lut_backend_bench(int64_t M, int64_t N, int64_t K, int threads, int warmup, int iters) {
-    printf("\n=== iFairy LUT backend bench ===\n");
+static bool
+run_ifairy_lut_backend_bench(int64_t M, int64_t N, int64_t K, int threads, int warmup, int iters, bool ifairy64) {
+    printf("\n=== %s LUT backend bench ===\n", ifairy64 ? "iFairy64" : "iFairy");
 
     ifairy_backend_bench_result off;
     ifairy_backend_bench_result on;
-    if (!run_ifairy_backend_bench_case(off, M, N, K, threads, false, 1, 1)) {
+    if (!run_ifairy_backend_bench_case(off, M, N, K, threads, ifairy64, false, 1, 1)) {
         return false;
     }
-    if (!run_ifairy_backend_bench_case(on, M, N, K, threads, true, warmup, iters)) {
+    if (!run_ifairy_backend_bench_case(on, M, N, K, threads, ifairy64, true, warmup, iters)) {
         return false;
     }
 
@@ -2220,17 +2237,18 @@ int main(int argc, char ** argv) {
         printf("iFairy Model Unit Tests\n");
         printf("========================================\n");
 
-        bool         verbose     = false;
-        bool         lut_only    = false;
-        bool         lut_bench   = false;
+        bool         verbose              = false;
+        bool         lut_only             = false;
+        bool         lut_bench            = false;
+        bool         lut_bench64          = false;
         bool         ifairy64_vecdot_only = false;
-        const char * vecdot_mode = NULL;
-        int64_t      bench_M     = 4096;
-        int64_t      bench_N     = 1;
-        int64_t      bench_K     = 1536;
-        int          bench_t     = 4;
-        int          bench_warm  = 5;
-        int          bench_iters = 50;
+        const char * vecdot_mode          = NULL;
+        int64_t      bench_M              = 4096;
+        int64_t      bench_N              = 1;
+        int64_t      bench_K              = 1536;
+        int          bench_t              = 4;
+        int          bench_warm           = 5;
+        int          bench_iters          = 50;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
                 verbose = true;
@@ -2252,6 +2270,27 @@ int main(int argc, char ** argv) {
                 lut_bench = true;
                 if (i + 6 >= argc) {
                     fprintf(stderr, "Usage: --ifairy-lut-backend-bench <M> <N> <K> <threads> <warmup> <iters>\n");
+                    return 2;
+                }
+                const char * arg_m     = argv[++i];
+                const char * arg_n     = argv[++i];
+                const char * arg_k     = argv[++i];
+                const char * arg_t     = argv[++i];
+                const char * arg_warm  = argv[++i];
+                const char * arg_iters = argv[++i];
+                if (!parse_cli_i64("M", arg_m, &bench_M) || !parse_cli_i64("N", arg_n, &bench_N) ||
+                    !parse_cli_i64("K", arg_k, &bench_K) || !parse_cli_int("threads", arg_t, &bench_t) ||
+                    !parse_cli_int("warmup", arg_warm, &bench_warm) ||
+                    !parse_cli_int("iters", arg_iters, &bench_iters)) {
+                    return 2;
+                }
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy64-lut-backend-bench") == 0) {
+                lut_bench   = true;
+                lut_bench64 = true;
+                if (i + 6 >= argc) {
+                    fprintf(stderr, "Usage: --ifairy64-lut-backend-bench <M> <N> <K> <threads> <warmup> <iters>\n");
                     return 2;
                 }
                 const char * arg_m     = argv[++i];
@@ -2296,7 +2335,10 @@ int main(int argc, char ** argv) {
         }
 
         if (lut_bench) {
-            return run_ifairy_lut_backend_bench(bench_M, bench_N, bench_K, bench_t, bench_warm, bench_iters) ? 0 : 1;
+            return run_ifairy_lut_backend_bench(bench_M, bench_N, bench_K, bench_t, bench_warm, bench_iters,
+                                                lut_bench64) ?
+                       0 :
+                       1;
         }
 
         int num_failed = 0;
