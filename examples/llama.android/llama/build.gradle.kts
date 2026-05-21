@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "android.llama.cpp"
     compileSdk = 34
+    ndkVersion = "30.0.14904198-beta1"
 
     defaultConfig {
         minSdk = 31

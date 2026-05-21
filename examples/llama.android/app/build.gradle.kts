@@ -4,6 +4,8 @@ plugins {
 }
 
 val bundledAssetDir = System.getenv("LLAMA_ANDROID_BUNDLED_ASSETS") ?: "/tmp/llama-android-assets"
+val usePrebuiltLlama = System.getenv("LLAMA_ANDROID_USE_PREBUILT_LLAMA") == "true"
+val prebuiltLlamaJniLibs = System.getenv("LLAMA_ANDROID_PREBUILT_JNILIBS")
 
 android {
     namespace = "com.example.llama"
@@ -28,6 +30,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            isDebuggable = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -54,6 +57,12 @@ android {
         "src/main/assets",
         bundledAssetDir,
     )
+    if (usePrebuiltLlama) {
+        sourceSets.getByName("main").java.srcDir("../llama/src/main/java")
+        sourceSets.getByName("main").jniLibs.srcDir(
+            prebuiltLlamaJniLibs ?: "${projectDir}/build/intermediates/merged_native_libs/release/out/lib",
+        )
+    }
 }
 
 dependencies {
@@ -66,7 +75,9 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
-    implementation(project(":llama"))
+    if (!usePrebuiltLlama) {
+        implementation(project(":llama"))
+    }
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")

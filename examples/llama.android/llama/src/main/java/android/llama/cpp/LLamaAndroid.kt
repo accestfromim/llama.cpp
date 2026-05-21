@@ -305,6 +305,16 @@ class LLamaAndroid {
         }
     }
 
+    suspend fun refreshBackend() {
+        withContext(runLoop) {
+            unloadLocked()
+            Log.i(LOG_TAG, "Refreshing llama backend")
+            backend_free()
+            backend_init()
+            Log.i(LOG_TAG, "Llama backend refreshed")
+        }
+    }
+
     private fun unloadLocked() {
         when (val current = state) {
             is State.Loaded -> {

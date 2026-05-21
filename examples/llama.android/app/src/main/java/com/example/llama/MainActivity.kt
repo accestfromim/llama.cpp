@@ -6,12 +6,15 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.os.Bundle
 import android.text.format.Formatter
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -88,6 +91,7 @@ class MainActivity(
         viewModel.log("Current memory: $free / $total")
         viewModel.log("App filesDir: $filesDir")
         viewModel.log("Model import dir: ${filesDir.resolve("models").absolutePath}")
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         viewModel.initialize(applicationContext)
         handleAutomationIntent(intent)
 
@@ -395,6 +399,7 @@ private fun SettingsSheet(
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
@@ -431,6 +436,52 @@ private fun SettingsSheet(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                Text(
+                    text = "Internal models (${viewModel.availableModels.size})",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (viewModel.availableModels.isEmpty()) {
+                    Text(
+                        text = "No .gguf files found in app internal model directory.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(140.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        items(viewModel.availableModels, key = { it.privatePath }) { model ->
+                            val selected = viewModel.importedModel?.privatePath == model.privatePath
+                            TextButton(
+                                onClick = { viewModel.selectAvailableModel(model.fileName) },
+                                enabled = !viewModel.isGenerating &&
+                                    !viewModel.isBenchmarking &&
+                                    viewModel.modelLoadState != ModelLoadState.LOADING &&
+                                    viewModel.modelLoadState != ModelLoadState.IMPORTING,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Text(
+                                        text = if (selected) "Selected: ${model.fileName}" else model.fileName,
+                                        textAlign = TextAlign.Start,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                    Text(
+                                        text = Formatter.formatShortFileSize(LocalContext.current, model.sizeBytes),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        textAlign = TextAlign.Start,
+                                        modifier = Modifier.fillMaxWidth(),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = onImportModel,
@@ -445,6 +496,9 @@ private fun SettingsSheet(
                             !viewModel.isGenerating,
                     ) {
                         Text(if (viewModel.modelLoadState == ModelLoadState.LOADING) "Loading" else "Load")
+                    }
+                    TextButton(onClick = viewModel::refreshModelList) {
+                        Text("Refresh")
                     }
                     TextButton(
                         onClick = viewModel::unloadModel,
@@ -529,6 +583,12 @@ private fun SettingsSheet(
                         enabled = viewModel.modelLoadState == ModelLoadState.LOADED && !viewModel.isGenerating,
                     ) {
                         Text("Benchmark")
+                    }
+                    Button(
+                        onClick = viewModel::startPowerBenchmark,
+                        enabled = viewModel.importedModel != null && !viewModel.isGenerating && !viewModel.isBenchmarking,
+                    ) {
+                        Text("Power 30m")
                     }
                     TextButton(onClick = viewModel::clearDiagnostics) {
                         Text("Clear")

@@ -1,11 +1,17 @@
 package com.example.llama
 
+import android.annotation.SuppressLint
 import android.content.ContentResolver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.database.Cursor
 import android.llama.cpp.LLamaAndroid
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
+import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.util.Log
 import androidx.compose.runtime.getValue
@@ -96,6 +102,50 @@ private data class E2eBenchSummary(
     val totalMs: Double,
 )
 
+private data class BatterySnapshot(
+    val percent: Double?,
+    val level: Int?,
+    val scale: Int?,
+    val voltageMv: Int?,
+    val temperatureC: Double?,
+    val status: Int?,
+    val plugged: Int?,
+    val chargeCounterUah: Long?,
+    val remainingCapacityMah: Double?,
+    val energyCounterNwh: Long?,
+)
+
+private data class PowerBenchSummary(
+    val modelFileName: String,
+    val presetLabel: String,
+    val promptTokens: Int,
+    val genTokens: Int,
+    val repetitions: Int,
+    val targetDurationMs: Long,
+    val elapsedMs: Long,
+    val loops: Int,
+    val refreshCount: Int,
+    val refreshTotalMs: Long,
+    val generatedTokensTotal: Double,
+    val startBattery: BatterySnapshot,
+    val endBattery: BatterySnapshot,
+    val batteryDeltaPercent: Double?,
+    val batteryDeltaPercentPerHour: Double?,
+    val chargeDeltaUah: Long?,
+    val startRemainingCapacityMah: Double?,
+    val endRemainingCapacityMah: Double?,
+    val remainingCapacityDeltaMah: Double?,
+    val energyDeltaWh: Double?,
+    val estimatedEnergyWh: Double?,
+    val estimatedAveragePowerW: Double?,
+    val avgPrefillMs: Double,
+    val avgFirstTokenMs: Double,
+    val avgDecodeMsPerToken: Double,
+    val avgTokS: Double,
+    val avgTotalMs: Double,
+    val note: String,
+)
+
 class MainViewModel(
     private val llamaAndroid: LLamaAndroid = LLamaAndroid.instance(),
 ) : ViewModel() {
@@ -108,6 +158,11 @@ class MainViewModel(
         private const val BENCH_STATUS_FILE_NAME = "builtin_models_bench.status"
         private const val E2E_BENCH_OUTPUT_FILE_NAME = "builtin_models_e2e_bench.csv"
         private const val E2E_BENCH_STATUS_FILE_NAME = "builtin_models_e2e_bench.status"
+        private const val POWER_BENCH_OUTPUT_FILE_NAME = "builtin_models_power_bench.csv"
+        private const val POWER_BENCH_STATUS_FILE_NAME = "builtin_models_power_bench.status"
+        private const val DEFAULT_POWER_BENCH_DURATION_MS = 30L * 60L * 1000L
+        private const val DEFAULT_POWER_BENCH_THREADS = 6
+        private const val DEFAULT_POWER_BENCH_AFFINITY_PROFILE = 0
         private val BUNDLED_MODELS = listOf(
             BundledModelSpec("iFairy 700M", "ifairy.gguf"),
             BundledModelSpec("BitNet b1.58 700M", "bitnet_b1_58_700m.gguf"),
@@ -163,15 +218,23 @@ class MainViewModel(
     var customGenerationLengthInput by mutableStateOf("96")
         private set
 
+    var availableModels by mutableStateOf(listOf<ImportedModel>())
+        private set
+
     private var generationJob: Job? = null
     private var typingJob: Job? = null
     private var pendingAutomationAction: String? = null
     private var initializationStarted = false
     private var nextMessageId = 1L
     private val streamingBuffer = StringBuilder()
-    private var availableModels: List<ImportedModel> = listOf()
     private var appContext: Context? = null
     private var bundledModelCooldownMs: Long = DEFAULT_BUNDLED_MODEL_COOLDOWN_MS
+    private var benchmarkModelFilter: Set<String>? = null
+    private var benchmarkPresetFilter: Set<String>? = null
+    private var benchmarkRepetitionsOverride: Int? = null
+    private var powerBenchDurationMs: Long = DEFAULT_POWER_BENCH_DURATION_MS
+    private var batteryCapacityMah: Double? = null
+    private val powerBenchOutputFileNames = mutableMapOf<String, String>()
 
     override fun onCleared() {
         super.onCleared()
@@ -225,6 +288,7 @@ class MainViewModel(
     }
 
     fun requestAutomationAction(action: String?) {
+        appContext?.let { refreshAvailableModels(it) }
         pendingAutomationAction = action?.trim()?.lowercase(Locale.US)?.takeIf { it.isNotEmpty() }
         if (pendingAutomationAction != null) {
             log("Automation action requested: $pendingAutomationAction")
@@ -248,6 +312,20 @@ class MainViewModel(
         val generationPriority = extras.getIntOrSentinel("codex_generation_priority", -99)
         val batchPriority = extras.getIntOrSentinel("codex_batch_priority", -99)
         val benchCooldownMs = extras.getIntOrSentinel("codex_bench_cooldown_ms")
+        val benchRepetitions = extras.getIntOrSentinel("codex_bench_repetitions")
+        val powerDurationMs = extras.getLongOrNull("codex_power_duration_ms")
+        val powerDurationMinutes = extras.getLongOrNull("codex_power_duration_minutes")
+        val configuredBatteryCapacityMah = extras.getDoubleOrNull("codex_battery_capacity_mah")
+        val modelFilter = extras.getString("codex_model_filter")
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+        val presetFilter = extras.getString("codex_bench_preset_filter")
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
 
         if (
             listOf(
@@ -260,16 +338,44 @@ class MainViewModel(
                 affinityProfile,
                 enableIFairyVecdotActTensor,
                 benchCooldownMs,
+                benchRepetitions,
             ).all { it < 0 } &&
             generationPriority == -99 &&
-            batchPriority == -99
+            batchPriority == -99 &&
+            powerDurationMs == null &&
+            powerDurationMinutes == null &&
+            configuredBatteryCapacityMah == null &&
+            modelFilter.isNullOrEmpty() &&
+            presetFilter.isNullOrEmpty()
         ) {
             return
+        }
+
+        if (!modelFilter.isNullOrEmpty()) {
+            benchmarkModelFilter = modelFilter
+            log("Benchmark model filter: ${modelFilter.joinToString(",")}")
+        }
+        if (!presetFilter.isNullOrEmpty()) {
+            benchmarkPresetFilter = presetFilter
+            log("Benchmark preset filter: ${presetFilter.joinToString(",")}")
         }
 
         if (benchCooldownMs >= 0) {
             bundledModelCooldownMs = benchCooldownMs.toLong()
             log("Benchmark cooldown override: ${bundledModelCooldownMs} ms")
+        }
+        if (benchRepetitions > 0) {
+            benchmarkRepetitionsOverride = benchRepetitions
+            log("Benchmark repetitions override: $benchRepetitions")
+        }
+        val resolvedPowerDurationMs = powerDurationMs ?: powerDurationMinutes?.let { it * 60L * 1000L }
+        if (resolvedPowerDurationMs != null && resolvedPowerDurationMs > 0L) {
+            powerBenchDurationMs = resolvedPowerDurationMs
+            log("Power benchmark duration override: ${powerBenchDurationMs} ms")
+        }
+        if (configuredBatteryCapacityMah != null && configuredBatteryCapacityMah > 0.0) {
+            batteryCapacityMah = configuredBatteryCapacityMah
+            log("Battery capacity override: ${formatCsvDecimal(configuredBatteryCapacityMah)} mAh")
         }
 
         viewModelScope.launch {
@@ -294,6 +400,11 @@ class MainViewModel(
                         "affinity_profile=${formatOverride(affinityProfile)}, " +
                         "ifairy_vecdot_act_tensor=${formatOverride(enableIFairyVecdotActTensor)}, " +
                         "bench_cooldown_ms=${formatOverride(benchCooldownMs)}, " +
+                        "bench_repetitions=${formatOverride(benchRepetitions)}, " +
+                        "power_duration_ms=${powerDurationMs ?: "default"}, " +
+                        "battery_capacity_mah=${configuredBatteryCapacityMah?.let(::formatCsvDecimal) ?: "default"}, " +
+                        "model_filter=${modelFilter?.joinToString(",") ?: "default"}, " +
+                        "preset_filter=${presetFilter?.joinToString(",") ?: "default"}, " +
                         "generation_priority=${formatOverride(generationPriority, -99)}, " +
                         "batch_priority=${formatOverride(batchPriority, -99)}"
                 )
@@ -326,6 +437,46 @@ class MainViewModel(
                 modelLoadState = if (importedModel == null) ModelLoadState.FAILED else ModelLoadState.IMPORTED
                 modelError = throwable.message ?: "Model import failed"
                 logError("importModel() failed", throwable)
+            }
+        }
+    }
+
+    fun refreshModelList() {
+        val context = appContext ?: return
+        refreshAvailableModels(context, importedModel?.fileName)
+        log("Refreshed model list: ${availableModels.size} model(s)")
+    }
+
+    fun selectAvailableModel(fileName: String) {
+        if (isGenerating || isBenchmarking || modelLoadState == ModelLoadState.LOADING || modelLoadState == ModelLoadState.IMPORTING) {
+            modelError = "Stop generation, loading, import, or benchmark before selecting another model"
+            return
+        }
+
+        val model = availableModels.firstOrNull { it.fileName == fileName } ?: run {
+            modelError = "Model not found: $fileName"
+            return
+        }
+
+        if (importedModel?.privatePath == model.privatePath && modelLoadState != ModelLoadState.LOADED) {
+            return
+        }
+
+        viewModelScope.launch {
+            runCatching {
+                if (modelLoadState == ModelLoadState.LOADED) {
+                    llamaAndroid.unload()
+                    log("Model unloaded")
+                }
+                importedModel = model
+                modelLoadState = ModelLoadState.IMPORTED
+                modelError = null
+                log("Selected model: ${model.fileName}")
+                log("Model path: ${model.privatePath}")
+                log("Model size: ${formatSize(model.sizeBytes)}")
+            }.onFailure { throwable ->
+                modelError = throwable.message ?: "Model selection failed"
+                logError("selectAvailableModel() failed", throwable)
             }
         }
     }
@@ -454,6 +605,13 @@ class MainViewModel(
         }
     }
 
+    fun startPowerBenchmark() {
+        viewModelScope.launch {
+            applyPowerBenchmarkRuntimeDefaults()
+            runBundledPowerBenchmarks()
+        }
+    }
+
     fun selectGenerationLength(preset: GenerationLengthPreset) {
         generationLength = preset
         useCustomGenerationLength = false
@@ -504,11 +662,9 @@ class MainViewModel(
             return
         }
 
-        val bundledModels = availableModels.filter { model ->
-            BUNDLED_MODELS.any { it.fileName == model.fileName }
-        }
+        val bundledModels = benchmarkTargetModels()
         if (bundledModels.isEmpty()) {
-            modelError = "Bundled models are not installed"
+            modelError = "No benchmark target models are installed"
             return
         }
 
@@ -521,7 +677,7 @@ class MainViewModel(
             for ((index, model) in bundledModels.withIndex()) {
                 loadModelInternal(model)
                 warmupBenchIfNeeded()
-                BENCH_PRESETS.forEach { preset ->
+                benchmarkTargetPresets().forEach { preset ->
                     summaries += runBenchPreset(model, preset)
                 }
                 unloadModelInternal()
@@ -563,11 +719,9 @@ class MainViewModel(
             return
         }
 
-        val bundledModels = availableModels.filter { model ->
-            BUNDLED_MODELS.any { it.fileName == model.fileName }
-        }
+        val bundledModels = benchmarkTargetModels()
         if (bundledModels.isEmpty()) {
-            modelError = "Bundled models are not installed"
+            modelError = "No benchmark target models are installed"
             return
         }
 
@@ -580,7 +734,7 @@ class MainViewModel(
             for ((index, model) in bundledModels.withIndex()) {
                 loadModelInternal(model)
                 warmupE2eBenchIfNeeded()
-                BENCH_PRESETS.forEach { preset ->
+                benchmarkTargetPresets().forEach { preset ->
                     summaries += runE2eBenchPreset(model, preset)
                 }
                 unloadModelInternal()
@@ -613,6 +767,92 @@ class MainViewModel(
             logError("runBundledE2eBenchmarks() failed", throwable)
         } finally {
             isBenchmarking = false
+        }
+    }
+
+    private suspend fun runBundledPowerBenchmarks() {
+        if (isGenerating || isBenchmarking) {
+            modelError = "Another benchmark or generation is in progress"
+            return
+        }
+
+        val targetModels = powerBenchmarkTargetModels()
+        if (targetModels.isEmpty()) {
+            modelError = "No power benchmark target models are installed"
+            return
+        }
+
+        isBenchmarking = true
+        val context = requireNotNull(appContext) { "App context is not initialized" }
+        val wakeLock = acquirePowerBenchWakeLock(context)
+        try {
+            val summaries = mutableListOf<PowerBenchSummary>()
+            powerBenchOutputFileNames.clear()
+            writeBenchStatus(context, POWER_BENCH_STATUS_FILE_NAME, "running")
+            log("Starting power benchmark sweep: duration=${powerBenchDurationMs / 1000}s per model/preset")
+            for ((index, model) in targetModels.withIndex()) {
+                if (modelLoadState == ModelLoadState.LOADED && importedModel?.privatePath == model.privatePath) {
+                    log("Reusing loaded model: ${model.fileName}")
+                } else {
+                    loadModelInternal(model)
+                }
+                warmupE2eBenchIfNeeded()
+                powerBenchmarkTargetPresets().forEach { preset ->
+                    summaries += runPowerBenchPreset(context, model, preset)
+                    writePowerBenchCsv(context, summaries)
+                }
+                unloadModelInternal()
+                if (index < targetModels.lastIndex) {
+                    log("Cooling down for ${bundledModelCooldownMs / 1000}s after ${model.fileName}")
+                    delay(bundledModelCooldownMs)
+                }
+            }
+            writePowerBenchCsv(context, summaries)
+            logCombinedPowerBenchTable(summaries)
+            writeBenchStatus(context, POWER_BENCH_STATUS_FILE_NAME, "completed")
+            log("Completed power benchmark sweep")
+        } catch (throwable: Throwable) {
+            appContext?.let { context ->
+                runCatching {
+                    writeBenchStatus(
+                        context,
+                        POWER_BENCH_STATUS_FILE_NAME,
+                        buildString {
+                            append("failed")
+                            val message = throwable.message?.takeIf { it.isNotBlank() }
+                            if (message != null) {
+                                append('\n')
+                                append(message)
+                            }
+                        },
+                    )
+                }
+            }
+            logError("runBundledPowerBenchmarks() failed", throwable)
+        } finally {
+            if (wakeLock.isHeld) {
+                wakeLock.release()
+            }
+            isBenchmarking = false
+        }
+    }
+
+    private suspend fun applyPowerBenchmarkRuntimeDefaults() {
+        runCatching {
+            llamaAndroid.configureRuntime(
+                nThreads = DEFAULT_POWER_BENCH_THREADS,
+                nThreadsBatch = DEFAULT_POWER_BENCH_THREADS,
+                affinityProfile = DEFAULT_POWER_BENCH_AFFINITY_PROFILE,
+            )
+        }.onSuccess {
+            log(
+                "Power benchmark runtime defaults: " +
+                    "n_threads=$DEFAULT_POWER_BENCH_THREADS, " +
+                    "n_threads_batch=$DEFAULT_POWER_BENCH_THREADS, " +
+                    "affinity_profile=$DEFAULT_POWER_BENCH_AFFINITY_PROFILE"
+            )
+        }.onFailure { throwable ->
+            logError("applyPowerBenchmarkRuntimeDefaults() failed", throwable)
         }
     }
 
@@ -667,10 +907,235 @@ class MainViewModel(
         )
     }
 
+    private suspend fun runPowerBenchPreset(
+        context: Context,
+        model: ImportedModel,
+        preset: BenchPreset,
+    ): PowerBenchSummary {
+        log(
+            "Running power benchmark: model=${model.fileName}, preset=${preset.label}, " +
+                "prompt=${preset.promptTokens}, decode=${preset.genTokens}, repetitions=${preset.repetitions}, " +
+                "duration=${powerBenchDurationMs / 1000}s"
+        )
+
+        val startBattery = readBatterySnapshot(context)
+        val startElapsedMs = SystemClock.elapsedRealtime()
+        val deadlineMs = startElapsedMs + powerBenchDurationMs
+        var loops = 0
+        var generatedTokensTotal = 0.0
+        var prefillMsTotal = 0.0
+        var firstTokenMsTotal = 0.0
+        var decodeMsPerTokenTotal = 0.0
+        var tokSTotal = 0.0
+        var totalMsTotal = 0.0
+        var refreshCount = 0
+        var refreshTotalMs = 0L
+
+        while (true) {
+            val nowMs = SystemClock.elapsedRealtime()
+            if (nowMs >= deadlineMs && loops > 0) {
+                break
+            }
+
+            val result = llamaAndroid.e2eBench(
+                pp = preset.promptTokens,
+                tg = preset.genTokens,
+                nr = preset.repetitions,
+            )
+            loops += 1
+            generatedTokensTotal += result.generatedTokensAvg * preset.repetitions
+            prefillMsTotal += result.prefillMs
+            firstTokenMsTotal += result.firstTokenMs
+            decodeMsPerTokenTotal += result.decodeMsPerToken
+            tokSTotal += result.tokS
+            totalMsTotal += result.totalMs
+            log(
+                String.format(
+                    Locale.US,
+                    "Power loop %d: model=%s preset=%s elapsed_s=%.2f target_s=%.2f tok_s=%.4f total_ms=%.2f",
+                    loops,
+                    model.fileName,
+                    preset.label,
+                    (SystemClock.elapsedRealtime() - startElapsedMs) / 1000.0,
+                    powerBenchDurationMs / 1000.0,
+                    result.tokS,
+                    result.totalMs,
+                )
+            )
+            writePowerProgressStatus(
+                context = context,
+                model = model,
+                preset = preset,
+                loops = loops,
+                refreshCount = refreshCount,
+                elapsedMs = SystemClock.elapsedRealtime() - startElapsedMs,
+            )
+
+            if (SystemClock.elapsedRealtime() < deadlineMs) {
+                val refreshMs = refreshLoadedModelForPowerBench(model)
+                refreshCount += 1
+                refreshTotalMs += refreshMs
+            }
+        }
+
+        val endElapsedMs = SystemClock.elapsedRealtime()
+        val endBattery = readBatterySnapshot(context)
+        val elapsedMs = endElapsedMs - startElapsedMs
+        val elapsedHours = elapsedMs / 3_600_000.0
+        val batteryDeltaPercent = if (startBattery.percent != null && endBattery.percent != null) {
+            startBattery.percent - endBattery.percent
+        } else {
+            null
+        }
+        val chargeDeltaUah = if (startBattery.chargeCounterUah != null && endBattery.chargeCounterUah != null) {
+            startBattery.chargeCounterUah - endBattery.chargeCounterUah
+        } else {
+            null
+        }
+        val remainingCapacityDeltaMah =
+            if (startBattery.remainingCapacityMah != null && endBattery.remainingCapacityMah != null) {
+                startBattery.remainingCapacityMah - endBattery.remainingCapacityMah
+            } else {
+                null
+            }
+        val energyDeltaWh = if (startBattery.energyCounterNwh != null && endBattery.energyCounterNwh != null) {
+            (startBattery.energyCounterNwh - endBattery.energyCounterNwh) / 1_000_000_000.0
+        } else {
+            null
+        }
+        val avgVoltageV = listOfNotNull(startBattery.voltageMv, endBattery.voltageMv)
+            .takeIf { it.isNotEmpty() }
+            ?.average()
+            ?.div(1000.0)
+        val estimatedEnergyWh = estimateEnergyWh(
+            energyDeltaWh = energyDeltaWh,
+            chargeDeltaUah = chargeDeltaUah,
+            remainingCapacityDeltaMah = remainingCapacityDeltaMah,
+            avgVoltageV = avgVoltageV,
+            batteryDeltaPercent = batteryDeltaPercent,
+        )
+        val estimatedAveragePowerW = estimatedEnergyWh?.takeIf { elapsedHours > 0.0 }?.div(elapsedHours)
+
+        return PowerBenchSummary(
+            modelFileName = model.fileName,
+            presetLabel = preset.label,
+            promptTokens = preset.promptTokens,
+            genTokens = preset.genTokens,
+            repetitions = preset.repetitions,
+            targetDurationMs = powerBenchDurationMs,
+            elapsedMs = elapsedMs,
+            loops = loops,
+            refreshCount = refreshCount,
+            refreshTotalMs = refreshTotalMs,
+            generatedTokensTotal = generatedTokensTotal,
+            startBattery = startBattery,
+            endBattery = endBattery,
+            batteryDeltaPercent = batteryDeltaPercent,
+            batteryDeltaPercentPerHour = batteryDeltaPercent?.takeIf { elapsedHours > 0.0 }?.div(elapsedHours),
+            chargeDeltaUah = chargeDeltaUah,
+            startRemainingCapacityMah = startBattery.remainingCapacityMah,
+            endRemainingCapacityMah = endBattery.remainingCapacityMah,
+            remainingCapacityDeltaMah = remainingCapacityDeltaMah,
+            energyDeltaWh = energyDeltaWh,
+            estimatedEnergyWh = estimatedEnergyWh,
+            estimatedAveragePowerW = estimatedAveragePowerW,
+            avgPrefillMs = prefillMsTotal / loops,
+            avgFirstTokenMs = firstTokenMsTotal / loops,
+            avgDecodeMsPerToken = decodeMsPerTokenTotal / loops,
+            avgTokS = tokSTotal / loops,
+            avgTotalMs = totalMsTotal / loops,
+            note = powerEstimateNote(energyDeltaWh, chargeDeltaUah, batteryDeltaPercent, avgVoltageV),
+        )
+    }
+
     private suspend fun warmupE2eBenchIfNeeded() {
         log("Warmup E2E benchmark: prompt=8 decode=4")
         runCatching { llamaAndroid.e2eBench(pp = 8, tg = 4, nr = 1) }
             .onFailure { logError("warmupE2eBenchIfNeeded() failed", it) }
+    }
+
+    private suspend fun refreshLoadedModelForPowerBench(model: ImportedModel): Long {
+        val startedAt = SystemClock.elapsedRealtime()
+        log("Refreshing native backend state after power bench loop: ${model.fileName}")
+        llamaAndroid.refreshBackend()
+        System.gc()
+        loadModelInternal(model)
+        val elapsedMs = SystemClock.elapsedRealtime() - startedAt
+        log("Power bench backend refresh completed in ${elapsedMs} ms")
+        return elapsedMs
+    }
+
+    private fun readBatterySnapshot(context: Context): BatterySnapshot {
+        val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = intent?.getValidIntExtra(BatteryManager.EXTRA_LEVEL)
+        val scale = intent?.getValidIntExtra(BatteryManager.EXTRA_SCALE)
+        val voltageMv = intent?.getValidIntExtra(BatteryManager.EXTRA_VOLTAGE)
+        val temperatureTenthsC = intent?.getValidIntExtra(BatteryManager.EXTRA_TEMPERATURE)
+        val status = intent?.getValidIntExtra(BatteryManager.EXTRA_STATUS)
+        val plugged = intent?.getValidIntExtra(BatteryManager.EXTRA_PLUGGED)
+        val batteryManager = context.getSystemService(BatteryManager::class.java)
+
+        return BatterySnapshot(
+            percent = if (level != null && scale != null && scale > 0) level * 100.0 / scale else null,
+            level = level,
+            scale = scale,
+            voltageMv = voltageMv,
+            temperatureC = temperatureTenthsC?.div(10.0),
+            status = status,
+            plugged = plugged,
+            chargeCounterUah = batteryManager?.getValidLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER),
+            remainingCapacityMah = batteryManager
+                ?.getValidLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
+                ?.toBatteryCapacityMah(),
+            energyCounterNwh = batteryManager?.getValidLongProperty(BatteryManager.BATTERY_PROPERTY_ENERGY_COUNTER),
+        )
+    }
+
+    @SuppressLint("WakelockTimeout")
+    private fun acquirePowerBenchWakeLock(context: Context): PowerManager.WakeLock {
+        val powerManager = context.getSystemService(PowerManager::class.java)
+        val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$LOG_TAG:PowerBench")
+        wakeLock.acquire()
+        log("Power benchmark wake lock acquired")
+        return wakeLock
+    }
+
+    private fun estimateEnergyWh(
+        energyDeltaWh: Double?,
+        chargeDeltaUah: Long?,
+        remainingCapacityDeltaMah: Double?,
+        avgVoltageV: Double?,
+        batteryDeltaPercent: Double?,
+    ): Double? {
+        if (energyDeltaWh != null && energyDeltaWh > 0.0) {
+            return energyDeltaWh
+        }
+        if (chargeDeltaUah != null && chargeDeltaUah > 0L && avgVoltageV != null) {
+            return chargeDeltaUah.toBatteryCapacityMah() / 1000.0 * avgVoltageV
+        }
+        if (remainingCapacityDeltaMah != null && remainingCapacityDeltaMah > 0.0 && avgVoltageV != null) {
+            return remainingCapacityDeltaMah / 1000.0 * avgVoltageV
+        }
+        val capacityMah = batteryCapacityMah
+        if (batteryDeltaPercent != null && batteryDeltaPercent > 0.0 && capacityMah != null && avgVoltageV != null) {
+            return batteryDeltaPercent / 100.0 * capacityMah / 1000.0 * avgVoltageV
+        }
+        return null
+    }
+
+    private fun powerEstimateNote(
+        energyDeltaWh: Double?,
+        chargeDeltaUah: Long?,
+        batteryDeltaPercent: Double?,
+        avgVoltageV: Double?,
+    ): String {
+        return when {
+            energyDeltaWh != null && energyDeltaWh > 0.0 -> "energy_counter_nwh"
+            chargeDeltaUah != null && chargeDeltaUah > 0L && avgVoltageV != null -> "charge_counter_capacity_mah_times_avg_voltage"
+            batteryDeltaPercent != null && batteryDeltaPercent > 0.0 && batteryCapacityMah != null && avgVoltageV != null ->
+                "battery_percent_times_configured_capacity_times_avg_voltage"
+            else -> "percent_only_no_energy_estimate"
+        }
     }
 
     private fun parseBenchResult(modelFileName: String, preset: BenchPreset, raw: String): BenchSummary? {
@@ -794,6 +1259,30 @@ class MainViewModel(
         }
     }
 
+    private fun logCombinedPowerBenchTable(summaries: List<PowerBenchSummary>) {
+        log("BENCH-TABLE-POWER combined")
+        log("| model | preset | elapsed s | loops | battery drop % | drop %/h | energy Wh | avg power W | tok/s | note |")
+        log("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+        summaries.forEach { summary ->
+            log(
+                String.format(
+                    Locale.US,
+                    "| %s | %s | %.2f | %d | %s | %s | %s | %s | %.4f | %s |",
+                    summary.modelFileName,
+                    summary.presetLabel,
+                    summary.elapsedMs / 1000.0,
+                    summary.loops,
+                    formatLogNullable(summary.batteryDeltaPercent),
+                    formatLogNullable(summary.batteryDeltaPercentPerHour),
+                    formatLogNullable(summary.estimatedEnergyWh),
+                    formatLogNullable(summary.estimatedAveragePowerW),
+                    summary.avgTokS,
+                    summary.note,
+                )
+            )
+        }
+    }
+
     private fun ensureTypingJob(messageId: Long) {
         if (typingJob?.isActive == true) {
             return
@@ -882,6 +1371,49 @@ class MainViewModel(
         return if (containsKey(key)) getInt(key) else sentinel
     }
 
+    private fun Bundle.getLongOrNull(key: String): Long? {
+        if (!containsKey(key)) {
+            return null
+        }
+        return when (val value = get(key)) {
+            is Long -> value
+            is Int -> value.toLong()
+            is String -> value.toLongOrNull()
+            else -> null
+        }
+    }
+
+    private fun Bundle.getDoubleOrNull(key: String): Double? {
+        if (!containsKey(key)) {
+            return null
+        }
+        return when (val value = get(key)) {
+            is Double -> value
+            is Float -> value.toDouble()
+            is Long -> value.toDouble()
+            is Int -> value.toDouble()
+            is String -> value.toDoubleOrNull()
+            else -> null
+        }
+    }
+
+    private fun Intent.getValidIntExtra(name: String): Int? {
+        val value = getIntExtra(name, Int.MIN_VALUE)
+        return value.takeIf { it != Int.MIN_VALUE && it >= 0 }
+    }
+
+    private fun BatteryManager.getValidLongProperty(id: Int): Long? {
+        return runCatching { getLongProperty(id) }
+            .getOrNull()
+            ?.takeIf { it > 0L && it != Long.MIN_VALUE }
+    }
+
+    private fun Long.toBatteryCapacityMah(): Double {
+        // Android documents BATTERY_PROPERTY_CHARGE_COUNTER as microampere-hours,
+        // but some vendor builds expose small mAh-like values. Preserve practical mAh in both cases.
+        return if (this >= 100_000L) this / 1000.0 else this.toDouble()
+    }
+
     private fun formatOverride(value: Int): String {
         return if (value >= 0) value.toString() else "default"
     }
@@ -904,10 +1436,23 @@ class MainViewModel(
 
     private fun maybeStartPendingAutomation() {
         when (pendingAutomationAction) {
-            "bench",
-            "smoke",
             "builtin_bench",
-            "builtin_e2e_bench" -> when (modelLoadState) {
+            "builtin_e2e_bench",
+            "builtin_power_bench" -> {
+                val targets = if (pendingAutomationAction == "builtin_power_bench") {
+                    powerBenchmarkTargetModels()
+                } else {
+                    benchmarkTargetModels()
+                }
+                if (targets.isNotEmpty()) {
+                    log("Benchmark targets: ${targets.joinToString { it.fileName }}")
+                    maybeRunPendingAutomation()
+                } else {
+                    log("No benchmark targets matched. Available models: ${availableModels.joinToString { it.fileName }}")
+                }
+            }
+            "bench",
+            "smoke" -> when (modelLoadState) {
                 ModelLoadState.IMPORTED,
                 ModelLoadState.LOADED -> maybeRunPendingAutomation()
                 else -> Unit
@@ -936,6 +1481,11 @@ class MainViewModel(
                 pendingAutomationAction = null
                 log("Running automation E2E benchmark for bundled models")
                 viewModelScope.launch { runBundledE2eBenchmarks() }
+            }
+            "builtin_power_bench" -> {
+                pendingAutomationAction = null
+                log("Running automation power benchmark")
+                viewModelScope.launch { runBundledPowerBenchmarks() }
             }
             "smoke" -> {
                 pendingAutomationAction = null
@@ -994,18 +1544,22 @@ class MainViewModel(
     }
 
     private fun refreshAvailableModels(context: Context, preferredFileName: String? = null) {
-        val modelsDir = File(context.filesDir, "models")
-        val models = modelsDir.listFiles()
-            ?.filter { it.isFile }
-            ?.sortedWith(compareBy({ bundledModelOrder(it.name) }, { it.name.lowercase(Locale.US) }))
-            ?.map {
+        val modelDirs = listOfNotNull(
+            File(context.filesDir, "models"),
+            context.getExternalFilesDir(null)?.let { File(it, "models") },
+        )
+        val seenPaths = mutableSetOf<String>()
+        val models = modelDirs
+            .flatMap { dir -> dir.listFiles()?.filter { it.isFile && it.name.endsWith(".gguf", ignoreCase = true) }.orEmpty() }
+            .filter { seenPaths.add(it.absolutePath) }
+            .sortedWith(compareBy({ bundledModelOrder(it.name) }, { it.name.lowercase(Locale.US) }))
+            .map {
                 ImportedModel(
                     fileName = it.name,
                     sizeBytes = it.length(),
                     privatePath = it.absolutePath,
                 )
             }
-            .orEmpty()
 
         availableModels = models
 
@@ -1028,9 +1582,49 @@ class MainViewModel(
         return BUNDLED_MODELS.filter { it.fileName in assets }
     }
 
+    private fun benchmarkTargetModels(): List<ImportedModel> {
+        val filter = benchmarkModelFilter
+        return if (filter.isNullOrEmpty()) {
+            availableModels.filter { model ->
+                BUNDLED_MODELS.any { it.fileName == model.fileName }
+            }
+        } else {
+            availableModels.filter { it.fileName in filter }
+        }
+    }
+
+    private fun benchmarkTargetPresets(): List<BenchPreset> {
+        val filter = benchmarkPresetFilter
+        val presets = if (filter.isNullOrEmpty()) {
+            BENCH_PRESETS
+        } else {
+            BENCH_PRESETS.filter { it.label in filter }
+        }
+        val repetitions = benchmarkRepetitionsOverride ?: return presets
+        return presets.map { it.copy(repetitions = repetitions) }
+    }
+
+    private fun powerBenchmarkTargetModels(): List<ImportedModel> {
+        val filter = benchmarkModelFilter
+        return if (filter.isNullOrEmpty()) {
+            importedModel?.let { listOf(it) }.orEmpty()
+        } else {
+            availableModels.filter { it.fileName in filter }
+        }
+    }
+
+    private fun powerBenchmarkTargetPresets(): List<BenchPreset> {
+        val presets = benchmarkTargetPresets()
+        return if (benchmarkPresetFilter.isNullOrEmpty()) {
+            presets.take(1)
+        } else {
+            presets
+        }
+    }
+
     private fun bundledModelOrder(fileName: String): Int {
         val index = BUNDLED_MODELS.indexOfFirst { it.fileName == fileName }
-        return if (index >= 0) index else Int.MAX_VALUE
+        return if (index >= 0) index else 1000
     }
 
     private suspend fun writeBenchCsv(context: Context, summaries: List<BenchSummary>) = withContext(Dispatchers.IO) {
@@ -1085,6 +1679,122 @@ class MainViewModel(
             },
         )
     }
+
+    private suspend fun writePowerBenchCsv(context: Context, summaries: List<PowerBenchSummary>) = withContext(Dispatchers.IO) {
+        val benchDir = prepareBenchDirectory(context)
+        File(benchDir, POWER_BENCH_OUTPUT_FILE_NAME).writeText(buildPowerBenchCsv(summaries))
+
+        summaries.groupBy { it.modelFileName }.forEach { (modelFileName, modelSummaries) ->
+            val outputFileName = powerBenchOutputFileNames.getOrPut(modelFileName) {
+                uniquePowerBenchOutputFileName(benchDir, modelFileName)
+            }
+            File(benchDir, outputFileName).writeText(buildPowerBenchCsv(modelSummaries))
+        }
+    }
+
+    private fun buildPowerBenchCsv(summaries: List<PowerBenchSummary>): String {
+        return buildString {
+            appendLine(
+                "model,preset,prompt,decode,repetitions,target_duration_ms,elapsed_ms,loops,generated_tokens_total," +
+                    "refresh_count,refresh_total_ms,refresh_avg_ms," +
+                    "start_battery_percent,end_battery_percent,battery_delta_percent,battery_delta_percent_per_hour," +
+                    "start_level,end_level,scale,start_voltage_mv,end_voltage_mv,start_temperature_c,end_temperature_c," +
+                    "start_plugged,end_plugged,start_status,end_status,start_charge_uah,end_charge_uah,charge_delta_uah," +
+                    "start_remaining_battery_mah,end_remaining_battery_mah,remaining_battery_delta_mah," +
+                    "start_energy_nwh,end_energy_nwh,energy_delta_wh,estimated_energy_wh,estimated_avg_power_w," +
+                    "avg_prefill_ms,avg_first_token_ms,avg_decode_ms_per_token,avg_tok_s,avg_total_ms,note"
+            )
+            summaries.forEach { summary ->
+                appendLine(
+                    listOf(
+                        summary.modelFileName,
+                        summary.presetLabel,
+                        summary.promptTokens.toString(),
+                        summary.genTokens.toString(),
+                        summary.repetitions.toString(),
+                        summary.targetDurationMs.toString(),
+                        summary.elapsedMs.toString(),
+                        summary.loops.toString(),
+                        formatCsvDecimal(summary.generatedTokensTotal),
+                        summary.refreshCount.toString(),
+                        summary.refreshTotalMs.toString(),
+                        formatCsvNullable(summary.refreshTotalMs.takeIf { summary.refreshCount > 0 }?.toDouble()?.div(summary.refreshCount)),
+                        formatCsvNullable(summary.startBattery.percent),
+                        formatCsvNullable(summary.endBattery.percent),
+                        formatCsvNullable(summary.batteryDeltaPercent),
+                        formatCsvNullable(summary.batteryDeltaPercentPerHour),
+                        formatCsvNullable(summary.startBattery.level),
+                        formatCsvNullable(summary.endBattery.level),
+                        formatCsvNullable(summary.startBattery.scale),
+                        formatCsvNullable(summary.startBattery.voltageMv),
+                        formatCsvNullable(summary.endBattery.voltageMv),
+                        formatCsvNullable(summary.startBattery.temperatureC),
+                        formatCsvNullable(summary.endBattery.temperatureC),
+                        formatCsvNullable(summary.startBattery.plugged),
+                        formatCsvNullable(summary.endBattery.plugged),
+                        formatCsvNullable(summary.startBattery.status),
+                        formatCsvNullable(summary.endBattery.status),
+                        formatCsvNullable(summary.startBattery.chargeCounterUah),
+                        formatCsvNullable(summary.endBattery.chargeCounterUah),
+                        formatCsvNullable(summary.chargeDeltaUah),
+                        formatCsvNullable(summary.startRemainingCapacityMah),
+                        formatCsvNullable(summary.endRemainingCapacityMah),
+                        formatCsvNullable(summary.remainingCapacityDeltaMah),
+                        formatCsvNullable(summary.startBattery.energyCounterNwh),
+                        formatCsvNullable(summary.endBattery.energyCounterNwh),
+                        formatCsvNullable(summary.energyDeltaWh),
+                        formatCsvNullable(summary.estimatedEnergyWh),
+                        formatCsvNullable(summary.estimatedAveragePowerW),
+                        formatCsvDecimal(summary.avgPrefillMs),
+                        formatCsvDecimal(summary.avgFirstTokenMs),
+                        formatCsvDecimal(summary.avgDecodeMsPerToken),
+                        formatCsvDecimal(summary.avgTokS),
+                        formatCsvDecimal(summary.avgTotalMs),
+                        summary.note,
+                    ).joinToString(","),
+                )
+            }
+        }
+    }
+
+    private fun uniquePowerBenchOutputFileName(benchDir: File, modelFileName: String): String {
+        val modelStem = sanitizeFileName(modelFileName.removeSuffix(".gguf"))
+        val baseName = POWER_BENCH_OUTPUT_FILE_NAME.removeSuffix(".csv")
+        val candidate = "${baseName}_${modelStem}.csv"
+        if (!File(benchDir, candidate).exists()) {
+            return candidate
+        }
+
+        var index = 2
+        while (true) {
+            val indexedCandidate = "${baseName}_${modelStem}_${index}.csv"
+            if (!File(benchDir, indexedCandidate).exists()) {
+                return indexedCandidate
+            }
+            index += 1
+        }
+    }
+
+    private suspend fun writePowerProgressStatus(
+        context: Context,
+        model: ImportedModel,
+        preset: BenchPreset,
+        loops: Int,
+        refreshCount: Int,
+        elapsedMs: Long,
+    ) = writeBenchStatus(
+        context,
+        POWER_BENCH_STATUS_FILE_NAME,
+        buildString {
+            appendLine("running")
+            appendLine("model=${model.fileName}")
+            appendLine("preset=${preset.label}")
+            appendLine("loops=$loops")
+            appendLine("refresh_count=$refreshCount")
+            appendLine("elapsed_ms=$elapsedMs")
+            appendLine("target_duration_ms=$powerBenchDurationMs")
+        },
+    )
 
     private suspend fun writeBenchStatus(context: Context, fileName: String, status: String) = withContext(Dispatchers.IO) {
         val benchDir = prepareBenchDirectory(context)
@@ -1143,5 +1853,21 @@ class MainViewModel(
 
     private fun formatCsvDecimal(value: Double): String {
         return String.format(Locale.US, "%.4f", value)
+    }
+
+    private fun formatCsvNullable(value: Double?): String {
+        return value?.let(::formatCsvDecimal).orEmpty()
+    }
+
+    private fun formatCsvNullable(value: Int?): String {
+        return value?.toString().orEmpty()
+    }
+
+    private fun formatCsvNullable(value: Long?): String {
+        return value?.toString().orEmpty()
+    }
+
+    private fun formatLogNullable(value: Double?): String {
+        return value?.let { String.format(Locale.US, "%.4f", it) } ?: "n/a"
     }
 }

@@ -84,6 +84,7 @@ enum affinity_profile {
     AFFINITY_PROFILE_BIG_CORES = 1,
     AFFINITY_PROFILE_BIG_GEN_DEFAULT_BATCH = 2,
     AFFINITY_PROFILE_BIG_GEN_LITTLE_BATCH = 3,
+    AFFINITY_PROFILE_STABLE_BIG_CORES = 4,
 };
 
 struct cpu_topology {
@@ -121,43 +122,15 @@ static const char * affinity_profile_name(int profile) {
             return "big-gen-default-batch";
         case AFFINITY_PROFILE_BIG_GEN_LITTLE_BATCH:
             return "big-gen-little-batch";
+        case AFFINITY_PROFILE_STABLE_BIG_CORES:
+            return "stable-big-cores";
         default:
             return "default";
     }
 }
 
 static mobile_profile choose_mobile_profile(const llama_model * model) {
-    const uint64_t n_params = llama_model_n_params(model);
-
-    // Keep the current, more aggressive defaults for small models, but move
-    // larger models onto tighter profiles that fit phone-class memory better.
-    if (n_params >= 6000000000ull) {
-        return {
-                /*.n_ctx    =*/ 2048,
-                /*.n_batch  =*/ 2048,
-                /*.n_ubatch =*/ 512,
-                /*.disable_ifairy_lut =*/ true,
-                /*.enable_ifairy_vecdot_act_tensor =*/ false,
-                /*.generation_priority =*/ GGML_SCHED_PRIO_NORMAL,
-                /*.batch_priority =*/ GGML_SCHED_PRIO_NORMAL,
-                /*.affinity_profile =*/ AFFINITY_PROFILE_BIG_CORES,
-                /*.name     =*/ "very-large-model-lut-disabled",
-        };
-    }
-
-    if (n_params >= 3000000000ull) {
-        return {
-                /*.n_ctx    =*/ 1024,
-                /*.n_batch  =*/ 128,
-                /*.n_ubatch =*/ 64,
-                /*.disable_ifairy_lut =*/ false,
-                /*.enable_ifairy_vecdot_act_tensor =*/ false,
-                /*.generation_priority =*/ GGML_SCHED_PRIO_NORMAL,
-                /*.batch_priority =*/ GGML_SCHED_PRIO_NORMAL,
-                /*.affinity_profile =*/ AFFINITY_PROFILE_NONE,
-                /*.name     =*/ "large-model-conservative",
-        };
-    }
+    (void) model;
 
     return {
             /*.n_ctx    =*/ 2048,
@@ -168,7 +141,7 @@ static mobile_profile choose_mobile_profile(const llama_model * model) {
             /*.generation_priority =*/ GGML_SCHED_PRIO_NORMAL,
             /*.batch_priority =*/ GGML_SCHED_PRIO_NORMAL,
             /*.affinity_profile =*/ AFFINITY_PROFILE_NONE,
-            /*.name     =*/ "small-model-default",
+            /*.name     =*/ "uniform-default",
     };
 }
 
@@ -493,6 +466,13 @@ static bool create_affinity_threadpools(
         case AFFINITY_PROFILE_BIG_GEN_LITTLE_BATCH:
             generation_cores = topology.big_cores;
             batch_cores = topology.little_cores;
+            break;
+        case AFFINITY_PROFILE_STABLE_BIG_CORES:
+            generation_cores = topology.big_cores;
+            if (generation_cores.size() > 1) {
+                generation_cores.pop_back();
+            }
+            batch_cores = generation_cores;
             break;
         default:
             LOGi("Unknown affinity profile `%d`; falling back to default scheduling", profile);
@@ -848,27 +828,32 @@ Java_android_llama_cpp_LLamaAndroid_bench_1model(
     const auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
 
     const int n_ctx = llama_n_ctx(context);
+    const int n_batch = (int) llama_n_batch(context);
 
-    LOGi("n_ctx = %d", n_ctx);
+    LOGi("n_ctx = %d, n_batch = %d", n_ctx, n_batch);
 
     int i, j;
     int nri;
     for (nri = 0; nri < nr; nri++) {
         LOGi("Benchmark prompt processing (pp)");
 
-        common_batch_clear(*batch);
-
         const int n_tokens = pp;
-        for (i = 0; i < n_tokens; i++) {
-            common_batch_add(*batch, 0, i, { 0 }, false);
-        }
-
-        batch->logits[batch->n_tokens - 1] = true;
         llama_memory_clear(llama_get_memory(context), false);
 
         const auto t_pp_start = ggml_time_us();
-        if (llama_decode(context, *batch) != 0) {
-            LOGi("llama_decode() failed during prompt processing");
+        for (int start = 0; start < n_tokens; start += n_batch) {
+            const int end = std::min(start + n_batch, n_tokens);
+
+            common_batch_clear(*batch);
+            for (i = start; i < end; i++) {
+                common_batch_add(*batch, 0, i, { 0 }, false);
+            }
+
+            batch->logits[batch->n_tokens - 1] = (end == n_tokens);
+            if (llama_decode(context, *batch) != 0) {
+                LOGi("llama_decode() failed during prompt processing chunk [%d, %d)", start, end);
+                break;
+            }
         }
         const auto t_pp_end = ggml_time_us();
 
