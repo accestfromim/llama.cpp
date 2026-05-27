@@ -247,8 +247,8 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
 
             const block_type * wb = w_blocks + (size_t) row * (size_t) blocks_per_row + (size_t) blk;
             if constexpr (std::is_same_v<wtile_type, ifairy64_lut_wtile_16>) {
-                t->d_real[lane] = GGML_FP16_TO_FP32(wb->d_real);
-                t->d_imag[lane] = GGML_FP16_TO_FP32(wb->d_imag);
+                t->d_real[lane] = wb->d_real;
+                t->d_imag[lane] = wb->d_imag;
             } else {
                 t->d_real[lane] = GGML_FP16_TO_FP32(wb->d_real);
                 t->d_imag[lane] = GGML_FP16_TO_FP32(wb->d_imag);

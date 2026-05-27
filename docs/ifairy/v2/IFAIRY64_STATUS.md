@@ -15,6 +15,22 @@ Status: Draft (2026-04-23)
 
 按日期追加（YYYY-MM-DD）：
 
+### 2026-05-23 (x86 synthetic-model repro + LUT auto routing)
+- 准备工作：
+  - 解压 `generate_model_scripts_20260521.tar.gz` 后，使用本仓库 `models/ggml-vocab-llama-spm.gguf` 作为 tokenizer 参考，无需下载大模型即可生成低配置 smoke GGUF：
+    - `python3 generate_model/generate_ifairy64_gguf_direct.py --name smoke256 --n-layer 1 --n-embd 256 --n-ff 256 --n-head 1 --vocab-size 32000 --ctx 256 --output-dir /tmp/ifairy64_smoke256 --ref-gguf models/ggml-vocab-llama-spm.gguf`
+  - `GGML_IFAIRY_LUT=1 GGML_IFAIRY_LUT_IMPL=lut16 ./build-rel/bin/llama-cli -m /tmp/ifairy64_smoke256/ifairy64-smoke256/ifairy64.gguf -p hi -n 1 --no-warmup -c 256 -t 4 -ngl 0 -no-cnv`: smoke PASS
+- 遗留 bench 修复：
+  - `--ifairy64-lut-backend-bench` 现在用相同 warmup/iters 计时 `GGML_IFAIRY_LUT=0` baseline，并打印 `baseline_ms_per_iter`、`lut16_ms_per_iter` 和 `speedup_vs_baseline`。
+- x86 routing:
+  - `GGML_IFAIRY_LUT_IMPL=auto` 在 x86 上默认选择 `lut16`；aarch64+NEON 维持 Fairy2i F32 默认 `lut_c`。
+- x86 观测（Machine: x86_64, AVX2/AVX512 available; synthetic `smoke256`, threads=4, `tg256`, `-b 1 -ub 1 -r 3`）：
+  - vecdot baseline: `870.13 ± 63.38 tok/s`
+  - explicit `GGML_IFAIRY_LUT=1 GGML_IFAIRY_LUT_IMPL=lut16`: `175.84 ± 13.24 tok/s`
+  - explicit `GGML_IFAIRY_LUT=1 GGML_IFAIRY_LUT_IMPL=lut_c`: `176.55 ± 15.59 tok/s`
+  - core bench (`M=4096 N=1 K=1536 threads=4 warmup=5 iters=50`): `baseline_ms_per_iter=0.257044`, `lut16_ms_per_iter=1.400920`
+  - 结论：x86 LUT 仍慢于 vecdot baseline；本轮先补齐 baseline 观测，并减少 x86 LUT 连续 bf16 输出的 store 开销。
+
 ### 2026-04-22 (working tree; base build `abcaafef`)
 - 变更摘要：
   - `IFAIRY64` 在 `GGML_IFAIRY_LUT=1` 时于模型加载阶段提前完成 LUT transform/prepack，避免 decode 首轮再做 transform。

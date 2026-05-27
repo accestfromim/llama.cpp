@@ -606,6 +606,34 @@ static inline void ggml_ifairy_lut_decode_lane_scalar(const uint8_t  code,
 }
 
 #if defined(__AVX2__)
+static inline __m256 ggml_ifairy_lut_load_scale8_avx2(const float * src) {
+    return _mm256_load_ps(src);
+}
+
+static inline __m256 ggml_ifairy_lut_load_scale8_avx2(const ggml_half * src) {
+#    if defined(__F16C__)
+    return _mm256_cvtph_ps(_mm_load_si128((const __m128i *) src));
+#    else
+    alignas(32) float tmp[8];
+    for (int i = 0; i < 8; ++i) {
+        tmp[i] = GGML_FP16_TO_FP32(src[i]);
+    }
+    return _mm256_load_ps(tmp);
+#    endif
+}
+
+static inline __m256i ggml_ifairy_lut_fp32_to_bf16_u32_avx2(const __m256 v) {
+    const __m256i x       = _mm256_castps_si256(v);
+    const __m256i lsb     = _mm256_and_si256(_mm256_srli_epi32(x, 16), _mm256_set1_epi32(1));
+    const __m256i rounded = _mm256_add_epi32(x, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), lsb));
+    const __m256i bf16    = _mm256_srli_epi32(rounded, 16);
+
+    const __m256i abs_x  = _mm256_and_si256(x, _mm256_set1_epi32(0x7fffffff));
+    const __m256i is_nan = _mm256_cmpgt_epi32(abs_x, _mm256_set1_epi32(0x7f800000));
+    const __m256i qnan   = _mm256_or_si256(_mm256_srli_epi32(x, 16), _mm256_set1_epi32(64));
+    return _mm256_blendv_epi8(bf16, qnan, is_nan);
+}
+
 template <typename wtile_type>
 static inline void ggml_ifairy_lut_apply_tile_sums_avx2(const wtile_type * wt,
                                                         const __m256i &    sum_01_lo,
@@ -637,10 +665,10 @@ static inline void ggml_ifairy_lut_apply_tile_sums_avx2(const wtile_type * wt,
     const __m256 v_bd_lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(sum_bd_lo_s16));
     const __m256 v_bd_hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(sum_bd_hi_s16));
 
-    const __m256 wr_lo = _mm256_load_ps(wt->d_real + 0);
-    const __m256 wr_hi = _mm256_load_ps(wt->d_real + 8);
-    const __m256 wi_lo = _mm256_load_ps(wt->d_imag + 0);
-    const __m256 wi_hi = _mm256_load_ps(wt->d_imag + 8);
+    const __m256 wr_lo = ggml_ifairy_lut_load_scale8_avx2(wt->d_real + 0);
+    const __m256 wr_hi = ggml_ifairy_lut_load_scale8_avx2(wt->d_real + 8);
+    const __m256 wi_lo = ggml_ifairy_lut_load_scale8_avx2(wt->d_imag + 0);
+    const __m256 wi_hi = ggml_ifairy_lut_load_scale8_avx2(wt->d_imag + 8);
 
 #    ifdef __FMA__
     acc_r_lo = _mm256_fmadd_ps(v_ac_lo, _mm256_mul_ps(v_lr, wr_lo), acc_r_lo);
@@ -683,6 +711,21 @@ static inline void ggml_ifairy_lut_store_tile_avx2(int            tile,
                                                    const __m256 & acc_r_hi,
                                                    const __m256 & acc_i_lo,
                                                    const __m256 & acc_i_hi) {
+    const int base_row = tile << 4;
+    if (pack_bf16 && dst_row_stride == sizeof(float) && base_row + 15 < m) {
+        __m256i out_lo = ggml_ifairy_lut_fp32_to_bf16_u32_avx2(acc_r_lo);
+        __m256i out_hi = ggml_ifairy_lut_fp32_to_bf16_u32_avx2(acc_r_hi);
+        out_lo         = _mm256_or_si256(
+            out_lo, _mm256_slli_epi32(ggml_ifairy_lut_fp32_to_bf16_u32_avx2(acc_i_lo), 16));
+        out_hi = _mm256_or_si256(
+            out_hi, _mm256_slli_epi32(ggml_ifairy_lut_fp32_to_bf16_u32_avx2(acc_i_hi), 16));
+
+        uint8_t * out_base = dst_col + (size_t) base_row * sizeof(float);
+        _mm256_storeu_si256((__m256i *) (out_base + 0), out_lo);
+        _mm256_storeu_si256((__m256i *) (out_base + 8 * sizeof(float)), out_hi);
+        return;
+    }
+
     alignas(32) float out_r[16];
     alignas(32) float out_i[16];
     _mm256_store_ps(out_r + 0, acc_r_lo);
@@ -690,7 +733,6 @@ static inline void ggml_ifairy_lut_store_tile_avx2(int            tile,
     _mm256_store_ps(out_i + 0, acc_i_lo);
     _mm256_store_ps(out_i + 8, acc_i_hi);
 
-    const int base_row = tile << 4;
     for (int lane = 0; lane < 16; ++lane) {
         const int row = base_row + lane;
         if (row >= m) {

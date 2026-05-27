@@ -86,10 +86,10 @@ struct GGML_IFAIRY_LUT_ALIGN(GGML_IFAIRY_LUT_WTILE_ALIGNMENT) ifairy_lut_wtile_1
 
 struct GGML_IFAIRY_LUT_ALIGN(GGML_IFAIRY_LUT_WTILE_ALIGNMENT) ifairy64_lut_wtile_16 {
     uint8_t qs[QK_IFAIRY64_GROUPS_PER_BLOCK / 2][16];
-    float   d_real[16];
-    float   d_imag[16];
+    ggml_half d_real[16];
+    ggml_half d_imag[16];
 };
-static_assert(sizeof(struct ifairy64_lut_wtile_16) == 384, "wrong ifairy64_lut_wtile_16 size");
+static_assert(sizeof(struct ifairy64_lut_wtile_16) == 320, "wrong ifairy64_lut_wtile_16 size");
 
 // iFairy 2-weight LUT API
 //
@@ -104,8 +104,8 @@ static_assert(sizeof(struct ifairy64_lut_wtile_16) == 384, "wrong ifairy64_lut_w
 //   - `GGML_IFAIRY_LUT=0/1` (enable/disable)
 //   - `GGML_IFAIRY_LUT_DEBUG=0/1` (debug logging)
 //   - `GGML_IFAIRY_LUT_IMPL=auto|lut16|lut_c` (optional impl selection; `lut_c` uses 42.6-scaled Q8 activations
-//     when src1 is F32; otherwise falls back to lut16). In `auto`, Fairy2i F32 activations default to `lut_c`;
-//     set `GGML_IFAIRY_LUT_IMPL=lut16` to force lut16.
+//     when src1 is F32; otherwise falls back to lut16). In `auto`, Fairy2i F32 activations default to `lut_c` on
+//     aarch64+NEON and to `lut16` on x86; set `GGML_IFAIRY_LUT_IMPL=lut16` or `lut_c` to force either path.
 
 void   ggml_ifairy_lut_init(void);
 void   ggml_ifairy_lut_free(void);

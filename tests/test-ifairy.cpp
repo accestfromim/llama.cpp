@@ -634,8 +634,7 @@ static bool test_ifairy64_lut_transform_pack() {
                 }
 
                 const block_ifairy64 & src = weights[(size_t) row * (size_t) blocks_per_row + (size_t) blk];
-                if (t->d_real[lane] != GGML_FP16_TO_FP32(src.d_real) ||
-                    t->d_imag[lane] != GGML_FP16_TO_FP32(src.d_imag)) {
+                if (t->d_real[lane] != src.d_real || t->d_imag[lane] != src.d_imag) {
                     fprintf(stderr, "transform packed scale mismatch at row=%lld blk=%lld lane=%d\n", (long long) row,
                             (long long) blk, lane);
                     pass = false;
@@ -2074,7 +2073,7 @@ run_ifairy_lut_backend_bench(int64_t M, int64_t N, int64_t K, int threads, int w
 
     ifairy_backend_bench_result off;
     ifairy_backend_bench_result on;
-    if (!run_ifairy_backend_bench_case(off, M, N, K, threads, ifairy64, false, 1, 1)) {
+    if (!run_ifairy_backend_bench_case(off, M, N, K, threads, ifairy64, false, warmup, iters)) {
         return false;
     }
     if (!run_ifairy_backend_bench_case(on, M, N, K, threads, ifairy64, true, warmup, iters)) {
@@ -2088,7 +2087,11 @@ run_ifairy_lut_backend_bench(int64_t M, int64_t N, int64_t K, int threads, int w
 
     printf("shape M=%lld N=%lld K=%lld threads=%d warmup=%d iters=%d\n", (long long) M, (long long) N, (long long) K,
            threads, warmup, iters);
+    printf("baseline_ms_per_iter=%.6f\n", off.ms_per_iter);
     printf("lut16_ms_per_iter=%.6f\n", on.ms_per_iter);
+    if (on.ms_per_iter > 0.0) {
+        printf("speedup_vs_baseline=%.3fx\n", off.ms_per_iter / on.ms_per_iter);
+    }
     printf("output_hash=0x%016llx\n", (unsigned long long) ifairy_hash_u32(on.packed_out));
     return true;
 }
