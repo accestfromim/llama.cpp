@@ -304,7 +304,7 @@ def main() -> None:
     writer.add_head_count_kv(n_head_kv)
     writer.add_layer_norm_rms_eps(float(config["rms_norm_eps"]))
     add_rope_metadata(config, writer)
-    writer.add_file_type(gguf.LlamaFileType.ALL_F32)
+    writer.add_file_type(gguf.LlamaFileType.MOSTLY_IFAIRY)
     writer.add_vocab_size(vocab_padded)
     writer.add_uint32("fairy2i.quant.residual_steps", args.residual_steps)
     writer.add_string("fairy2i.quant.codebook", "{+/-1,+/-i}")
