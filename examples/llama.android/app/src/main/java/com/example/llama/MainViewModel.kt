@@ -158,6 +158,9 @@ class MainViewModel(
         private const val BENCH_STATUS_FILE_NAME = "builtin_models_bench.status"
         private const val E2E_BENCH_OUTPUT_FILE_NAME = "builtin_models_e2e_bench.csv"
         private const val E2E_BENCH_STATUS_FILE_NAME = "builtin_models_e2e_bench.status"
+        private const val E2E_LONG_DECODE_PRESET_LABEL = "short_prompt_long_decode_64_1024"
+        private const val E2E_LONG_DECODE_OUTPUT_FILE_NAME = "builtin_models_e2e_long_decode_64p_1024g.csv"
+        private const val E2E_LONG_DECODE_STATUS_FILE_NAME = "builtin_models_e2e_long_decode_64p_1024g.status"
         private const val POWER_BENCH_OUTPUT_FILE_NAME = "builtin_models_power_bench.csv"
         private const val POWER_BENCH_STATUS_FILE_NAME = "builtin_models_power_bench.status"
         private const val DEFAULT_POWER_BENCH_DURATION_MS = 30L * 60L * 1000L
@@ -180,6 +183,14 @@ class MainViewModel(
                 promptTokens = 512,
                 genTokens = 128,
                 repetitions = 3,
+            ),
+        )
+        private val E2E_EXTRA_PRESETS = listOf(
+            BenchPreset(
+                label = E2E_LONG_DECODE_PRESET_LABEL,
+                promptTokens = 64,
+                genTokens = 1024,
+                repetitions = 1,
             ),
         )
         private val SAFE_FILE_NAME = Regex("[^A-Za-z0-9._-]")
@@ -728,13 +739,15 @@ class MainViewModel(
         isBenchmarking = true
         try {
             val context = requireNotNull(appContext) { "App context is not initialized" }
+            val targetPresets = e2eBenchmarkTargetPresets()
+            val statusFileName = e2eBenchStatusFileName(targetPresets)
             val summaries = mutableListOf<E2eBenchSummary>()
-            writeBenchStatus(context, E2E_BENCH_STATUS_FILE_NAME, "running")
+            writeBenchStatus(context, statusFileName, "running")
             log("Starting bundled model E2E benchmark sweep")
             for ((index, model) in bundledModels.withIndex()) {
                 loadModelInternal(model)
                 warmupE2eBenchIfNeeded()
-                benchmarkTargetPresets().forEach { preset ->
+                targetPresets.forEach { preset ->
                     summaries += runE2eBenchPreset(model, preset)
                 }
                 unloadModelInternal()
@@ -745,14 +758,14 @@ class MainViewModel(
             }
             writeE2eBenchCsv(context, summaries)
             logCombinedE2eBenchTable(summaries)
-            writeBenchStatus(context, E2E_BENCH_STATUS_FILE_NAME, "completed")
+            writeBenchStatus(context, statusFileName, "completed")
             log("Completed bundled model E2E benchmark sweep")
         } catch (throwable: Throwable) {
             appContext?.let { context ->
                 runCatching {
                     writeBenchStatus(
                         context,
-                        E2E_BENCH_STATUS_FILE_NAME,
+                        e2eBenchStatusFileName(e2eBenchmarkTargetPresets()),
                         buildString {
                             append("failed")
                             val message = throwable.message?.takeIf { it.isNotBlank() }
@@ -1604,6 +1617,34 @@ class MainViewModel(
         return presets.map { it.copy(repetitions = repetitions) }
     }
 
+    private fun e2eBenchmarkTargetPresets(): List<BenchPreset> {
+        val filter = benchmarkPresetFilter
+        val e2ePresets = BENCH_PRESETS + E2E_EXTRA_PRESETS
+        val presets = if (filter.isNullOrEmpty()) {
+            BENCH_PRESETS
+        } else {
+            e2ePresets.filter { it.label in filter }
+        }
+        val repetitions = benchmarkRepetitionsOverride ?: return presets
+        return presets.map { it.copy(repetitions = repetitions) }
+    }
+
+    private fun e2eBenchOutputFileName(summaries: List<E2eBenchSummary>): String {
+        return if (summaries.isNotEmpty() && summaries.all { it.presetLabel == E2E_LONG_DECODE_PRESET_LABEL }) {
+            E2E_LONG_DECODE_OUTPUT_FILE_NAME
+        } else {
+            E2E_BENCH_OUTPUT_FILE_NAME
+        }
+    }
+
+    private fun e2eBenchStatusFileName(presets: List<BenchPreset>): String {
+        return if (presets.isNotEmpty() && presets.all { it.label == E2E_LONG_DECODE_PRESET_LABEL }) {
+            E2E_LONG_DECODE_STATUS_FILE_NAME
+        } else {
+            E2E_BENCH_STATUS_FILE_NAME
+        }
+    }
+
     private fun powerBenchmarkTargetModels(): List<ImportedModel> {
         val filter = benchmarkModelFilter
         return if (filter.isNullOrEmpty()) {
@@ -1655,11 +1696,15 @@ class MainViewModel(
 
     private suspend fun writeE2eBenchCsv(context: Context, summaries: List<E2eBenchSummary>) = withContext(Dispatchers.IO) {
         val benchDir = prepareBenchDirectory(context)
-        val csvFile = File(benchDir, E2E_BENCH_OUTPUT_FILE_NAME)
+        val csvFile = File(benchDir, e2eBenchOutputFileName(summaries))
         csvFile.writeText(
             buildString {
-                appendLine("model,preset,prompt,decode,repetitions,generated_tokens_avg,prefill_ms,first_token_ms,decode_ms_per_token,tok_s,total_ms")
+                appendLine("model,preset,prompt,decode,repetitions,generated_tokens_avg,prefill_ms,first_token_ms,decode_total_ms,decode_ms_per_token,tok_s,total_ms,prefill_ratio,status,note")
                 summaries.forEach { summary ->
+                    val decodeTotalMs = (summary.totalMs - summary.firstTokenMs).coerceAtLeast(0.0)
+                    val prefillRatio = if (summary.totalMs > 0.0) summary.prefillMs / summary.totalMs else 0.0
+                    val status = if (summary.generatedTokensAvg + 0.5 >= summary.genTokens) "completed" else "early_eog"
+                    val note = if (status == "early_eog") "generated_tokens_less_than_target" else ""
                     appendLine(
                         listOf(
                             summary.modelFileName,
@@ -1670,9 +1715,13 @@ class MainViewModel(
                             formatCsvDecimal(summary.generatedTokensAvg),
                             formatCsvDecimal(summary.prefillMs),
                             formatCsvDecimal(summary.firstTokenMs),
+                            formatCsvDecimal(decodeTotalMs),
                             formatCsvDecimal(summary.decodeLatencyMsPerToken),
                             formatCsvDecimal(summary.tokS),
                             formatCsvDecimal(summary.totalMs),
+                            formatCsvDecimal(prefillRatio),
+                            status,
+                            note,
                         ).joinToString(","),
                     )
                 }
