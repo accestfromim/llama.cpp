@@ -102,7 +102,6 @@ static size_t align_to(size_t value, size_t to_alignment) {
     return ((value + to_alignment - 1) / to_alignment) * to_alignment;
 }
 
-
 // Parses a version string of form "XX.YY ". On an error returns ggml_cl_version with all zeroes.
 static ggml_cl_version parse_cl_version(std::string_view str) {
     size_t major_str_begin = 0;
@@ -5030,15 +5029,20 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
 
     {
         cl_kernel  kernel = backend_ctx->kernel_ifairy64_mul_mat_f32_q16;
-        const int nth = ggml_cl_ifairy_rms_norm_nth(backend_ctx, kernel);
+        const int nth = 64;
+        const int tile_m = 2;
+        const int tile_n = 2;
+        const int tile_out = tile_m * tile_n;
+        const int ifairy64_block = ggml_blck_size(GGML_TYPE_IFAIRY64);
+        GGML_ASSERT(backend_ctx->get_kernel_workgroup_size(kernel) >= (size_t) nth);
 
         cl_ulong offsetd = extrad->offset + dst->view_offs;
         cl_ulong nb0     = dst->nb[0];
         cl_ulong nb1     = dst->nb[1];
 
         size_t global_work_size[] = {
-            (size_t) m * (size_t) nth,
-            (size_t) n,
+            (size_t) CEIL_DIV(m, tile_m) * (size_t) nth,
+            (size_t) CEIL_DIV(n, tile_n),
         };
         size_t local_work_size[] = {(size_t) nth, 1};
 
@@ -5053,8 +5057,10 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
         CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &n));
         CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb0));
         CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb1));
-        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(float) * nth, NULL));
-        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(float) * nth, NULL));
+        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(float) * tile_out * nth, NULL));
+        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(float) * tile_out * nth, NULL));
+        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(char) * 4 * tile_n * ifairy64_block, NULL));
+        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(char) * 4 * tile_n * ifairy64_block, NULL));
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     }
