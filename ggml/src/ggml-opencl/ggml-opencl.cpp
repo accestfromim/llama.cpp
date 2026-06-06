@@ -422,6 +422,8 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_ifairy_add;
     cl_kernel kernel_ifairy_q16_quantize_block127;
     cl_kernel kernel_ifairy64_mul_mat_f32_q16;
+    cl_kernel kernel_ifairy64_mul_vec_f32_q16;
+    cl_kernel kernel_ifairy64_mul_vec4_f32_q16;
     cl_kernel kernel_ifairy_mul;
     cl_kernel kernel_ifairy_rms_norm, kernel_ifairy_rms_norm_mul;
     cl_kernel kernel_add_id;
@@ -806,6 +808,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
                   err));
         CL_CHECK((backend_ctx->kernel_ifairy64_mul_mat_f32_q16 =
                       clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy64_mul_mat_f32_q16", &err),
+                  err));
+        CL_CHECK((backend_ctx->kernel_ifairy64_mul_vec_f32_q16 =
+                      clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy64_mul_vec_f32_q16", &err),
+                  err));
+        CL_CHECK((backend_ctx->kernel_ifairy64_mul_vec4_f32_q16 =
+                      clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy64_mul_vec4_f32_q16", &err),
                   err));
         GGML_LOG_CONT(".");
     }
@@ -5014,6 +5022,76 @@ static void ggml_cl_ifairy_rms_norm(ggml_backend_t backend, const ggml_tensor * 
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+enum ggml_opencl_ifairy64_mul_mat_impl {
+    GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_AUTO,
+    GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMM,
+    GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV2,
+    GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV4,
+};
+
+static ggml_opencl_ifairy64_mul_mat_impl ggml_opencl_ifairy64_mul_mat_impl_from_env() {
+    const char * env = getenv("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
+    if (env == nullptr || env[0] == '\0' || strcmp(env, "auto") == 0) {
+        return GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_AUTO;
+    }
+    if (strcmp(env, "gemm") == 0) {
+        return GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMM;
+    }
+    if (strcmp(env, "gemv2") == 0) {
+        return GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV2;
+    }
+    if (strcmp(env, "gemv4") == 0) {
+        return GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV4;
+    }
+
+    GGML_LOG_WARN("ggml_opencl: ignoring unknown GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL=%s\n", env);
+    return GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_AUTO;
+}
+
+static void ggml_cl_ifairy64_mul_mat_gemv(ggml_backend_opencl_context *          backend_ctx,
+                                          const ggml_tensor_extra_cl_ifairy64 * extra0,
+                                          const ggml_tensor_extra_cl *          extrad,
+                                          cl_mem                                act_q,
+                                          cl_mem                                act_d,
+                                          ggml_tensor *                         dst,
+                                          int                                  k,
+                                          int                                  m,
+                                          int                                  n,
+                                          int                                  tile_m,
+                                          cl_kernel                            kernel) {
+    const int nth = 64;
+    const int ifairy64_block = ggml_blck_size(GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(backend_ctx->get_kernel_workgroup_size(kernel) >= (size_t) nth);
+
+    cl_ulong offsetd = extrad->offset + dst->view_offs;
+    cl_ulong nb0     = dst->nb[0];
+    cl_ulong nb1     = dst->nb[1];
+
+    size_t global_work_size[] = {
+        (size_t) CEIL_DIV(m, tile_m) * (size_t) nth,
+        (size_t) n,
+    };
+    size_t local_work_size[] = {(size_t) nth, 1};
+
+    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->q));
+    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0->d));
+    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &act_q));
+    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &act_d));
+    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &k));
+    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &m));
+    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &n));
+    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb0));
+    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(float) * tile_m * nth, NULL));
+    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(float) * tile_m * nth, NULL));
+    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(char) * 4 * ifairy64_block, NULL));
+    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(char) * 4 * ifairy64_block, NULL));
+
+    backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+}
+
 static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(ggml_opencl_can_ifairy64_mul_mat(dst));
 
@@ -5068,7 +5146,22 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     }
 
-    {
+    ggml_opencl_ifairy64_mul_mat_impl impl = ggml_opencl_ifairy64_mul_mat_impl_from_env();
+    if (impl == GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_AUTO) {
+        if (n == 1) {
+            impl = m >= 2048 ? GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV4 : GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV2;
+        } else {
+            impl = GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMM;
+        }
+    }
+
+    if (impl == GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV2) {
+        ggml_cl_ifairy64_mul_mat_gemv(backend_ctx, extra0, extrad, act_q, act_d, dst, k, m, n, 2,
+                                      backend_ctx->kernel_ifairy64_mul_vec_f32_q16);
+    } else if (impl == GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL_GEMV4) {
+        ggml_cl_ifairy64_mul_mat_gemv(backend_ctx, extra0, extrad, act_q, act_d, dst, k, m, n, 4,
+                                      backend_ctx->kernel_ifairy64_mul_vec4_f32_q16);
+    } else {
         cl_kernel  kernel = backend_ctx->kernel_ifairy64_mul_mat_f32_q16;
         const int nth = 64;
         const int tile_m = 2;

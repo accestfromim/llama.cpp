@@ -2486,6 +2486,18 @@ static int run_ifairy64_opencl_mul_mat_tests(void) {
     if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 9, 1, 2 * QK_IFAIRY)) {
         num_failed++;
     }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 256, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 512, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 1024, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 2048, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
     if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 13, 4, 2 * QK_IFAIRY)) {
         num_failed++;
     }
@@ -2925,9 +2937,12 @@ static bool run_ifairy64_opencl_mul_mat_bench_once(ifairy64_mulmat_bench_result 
                                                    ggml_backend_dev_t            dev,
                                                    int64_t                       m,
                                                    int64_t                       n,
-                                                   int64_t                       k) {
+                                                   int64_t                       k,
+                                                   const char *                  impl) {
     scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    scoped_env_var env_impl("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
     env_gate.set("1");
+    env_impl.set(impl);
 
     ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
     if (!backend) {
@@ -3025,6 +3040,101 @@ static bool run_ifairy64_opencl_mul_mat_bench_once(ifairy64_mulmat_bench_result 
     return true;
 }
 
+static bool run_ifairy64_cpu_mul_mat_bench_once(ifairy64_mulmat_bench_result & result,
+                                                std::vector<uint32_t> &       packed_out,
+                                                int64_t                       m,
+                                                int64_t                       n,
+                                                int64_t                       k,
+                                                int                           n_threads) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        fprintf(stderr, "Failed to init CPU backend for IFAIRY64 MUL_MAT bench\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+
+    std::vector<block_ifairy64> weights;
+    std::vector<float>          act_f32;
+    fill_ifairy64_backend_weights(weights, m, k);
+    fill_ifairy_backend_act_f32(act_f32, n, k);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "Failed to init ggml context for CPU IFAIRY64 MUL_MAT bench\n");
+        return false;
+    }
+
+    struct ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, m);
+    struct ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    struct ggml_tensor * out = ggml_mul_mat(ctx, w, a);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate CPU backend buffer for IFAIRY64 MUL_MAT bench\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(a, act_f32.data(), 0, act_f32.size() * sizeof(float));
+
+    for (int i = 0; i < 8; ++i) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "CPU IFAIRY64 MUL_MAT bench warmup failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+    }
+    ggml_backend_synchronize(backend);
+
+    int64_t total_us = 0;
+    int     runs     = 0;
+    do {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "CPU IFAIRY64 MUL_MAT bench run failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+        const auto t1 = std::chrono::steady_clock::now();
+
+        total_us += (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        runs++;
+    } while (total_us < 500 * 1000 || runs < 30);
+
+    std::vector<float> out_f32((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_f32.data(), 0, ggml_nbytes(out));
+
+    packed_out.resize(out_f32.size());
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+        memcpy(&packed_out[i], &out_f32[i], sizeof(uint32_t));
+    }
+
+    result.us_per_run = (double) total_us / (double) runs;
+    result.runs       = runs;
+    result.hash       = hash_u32_bits(packed_out);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
 static int run_ifairy64_opencl_mul_mat_bench(void) {
     printf("\n=== iFairy64 OpenCL MUL_MAT microbench ===\n");
 
@@ -3038,23 +3148,65 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
 
     int num_failed = 0;
     auto bench = [&](int64_t m, int64_t n, int64_t k) {
-        ifairy64_mulmat_bench_result result;
-        std::vector<uint32_t>        out;
+        ifairy64_mulmat_bench_result gemv2;
+        ifairy64_mulmat_bench_result gemv4;
+        ifairy64_mulmat_bench_result gemm;
+        ifairy64_mulmat_bench_result cpu4t;
+        std::vector<uint32_t>        out_gemv2;
+        std::vector<uint32_t>        out_gemv4;
+        std::vector<uint32_t>        out_gemm;
+        std::vector<uint32_t>        out_cpu4t;
 
-        if (!run_ifairy64_opencl_mul_mat_bench_once(result, out, dev, m, n, k)) {
+        if (!run_ifairy64_opencl_mul_mat_bench_once(gemv2, out_gemv2, dev, m, n, k, "gemv2") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(gemv4, out_gemv4, dev, m, n, k, "gemv4") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(gemm, out_gemm, dev, m, n, k, "gemm") ||
+            !run_ifairy64_cpu_mul_mat_bench_once(cpu4t, out_cpu4t, m, n, k, 4)) {
             num_failed++;
             return;
         }
 
-        printf("  M=%lld N=%lld K=%lld us/run=%.2f runs=%d hash=0x%016llx\n",
-               (long long) m, (long long) n, (long long) k, result.us_per_run, result.runs,
-               (unsigned long long) result.hash);
+        if (!compare_packed_complex_outputs(out_gemv2.data(), out_gemm.data(), out_gemm.size()) ||
+            !compare_packed_complex_outputs(out_gemv4.data(), out_gemm.data(), out_gemm.size()) ||
+            !compare_packed_complex_outputs(out_gemm.data(), out_cpu4t.data(), out_cpu4t.size())) {
+            fprintf(stderr, "IFAIRY64 MUL_MAT bench output mismatch M=%lld N=%lld K=%lld\n",
+                    (long long) m, (long long) n, (long long) k);
+            num_failed++;
+            return;
+        }
+
+        const double speedup_gemv2 = gemm.us_per_run / gemv2.us_per_run;
+        const double speedup_gemv4 = gemm.us_per_run / gemv4.us_per_run;
+        const char * best = "gemm";
+        double best_us = gemm.us_per_run;
+        if (gemv2.us_per_run < best_us) {
+            best = "gemv2";
+            best_us = gemv2.us_per_run;
+        }
+        if (gemv4.us_per_run < best_us) {
+            best = "gemv4";
+        }
+
+        printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemm_us=%.2f cpu4t_us=%.2f "
+               "gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
+               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx runs=%d/%d/%d/%d\n",
+               (long long) m, (long long) n, (long long) k,
+               gemv2.us_per_run, gemv4.us_per_run, gemm.us_per_run, cpu4t.us_per_run,
+               speedup_gemv2, speedup_gemv4, cpu4t.us_per_run / gemm.us_per_run, best,
+               (unsigned long long) gemv2.hash, (unsigned long long) gemv4.hash,
+               (unsigned long long) gemm.hash, (unsigned long long) cpu4t.hash,
+               gemv2.runs, gemv4.runs, gemm.runs, cpu4t.runs);
     };
 
+    bench(128, 1, 2 * QK_IFAIRY);
     bench(256, 1, 2 * QK_IFAIRY);
-    bench(512, 2, 2 * QK_IFAIRY);
-    bench(512, 4, 4 * QK_IFAIRY);
-    bench(512, 8, 4 * QK_IFAIRY);
+    bench(512, 1, 2 * QK_IFAIRY);
+    bench(1024, 1, 2 * QK_IFAIRY);
+    bench(2048, 1, 2 * QK_IFAIRY);
+    bench(128, 1, 4 * QK_IFAIRY);
+    bench(256, 1, 4 * QK_IFAIRY);
+    bench(512, 1, 4 * QK_IFAIRY);
+    bench(1024, 1, 4 * QK_IFAIRY);
+    bench(2048, 1, 4 * QK_IFAIRY);
 
     return num_failed > 0 ? 1 : 0;
 }

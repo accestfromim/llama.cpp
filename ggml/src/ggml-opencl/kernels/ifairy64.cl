@@ -7,6 +7,9 @@
 #define IFAIRY64_TILE_N 2
 #define IFAIRY64_TILE_OUT (IFAIRY64_TILE_M * IFAIRY64_TILE_N)
 
+#define IFAIRY64_GEMV_TILE_M 2
+#define IFAIRY64_GEMV4_TILE_M 4
+
 static inline float ifairy_bf16_to_f32(ushort h) {
     return as_float(((uint) h) << 16);
 }
@@ -294,6 +297,301 @@ kernel void kernel_ifairy64_mul_mat_f32_q16(
                 const int out_idx = tr * IFAIRY64_TILE_N + tc;
                 *((global uint *) (dst + (ulong) col * nb1 + (ulong) row * nb0)) =
                     ifairy64_pack_bf16_pair(tmp_real[out_idx * lsize], tmp_imag[out_idx * lsize]);
+            }
+        }
+    }
+}
+
+/**
+ * iFairy64 GEMV kernel. Each work-group computes one activation column and a
+ * small row tile, so it can be used either for N == 1 routing or direct GEMV
+ * benchmarking across multiple columns.
+ */
+kernel void kernel_ifairy64_mul_vec_f32_q16(
+        global uchar * w_q,
+        global half  * w_d,
+        global char  * act_q,
+        global half  * act_d,
+        global char  * dst,
+        ulong         offsetd,
+        int           k,
+        int           m,
+        int           n,
+        ulong         nb0,
+        ulong         nb1,
+        local float * tmp_real,
+        local float * tmp_imag,
+        local char  * act_real_tile,
+        local char  * act_imag_tile
+) {
+    dst = dst + offsetd;
+
+    const int row_base = get_group_id(0) * IFAIRY64_GEMV_TILE_M;
+    const int col = get_group_id(1);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int block_slot = lid >> 4;
+    const int lane = lid & 15;
+    const int nb64 = k / QK_IFAIRY64;
+    const int nbq = k / QK_IFAIRY_Q16;
+
+    if (col >= n) {
+        return;
+    }
+
+    float acc_real[IFAIRY64_GEMV_TILE_M];
+    float acc_imag[IFAIRY64_GEMV_TILE_M];
+#pragma unroll
+    for (int i = 0; i < IFAIRY64_GEMV_TILE_M; ++i) {
+        acc_real[i] = 0.0f;
+        acc_imag[i] = 0.0f;
+    }
+
+    for (int wb_base = 0; wb_base < nb64; wb_base += 4) {
+        const int wb = wb_base + block_slot;
+        const int act_block = wb >> 2;
+        const int act_base = (wb & 3) * QK_IFAIRY64;
+
+        if (wb < nb64) {
+            const int act_index = col * nbq + act_block;
+            const int q_base = act_index * (2 * QK_IFAIRY_Q16) + act_base;
+#pragma unroll
+            for (int part = 0; part < 4; ++part) {
+                const int j = lane + 16 * part;
+                act_real_tile[block_slot * QK_IFAIRY64 + j] = act_q[q_base + j];
+                act_imag_tile[block_slot * QK_IFAIRY64 + j] = act_q[q_base + QK_IFAIRY_Q16 + j];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (wb < nb64) {
+            const int act_index = col * nbq + act_block;
+            const float x_real = vload_half(act_index * 2 + 0, act_d);
+            const float x_imag = vload_half(act_index * 2 + 1, act_d);
+
+#pragma unroll
+            for (int tr = 0; tr < IFAIRY64_GEMV_TILE_M; ++tr) {
+                const int row = row_base + tr;
+                if (row >= m) {
+                    continue;
+                }
+
+                const int w_block = row * nb64 + wb;
+                const uint packed = (uint) w_q[w_block * 16 + lane];
+                const float w_real = vload_half(w_block * 2 + 0, w_d);
+                const float w_imag = vload_half(w_block * 2 + 1, w_d);
+
+                int sum_ac = 0;
+                int sum_ad = 0;
+                int sum_bc = 0;
+                int sum_bd = 0;
+
+#pragma unroll
+                for (int part = 0; part < 4; ++part) {
+                    const int j = lane + 16 * part;
+                    const uint code = (packed >> (2 * part)) & 3U;
+                    int wr = 0;
+                    int wi = 0;
+                    if (code == 0U) {
+                        wr = -1;
+                    } else if (code == 1U) {
+                        wr = 1;
+                    } else if (code == 2U) {
+                        wi = -1;
+                    } else {
+                        wi = 1;
+                    }
+
+                    const int xr = (int) act_real_tile[block_slot * QK_IFAIRY64 + j];
+                    const int xi = (int) act_imag_tile[block_slot * QK_IFAIRY64 + j];
+
+                    sum_ac += xr * wr;
+                    sum_ad += xi * wr;
+                    sum_bc += xr * wi;
+                    sum_bd += xi * wi;
+                }
+
+                acc_real[tr] += w_real * x_real * (float) sum_ac +
+                                w_imag * x_imag * (float) sum_bd;
+                acc_imag[tr] += w_imag * x_real * (float) sum_bc -
+                                w_real * x_imag * (float) sum_ad;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+#pragma unroll
+    for (int tr = 0; tr < IFAIRY64_GEMV_TILE_M; ++tr) {
+        tmp_real[tr * lsize + lid] = acc_real[tr];
+        tmp_imag[tr * lsize + lid] = acc_imag[tr];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+#pragma unroll
+            for (int tr = 0; tr < IFAIRY64_GEMV_TILE_M; ++tr) {
+                tmp_real[tr * lsize + lid] += tmp_real[tr * lsize + lid + stride];
+                tmp_imag[tr * lsize + lid] += tmp_imag[tr * lsize + lid + stride];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0) {
+#pragma unroll
+        for (int tr = 0; tr < IFAIRY64_GEMV_TILE_M; ++tr) {
+            const int row = row_base + tr;
+            if (row < m) {
+                *((global uint *) (dst + (ulong) col * nb1 + (ulong) row * nb0)) =
+                    ifairy64_pack_bf16_pair(tmp_real[tr * lsize], tmp_imag[tr * lsize]);
+            }
+        }
+    }
+}
+
+/**
+ * iFairy64 GEMV kernel with a 4-row tile. This is intentionally separate from
+ * the 2-row kernel so the compiler can unroll fixed-size accumulators.
+ */
+kernel void kernel_ifairy64_mul_vec4_f32_q16(
+        global uchar * w_q,
+        global half  * w_d,
+        global char  * act_q,
+        global half  * act_d,
+        global char  * dst,
+        ulong         offsetd,
+        int           k,
+        int           m,
+        int           n,
+        ulong         nb0,
+        ulong         nb1,
+        local float * tmp_real,
+        local float * tmp_imag,
+        local char  * act_real_tile,
+        local char  * act_imag_tile
+) {
+    dst = dst + offsetd;
+
+    const int row_base = get_group_id(0) * IFAIRY64_GEMV4_TILE_M;
+    const int col = get_group_id(1);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int block_slot = lid >> 4;
+    const int lane = lid & 15;
+    const int nb64 = k / QK_IFAIRY64;
+    const int nbq = k / QK_IFAIRY_Q16;
+
+    if (col >= n) {
+        return;
+    }
+
+    float acc_real[IFAIRY64_GEMV4_TILE_M];
+    float acc_imag[IFAIRY64_GEMV4_TILE_M];
+#pragma unroll
+    for (int i = 0; i < IFAIRY64_GEMV4_TILE_M; ++i) {
+        acc_real[i] = 0.0f;
+        acc_imag[i] = 0.0f;
+    }
+
+    for (int wb_base = 0; wb_base < nb64; wb_base += 4) {
+        const int wb = wb_base + block_slot;
+        const int act_block = wb >> 2;
+        const int act_base = (wb & 3) * QK_IFAIRY64;
+
+        if (wb < nb64) {
+            const int act_index = col * nbq + act_block;
+            const int q_base = act_index * (2 * QK_IFAIRY_Q16) + act_base;
+#pragma unroll
+            for (int part = 0; part < 4; ++part) {
+                const int j = lane + 16 * part;
+                act_real_tile[block_slot * QK_IFAIRY64 + j] = act_q[q_base + j];
+                act_imag_tile[block_slot * QK_IFAIRY64 + j] = act_q[q_base + QK_IFAIRY_Q16 + j];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (wb < nb64) {
+            const int act_index = col * nbq + act_block;
+            const float x_real = vload_half(act_index * 2 + 0, act_d);
+            const float x_imag = vload_half(act_index * 2 + 1, act_d);
+
+#pragma unroll
+            for (int tr = 0; tr < IFAIRY64_GEMV4_TILE_M; ++tr) {
+                const int row = row_base + tr;
+                if (row >= m) {
+                    continue;
+                }
+
+                const int w_block = row * nb64 + wb;
+                const uint packed = (uint) w_q[w_block * 16 + lane];
+                const float w_real = vload_half(w_block * 2 + 0, w_d);
+                const float w_imag = vload_half(w_block * 2 + 1, w_d);
+
+                int sum_ac = 0;
+                int sum_ad = 0;
+                int sum_bc = 0;
+                int sum_bd = 0;
+
+#pragma unroll
+                for (int part = 0; part < 4; ++part) {
+                    const int j = lane + 16 * part;
+                    const uint code = (packed >> (2 * part)) & 3U;
+                    int wr = 0;
+                    int wi = 0;
+                    if (code == 0U) {
+                        wr = -1;
+                    } else if (code == 1U) {
+                        wr = 1;
+                    } else if (code == 2U) {
+                        wi = -1;
+                    } else {
+                        wi = 1;
+                    }
+
+                    const int xr = (int) act_real_tile[block_slot * QK_IFAIRY64 + j];
+                    const int xi = (int) act_imag_tile[block_slot * QK_IFAIRY64 + j];
+
+                    sum_ac += xr * wr;
+                    sum_ad += xi * wr;
+                    sum_bc += xr * wi;
+                    sum_bd += xi * wi;
+                }
+
+                acc_real[tr] += w_real * x_real * (float) sum_ac +
+                                w_imag * x_imag * (float) sum_bd;
+                acc_imag[tr] += w_imag * x_real * (float) sum_bc -
+                                w_real * x_imag * (float) sum_ad;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+#pragma unroll
+    for (int tr = 0; tr < IFAIRY64_GEMV4_TILE_M; ++tr) {
+        tmp_real[tr * lsize + lid] = acc_real[tr];
+        tmp_imag[tr * lsize + lid] = acc_imag[tr];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+#pragma unroll
+            for (int tr = 0; tr < IFAIRY64_GEMV4_TILE_M; ++tr) {
+                tmp_real[tr * lsize + lid] += tmp_real[tr * lsize + lid + stride];
+                tmp_imag[tr * lsize + lid] += tmp_imag[tr * lsize + lid + stride];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0) {
+#pragma unroll
+        for (int tr = 0; tr < IFAIRY64_GEMV4_TILE_M; ++tr) {
+            const int row = row_base + tr;
+            if (row < m) {
+                *((global uint *) (dst + (ulong) col * nb1 + (ulong) row * nb0)) =
+                    ifairy64_pack_bf16_pair(tmp_real[tr * lsize], tmp_imag[tr * lsize]);
             }
         }
     }
