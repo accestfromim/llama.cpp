@@ -345,6 +345,11 @@ struct ggml_backend_opencl_context {
     cl_context context;
     cl_command_queue queue;
 
+    cl_mem ifairy64_act_q_scratch = nullptr;
+    cl_mem ifairy64_act_d_scratch = nullptr;
+    size_t ifairy64_act_q_capacity = 0;
+    size_t ifairy64_act_d_capacity = 0;
+
     cl_program program_add;
     cl_program program_add_id;
     cl_program program_clamp;
@@ -596,6 +601,41 @@ struct ggml_backend_opencl_context {
 #endif
     }
 
+    void ensure_ifairy64_act_scratch(size_t act_q_size, size_t act_d_size) {
+        cl_int err;
+
+        if (ifairy64_act_q_capacity < act_q_size) {
+            if (ifairy64_act_q_scratch != nullptr) {
+                CL_CHECK(clReleaseMemObject(ifairy64_act_q_scratch));
+            }
+            ifairy64_act_q_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_q_size, NULL, &err);
+            CL_CHECK(err);
+            ifairy64_act_q_capacity = act_q_size;
+        }
+
+        if (ifairy64_act_d_capacity < act_d_size) {
+            if (ifairy64_act_d_scratch != nullptr) {
+                CL_CHECK(clReleaseMemObject(ifairy64_act_d_scratch));
+            }
+            ifairy64_act_d_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_d_size, NULL, &err);
+            CL_CHECK(err);
+            ifairy64_act_d_capacity = act_d_size;
+        }
+    }
+
+    void release_ifairy64_act_scratch() {
+        if (ifairy64_act_q_scratch != nullptr) {
+            CL_CHECK(clReleaseMemObject(ifairy64_act_q_scratch));
+            ifairy64_act_q_scratch = nullptr;
+        }
+        if (ifairy64_act_d_scratch != nullptr) {
+            CL_CHECK(clReleaseMemObject(ifairy64_act_d_scratch));
+            ifairy64_act_d_scratch = nullptr;
+        }
+        ifairy64_act_q_capacity = 0;
+        ifairy64_act_d_capacity = 0;
+    }
+
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // Transpose kernels
     cl_program program_transpose;
@@ -631,6 +671,7 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_info.clear();
 #endif
+            release_ifairy64_act_scratch();
         }
     }
 };
@@ -4996,11 +5037,11 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
     const size_t act_q_size = (size_t) n * (size_t) act_blocks * (size_t) act_block_k * 2;
     const size_t act_d_size = (size_t) n * (size_t) act_blocks * 2 * sizeof(ggml_fp16_t);
 
-    cl_int err;
-    cl_mem act_q = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, act_q_size, NULL, &err);
-    CL_CHECK(err);
-    cl_mem act_d = clCreateBuffer(backend_ctx->context, CL_MEM_READ_WRITE, act_d_size, NULL, &err);
-    CL_CHECK(err);
+    backend_ctx->ensure_ifairy64_act_scratch(act_q_size, act_d_size);
+    cl_mem act_q = backend_ctx->ifairy64_act_q_scratch;
+    cl_mem act_d = backend_ctx->ifairy64_act_d_scratch;
+    GGML_ASSERT(act_q != nullptr);
+    GGML_ASSERT(act_d != nullptr);
 
     {
         cl_kernel kernel = backend_ctx->kernel_ifairy_q16_quantize_block127;
@@ -5064,9 +5105,6 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
 
         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
     }
-
-    CL_CHECK(clReleaseMemObject(act_q));
-    CL_CHECK(clReleaseMemObject(act_d));
 }
 
 static void ggml_cl_add_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
