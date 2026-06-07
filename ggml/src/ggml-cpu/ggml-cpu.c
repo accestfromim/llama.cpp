@@ -2361,6 +2361,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ifairy_mul(params, tensor);
             }
             break;
+        case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
+            {
+                GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 not implemented");
+            }
+            break;
         case GGML_OP_ROPE:
             {
                 ggml_compute_forward_rope(params, tensor);
@@ -2764,6 +2769,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ADD_REL_POS:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_CLAMP:
             {
@@ -3281,6 +3290,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_IFAIRY_RMSNORM:
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                    } break;
+                case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
+                    {
+                        cur = 0;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {

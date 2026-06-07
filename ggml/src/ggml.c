@@ -1097,14 +1097,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
+    "GLU",
+
     "IFAIRY_ROPE",
     "IFAIRY_SPLIT",
     "IFAIRY_MERGE",
     "IFAIRY_ADD",
     "IFAIRY_RMS_NORM",
     "IFAIRY_MUL",
-
-    "GLU",
+    "IFAIRY_WIDE_LINEAR_W2",
 };
 
 // static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
@@ -1215,6 +1216,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ifairy_add(x, y)",
     "ifairy_rms_norm(x)",
     "ifairy_mul(x,y)",
+    "ifairy_wide_linear_w2(x)",
 };
 
 // static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
@@ -4140,6 +4142,63 @@ struct ggml_tensor * ggml_ifairy_add(struct ggml_context * ctx, struct ggml_tens
 
 struct ggml_tensor * ggml_ifairy_mul(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
     return ggml_ifairy_mul_impl(ctx, a, b, false);
+}
+
+struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
+                                                struct ggml_tensor *  x,
+                                                struct ggml_tensor *  x_conj,
+                                                struct ggml_tensor *  u_s0,
+                                                struct ggml_tensor *  u_s1,
+                                                struct ggml_tensor *  w_s0,
+                                                struct ggml_tensor *  w_s1,
+                                                struct ggml_tensor *  bias) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(x_conj);
+    GGML_ASSERT(u_s0);
+    GGML_ASSERT(u_s1);
+    GGML_ASSERT(w_s0);
+    GGML_ASSERT(w_s1);
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x_conj->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(x, x_conj));
+
+    GGML_ASSERT(u_s0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(u_s1->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w_s0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w_s1->type == GGML_TYPE_IFAIRY64);
+
+    GGML_ASSERT(ggml_can_mul_mat(u_s0, x_conj));
+    GGML_ASSERT(ggml_can_mul_mat(u_s1, x_conj));
+    GGML_ASSERT(ggml_can_mul_mat(w_s0, x));
+    GGML_ASSERT(ggml_can_mul_mat(w_s1, x));
+
+    GGML_ASSERT(u_s0->ne[1] == u_s1->ne[1]);
+    GGML_ASSERT(u_s0->ne[1] == w_s0->ne[1]);
+    GGML_ASSERT(u_s0->ne[1] == w_s1->ne[1]);
+
+    const int64_t ne[4] = { u_s0->ne[1], x->ne[1], x->ne[2], x->ne[3] };
+
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT((2 * ne[0]) % bias->ne[0] == 0);
+        GGML_ASSERT(ne[1] % bias->ne[1] == 0);
+        GGML_ASSERT(ne[2] % bias->ne[2] == 0);
+        GGML_ASSERT(ne[3] % bias->ne[3] == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_IFAIRY_WIDE_LINEAR_W2;
+    result->src[0] = x;
+    result->src[1] = x_conj;
+    result->src[2] = u_s0;
+    result->src[3] = u_s1;
+    result->src[4] = w_s0;
+    result->src[5] = w_s1;
+    result->src[6] = bias;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_ifairy_split(struct ggml_context * ctx, struct ggml_tensor * a) {
