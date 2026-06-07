@@ -949,6 +949,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL,
         .from_float_ref           = quantize_row_ifairy64_from_float_ref,
     },
+    [GGML_TYPE_IFAIRY64_Q16] = {
+        .type_name                = "ifairy64_q16",
+        .blck_size                = QK_IFAIRY64,
+        .type_size                = sizeof(block_ifairy64_q16),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {

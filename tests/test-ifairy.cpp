@@ -1193,7 +1193,6 @@ static bool test_ifairy64_vecdot_compare() {
 
     const int k    = 1024;
     const int nb64 = k / QK_IFAIRY64;
-    const int nbq  = k / QK_IFAIRY;
     const int rows = 3;
 
     std::mt19937                          rng(4049u);
@@ -1214,14 +1213,14 @@ static bool test_ifairy64_vecdot_compare() {
         }
     }
 
-    std::vector<block_ifairy_q16> x((size_t) nbq);
-    for (int ib = 0; ib < nbq; ++ib) {
+    std::vector<block_ifairy64_q16> x((size_t) nb64);
+    for (int ib = 0; ib < nb64; ++ib) {
         x[ib].d_real = GGML_FP32_TO_FP16(scale_dist(rng));
         x[ib].d_imag = GGML_FP32_TO_FP16(scale_dist(rng));
 
         int8_t * xr = (int8_t *) x[ib].x_real;
         int8_t * xi = (int8_t *) x[ib].x_imag;
-        for (int j = 0; j < QK_IFAIRY; ++j) {
+        for (int j = 0; j < QK_IFAIRY64; ++j) {
             xr[j] = (int8_t) act_dist(rng);
             xi[j] = (int8_t) act_dist(rng);
         }
@@ -1671,6 +1670,18 @@ static void quantize_ifairy_backend_act_q16(std::vector<block_ifairy_q16> & act_
     }
 }
 
+static void quantize_ifairy64_backend_act_q16(std::vector<block_ifairy64_q16> & act_q16,
+                                              const std::vector<float> &        act_f32,
+                                              int64_t                           N,
+                                              int64_t                           K) {
+    const int64_t blocks = K / QK_IFAIRY64;
+    act_q16.assign((size_t) N * (size_t) blocks, block_ifairy64_q16{});
+    for (int64_t c = 0; c < N; ++c) {
+        quantize_row_ifairy64_q16_ref(act_f32.data() + (size_t) c * (size_t) K,
+                                      act_q16.data() + (size_t) c * (size_t) blocks, K);
+    }
+}
+
 static void quantize_ifairy_backend_act_q16_lut_c(std::vector<block_ifairy_q16> & act_q16,
                                                   const std::vector<float> &      act_f32,
                                                   int64_t                         N,
@@ -1858,20 +1869,18 @@ static bool test_ifairy64_lut_backend_compare() {
     const int64_t N = 2;
     const int64_t K = 2 * QK_IFAIRY;
 
-    std::vector<float>            act_f32;
-    std::vector<block_ifairy_q16> act_q16;
+    std::vector<float> act_f32;
     fill_ifairy_backend_act_f32(act_f32, N, K);
-    quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
 
     std::vector<uint32_t> out_off;
     std::vector<uint32_t> out_on;
-    if (!run_ifairy64_backend_mul_mat_shape(out_off, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
+    if (!run_ifairy64_backend_mul_mat_shape(out_off, M, N, K, GGML_TYPE_F32, act_f32.data(),
+                                            act_f32.size() * sizeof(float),
                                             /*lut_env*/ "0")) {
         return false;
     }
-    if (!run_ifairy64_backend_mul_mat_shape(out_on, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
+    if (!run_ifairy64_backend_mul_mat_shape(out_on, M, N, K, GGML_TYPE_F32, act_f32.data(),
+                                            act_f32.size() * sizeof(float),
                                             /*lut_env*/ "1")) {
         return false;
     }
@@ -1885,30 +1894,30 @@ static bool test_ifairy64_lut_backend_compare() {
 
 static bool test_ifairy64_lut_backend_f32_vs_q16() {
 #if !GGML_IFAIRY_LUT_TEST_BACKEND_ENABLED
-    printf("\n=== Test 5.4: iFairy64 LUT backend F32 vs Q16 (SKIP: backend not enabled on this platform) ===\n");
+    printf("\n=== Test 5.4: iFairy64 backend F32 vs Q16 (SKIP: backend not enabled on this platform) ===\n");
     return true;
 #else
-    printf("\n=== Test 5.4: iFairy64 LUT backend F32 vs Q16 ===\n");
+    printf("\n=== Test 5.4: iFairy64 backend F32 vs Q16 ===\n");
 
     const int64_t M = 8;
     const int64_t N = 2;
     const int64_t K = 2 * QK_IFAIRY;
 
-    std::vector<float>            act_f32;
-    std::vector<block_ifairy_q16> act_q16;
+    std::vector<float>              act_f32;
+    std::vector<block_ifairy64_q16> act_q16;
     fill_ifairy_backend_act_f32(act_f32, N, K);
-    quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
+    quantize_ifairy64_backend_act_q16(act_q16, act_f32, N, K);
 
     std::vector<uint32_t> out_f32;
     std::vector<uint32_t> out_q16;
     if (!run_ifairy64_backend_mul_mat_shape(out_f32, M, N, K, GGML_TYPE_F32, act_f32.data(),
                                             act_f32.size() * sizeof(float),
-                                            /*lut_env*/ "1")) {
+                                            /*lut_env*/ "0")) {
         return false;
     }
-    if (!run_ifairy64_backend_mul_mat_shape(out_q16, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
-                                            /*lut_env*/ "1")) {
+    if (!run_ifairy64_backend_mul_mat_shape(out_q16, M, N, K, GGML_TYPE_IFAIRY64_Q16, act_q16.data(),
+                                            act_q16.size() * sizeof(block_ifairy64_q16),
+                                            /*lut_env*/ "0")) {
         return false;
     }
     if (out_f32.size() != out_q16.size()) {

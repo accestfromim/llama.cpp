@@ -364,6 +364,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IFAIRY_Q16] = {
         .from_float               = quantize_row_ifairy_q16,
     },
+    [GGML_TYPE_IFAIRY64_Q16] = {
+        .from_float               = quantize_row_ifairy64_q16,
+    },
     [GGML_TYPE_BF16] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_bf16,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_bf16,
@@ -388,13 +391,13 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IFAIRY] = {
         .from_float               = quantize_row_ifairy,
         .vec_dot                  = ggml_vec_dot_ifairy_q16_K,
-        .vec_dot_type             = GGML_TYPE_IFAIRY_Q16, 
+        .vec_dot_type             = GGML_TYPE_IFAIRY_Q16,
         .nrows                    = 1,
     },
     [GGML_TYPE_IFAIRY64] = {
         .from_float               = quantize_row_ifairy64,
         .vec_dot                  = ggml_vec_dot_ifairy64_q16_K,
-        .vec_dot_type             = GGML_TYPE_IFAIRY_Q16,
+        .vec_dot_type             = GGML_TYPE_IFAIRY64_Q16,
         .nrows                    = 1,
     },
 };
