@@ -184,7 +184,15 @@ for output row assigned to thread:
   - LoRA 仍走 fallback。
   - 或将 base fused 与 LoRA delta 分开计算再 add。
 
-### 3.5 风险
+### 3.5 当前 graph-only 实验入口
+
+- 新增环境变量：`LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1`。
+- 默认关闭；未设置时 Fairy2i wide linear 继续构造旧图。
+- 打开后，仅当 `U.s0`、`U.s1`、`W.s0`、`W.s1` 四个权重均存在且均为 `GGML_TYPE_IFAIRY64` 时，构造 `GGML_OP_IFAIRY_WIDE_LINEAR_W2`。
+- 该 op 的 graph 语义包含 optional bias，等价于当前 `build_ifairy_bias()` 的 split/add/merge。
+- 当前阶段只添加 graph op、builder 和 CPU dispatch stub；CPU/GPU 后端 fused kernel 尚未实现，实际执行会显式报 `GGML_OP_IFAIRY_WIDE_LINEAR_W2 not implemented`。
+
+### 3.6 风险
 
 - 新 op 的 graph buffer / backend scheduler 适配成本。
 - 多输入 op 的 tensor 生命周期和 backend placement。
@@ -218,6 +226,12 @@ IFAIRY64: K=64  一个 block，共用一组 d_real/d_imag
 - LUT preprocess 会把同一个激活 scale 复制到 4 个 K64 权重块。
 
 ### 4.2 优先方案：compute-only super-block
+
+当前实现备注：
+
+- 已新增 `GGML_TYPE_IFAIRY64_Q16` / `block_ifairy64_q16`，作为 `GGML_TYPE_IFAIRY64` vecdot 的专用激活格式。
+- 新格式每个 activation block 包含 64 个 complex activation，`IFAIRY64` vecdot 不再从旧 `GGML_TYPE_IFAIRY_Q16` 的 K256 block 中按 `i / 4` 切片。
+- 下面的 compute-only super-block 仍是后续权重 packed layout 优化方向；它需要基于新的 K64 activation 格式重新评估。
 
 不先修改 GGUF 权重格式，而是在 CPU transform / packed layout 阶段把连续 4 个 `block_ifairy64` 组合为计算态 super-block：
 

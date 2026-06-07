@@ -40,6 +40,11 @@ static bool llama_fairy2i_merged_output_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
+static bool llama_fairy2i_fused_wide_linear_w2_enabled() {
+    const char * env = getenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -14173,6 +14178,18 @@ struct llm_build_fairy2i : public llm_graph_context {
         auto build_wide_linear = [&](const llama_widely_linear_ifairy & linear, ggml_tensor * x, ggml_tensor * x_conj,
                                      ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
             GGML_ASSERT(linear.U[0] && linear.W[0]);
+
+            const bool can_fuse_w2 = llama_fairy2i_fused_wide_linear_w2_enabled() && linear.U[1] && linear.W[1] &&
+                                     linear.U[0]->type == GGML_TYPE_IFAIRY64 &&
+                                     linear.U[1]->type == GGML_TYPE_IFAIRY64 &&
+                                     linear.W[0]->type == GGML_TYPE_IFAIRY64 &&
+                                     linear.W[1]->type == GGML_TYPE_IFAIRY64;
+            if (can_fuse_w2) {
+                ggml_tensor * y = ggml_ifairy_wide_linear_w2(ctx0, x, x_conj, linear.U[0], linear.U[1], linear.W[0],
+                                                             linear.W[1], bias);
+                cb(y, name, il);
+                return y;
+            }
 
             ggml_tensor * u0 = build_lora_mm(linear.U[0], x_conj);
             ggml_tensor * u  = linear.U[1] ? ggml_ifairy_add(ctx0, u0, build_lora_mm(linear.U[1], x_conj)) : u0;
