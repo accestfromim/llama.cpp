@@ -192,7 +192,59 @@ for output row assigned to thread:
 - 该 op 的 graph 语义包含 optional bias，等价于当前 `build_ifairy_bias()` 的 split/add/merge。
 - 当前阶段只添加 graph op、builder 和 CPU dispatch stub；CPU/GPU 后端 fused kernel 尚未实现，实际执行会显式报 `GGML_OP_IFAIRY_WIDE_LINEAR_W2 not implemented`。
 
-### 3.6 风险
+### 3.6 后续完整 fused CPU 算子实现路线
+
+#### F1. 固化 fused op contract
+
+- 只支持 Fairy2i `IFAIRY64` W2：`U.s0`、`U.s1`、`W.s0`、`W.s1` 全存在。
+- 固定 src 顺序、输出 shape、bias 语义，不在 kernel 内做隐式重解释。
+- 第一版不支持 LoRA、不支持非 `IFAIRY64`、不支持 GPU 后端。
+- 第一版优先覆盖 decode / small-N；prefill 大 N 作为后续扩展。
+
+#### F2. 实现 CPU compute 入口
+
+- 新增 `ggml_compute_forward_ifairy_wide_linear_w2()`。
+- 将当前 `GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 not implemented")` 替换为真实 dispatch。
+- 补齐真实 `n_tasks` 和 `ggml_graph_plan()` workspace 需求。
+- workspace 至少包含 `x` 与 `x_conj` 的 activation quantization 缓冲。
+- 第一版只走 no-LUT baseline vecdot，不实现 LUT fused kernel。
+
+#### F3. 复用 activation quantization
+
+- fused op 内部分别量化一次 `x` 和 `x_conj`。
+- `U.s0` / `U.s1` 共用 `x_conj_q16`。
+- `W.s0` / `W.s1` 共用 `x_q16`。
+- 目标是消除旧图中四个 matmul node 对输入的重复量化。
+
+#### F4. 四路 matmul 直接累加输出
+
+- CPU fused op 内部按 output row / token 分片。
+- 每个输出元素完成四路累加：`U.s0*x_conj`、`U.s1*x_conj`、`W.s0*x`、`W.s1*x`。
+- 四路结果直接写入最终 `y`，不再生成 `u0/u1/w0/w1/u/w` 中间 tensor。
+- bias 在最终 store 前处理，语义等价当前 `ifairy_split -> add -> ifairy_merge`。
+
+#### F5. 完善 graph / backend gate
+
+- 保持 `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1` opt-in，直到正确性和性能稳定。
+- 如果输入或权重 backend placement 不适合 CPU-only fused op，第一版回退旧图。
+- 不给 OpenCL / CUDA / Metal / Vulkan 声明支持，避免 scheduler 将 fused op 分配给未实现后端。
+- 后续若实现 GPU fused kernel，再为对应 backend 单独补 `supports_op` 和 kernel dispatch。
+
+#### F6. 测试与验收
+
+- 新增 ggml fused op 单测：小 shape 下比较 fused 输出与旧图输出。
+- 覆盖 no-bias、with-bias、decode `N=1`、small-N、条件不满足时图回退。
+- 保留 `test-ifairy` 作为基础回归门。
+- 验收标准：默认不开 env 时现有路径不变；开 env 时 graph 出现 fused node；fused 输出与旧图一致。
+
+#### F7. 性能验证与后续扩展
+
+- 先确认 graph node 数从 4 个 matmul + 3 个 add 收敛到 1 个 fused node。
+- 再用固定模型、固定线程数、`--gpu-layers 0` 跑 `llama-bench` decode tok/s。
+- 记录完整命令、env、raw tok/s 输出和对比摘要。
+- 后续扩展顺序：prefill 更大 N、LUT fused 版本、SVE/SVE2/SME 专用实现、LoRA fused 支持。
+
+### 3.7 风险
 
 - 新 op 的 graph buffer / backend scheduler 适配成本。
 - 多输入 op 的 tensor 生命周期和 backend placement。
