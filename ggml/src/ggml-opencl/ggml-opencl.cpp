@@ -3095,10 +3095,12 @@ static bool ggml_opencl_can_ifairy_rope(const struct ggml_tensor * op) {
         return false;
     }
 
-    if (n_dims_param <= 0 || n_dims_param % 2 != 0 || n_dims_param / 2 > src0->ne[0]) {
+    const int n_dims = n_dims_param / 2;
+    if (n_dims_param <= 0 || n_dims_param % 4 != 0 || n_dims > src0->ne[0]) {
         return false;
     }
 
+    // CPU iFairy RoPE currently only supports the default ggml_ifairy_rope() parameters.
     if (freq_base != 10000.0f || freq_scale != 1.0f || ext_factor != 0.0f || attn_factor != 1.0f || beta_fast != 0.0f ||
         beta_slow != 0.0f) {
         return false;
