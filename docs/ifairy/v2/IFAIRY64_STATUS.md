@@ -17,6 +17,29 @@ Status: Draft (2026-04-23)
 
 按日期追加（YYYY-MM-DD）：
 
+### 2026-06-04 (working tree, Llama 7B Fairy2i conversion support)
+- Scope:
+  - Supports the Llama-based Fairy2i 7B checkpoint with existing `fairy2i` architecture metadata and the existing `IFAIRY64` `tile64_v2` tensor format.
+  - No new runtime architecture or kernel is required; the current Fairy2i graph path uses `fairy2i.attn.layout = qwen2_real`, which matches this checkpoint's attention/RoPE layout.
+- Converter:
+  - Use the local repo package explicitly:
+    - `.venv/bin/python gguf-py/convert_fairy2i_llama.py /home/zybi/projects/llama2_7b_new/checkpoint-24920 /tmp/llama2_7b_new.fairy2i.gguf --verbose`
+  - Dry-run validation:
+    - `.venv/bin/python gguf-py/convert_fairy2i_llama.py --dry-run /home/zybi/projects/llama2_7b_new/checkpoint-24920`
+  - The converter pads vocab/embedding/output rows from the original Llama vocab size to a 128-token boundary and records:
+    - `fairy2i.vocab.original_size`
+    - `fairy2i.vocab.padded_size`
+  - Added padding tokens are emitted as `UNUSED`; token ids below the original vocab size keep their original order.
+  - The output projection is kept dense `F16` with zero padded rows, while transformer linear weights use `IFAIRY64`. This avoids changing output token id ordering and keeps padded logits neutral unless a future sampler-side mask is needed.
+  - `general.file_type` is written as `MOSTLY_IFAIRY`.
+- Runtime notes:
+  - File-type guessing maps both `GGML_TYPE_IFAIRY` and `GGML_TYPE_IFAIRY64` to `LLAMA_FTYPE_MOSTLY_IFAIRY`, so converted files no longer report `unknown type ifairy64` / guessed `all F32` when metadata is absent.
+  - The EOG token texts `</s>` and `<｜end▁of▁sentence｜>` are recognized directly by `llama-vocab.cpp`, avoiding the tokenizer warning fallback for this checkpoint.
+- Inspection / smoke:
+  - If `.venv` has an old installed `gguf` package, run GGUF tools with `PYTHONPATH=gguf-py` so dtype `42` / `IFAIRY64` is recognized:
+    - `PYTHONPATH=gguf-py .venv/bin/python -m gguf.scripts.gguf_dump /tmp/llama2_7b_new.fairy2i.gguf`
+  - CPU smoke:
+    - `./build-rel/bin/llama-cli -m /tmp/llama2_7b_new.fairy2i.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 16 -no-cnv`
 ### 2026-05-28 (OpenCL routing skeleton)
 - 变更：
   - OpenCL 后端新增 `GGML_OPENCL_IFAIRY64` opt-in gate 和 `IFAIRY64` matmul 严格白名单。

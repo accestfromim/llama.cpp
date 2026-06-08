@@ -663,6 +663,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_IFAIRY:
+            case GGML_TYPE_IFAIRY64:
                 ftype = LLAMA_FTYPE_MOSTLY_IFAIRY;
                 break;
             default:
