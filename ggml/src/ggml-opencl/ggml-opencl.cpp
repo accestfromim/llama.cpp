@@ -3067,21 +3067,45 @@ static bool ggml_opencl_can_ifairy_rope(const struct ggml_tensor * op) {
 
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+    const struct ggml_tensor * src2 = op->src[2];
     if (src0 == nullptr || src1 == nullptr) {
         return false;
     }
 
-    const int mode = ((const int32_t *) op->op_params)[2];
-    const bool is_neox = mode & 2;
-    const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
-    const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
-    if (is_neox || is_mrope || is_vision) {
+    const int32_t * op_params = (const int32_t *) op->op_params;
+
+    const int n_dims_param = op_params[1];
+    const int mode         = op_params[2];
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+
+    memcpy(&freq_base, op_params + 5, sizeof(float));
+    memcpy(&freq_scale, op_params + 6, sizeof(float));
+    memcpy(&ext_factor, op_params + 7, sizeof(float));
+    memcpy(&attn_factor, op_params + 8, sizeof(float));
+    memcpy(&beta_fast, op_params + 9, sizeof(float));
+    memcpy(&beta_slow, op_params + 10, sizeof(float));
+
+    if (mode != 0 || src2 != nullptr) {
+        return false;
+    }
+
+    if (n_dims_param <= 0 || n_dims_param % 2 != 0 || n_dims_param / 2 > src0->ne[0]) {
+        return false;
+    }
+
+    if (freq_base != 10000.0f || freq_scale != 1.0f || ext_factor != 0.0f || attn_factor != 1.0f || beta_fast != 0.0f ||
+        beta_slow != 0.0f) {
         return false;
     }
 
     return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32 &&
-           op->ne[0] == 2 * src0->ne[0] &&
-           src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+           op->ne[0] == 2 * src0->ne[0] && src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
            ggml_is_contiguous(src0) && ggml_is_contiguous(op);
 }
 
