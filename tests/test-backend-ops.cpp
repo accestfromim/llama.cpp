@@ -58,6 +58,13 @@ static float make_ifairy_split_value(float x) {
     return ggml_bf16_to_fp32(ggml_fp32_to_bf16(x));
 }
 
+static bool is_ifairy_packed_pair_output(const ggml_tensor * t) {
+    if (t->op == GGML_OP_IFAIRY_ADD || t->op == GGML_OP_IFAIRY_MUL || t->op == GGML_OP_IFAIRY_MERGE) {
+        return true;
+    }
+    return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_IFAIRY_RELU2;
+}
+
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
@@ -166,14 +173,14 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
         for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
             for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
                 for (int64_t i0 = 0; i0 < t->ne[0]; i0 += bs) {
-                    size_t i = i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1] + i0/bs*t->nb[0];
+                    size_t i = i3 * t->nb[3] + i2 * t->nb[2] + i1 * t->nb[1] + i0 / bs * t->nb[0];
                     if (t->type == GGML_TYPE_F16) {
-                        tv.push_back(ggml_fp16_to_fp32(*(ggml_fp16_t*)&buf[i]));
+                        tv.push_back(ggml_fp16_to_fp32(*(ggml_fp16_t *) &buf[i]));
                     } else if (t->type == GGML_TYPE_BF16) {
-                        tv.push_back(ggml_bf16_to_fp32(*(ggml_bf16_t*)&buf[i]));
+                        tv.push_back(ggml_bf16_to_fp32(*(ggml_bf16_t *) &buf[i]));
                     } else if (t->type == GGML_TYPE_F32) {
                         const float v = *(float *) &buf[i];
-                        if (t->op == GGML_OP_IFAIRY_ADD || t->op == GGML_OP_IFAIRY_MUL) {
+                        if (is_ifairy_packed_pair_output(t)) {
                             float real;
                             float imag;
                             unpack_ifairy_bf16_pair(v, real, imag);
@@ -2782,6 +2789,204 @@ struct test_ifairy_rms_norm_mul : public test_case {
 
     double max_nmse_err() override {
         return 1e-5;
+    }
+};
+
+struct test_ifairy_split : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    test_ifairy_split(std::array<int64_t, 4> ne = {32, 5, 4, 3})
+        : ne(ne) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "IFAIRY_SPLIT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_ifairy_split(ctx, a);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") != 0) {
+                continue;
+            }
+
+            const size_t nels = ggml_nelements(t);
+            std::vector<float> data(nels);
+            for (size_t i = 0; i < nels; ++i) {
+                const float real = -0.75f + 0.03125f * (float) ((int) (i % 31) - 15);
+                const float imag =  0.25f + 0.015625f * (float) ((int) ((i / 5) % 29) - 14);
+                data[i] = pack_ifairy_bf16_pair(real, imag);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
+        }
+    }
+
+    double max_nmse_err() override {
+        return 1e-12;
+    }
+};
+
+struct test_ifairy_merge : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    test_ifairy_merge(std::array<int64_t, 4> ne = {64, 5, 4, 3})
+        : ne(ne) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "IFAIRY_MERGE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_ifairy_merge(ctx, a);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") != 0) {
+                continue;
+            }
+
+            const size_t nels = ggml_nelements(t);
+            std::vector<float> data(nels);
+            for (size_t i = 0; i < nels; ++i) {
+                data[i] = -1.0f + 0.015625f * (float) ((int) (i % 127) - 63);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
+        }
+    }
+
+    double max_nmse_err() override { return 1e-12; }
+};
+
+struct test_ifairy_relu2 : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    test_ifairy_relu2(std::array<int64_t, 4> ne = { 32, 5, 4, 3 }) : ne(ne) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "IFAIRY_RELU2";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override { return VARS_TO_STR1(ne); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_ifairy_relu2(ctx, a);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") != 0) {
+                continue;
+            }
+
+            const size_t       nels = ggml_nelements(t);
+            std::vector<float> data(nels);
+            for (size_t i = 0; i < nels; ++i) {
+                const float real_mag = 0.0625f * (float) ((int) (i % 13) + 1);
+                const float imag_mag = 0.03125f * (float) ((int) ((i / 3) % 17) + 1);
+                const float real     = (i & 1) ? real_mag : -real_mag;
+                const float imag     = (i & 2) ? imag_mag : -imag_mag;
+                data[i]              = pack_ifairy_bf16_pair(real, imag);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
+        }
+    }
+
+    double max_nmse_err() override { return 1e-12; }
+};
+
+struct test_ifairy_rope : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int                    n_dims;
+    const int                    n_ctx;
+
+    test_ifairy_rope(std::array<int64_t, 4> ne = {32, 5, 4, 3}, int n_dims = 64, int n_ctx = 512)
+        : ne(ne), n_dims(n_dims), n_ctx(n_ctx) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "IFAIRY_ROPE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, n_dims, n_ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[2]);
+        ggml_set_name(pos, "pos");
+
+        ggml_tensor * out = ggml_ifairy_rope(ctx, a, pos, n_dims, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") == 0) {
+                const size_t nels = ggml_nelements(t);
+                std::vector<float> data(nels);
+                for (size_t i = 0; i < nels; ++i) {
+                    const float real = -0.5f + 0.015625f * (float) ((int) (i % 41) - 20);
+                    const float imag =  0.5f + 0.0078125f * (float) ((int) ((i / 7) % 37) - 18);
+                    data[i] = pack_ifairy_bf16_pair(real, imag);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
+            } else if (strcmp(t->name, "pos") == 0) {
+                std::vector<int32_t> data(ne[2]);
+                for (int64_t i = 0; i < ne[2]; ++i) {
+                    data[i] = (int32_t) ((7 * i + 3) % n_ctx);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            }
+        }
+    }
+
+    double max_maa_err() override {
+        return 1e-3;
     }
 };
 
@@ -5803,6 +6008,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
+                if (op == GGML_UNARY_OP_IFAIRY_RELU2) {
+                    continue;
+                }
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 128, 2, 2, 2 }, v));
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 5, 7, 11, 13 }, v));
             }
@@ -6302,6 +6510,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ifairy_rms_norm_mul({33, 2, 1, 1}, 1e-6f));
     test_cases.emplace_back(new test_ifairy_rms_norm_mul({64, 5, 4, 3}, 1e-6f, true));
     test_cases.emplace_back(new test_ifairy_rms_norm_mul({64, 5, 4, 3}, 1e-4f, false, true));
+    test_cases.emplace_back(new test_ifairy_split({1, 1, 1, 1}));
+    test_cases.emplace_back(new test_ifairy_split({32, 5, 4, 3}));
+    test_cases.emplace_back(new test_ifairy_merge({2, 1, 1, 1}));
+    test_cases.emplace_back(new test_ifairy_merge({64, 5, 4, 3}));
+    test_cases.emplace_back(new test_ifairy_relu2({1, 1, 1, 1}));
+    test_cases.emplace_back(new test_ifairy_relu2({32, 5, 4, 3}));
+    test_cases.emplace_back(new test_ifairy_rope({2, 1, 1, 1}, 4, 32));
+    test_cases.emplace_back(new test_ifairy_rope({32, 5, 4, 3}, 64, 512));
 
     // single in-place tests, especially important for WebGPU backend since kernels for in-place vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
