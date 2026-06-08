@@ -6,6 +6,8 @@ Status: Draft (2026-04-23)
 
 相关文档：
 - `IFAIRY64_LUT_IMPLEMENTATION_PLAN.md`
+- `IFAIRY64_OPENCL_OPS_IMPLEMENTATION_GUIDE.md`
+- `IFAIRY64_OPENCL_PLAN.md`
 - `IFAIRY64_X86_ADAPTATION_EXECUTION_GUIDE.md`
 - `IFAIRY_ARM_3W_LUT_V2_STATUS.md`（旧的 ARM 3W LUT V2 总状态）
 
@@ -38,6 +40,25 @@ Status: Draft (2026-04-23)
     - `PYTHONPATH=gguf-py .venv/bin/python -m gguf.scripts.gguf_dump /tmp/llama2_7b_new.fairy2i.gguf`
   - CPU smoke:
     - `./build-rel/bin/llama-cli -m /tmp/llama2_7b_new.fairy2i.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 16 -no-cnv`
+### 2026-05-28 (OpenCL routing skeleton)
+- 变更：
+  - OpenCL 后端新增 `GGML_OPENCL_IFAIRY64` opt-in gate 和 `IFAIRY64` matmul 严格白名单。
+  - 第一阶段范围固定为 raw `GGML_TYPE_IFAIRY64` weights、`F32` activations、`F32` output 的 `GGML_OP_MUL_MAT`。
+  - 语义不变量写入 OpenCL skeleton：必须匹配 CPU 路径的 `w * conj(x)`。
+  - 由于 OpenCL kernel 尚未实现，kernel-ready gate 仍为 false；所有 `IFAIRY64` / iFairy custom ops 默认继续 scheduler CPU fallback。
+- 验证：
+  - `cmake --build build-opencl --target ggml-opencl -j 2`: PASS
+  - `./build-rel/bin/test-ifairy --ifairy-lut-only`: PASS
+
+### 2026-05-28 (OpenCL IFAIRY64 buffer layout)
+- 变更：
+  - 采用 SoA raw-weight layout 作为第一版 OpenCL 可读布局，而不是直接绑定 CPU LUT packed layout。
+  - 新增 OpenCL `IFAIRY64` tensor extra：`q` 保存 row-major 2-bit packed codes，`d` 保存 row-major `(d_real, d_imag)` fp16 scale pairs。
+  - OpenCL buffer alloc size 对 `GGML_TYPE_IFAIRY64` 预留 `q` + alignment padding + `d` 空间。
+  - `set_tensor` 将 raw `block_ifairy64` pack 到 `q`/`d` sub-buffers；`get_tensor` 从 `q`/`d` 重建 raw bytes 以支持 test-backend 回读。
+  - kernel-ready gate 仍为 false；该变更只准备 buffer layout，不启用 OpenCL compute。
+- 验证：
+  - `cmake --build build-opencl --target ggml-opencl -j 2`: PASS
 
 ### 2026-04-22 (working tree; base build `abcaafef`)
 - 变更摘要：
