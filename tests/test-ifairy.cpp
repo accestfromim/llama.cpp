@@ -3151,15 +3151,18 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
         ifairy64_mulmat_bench_result gemv2;
         ifairy64_mulmat_bench_result gemv4;
         ifairy64_mulmat_bench_result gemm;
+        ifairy64_mulmat_bench_result direct;
         ifairy64_mulmat_bench_result cpu4t;
         std::vector<uint32_t>        out_gemv2;
         std::vector<uint32_t>        out_gemv4;
         std::vector<uint32_t>        out_gemm;
+        std::vector<uint32_t>        out_direct;
         std::vector<uint32_t>        out_cpu4t;
 
         if (!run_ifairy64_opencl_mul_mat_bench_once(gemv2, out_gemv2, dev, m, n, k, "gemv2") ||
             !run_ifairy64_opencl_mul_mat_bench_once(gemv4, out_gemv4, dev, m, n, k, "gemv4") ||
             !run_ifairy64_opencl_mul_mat_bench_once(gemm, out_gemm, dev, m, n, k, "gemm") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(direct, out_direct, dev, m, n, k, "direct") ||
             !run_ifairy64_cpu_mul_mat_bench_once(cpu4t, out_cpu4t, m, n, k, 4)) {
             num_failed++;
             return;
@@ -3186,15 +3189,16 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
             best = "gemv4";
         }
 
-        printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemm_us=%.2f cpu4t_us=%.2f "
-               "gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
-               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx runs=%d/%d/%d/%d\n",
+        printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemm_us=%.2f direct_us=%.2f cpu4t_us=%.2f "
+               "gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx direct_over_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
+               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx runs=%d/%d/%d/%d/%d\n",
                (long long) m, (long long) n, (long long) k,
-               gemv2.us_per_run, gemv4.us_per_run, gemm.us_per_run, cpu4t.us_per_run,
-               speedup_gemv2, speedup_gemv4, cpu4t.us_per_run / gemm.us_per_run, best,
+               gemv2.us_per_run, gemv4.us_per_run, gemm.us_per_run, direct.us_per_run, cpu4t.us_per_run,
+               speedup_gemv2, speedup_gemv4, direct.us_per_run / gemm.us_per_run, cpu4t.us_per_run / gemm.us_per_run, best,
                (unsigned long long) gemv2.hash, (unsigned long long) gemv4.hash,
-               (unsigned long long) gemm.hash, (unsigned long long) cpu4t.hash,
-               gemv2.runs, gemv4.runs, gemm.runs, cpu4t.runs);
+               (unsigned long long) gemm.hash, (unsigned long long) direct.hash,
+               (unsigned long long) cpu4t.hash,
+               gemv2.runs, gemv4.runs, gemm.runs, direct.runs, cpu4t.runs);
     };
 
     bench(128, 1, 2 * QK_IFAIRY);
