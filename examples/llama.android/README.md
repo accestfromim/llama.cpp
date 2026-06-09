@@ -168,7 +168,16 @@ printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
 
 CPU 后端会显式设置 `GGML_IFAIRY_LUT_CPU=ON`。这个 iFairy LUT 路线是 CPU-only，会强制关闭加速后端；因此 OpenCL 后端会显式设置 `GGML_IFAIRY_LUT_CPU=OFF`，否则 `GGML_OPENCL=ON` 会被 CMake 覆盖成 OFF。
 
-## 6. CPU 后端构建
+## 6. APK 后端切换方式
+
+当前 app 运行时不提供 CPU/OpenCL 后端切换开关。后端是在构建 APK 时由 `LLAMA_ANDROID_BACKEND` 决定的：
+
+- CPU APK：用 `LLAMA_ANDROID_BACKEND=cpu` 构建。
+- OpenCL APK：用 `LLAMA_ANDROID_BACKEND=opencl` 构建，并提供 OpenCL headers 和 Android arm64 `libOpenCL.so`。
+
+手机上切换后端的方式是安装不同构建产物，而不是在 app UI 或 adb intent extras 中切换。建议测试时同时保留 CPU APK 作为基线和回退路径，再安装 OpenCL APK 验证 GPU 路径。
+
+## 7. CPU 后端构建
 
 CPU 是默认后端：
 
@@ -187,7 +196,7 @@ LLAMA_ANDROID_BACKEND=cpu ./gradlew :app:assembleRelease --stacktrace
 - Debug: `app/build/outputs/apk/debug/app-debug.apk`
 - Release: `app/build/outputs/apk/release/app-release.apk`
 
-## 7. OpenCL 后端准备
+## 8. OpenCL 后端准备
 
 OpenCL 后端需要 CMake 找到 OpenCL headers 和 `libOpenCL.so`。Android NDK 默认不提供 OpenCL headers/library，所以需要额外准备。
 
@@ -263,7 +272,7 @@ test -f "$LLAMA_ANDROID_OPENCL_ROOT/jniLibs/arm64-v8a/libOpenCL.so"
 
 如果测试同事已经提供了 `opencl-deps/` 目录，不需要重新 clone/编译 Khronos 仓库，直接设置 `LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps` 即可。
 
-## 8. OpenCL 后端构建
+## 9. OpenCL 后端构建
 
 回到 Android 示例目录：
 
@@ -324,7 +333,7 @@ rm -rf llama/.cxx app/.cxx
 - APK 内容检查：确认 `libllama-android.so` 和 `libOpenCL.so` 都在 `app-debug.apk` 中。
 - 设备 smoke：安装 APK 后用 `adb logcat -s LLAMA_ANDROID` 观察 OpenCL 初始化日志；若失败，先用 CPU APK 确认 app 和模型路径正常。
 
-## 9. 打包内置模型
+## 10. 打包内置模型
 
 默认 assets root 是 `/tmp/llama-android-assets`，也可以通过 `LLAMA_ANDROID_BUNDLED_ASSETS` 指定。目录结构：
 
@@ -346,7 +355,7 @@ LLAMA_ANDROID_BUNDLED_ASSETS=/path/to/assets \
 
 当前 app 会自动识别并安装这些内置模型名：`ifairy.gguf`、`bitnet_b1_58_700m.gguf`、`llama_700m.gguf`。其他 `models/*.gguf` 可以被打进 APK，但若要自动安装或参与内置 benchmark，需要同步扩展 app 中的 bundled model 列表。
 
-## 10. 安装与 smoke test
+## 11. 安装与 smoke test
 
 确认设备：
 
@@ -382,7 +391,7 @@ adb shell am start \
 
 CPU smoke 重点看模型加载、context 创建、生成是否完成。OpenCL smoke 额外看 logcat 中是否出现 `ggml_opencl` 设备选择和 kernel 初始化日志；如果 OpenCL 初始化失败，先用 `LLAMA_ANDROID_BACKEND=cpu` 构建确认 app 和模型路径本身没有问题。
 
-## 11. 自动 benchmark
+## 12. 自动 benchmark
 
 短 E2E benchmark 示例：
 
@@ -406,7 +415,7 @@ adb shell cat /sdcard/Android/data/com.example.llama/files/bench/builtin_models_
 adb pull /sdcard/Android/data/com.example.llama/files/bench ./android-bench-results
 ```
 
-## 12. 预编译 JNI 库模式
+## 13. 预编译 JNI 库模式
 
 默认构建会包含 `:llama` module，并从源码编译 JNI 库。若已经有预编译 native 库，可用：
 
