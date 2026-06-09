@@ -40,6 +40,7 @@ Status: Draft (2026-04-23)
     - `PYTHONPATH=gguf-py .venv/bin/python -m gguf.scripts.gguf_dump /tmp/llama2_7b_new.fairy2i.gguf`
   - CPU smoke:
     - `./build-rel/bin/llama-cli -m /tmp/llama2_7b_new.fairy2i.gguf --gpu-layers 0 -t 4 -p "I believe life is" -n 16 -no-cnv`
+
 ### 2026-05-28 (OpenCL routing skeleton)
 - 变更：
   - OpenCL 后端新增 `GGML_OPENCL_IFAIRY64` opt-in gate 和 `IFAIRY64` matmul 严格白名单。

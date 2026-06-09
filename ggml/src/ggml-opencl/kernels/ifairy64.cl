@@ -303,6 +303,182 @@ kernel void kernel_ifairy64_mul_mat_f32_q16(
 }
 
 /**
+ * Tiled iFairy64 matmul without activation quantization. We keep the SoA
+ * iFairy64 weight layout and the 2x2 output tile, but read packed-BF16
+ * activation values directly from the F32 carrier tensor.
+ */
+kernel void kernel_ifairy64_mul_mat_f32_direct(
+        global uchar * w_q,
+        global half  * w_d,
+        global char  * src,
+        ulong         offset1,
+        global char  * dst,
+        ulong         offsetd,
+        int           k,
+        int           m,
+        int           n,
+        ulong         nb10,
+        ulong         nb11,
+        ulong         nb0,
+        ulong         nb1,
+        local float * tmp_real,
+        local float * tmp_imag,
+        local float * act_real_tile,
+        local float * act_imag_tile
+) {
+    src = src + offset1;
+    dst = dst + offsetd;
+
+    const int row_base = get_group_id(0) * IFAIRY64_TILE_M;
+    const int col_base = get_group_id(1) * IFAIRY64_TILE_N;
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int block_slot = lid >> 4;
+    const int lane = lid & 15;
+    const int nb64 = k / QK_IFAIRY64;
+
+    float acc_real[IFAIRY64_TILE_OUT];
+    float acc_imag[IFAIRY64_TILE_OUT];
+#pragma unroll
+    for (int i = 0; i < IFAIRY64_TILE_OUT; ++i) {
+        acc_real[i] = 0.0f;
+        acc_imag[i] = 0.0f;
+    }
+
+    for (int wb_base = 0; wb_base < nb64; wb_base += 4) {
+        const int wb = wb_base + block_slot;
+
+        if (wb < nb64) {
+#pragma unroll
+            for (int tc = 0; tc < IFAIRY64_TILE_N; ++tc) {
+                const int col = col_base + tc;
+                const int local_base = (block_slot * IFAIRY64_TILE_N + tc) * QK_IFAIRY64;
+                if (col < n) {
+#pragma unroll
+                    for (int part = 0; part < 4; ++part) {
+                        const int j = lane + 16 * part;
+                        const int k_idx = wb * QK_IFAIRY64 + j;
+                        const uint pair = *((global uint *) (src + (ulong) col * nb11 + (ulong) k_idx * nb10));
+                        act_real_tile[local_base + j] = ifairy_bf16_to_f32((ushort) (pair & 0xffffU));
+                        act_imag_tile[local_base + j] = ifairy_bf16_to_f32((ushort) (pair >> 16));
+                    }
+                } else {
+#pragma unroll
+                    for (int part = 0; part < 4; ++part) {
+                        const int j = lane + 16 * part;
+                        act_real_tile[local_base + j] = 0.0f;
+                        act_imag_tile[local_base + j] = 0.0f;
+                    }
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (wb < nb64) {
+#pragma unroll
+            for (int tr = 0; tr < IFAIRY64_TILE_M; ++tr) {
+                const int row = row_base + tr;
+                if (row >= m) {
+                    continue;
+                }
+
+                const int w_block = row * nb64 + wb;
+                const uint packed = (uint) w_q[w_block * 16 + lane];
+                const float w_real = vload_half(w_block * 2 + 0, w_d);
+                const float w_imag = vload_half(w_block * 2 + 1, w_d);
+
+                float sum_ac[IFAIRY64_TILE_N];
+                float sum_ad[IFAIRY64_TILE_N];
+                float sum_bc[IFAIRY64_TILE_N];
+                float sum_bd[IFAIRY64_TILE_N];
+#pragma unroll
+                for (int tc = 0; tc < IFAIRY64_TILE_N; ++tc) {
+                    sum_ac[tc] = 0.0f;
+                    sum_ad[tc] = 0.0f;
+                    sum_bc[tc] = 0.0f;
+                    sum_bd[tc] = 0.0f;
+                }
+
+#pragma unroll
+                for (int part = 0; part < 4; ++part) {
+                    const int j = lane + 16 * part;
+                    const uint code = (packed >> (2 * part)) & 3U;
+                    float wr = 0.0f;
+                    float wi = 0.0f;
+                    if (code == 0U) {
+                        wr = -1.0f;
+                    } else if (code == 1U) {
+                        wr = 1.0f;
+                    } else if (code == 2U) {
+                        wi = -1.0f;
+                    } else {
+                        wi = 1.0f;
+                    }
+
+#pragma unroll
+                    for (int tc = 0; tc < IFAIRY64_TILE_N; ++tc) {
+                        const int local_base = (block_slot * IFAIRY64_TILE_N + tc) * QK_IFAIRY64;
+                        const float xr = act_real_tile[local_base + j];
+                        const float xi = act_imag_tile[local_base + j];
+
+                        sum_ac[tc] += xr * wr;
+                        sum_ad[tc] += xi * wr;
+                        sum_bc[tc] += xr * wi;
+                        sum_bd[tc] += xi * wi;
+                    }
+                }
+
+#pragma unroll
+                for (int tc = 0; tc < IFAIRY64_TILE_N; ++tc) {
+                    const int out_idx = tr * IFAIRY64_TILE_N + tc;
+                    acc_real[out_idx] += w_real * sum_ac[tc] + w_imag * sum_bd[tc];
+                    acc_imag[out_idx] += w_imag * sum_bc[tc] - w_real * sum_ad[tc];
+                }
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+#pragma unroll
+    for (int out_idx = 0; out_idx < IFAIRY64_TILE_OUT; ++out_idx) {
+        tmp_real[out_idx * lsize + lid] = acc_real[out_idx];
+        tmp_imag[out_idx * lsize + lid] = acc_imag[out_idx];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+#pragma unroll
+            for (int out_idx = 0; out_idx < IFAIRY64_TILE_OUT; ++out_idx) {
+                tmp_real[out_idx * lsize + lid] += tmp_real[out_idx * lsize + lid + stride];
+                tmp_imag[out_idx * lsize + lid] += tmp_imag[out_idx * lsize + lid + stride];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0) {
+#pragma unroll
+        for (int tr = 0; tr < IFAIRY64_TILE_M; ++tr) {
+            const int row = row_base + tr;
+            if (row >= m) {
+                continue;
+            }
+#pragma unroll
+            for (int tc = 0; tc < IFAIRY64_TILE_N; ++tc) {
+                const int col = col_base + tc;
+                if (col >= n) {
+                    continue;
+                }
+                const int out_idx = tr * IFAIRY64_TILE_N + tc;
+                *((global uint *) (dst + (ulong) col * nb1 + (ulong) row * nb0)) =
+                    ifairy64_pack_bf16_pair(tmp_real[out_idx * lsize], tmp_imag[out_idx * lsize]);
+            }
+        }
+    }
+}
+
+/**
  * iFairy64 GEMV kernel. Each work-group computes one activation column and a
  * small row tile, so it can be used either for N == 1 routing or direct GEMV
  * benchmarking across multiple columns.

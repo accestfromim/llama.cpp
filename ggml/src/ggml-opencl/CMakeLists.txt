@@ -97,6 +97,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
     mul
+    neg
     norm
     relu
     rms_norm
