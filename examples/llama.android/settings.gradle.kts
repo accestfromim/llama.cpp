@@ -15,4 +15,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "LlamaAndroid"
 include(":app")
-include(":llama")
+if (System.getenv("LLAMA_ANDROID_USE_PREBUILT_LLAMA") != "true") {
+    include(":llama")
+}
