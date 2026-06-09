@@ -1,108 +1,297 @@
-# llama.android 构建与验证指南
+# llama.android: Ubuntu/Debian 从零构建指南
 
-这份文档面向 Linux/CLI 环境，用来把 `examples/llama.android` 构建成可安装的 Android APK，并可选打包 GGUF 模型、安装到设备、跑 smoke test 或内置 benchmark。Android Studio 也可以使用，但这里以命令行为主，方便把步骤交给其他人复现。
+本文面向一台没有 Java、Android SDK、NDK 的 Ubuntu/Debian Linux 机器，说明如何安装构建环境、编译 `examples/llama.android`、安装 APK，并按 CPU 或 OpenCL 后端做 smoke test。
 
-不要提交这些本机产物：`local.properties`、APK、模型权重、Gradle/Android SDK 缓存、benchmark 输出。
+本版只覆盖 Android APK 相关的 CPU 和 OpenCL 后端。CUDA、Metal、SYCL 不适用于普通 Android APK；Vulkan 还需要额外的 host shader 工具链和设备验证，暂不纳入本文。
 
-## 环境基线
+不要提交这些本机产物：`local.properties`、Android SDK/NDK、OpenCL headers/library、APK、模型权重、Gradle 缓存、benchmark 输出。
 
-| 项目 | 本工程要求 / 本机实测 |
+## 版本基线
+
+| 项目 | 版本 |
 | --- | --- |
-| Gradle wrapper | `8.2`，由 `gradle/wrapper/gradle-wrapper.properties` 指定 |
-| Android Gradle Plugin | `8.2.0` |
-| Kotlin Android plugin | `1.9.0` |
-| compile SDK / target SDK | `34` |
-| min SDK | `31` |
-| ABI | `arm64-v8a` |
-| Android NDK | `30.0.14904198-beta1`，目录通常是 `ndk/30.0.14904198` |
-| Android SDK CMake | `3.22.1` |
-| 推荐 JDK | JDK 17；JDK 21 可作为本机验证备选，默认 Java 26 不作为推荐基线 |
+| OS | Ubuntu/Debian Linux |
+| JDK | 17 |
+| Gradle wrapper | 8.2 |
+| Android Gradle Plugin | 8.2.0 |
+| Kotlin Android plugin | 1.9.0 |
+| compile SDK / target SDK | 34 |
+| min SDK | 31 |
+| Android build tools | 34.0.0 |
+| Android NDK | 30.0.14904198-beta1 |
+| Android SDK CMake | 3.22.1 |
+| ABI | arm64-v8a |
 
-本机检查到两个 SDK root：
+官方参考：
 
-- `/home/zybi/Android/Sdk`：包含 `platforms/android-34`、`build-tools/34.0.0`、`cmake/3.22.1`、`ndk/30.0.14904198`，适合作为 Gradle 的 `sdk.dir`。
-- `/opt/android-sdk`：包含 cmdline-tools、platform-tools、build-tools 37 和 preview platform，但没有 NDK。可以提供 `sdkmanager`/`adb`，但不要直接作为本工程的 `sdk.dir`，除非先补齐 NDK 和 SDK 34。
+- Android command-line tools and `sdkmanager`: https://developer.android.com/tools/sdkmanager
+- Android Studio command-line tools download: https://developer.android.com/studio#command-tools
+- Android Gradle Plugin 8.2 compatibility: https://developer.android.com/build/releases/agp-8-2-0-release-notes
+- llama.cpp OpenCL backend: `docs/backend/OPENCL.md`
 
-给别人使用时，推荐统一一个 SDK root，下面用 `/path/to/Android/Sdk` 表示。
-
-## 准备 SDK / NDK / JDK
-
-安装或选择一个 JDK 17：
+## 1. 安装 Linux 基础包
 
 ```bash
-export JAVA_HOME=/path/to/jdk17
-export PATH="$JAVA_HOME/bin:$PATH"
-java -version
+sudo apt-get update
+sudo apt-get install -y \
+  openjdk-17-jdk \
+  git \
+  curl \
+  wget \
+  unzip \
+  cmake \
+  ninja-build \
+  python3 \
+  python3-pip
 ```
 
-准备 Android SDK。若使用 Android Studio，可以在 SDK Manager 中安装同样的组件；若使用命令行工具：
+确认 JDK：
 
 ```bash
-export ANDROID_SDK_ROOT=/path/to/Android/Sdk
+java -version
+javac -version
+```
+
+`java -version` 应显示 OpenJDK 17。不要用系统自带的 `gradle`；本工程使用 `examples/llama.android/gradlew` 指定的 Gradle wrapper。
+
+## 2. 安装 Android command-line tools
+
+下面把 SDK 安装到 `$HOME/Android/Sdk`。如果要换目录，只需要同步改 `ANDROID_SDK_ROOT`。
+
+```bash
+export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
 export ANDROID_HOME="$ANDROID_SDK_ROOT"
+mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+```
+
+从 Android Studio 下载页获取 Linux command-line tools。当前示例使用 `commandlinetools-linux-14742923_latest.zip`；如果该文件已更新，请到官方下载页复制新的 Linux zip 文件名。
+
+```bash
+CMDLINE_TOOLS_ZIP=commandlinetools-linux-14742923_latest.zip
+
+curl -L \
+  "https://dl.google.com/android/repository/$CMDLINE_TOOLS_ZIP" \
+  -o "/tmp/$CMDLINE_TOOLS_ZIP"
+
+rm -rf /tmp/android-cmdline-tools
+mkdir -p /tmp/android-cmdline-tools
+unzip -q "/tmp/$CMDLINE_TOOLS_ZIP" -d /tmp/android-cmdline-tools
+rm -rf "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+mv /tmp/android-cmdline-tools/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+```
+
+配置 shell 环境：
+
+```bash
 export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
 
-sdkmanager --install \
+sdkmanager --version
+```
+
+建议写入 `~/.bashrc` 或当前 shell 的 profile：
+
+```bash
+cat >> ~/.bashrc <<'EOF'
+export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
+export ANDROID_HOME="$ANDROID_SDK_ROOT"
+export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$ANDROID_SDK_ROOT/platform-tools:$PATH"
+EOF
+```
+
+## 3. 安装 SDK / NDK / CMake
+
+NDK `30.0.14904198-beta1` 是 beta 包，需要让 `sdkmanager` 包含 beta channel：
+
+```bash
+sdkmanager --install --channel=1 \
   "platform-tools" \
   "platforms;android-34" \
   "build-tools;34.0.0" \
   "cmake;3.22.1" \
   "ndk;30.0.14904198"
 
-sdkmanager --licenses
+yes | sdkmanager --licenses
 ```
 
-检查关键文件：
+检查安装结果：
 
 ```bash
 test -f "$ANDROID_SDK_ROOT/platforms/android-34/source.properties"
+test -f "$ANDROID_SDK_ROOT/build-tools/34.0.0/source.properties"
 test -f "$ANDROID_SDK_ROOT/cmake/3.22.1/bin/cmake"
 test -f "$ANDROID_SDK_ROOT/ndk/30.0.14904198/source.properties"
+
 grep -n "Pkg.Revision" "$ANDROID_SDK_ROOT/ndk/30.0.14904198/source.properties"
 ```
 
-`source.properties` 中的 NDK revision 应为 `30.0.14904198-beta1`。如果 `sdkmanager` 看不到这个 NDK 包，优先用 Android Studio SDK Manager 安装，或从已有机器复制同版本 NDK 目录。
+NDK revision 应为 `30.0.14904198-beta1`。如果 `sdkmanager` 仍看不到该 NDK，先运行 `sdkmanager --list --channel=1 | grep 30.0.14904198`，确认 beta channel 是否可见。
 
-## 标准构建
+## 4. 获取源码并配置本机 SDK 路径
 
-所有 Gradle 命令都在 Android 示例目录执行：
+```bash
+mkdir -p "$HOME/projects"
+cd "$HOME/projects"
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp/examples/llama.android
+```
+
+如果已经在本仓库中：
 
 ```bash
 cd /path/to/llama.cpp/examples/llama.android
 ```
 
-创建本机 SDK 配置。`local.properties` 不应提交：
+创建 `local.properties`。这个文件只记录本机路径，不要提交：
 
 ```bash
 printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
 ```
 
-Debug 构建：
+## 5. 后端选择
+
+`LLAMA_ANDROID_BACKEND` 控制 `:llama` native module 的 CMake 后端：
+
+| 后端 | 命令值 | 说明 |
+| --- | --- | --- |
+| CPU | `cpu` | 默认后端，最稳，适合先验证环境。 |
+| OpenCL | `opencl` | 面向支持 OpenCL 2.0+ 和 FP16 的 Android GPU，主要是已验证的 Adreno 750/830 等。 |
+
+未知值会让 Gradle 直接报错，避免静默构建出错误 APK。
+
+无论哪个后端，Android 构建都会固定使用：
+
+- `LLAMA_CURL=OFF`：Android app 不依赖 libcurl。
+- `LLAMA_BUILD_COMMON=ON`：JNI 层需要 common/chat helper。
+- `GGML_LLAMAFILE=OFF`：llamafile 不用于 Android APK。
+- `GGML_NATIVE=OFF`：避免按 host CPU 生成不适合 Android 设备的 native flags。
+- `GGML_OPENMP=OFF`：避免 Android OpenMP 运行库依赖问题。
+
+CPU 后端会显式设置 `GGML_IFAIRY_LUT_CPU=ON`。这个 iFairy LUT 路线是 CPU-only，会强制关闭加速后端；因此 OpenCL 后端会显式设置 `GGML_IFAIRY_LUT_CPU=OFF`，否则 `GGML_OPENCL=ON` 会被 CMake 覆盖成 OFF。
+
+## 6. CPU 后端构建
+
+CPU 是默认后端：
 
 ```bash
-./gradlew :app:assembleDebug
+LLAMA_ANDROID_BACKEND=cpu ./gradlew :app:assembleDebug --stacktrace
 ```
 
-Release 构建：
+Release APK：
 
 ```bash
-./gradlew :app:assembleRelease
+LLAMA_ANDROID_BACKEND=cpu ./gradlew :app:assembleRelease --stacktrace
 ```
 
-常见输出：
+输出路径：
 
-- Debug APK：`app/build/outputs/apk/debug/app-debug.apk`
-- Release APK：`app/build/outputs/apk/release/app-release.apk`
+- Debug: `app/build/outputs/apk/debug/app-debug.apk`
+- Release: `app/build/outputs/apk/release/app-release.apk`
 
-如果需要更多诊断：
+## 7. OpenCL 后端准备
+
+OpenCL 后端需要 CMake 找到 OpenCL headers 和 `libOpenCL.so`。Android NDK 默认不提供 OpenCL headers/library，所以需要额外准备。
+
+已知状态见 `docs/backend/OPENCL.md`：
+
+- 已验证：Adreno 750、Adreno 830、Adreno X85。
+- 推荐模型量化：`Q4_0`，并在 `llama-quantize` 时加 `--pure`。
+- Known issue：Adreno 6xx 目前不工作。
+
+创建 OpenCL 工作目录：
 
 ```bash
-./gradlew :app:assembleDebug --stacktrace
+export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/30.0.14904198"
+export OPENCL_ANDROID_ROOT="$HOME/android-opencl"
+mkdir -p "$OPENCL_ANDROID_ROOT"
+cd "$OPENCL_ANDROID_ROOT"
 ```
 
-## 打包内置模型 assets
+安装 OpenCL headers 到 NDK sysroot：
 
-默认 assets root 是 `/tmp/llama-android-assets`，也可以通过 `LLAMA_ANDROID_BUNDLED_ASSETS` 指定。目录结构必须是：
+```bash
+git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers
+cp -r OpenCL-Headers/CL \
+  "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/"
+```
+
+交叉编译 OpenCL ICD loader：
+
+```bash
+git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader
+
+cmake -S OpenCL-ICD-Loader -B OpenCL-ICD-Loader/build-android -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+  -DOPENCL_ICD_LOADER_HEADERS_DIR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-24 \
+  -DANDROID_STL=c++_shared
+
+cmake --build OpenCL-ICD-Loader/build-android
+```
+
+准备给 Gradle 使用的路径：
+
+```bash
+mkdir -p "$OPENCL_ANDROID_ROOT/jniLibs/arm64-v8a"
+cp OpenCL-ICD-Loader/build-android/libOpenCL.so \
+  "$OPENCL_ANDROID_ROOT/jniLibs/arm64-v8a/libOpenCL.so"
+
+export LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+export LLAMA_ANDROID_OPENCL_LIBRARY="$OPENCL_ANDROID_ROOT/jniLibs/arm64-v8a/libOpenCL.so"
+export LLAMA_ANDROID_EXTRA_JNILIBS="$OPENCL_ANDROID_ROOT/jniLibs"
+```
+
+`LLAMA_ANDROID_EXTRA_JNILIBS` 会把 `arm64-v8a/libOpenCL.so` 打进 APK。不要把 `$OPENCL_ANDROID_ROOT` 或其中二进制提交到仓库。
+
+## 8. OpenCL 后端构建
+
+回到 Android 示例目录：
+
+```bash
+cd /path/to/llama.cpp/examples/llama.android
+```
+
+构建 Adreno 优化版本：
+
+```bash
+LLAMA_ANDROID_BACKEND=opencl \
+LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$LLAMA_ANDROID_OPENCL_INCLUDE_DIR" \
+LLAMA_ANDROID_OPENCL_LIBRARY="$LLAMA_ANDROID_OPENCL_LIBRARY" \
+LLAMA_ANDROID_EXTRA_JNILIBS="$LLAMA_ANDROID_EXTRA_JNILIBS" \
+LLAMA_ANDROID_OPENCL_ADRENO=1 \
+LLAMA_ANDROID_OPENCL_EMBED_KERNELS=1 \
+LLAMA_ANDROID_OPENCL_TARGET_VERSION=300 \
+  ./gradlew :app:assembleDebug --stacktrace
+```
+
+非 Adreno GPU 或想排查 Adreno kernel 问题时：
+
+```bash
+LLAMA_ANDROID_BACKEND=opencl \
+LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$LLAMA_ANDROID_OPENCL_INCLUDE_DIR" \
+LLAMA_ANDROID_OPENCL_LIBRARY="$LLAMA_ANDROID_OPENCL_LIBRARY" \
+LLAMA_ANDROID_EXTRA_JNILIBS="$LLAMA_ANDROID_EXTRA_JNILIBS" \
+LLAMA_ANDROID_OPENCL_ADRENO=0 \
+  ./gradlew :app:assembleDebug --stacktrace
+```
+
+检查 APK 是否包含 native 库：
+
+```bash
+unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E 'libllama-android|libOpenCL'
+```
+
+如果从 CPU 切到 OpenCL 后 CMake 没有重新配置，先清理 Android native build 缓存：
+
+```bash
+./gradlew :app:clean
+rm -rf llama/.cxx app/.cxx
+```
+
+## 9. 打包内置模型
+
+默认 assets root 是 `/tmp/llama-android-assets`，也可以通过 `LLAMA_ANDROID_BUNDLED_ASSETS` 指定。目录结构：
 
 ```text
 /path/to/assets/
@@ -115,35 +304,14 @@ Release 构建：
 构建带模型的 APK：
 
 ```bash
+LLAMA_ANDROID_BACKEND=cpu \
 LLAMA_ANDROID_BUNDLED_ASSETS=/path/to/assets \
-  ./gradlew :app:assembleRelease
+  ./gradlew :app:assembleRelease --stacktrace
 ```
 
 当前 app 会自动识别并安装这些内置模型名：`ifairy.gguf`、`bitnet_b1_58_700m.gguf`、`llama_700m.gguf`。其他 `models/*.gguf` 可以被打进 APK，但若要自动安装或参与内置 benchmark，需要同步扩展 app 中的 bundled model 列表。
 
-`app/build.gradle.kts` 已设置 `noCompress += listOf("gguf")`，GGUF 打包时不会被压缩。模型很大时 APK 会快速膨胀；如果只是手动体验，通常用 UI 导入模型更轻便。
-
-## 预编译 JNI 库模式
-
-默认构建会包含 `:llama` module，并从源码编译 JNI 库。若已经有预编译 native 库，可用：
-
-```bash
-LLAMA_ANDROID_USE_PREBUILT_LLAMA=true \
-LLAMA_ANDROID_PREBUILT_JNILIBS=/path/to/jniLibs \
-  ./gradlew :app:assembleRelease
-```
-
-`/path/to/jniLibs` 应包含 ABI 子目录，例如：
-
-```text
-/path/to/jniLibs/
-└── arm64-v8a/
-    └── libllama-android.so
-```
-
-没有明确需要时，使用默认源码构建路径更简单。
-
-## 安装与运行
+## 10. 安装与 smoke test
 
 确认设备：
 
@@ -155,8 +323,6 @@ adb devices -l
 
 ```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-# 或
-adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
 启动 app：
@@ -171,38 +337,17 @@ adb shell am start -n com.example.llama/.MainActivity
 adb logcat -s LLAMA_ANDROID
 ```
 
-使用模型有两种方式：
-
-- 带内置模型构建：app 启动后会从 assets 安装可识别的 bundled models。
-- 不带内置模型构建：进入 app 的 Settings，选择本地 `.gguf` 文件导入。
-
-## 自动化 smoke test 和 benchmark
-
-`MainActivity` 支持通过 intent extras 触发自动化动作：
-
-| key | 类型 | 说明 |
-| --- | --- | --- |
-| `codex_action` | string | `smoke`、`bench`、`builtin_bench`、`builtin_e2e_bench`、`builtin_power_bench` |
-| `codex_model_filter` | string | 逗号分隔模型文件名，例如 `ifairy.gguf,llama_700m.gguf` |
-| `codex_bench_preset_filter` | string | 逗号分隔 preset，例如 `short_prompt_short_decode,long_prompt_long_decode` |
-| `codex_bench_repetitions` | int | benchmark 重复次数 |
-| `codex_bench_cooldown_ms` | int | bundled benchmark 模型间冷却时间 |
-| `codex_n_ctx` / `codex_n_batch` / `codex_n_ubatch` | int | llama runtime context/batch override |
-| `codex_n_threads` / `codex_n_threads_batch` | int | generation / batch 线程数 |
-| `codex_affinity_profile` | int | 线程 affinity profile override |
-| `codex_disable_ifairy_lut` | int | `0` 启用、`1` 禁用、缺省使用 profile 默认 |
-| `codex_enable_ifairy_vecdot_act_tensor` | int | `0`/`1` override，缺省使用 profile 默认 |
-| `codex_generation_priority` / `codex_batch_priority` | int | 线程优先级 override，缺省 sentinel 是 `-99` |
-| `codex_power_duration_ms` / `codex_power_duration_minutes` | long | power benchmark 时长 |
-| `codex_battery_capacity_mah` | float | 电池容量估计值，用于 power benchmark 估算 |
-
-Smoke test：
+触发自动 smoke：
 
 ```bash
 adb shell am start \
   -n com.example.llama/.MainActivity \
   -e codex_action smoke
 ```
+
+CPU smoke 重点看模型加载、context 创建、生成是否完成。OpenCL smoke 额外看 logcat 中是否出现 `ggml_opencl` 设备选择和 kernel 初始化日志；如果 OpenCL 初始化失败，先用 `LLAMA_ANDROID_BACKEND=cpu` 构建确认 app 和模型路径本身没有问题。
+
+## 11. 自动 benchmark
 
 短 E2E benchmark 示例：
 
@@ -226,44 +371,72 @@ adb shell cat /sdcard/Android/data/com.example.llama/files/bench/builtin_models_
 adb pull /sdcard/Android/data/com.example.llama/files/bench ./android-bench-results
 ```
 
-常见输出文件：
+## 12. 预编译 JNI 库模式
 
-- `builtin_models_bench.csv`
-- `builtin_models_bench.status`
-- `builtin_models_e2e_bench.csv`
-- `builtin_models_e2e_bench.status`
-- `builtin_models_power_bench.csv`
-- `builtin_models_power_bench.status`
+默认构建会包含 `:llama` module，并从源码编译 JNI 库。若已经有预编译 native 库，可用：
+
+```bash
+LLAMA_ANDROID_USE_PREBUILT_LLAMA=true \
+LLAMA_ANDROID_PREBUILT_JNILIBS=/path/to/jniLibs \
+  ./gradlew :app:assembleRelease --stacktrace
+```
+
+`/path/to/jniLibs` 应包含 ABI 子目录，例如：
+
+```text
+/path/to/jniLibs/
+└── arm64-v8a/
+    └── libllama-android.so
+```
+
+如果预编译库依赖 `libOpenCL.so`，同时传：
+
+```bash
+LLAMA_ANDROID_EXTRA_JNILIBS=/path/to/opencl-jniLibs
+```
 
 ## Troubleshooting
 
-- NDK 版本不匹配：确认 `local.properties` 指向的 SDK root 下存在 `ndk/30.0.14904198/source.properties`，且 revision 是 `30.0.14904198-beta1`。
-- SDK root 混用：`sdk.dir`、`ANDROID_SDK_ROOT`、`adb`、`sdkmanager` 最好来自同一个 SDK。若 `adb` 来自 `/opt/android-sdk` 而 Gradle 使用 `/home/zybi/Android/Sdk`，通常可行，但排查问题时先统一路径。
-- licenses 未接受：运行 `sdkmanager --licenses`，或在 Android Studio SDK Manager 中接受。
-- JDK 问题：优先用 JDK 17 跑 `./gradlew`，不要依赖系统 `gradle`。若出现 Gradle native cache 异常，可先用干净缓存验证：`GRADLE_USER_HOME=/tmp/llama-android-gradle ./gradlew :app:assembleDebug`。
-- `adb devices` 没有设备：检查 USB 调试授权、线缆、udev/权限；必要时执行 `adb kill-server` 后重新 `adb devices -l`。
-- APK 太大或安装失败：减少 bundled models，改用 UI 导入模型，或只保留一个小模型做 smoke test。
-- 运行时内存不足：降低模型大小、上下文长度和生成 token 数；优先在 app 中先跑短 prompt。
-- benchmark 没有目标模型：确认 bundled model 文件名在当前 app 的 bundled model 列表中，或用 `codex_model_filter` 指向已经导入到 app 私有目录的模型文件名。
+- JDK 缺失或版本错误：安装 `openjdk-17-jdk`，确认 `java -version` 是 17；不要用系统 `gradle`。
+- `sdkmanager` 找不到：确认 `cmdline-tools` 目录布局是 `$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager`。
+- NDK 找不到：安装时加 `--channel=1`，并确认 `ndk/30.0.14904198/source.properties` 中 revision 是 `30.0.14904198-beta1`。
+- licenses 未接受：运行 `yes | sdkmanager --licenses`。
+- Gradle 仍用旧 SDK：重新写 `local.properties`，内容只保留 `sdk.dir=/your/Android/Sdk`。
+- OpenCL headers 找不到：确认 `LLAMA_ANDROID_OPENCL_INCLUDE_DIR` 指向包含 `CL/cl.h` 的目录。
+- OpenCL library 找不到：确认 `LLAMA_ANDROID_OPENCL_LIBRARY` 指向 arm64 Android 版 `libOpenCL.so`，不是 x86_64 host 版。
+- OpenCL 被 CMake 强制关闭：确认 OpenCL 构建命令使用 `LLAMA_ANDROID_BACKEND=opencl`，该模式会设置 `GGML_IFAIRY_LUT_CPU=OFF`。
+- APK 中没有 `libOpenCL.so`：确认 `LLAMA_ANDROID_EXTRA_JNILIBS` 指向包含 `arm64-v8a/libOpenCL.so` 的目录。
+- OpenCL runtime 找不到设备：确认目标 Android 设备支持 OpenCL 2.0+ 和 FP16；Adreno 6xx 目前是 known issue。
+- Adreno kernel 报错：用 `LLAMA_ANDROID_OPENCL_ADRENO=0` 重新构建排查。
+- APK 太大：减少 bundled models，或用 app Settings 手动导入 `.gguf`。
+- 切换后端后结果不变：执行 `./gradlew :app:clean` 并删除 `llama/.cxx app/.cxx` 后重新构建。
 
 ## 维护者验收清单
 
-更新这份文档或 Android 构建流程后，建议至少验证：
+CPU 路径：
 
 ```bash
 cd /path/to/llama.cpp/examples/llama.android
-./gradlew :app:assembleDebug
+LLAMA_ANDROID_BACKEND=cpu ./gradlew :app:assembleDebug --stacktrace
 git diff --check
 ```
 
-可选验证：
+OpenCL 路径：
 
 ```bash
-LLAMA_ANDROID_BUNDLED_ASSETS=/tmp/llama-android-assets \
-  ./gradlew :app:assembleRelease
+LLAMA_ANDROID_BACKEND=opencl \
+LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$LLAMA_ANDROID_OPENCL_INCLUDE_DIR" \
+LLAMA_ANDROID_OPENCL_LIBRARY="$LLAMA_ANDROID_OPENCL_LIBRARY" \
+LLAMA_ANDROID_EXTRA_JNILIBS="$LLAMA_ANDROID_EXTRA_JNILIBS" \
+  ./gradlew :app:assembleDebug --stacktrace
 
-adb devices -l
-adb install -r app/build/outputs/apk/release/app-release.apk
+unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E 'libllama-android|libOpenCL'
+```
+
+设备验证：
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n com.example.llama/.MainActivity -e codex_action smoke
 adb logcat -s LLAMA_ANDROID
 ```

@@ -3,6 +3,22 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+fun envFlag(name: String, default: Boolean): Boolean {
+    return when (System.getenv(name)?.trim()?.lowercase()) {
+        null, "" -> default
+        "1", "true", "yes", "on" -> true
+        "0", "false", "no", "off" -> false
+        else -> throw IllegalArgumentException("$name must be 1/0, true/false, yes/no, or on/off")
+    }
+}
+
+fun envValue(name: String): String? = System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
+
+val llamaAndroidBackend = envValue("LLAMA_ANDROID_BACKEND")?.lowercase() ?: "cpu"
+require(llamaAndroidBackend in setOf("cpu", "opencl")) {
+    "LLAMA_ANDROID_BACKEND must be one of: cpu, opencl"
+}
+
 android {
     namespace = "android.llama.cpp"
     compileSdk = 34
@@ -23,10 +39,26 @@ android {
                 arguments += "-DGGML_LLAMAFILE=OFF"
                 arguments += "-DGGML_NATIVE=OFF"
                 arguments += "-DGGML_OPENMP=OFF"
-                cppFlags += listOf()
-                arguments += listOf()
 
-                cppFlags("")
+                when (llamaAndroidBackend) {
+                    "cpu" -> {
+                        arguments += "-DGGML_IFAIRY_LUT_CPU=ON"
+                        arguments += "-DGGML_OPENCL=OFF"
+                    }
+                    "opencl" -> {
+                        arguments += "-DGGML_IFAIRY_LUT_CPU=OFF"
+                        arguments += "-DGGML_OPENCL=ON"
+                        arguments += "-DGGML_OPENCL_USE_ADRENO_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_ADRENO", true)) "ON" else "OFF"}"
+                        arguments += "-DGGML_OPENCL_EMBED_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_EMBED_KERNELS", true)) "ON" else "OFF"}"
+                        arguments += "-DGGML_OPENCL_TARGET_VERSION=${envValue("LLAMA_ANDROID_OPENCL_TARGET_VERSION") ?: "300"}"
+                        envValue("LLAMA_ANDROID_OPENCL_INCLUDE_DIR")?.let {
+                            arguments += "-DOpenCL_INCLUDE_DIR=$it"
+                        }
+                        envValue("LLAMA_ANDROID_OPENCL_LIBRARY")?.let {
+                            arguments += "-DOpenCL_LIBRARY=$it"
+                        }
+                    }
+                }
             }
         }
     }

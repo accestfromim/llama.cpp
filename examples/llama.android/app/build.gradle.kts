@@ -6,6 +6,7 @@ plugins {
 val bundledAssetDir = System.getenv("LLAMA_ANDROID_BUNDLED_ASSETS") ?: "/tmp/llama-android-assets"
 val usePrebuiltLlama = System.getenv("LLAMA_ANDROID_USE_PREBUILT_LLAMA") == "true"
 val prebuiltLlamaJniLibs = System.getenv("LLAMA_ANDROID_PREBUILT_JNILIBS")
+val extraJniLibs = System.getenv("LLAMA_ANDROID_EXTRA_JNILIBS")
 
 android {
     namespace = "com.example.llama"
@@ -58,6 +59,9 @@ android {
         "src/main/assets",
         bundledAssetDir,
     )
+    extraJniLibs?.trim()?.takeIf { it.isNotEmpty() }?.let {
+        sourceSets.getByName("main").jniLibs.srcDir(it)
+    }
     if (usePrebuiltLlama) {
         sourceSets.getByName("main").java.srcDir("../llama/src/main/java")
         sourceSets.getByName("main").jniLibs.srcDir(
