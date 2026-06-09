@@ -141,6 +141,8 @@ class LLamaAndroid {
         ncur: IntVar
     ): String?
 
+    private external fun completion_end(context: Long)
+
     private external fun kv_cache_clear(context: Long)
 
     suspend fun configureRuntime(
@@ -243,7 +245,7 @@ class LLamaAndroid {
         }
     }
 
-    fun send(message: String, maxTokens: Int, formatChat: Boolean = false): Flow<String> = flow {
+    fun send(message: String, maxTokens: Int, formatChat: Boolean = true): Flow<String> = flow {
         val current = when (val snapshot = state) {
             is State.Loaded -> snapshot
             State.Idle -> throw IllegalStateException("No model loaded")
@@ -286,8 +288,13 @@ class LLamaAndroid {
                 Log.i(LOG_TAG, "Generation completed")
             }
         } finally {
-            kv_cache_clear(current.context)
-            logMemorySnapshot("after-kv-cache-clear")
+            if (formatChat) {
+                completion_end(current.context)
+                logMemorySnapshot("after-completion-end")
+            } else {
+                kv_cache_clear(current.context)
+                logMemorySnapshot("after-kv-cache-clear")
+            }
             isGenerating = false
             stopRequested = false
         }

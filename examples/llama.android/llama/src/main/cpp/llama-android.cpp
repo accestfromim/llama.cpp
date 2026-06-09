@@ -2,16 +2,19 @@
 #include <chrono>
 #include <jni.h>
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <math.h>
 #include <sstream>
 #include <stdlib.h>
 #include <string>
+#include <utility>
 #include <unistd.h>
 #include <vector>
 #include "llama.h"
 #include "common.h"
+#include "chat.h"
 #include "ggml-cpu.h"
 
 // Write C++ code here.
@@ -79,6 +82,21 @@ struct runtime_overrides {
 
 static runtime_overrides g_runtime_overrides;
 
+struct effective_runtime_config {
+    int n_ctx = -1;
+    int n_batch = -1;
+    int n_ubatch = -1;
+    int n_threads = -1;
+    int n_threads_batch = -1;
+    int disable_ifairy_lut = -1;
+    int affinity_profile = -1;
+    int enable_ifairy_vecdot_act_tensor = -1;
+    int generation_priority = -99;
+    int batch_priority = -99;
+};
+
+static effective_runtime_config g_effective_runtime_config;
+
 enum affinity_profile {
     AFFINITY_PROFILE_NONE = 0,
     AFFINITY_PROFILE_BIG_CORES = 1,
@@ -98,6 +116,12 @@ struct android_llama_context {
     llama_context * context = nullptr;
     ggml_threadpool_t threadpool = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+    common_chat_templates_ptr chat_templates;
+    std::vector<common_chat_msg> chat_history;
+    std::string pending_user_content;
+    std::string pending_assistant_content;
+    int n_past = 0;
+    bool pending_chat = false;
 };
 
 static android_llama_context * from_context_handle(jlong handle) {
@@ -107,6 +131,42 @@ static android_llama_context * from_context_handle(jlong handle) {
 static llama_context * unwrap_context(jlong handle) {
     const auto wrapper = from_context_handle(handle);
     return wrapper != nullptr ? wrapper->context : nullptr;
+}
+
+static void clear_chat_state(android_llama_context * wrapper) {
+    if (!wrapper) {
+        return;
+    }
+
+    wrapper->chat_history.clear();
+    wrapper->pending_user_content.clear();
+    wrapper->pending_assistant_content.clear();
+    wrapper->pending_chat = false;
+    wrapper->n_past = 0;
+}
+
+static void commit_pending_chat(android_llama_context * wrapper) {
+    if (!wrapper || !wrapper->pending_chat) {
+        return;
+    }
+
+    common_chat_msg user_msg;
+    user_msg.role = "user";
+    user_msg.content = std::move(wrapper->pending_user_content);
+    wrapper->chat_history.push_back(std::move(user_msg));
+
+    common_chat_msg assistant_msg;
+    assistant_msg.role = "assistant";
+    assistant_msg.content = std::move(wrapper->pending_assistant_content);
+    wrapper->chat_history.push_back(std::move(assistant_msg));
+
+    wrapper->pending_user_content.clear();
+    wrapper->pending_assistant_content.clear();
+    wrapper->pending_chat = false;
+
+    LOGi("Committed chat turn: history_messages=%zu n_past=%d",
+            wrapper->chat_history.size(),
+            wrapper->n_past);
 }
 
 static void log_native_memory_snapshot(const char * stage);
@@ -127,6 +187,17 @@ static const char * affinity_profile_name(int profile) {
         default:
             return "default";
     }
+}
+
+static const char * runtime_toggle_name(int value) {
+    if (value < 0) {
+        return "default";
+    }
+    return value == 0 ? "0" : "1";
+}
+
+static int default_mobile_threads(int cpu_count) {
+    return std::max(1, std::min(6, cpu_count));
 }
 
 static mobile_profile choose_mobile_profile(const llama_model * model) {
@@ -154,8 +225,8 @@ static void apply_mobile_runtime_toggles(const mobile_profile & profile) {
         setenv("GGML_IFAIRY_LUT", "0", 1);
         LOGi("Runtime toggle: GGML_IFAIRY_LUT=0 for profile `%s`", profile.name);
     } else {
-        unsetenv("GGML_IFAIRY_LUT");
-        LOGi("Runtime toggle: GGML_IFAIRY_LUT unset for profile `%s`", profile.name);
+        setenv("GGML_IFAIRY_LUT", "1", 1);
+        LOGi("Runtime toggle: GGML_IFAIRY_LUT=1 for profile `%s`", profile.name);
     }
 
     const bool enable_ifairy_vecdot_act_tensor = g_runtime_overrides.enable_ifairy_vecdot_act_tensor >= 0
@@ -218,14 +289,15 @@ static int completion_init_tokens(
         llama_context * context,
         llama_batch * batch,
         const std::vector<llama_token> & tokens_list,
-        const int n_len
+        const int n_len,
+        const int n_past
 ) {
     cached_token_chars.clear();
 
     const int n_ctx = llama_n_ctx(context);
-    const size_t n_kv_req = tokens_list.size() + static_cast<size_t>(n_len);
+    const size_t n_kv_req = static_cast<size_t>(n_past) + tokens_list.size() + static_cast<size_t>(n_len);
 
-    LOGi("n_len = %d, n_ctx = %d, n_kv_req = %zu", n_len, n_ctx, n_kv_req);
+    LOGi("n_len = %d, n_ctx = %d, n_past = %d, n_kv_req = %zu", n_len, n_ctx, n_past, n_kv_req);
     log_native_memory_snapshot("jni-before-completion-init");
 
     if (n_kv_req > (size_t) n_ctx) {
@@ -239,7 +311,7 @@ static int completion_init_tokens(
 
         common_batch_clear(*batch);
         for (size_t i = start; i < end; ++i) {
-            common_batch_add(*batch, tokens_list[i], static_cast<llama_pos>(i), { 0 }, false);
+            common_batch_add(*batch, tokens_list[i], static_cast<llama_pos>(n_past + i), { 0 }, false);
         }
 
         batch->logits[batch->n_tokens - 1] = (end == n_tokens);
@@ -251,7 +323,7 @@ static int completion_init_tokens(
     }
 
     log_native_memory_snapshot("jni-after-completion-init");
-    return (int) tokens_list.size();
+    return n_past + (int) tokens_list.size();
 }
 
 static bool completion_loop_step(
@@ -642,14 +714,9 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
         return 0;
     }
 
-    const uint64_t n_params = llama_model_n_params(model);
     const int cpu_count = std::max(1, (int) sysconf(_SC_NPROCESSORS_ONLN));
-    const int default_threads_batch = cpu_count >= 8 ? 4 : std::max(1, cpu_count - 2);
-    // On Snapdragon 778G-class phones, 7B models benefit from using all four
-    // big cores for token generation once the iFairy LUT path is disabled.
-    const int default_threads = cpu_count >= 8
-            ? (n_params >= 6000000000ull ? 4 : 3)
-            : std::max(1, cpu_count - 2);
+    const int default_threads_batch = default_mobile_threads(cpu_count);
+    const int default_threads = default_mobile_threads(cpu_count);
     const int n_threads_batch = g_runtime_overrides.n_threads_batch > 0
             ? g_runtime_overrides.n_threads_batch
             : default_threads_batch;
@@ -662,6 +729,12 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
     const int affinity_profile = g_runtime_overrides.affinity_profile >= 0
             ? g_runtime_overrides.affinity_profile
             : profile.affinity_profile;
+    const int effective_disable_ifairy_lut = g_runtime_overrides.disable_ifairy_lut >= 0
+            ? g_runtime_overrides.disable_ifairy_lut
+            : (profile.disable_ifairy_lut ? 1 : 0);
+    const int effective_enable_ifairy_vecdot_act_tensor = g_runtime_overrides.enable_ifairy_vecdot_act_tensor >= 0
+            ? g_runtime_overrides.enable_ifairy_vecdot_act_tensor
+            : (profile.enable_ifairy_vecdot_act_tensor ? 1 : 0);
     LOGi("Using %d generation threads, %d batch threads, affinity profile `%s`, generation prio %d, batch prio %d",
             n_threads,
             n_threads_batch,
@@ -679,6 +752,19 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
     ctx_params.n_threads_batch = n_threads_batch;
     ctx_params.no_perf         = true;
 
+    g_effective_runtime_config = {
+            /*.n_ctx =*/ (int) ctx_params.n_ctx,
+            /*.n_batch =*/ (int) ctx_params.n_batch,
+            /*.n_ubatch =*/ (int) ctx_params.n_ubatch,
+            /*.n_threads =*/ n_threads,
+            /*.n_threads_batch =*/ n_threads_batch,
+            /*.disable_ifairy_lut =*/ effective_disable_ifairy_lut,
+            /*.affinity_profile =*/ affinity_profile,
+            /*.enable_ifairy_vecdot_act_tensor =*/ effective_enable_ifairy_vecdot_act_tensor,
+            /*.generation_priority =*/ generation_priority,
+            /*.batch_priority =*/ batch_priority,
+    };
+
     LOGi("Creating context with profile `%s`: params = %.2f B, n_ctx = %u, n_batch = %u, n_ubatch = %u, type_k = %d, type_v = %d",
             profile.name,
             llama_model_n_params(model) / 1e9,
@@ -687,6 +773,15 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
             ctx_params.n_ubatch,
             (int) ctx_params.type_k,
             (int) ctx_params.type_v);
+    LOGi("Effective runtime: threads=%d batch_threads=%d affinity=%s(%d) ifairy_lut=%s ifairy_vecdot_act_tensor=%s generation_prio=%d batch_prio=%d",
+            g_effective_runtime_config.n_threads,
+            g_effective_runtime_config.n_threads_batch,
+            affinity_profile_name(g_effective_runtime_config.affinity_profile),
+            g_effective_runtime_config.affinity_profile,
+            g_effective_runtime_config.disable_ifairy_lut == 0 ? "enabled" : "disabled",
+            runtime_toggle_name(g_effective_runtime_config.enable_ifairy_vecdot_act_tensor),
+            g_effective_runtime_config.generation_priority,
+            g_effective_runtime_config.batch_priority);
     log_native_memory_snapshot("jni-before-new-context");
 
     llama_context * context = llama_new_context_with_model(model, ctx_params);
@@ -702,7 +797,27 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
         /*.context =*/ context,
         /*.threadpool =*/ nullptr,
         /*.threadpool_batch =*/ nullptr,
+        /*.chat_templates =*/ nullptr,
+        /*.chat_history =*/ {},
+        /*.pending_user_content =*/ {},
+        /*.pending_assistant_content =*/ {},
+        /*.n_past =*/ 0,
+        /*.pending_chat =*/ false,
     };
+
+    try {
+        wrapper->chat_templates = common_chat_templates_init(model, "");
+        const bool explicit_template = common_chat_templates_was_explicit(wrapper->chat_templates.get());
+        const char * source = common_chat_templates_source(wrapper->chat_templates.get());
+        const int source_bytes = source != nullptr ? (int) strlen(source) : 0;
+        LOGi("Chat template initialized: source=%s bytes=%d preview=`%.*s`",
+                explicit_template ? "model-tokenizer.chat_template" : "common-fallback",
+                source_bytes,
+                std::min(source_bytes, 160),
+                source != nullptr ? source : "");
+    } catch (const std::exception & e) {
+        LOGe("Chat template initialization failed: %s", e.what());
+    }
 
     const cpu_topology topology = detect_cpu_topology();
     if (!create_affinity_threadpools(context, n_threads, n_threads_batch, generation_priority, batch_priority, affinity_profile, topology, *wrapper)) {
@@ -1024,13 +1139,79 @@ Java_android_llama_cpp_LLamaAndroid_completion_1init(
         jint n_len
     ) {
     const auto text = env->GetStringUTFChars(jtext, 0);
-    const auto context = unwrap_context(context_pointer);
+    if (text == nullptr) {
+        return 0;
+    }
+    auto * wrapper = from_context_handle(context_pointer);
+    const auto context = wrapper != nullptr ? wrapper->context : nullptr;
     const auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
+    if (context == nullptr || batch == nullptr) {
+        env->ReleaseStringUTFChars(jtext, text);
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "completion_init() received null state");
+        return 0;
+    }
+
+    std::string prompt;
+    bool add_special = true;
     const bool parse_special = (format_chat == JNI_TRUE);
-    const auto tokens_list = common_tokenize(context, text, true, parse_special);
+    int n_past = 0;
+
+    if (format_chat == JNI_TRUE) {
+        if (!wrapper->chat_templates) {
+            env->ReleaseStringUTFChars(jtext, text);
+            env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "chat template is not initialized");
+            return 0;
+        }
+        if (wrapper->pending_chat) {
+            commit_pending_chat(wrapper);
+        }
+
+        common_chat_msg user_msg;
+        user_msg.role = "user";
+        user_msg.content = text != nullptr ? text : "";
+
+        try {
+            prompt = common_chat_format_single(
+                    wrapper->chat_templates.get(),
+                    wrapper->chat_history,
+                    user_msg,
+                    /* add_ass = */ true,
+                    /* use_jinja = */ true);
+        } catch (const std::exception & e) {
+            env->ReleaseStringUTFChars(jtext, text);
+            LOGe("Chat template formatting failed: %s", e.what());
+            env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), e.what());
+            return 0;
+        }
+
+        wrapper->pending_user_content = std::move(user_msg.content);
+        wrapper->pending_assistant_content.clear();
+        wrapper->pending_chat = true;
+        n_past = wrapper->n_past;
+        add_special = false;
+
+        LOGi("Formatted chat prompt: history_messages=%zu n_past=%d bytes=%zu add_special=%d parse_special=1 preview=`%.*s`",
+                wrapper->chat_history.size(),
+                n_past,
+                prompt.size(),
+                add_special ? 1 : 0,
+                (int) std::min<size_t>(prompt.size(), 240),
+                prompt.c_str());
+    } else {
+        clear_chat_state(wrapper);
+        llama_memory_clear(llama_get_memory(context), true);
+        prompt = text != nullptr ? text : "";
+        LOGi("Using raw prompt path: bytes=%zu parse_special=0", prompt.size());
+    }
+
+    const auto tokens_list = common_tokenize(context, prompt, add_special, parse_special);
+    const int n_cur = completion_init_tokens(context, batch, tokens_list, n_len, n_past);
+    if (wrapper != nullptr) {
+        wrapper->n_past = n_cur;
+    }
 
     env->ReleaseStringUTFChars(jtext, text);
-    return completion_init_tokens(context, batch, tokens_list, n_len);
+    return n_cur;
 }
 
 extern "C"
@@ -1044,7 +1225,8 @@ Java_android_llama_cpp_LLamaAndroid_completion_1loop(
         jint n_len,
         jobject intvar_ncur
 ) {
-    const auto context = unwrap_context(context_pointer);
+    auto * wrapper = from_context_handle(context_pointer);
+    const auto context = wrapper != nullptr ? wrapper->context : nullptr;
     const auto batch   = reinterpret_cast<llama_batch   *>(batch_pointer);
     const auto sampler = reinterpret_cast<llama_sampler *>(sampler_pointer);
 
@@ -1059,8 +1241,25 @@ Java_android_llama_cpp_LLamaAndroid_completion_1loop(
         return nullptr;
     }
 
+    if (wrapper != nullptr) {
+        wrapper->n_past = n_cur_mut;
+        if (wrapper->pending_chat) {
+            wrapper->pending_assistant_content += piece;
+        }
+    }
+
     env->CallVoidMethod(intvar_ncur, la_int_var_inc);
     return env->NewStringUTF(piece.c_str());
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_android_llama_cpp_LLamaAndroid_completion_1end(
+        JNIEnv *,
+        jobject,
+        jlong context_pointer
+) {
+    commit_pending_chat(from_context_handle(context_pointer));
 }
 
 extern "C"
@@ -1091,6 +1290,23 @@ Java_android_llama_cpp_LLamaAndroid_e2e_1bench_1model(
 
     e2e_bench_aggregate aggregate;
 
+    char model_desc[128];
+    llama_model_desc(llama_get_model(context), model_desc, sizeof(model_desc));
+    LOGi("E2E benchmark start: model=%s prompt=%d decode=%d repetitions=%d n_ctx=%d n_batch=%d n_ubatch=%d threads=%d batch_threads=%d affinity=%s(%d) ifairy_lut=%s ifairy_vecdot_act_tensor=%s",
+            model_desc,
+            pp,
+            tg,
+            nr,
+            g_effective_runtime_config.n_ctx,
+            g_effective_runtime_config.n_batch,
+            g_effective_runtime_config.n_ubatch,
+            g_effective_runtime_config.n_threads,
+            g_effective_runtime_config.n_threads_batch,
+            affinity_profile_name(g_effective_runtime_config.affinity_profile),
+            g_effective_runtime_config.affinity_profile,
+            g_effective_runtime_config.disable_ifairy_lut == 0 ? "enabled" : "disabled",
+            runtime_toggle_name(g_effective_runtime_config.enable_ifairy_vecdot_act_tensor));
+
     for (int run = 0; run < nr; ++run) {
         llama_memory_clear(llama_get_memory(context), true);
         llama_sampler_reset(sampler);
@@ -1100,7 +1316,7 @@ Java_android_llama_cpp_LLamaAndroid_e2e_1bench_1model(
 
         using clock = std::chrono::steady_clock;
         const auto request_start = clock::now();
-        int n_cur = completion_init_tokens(context, batch, prompt_tokens, tg);
+        int n_cur = completion_init_tokens(context, batch, prompt_tokens, tg, 0);
         const int total_len = n_cur + tg;
         const auto after_prefill = clock::now();
 
@@ -1146,6 +1362,17 @@ Java_android_llama_cpp_LLamaAndroid_e2e_1bench_1model(
         aggregate.decode_ms_per_token_avg += decode_ms_per_token;
         aggregate.tok_s_avg += tok_s;
         aggregate.total_ms_avg += total_ms;
+
+        LOGi("E2E benchmark run %d/%d: model=%s generated=%d prefill_ms=%.2f first_token_ms=%.2f decode_ms_per_token=%.2f tok_s=%.4f total_ms=%.2f",
+                run + 1,
+                nr,
+                model_desc,
+                generated_tokens,
+                prefill_ms,
+                first_token_ms,
+                decode_ms_per_token,
+                tok_s,
+                total_ms);
     }
 
     aggregate.generated_tokens_avg /= nr;
@@ -1154,6 +1381,15 @@ Java_android_llama_cpp_LLamaAndroid_e2e_1bench_1model(
     aggregate.decode_ms_per_token_avg /= nr;
     aggregate.tok_s_avg /= nr;
     aggregate.total_ms_avg /= nr;
+
+    LOGi("E2E benchmark average: model=%s generated=%.2f prefill_ms=%.2f first_token_ms=%.2f decode_ms_per_token=%.2f tok_s=%.4f total_ms=%.2f",
+            model_desc,
+            aggregate.generated_tokens_avg,
+            aggregate.prefill_ms_avg,
+            aggregate.first_token_ms_avg,
+            aggregate.decode_ms_per_token_avg,
+            aggregate.tok_s_avg,
+            aggregate.total_ms_avg);
 
     jdouble values[6] = {
             aggregate.generated_tokens_avg,
@@ -1171,7 +1407,11 @@ Java_android_llama_cpp_LLamaAndroid_e2e_1bench_1model(
 extern "C"
 JNIEXPORT void JNICALL
 Java_android_llama_cpp_LLamaAndroid_kv_1cache_1clear(JNIEnv *, jobject, jlong context) {
-    llama_memory_clear(llama_get_memory(unwrap_context(context)), true);
+    auto * wrapper = from_context_handle(context);
+    if (wrapper != nullptr && wrapper->context != nullptr) {
+        llama_memory_clear(llama_get_memory(wrapper->context), true);
+    }
+    clear_chat_state(wrapper);
     log_native_memory_snapshot("jni-after-kv-cache-clear");
 }
 

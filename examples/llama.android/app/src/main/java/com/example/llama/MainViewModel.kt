@@ -94,6 +94,11 @@ private data class E2eBenchSummary(
     val promptTokens: Int,
     val genTokens: Int,
     val repetitions: Int,
+    val nThreads: Int,
+    val nThreadsBatch: Int,
+    val affinityProfile: Int,
+    val disableIFairyLut: Int,
+    val enableIFairyVecdotActTensor: Int,
     val generatedTokensAvg: Double,
     val prefillMs: Double,
     val firstTokenMs: Double,
@@ -144,6 +149,14 @@ private data class PowerBenchSummary(
     val avgTokS: Double,
     val avgTotalMs: Double,
     val note: String,
+)
+
+private data class RuntimeBenchConfig(
+    val nThreads: Int = -1,
+    val nThreadsBatch: Int = -1,
+    val affinityProfile: Int = -1,
+    val disableIFairyLut: Int = -1,
+    val enableIFairyVecdotActTensor: Int = -1,
 )
 
 class MainViewModel(
@@ -245,6 +258,7 @@ class MainViewModel(
     private var benchmarkRepetitionsOverride: Int? = null
     private var powerBenchDurationMs: Long = DEFAULT_POWER_BENCH_DURATION_MS
     private var batteryCapacityMah: Double? = null
+    private var runtimeBenchConfig = RuntimeBenchConfig()
     private val powerBenchOutputFileNames = mutableMapOf<String, String>()
 
     override fun onCleared() {
@@ -337,6 +351,17 @@ class MainViewModel(
             ?.map { it.trim() }
             ?.filter { it.isNotEmpty() }
             ?.toSet()
+        val nextRuntimeBenchConfig = runtimeBenchConfig.copy(
+            nThreads = if (nThreads >= 0) nThreads else runtimeBenchConfig.nThreads,
+            nThreadsBatch = if (nThreadsBatch >= 0) nThreadsBatch else runtimeBenchConfig.nThreadsBatch,
+            affinityProfile = if (affinityProfile >= 0) affinityProfile else runtimeBenchConfig.affinityProfile,
+            disableIFairyLut = if (disableIFairyLut >= 0) disableIFairyLut else runtimeBenchConfig.disableIFairyLut,
+            enableIFairyVecdotActTensor = if (enableIFairyVecdotActTensor >= 0) {
+                enableIFairyVecdotActTensor
+            } else {
+                runtimeBenchConfig.enableIFairyVecdotActTensor
+            },
+        )
 
         if (
             listOf(
@@ -388,6 +413,7 @@ class MainViewModel(
             batteryCapacityMah = configuredBatteryCapacityMah
             log("Battery capacity override: ${formatCsvDecimal(configuredBatteryCapacityMah)} mAh")
         }
+        runtimeBenchConfig = nextRuntimeBenchConfig
 
         viewModelScope.launch {
             runCatching {
@@ -896,7 +922,12 @@ class MainViewModel(
     private suspend fun runE2eBenchPreset(model: ImportedModel, preset: BenchPreset): E2eBenchSummary {
         log(
             "Running E2E benchmark: model=${model.fileName}, preset=${preset.label}, " +
-                "prompt=${preset.promptTokens}, decode=${preset.genTokens}, repetitions=${preset.repetitions}"
+                "prompt=${preset.promptTokens}, decode=${preset.genTokens}, repetitions=${preset.repetitions}, " +
+                "threads=${formatOverride(runtimeBenchConfig.nThreads)}, " +
+                "batch_threads=${formatOverride(runtimeBenchConfig.nThreadsBatch)}, " +
+                "affinity=${formatOverride(runtimeBenchConfig.affinityProfile)}, " +
+                "disable_ifairy_lut=${formatOverride(runtimeBenchConfig.disableIFairyLut)}, " +
+                "ifairy_vecdot_act_tensor=${formatOverride(runtimeBenchConfig.enableIFairyVecdotActTensor)}"
         )
 
         val result = llamaAndroid.e2eBench(
@@ -911,6 +942,11 @@ class MainViewModel(
             promptTokens = preset.promptTokens,
             genTokens = preset.genTokens,
             repetitions = preset.repetitions,
+            nThreads = runtimeBenchConfig.nThreads,
+            nThreadsBatch = runtimeBenchConfig.nThreadsBatch,
+            affinityProfile = runtimeBenchConfig.affinityProfile,
+            disableIFairyLut = runtimeBenchConfig.disableIFairyLut,
+            enableIFairyVecdotActTensor = runtimeBenchConfig.enableIFairyVecdotActTensor,
             generatedTokensAvg = result.generatedTokensAvg,
             prefillMs = result.prefillMs,
             firstTokenMs = result.firstTokenMs,
@@ -1699,7 +1735,7 @@ class MainViewModel(
         val csvFile = File(benchDir, e2eBenchOutputFileName(summaries))
         csvFile.writeText(
             buildString {
-                appendLine("model,preset,prompt,decode,repetitions,generated_tokens_avg,prefill_ms,first_token_ms,decode_total_ms,decode_ms_per_token,tok_s,total_ms,prefill_ratio,status,note")
+                appendLine("model,preset,prompt,decode,repetitions,n_threads,n_threads_batch,affinity_profile,disable_ifairy_lut,ifairy_vecdot_act_tensor,generated_tokens_avg,prefill_ms,first_token_ms,decode_total_ms,decode_ms_per_token,tok_s,total_ms,prefill_ratio,status,note")
                 summaries.forEach { summary ->
                     val decodeTotalMs = (summary.totalMs - summary.firstTokenMs).coerceAtLeast(0.0)
                     val prefillRatio = if (summary.totalMs > 0.0) summary.prefillMs / summary.totalMs else 0.0
@@ -1712,6 +1748,11 @@ class MainViewModel(
                             summary.promptTokens.toString(),
                             summary.genTokens.toString(),
                             summary.repetitions.toString(),
+                            formatOverride(summary.nThreads),
+                            formatOverride(summary.nThreadsBatch),
+                            formatOverride(summary.affinityProfile),
+                            formatOverride(summary.disableIFairyLut),
+                            formatOverride(summary.enableIFairyVecdotActTensor),
                             formatCsvDecimal(summary.generatedTokensAvg),
                             formatCsvDecimal(summary.prefillMs),
                             formatCsvDecimal(summary.firstTokenMs),
