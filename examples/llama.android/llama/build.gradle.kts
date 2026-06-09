@@ -1,3 +1,5 @@
+import java.io.File
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
@@ -17,6 +19,34 @@ fun envValue(name: String): String? = System.getenv(name)?.trim()?.takeIf { it.i
 val llamaAndroidBackend = envValue("LLAMA_ANDROID_BACKEND")?.lowercase() ?: "cpu"
 require(llamaAndroidBackend in setOf("cpu", "opencl")) {
     "LLAMA_ANDROID_BACKEND must be one of: cpu, opencl"
+}
+
+val openclRoot = envValue("LLAMA_ANDROID_OPENCL_ROOT")
+val openclIncludeDir = envValue("LLAMA_ANDROID_OPENCL_INCLUDE_DIR")
+    ?: openclRoot?.let { File(it, "include").path }
+val openclLibrary = envValue("LLAMA_ANDROID_OPENCL_LIBRARY")
+    ?: openclRoot?.let { File(it, "jniLibs/arm64-v8a/libOpenCL.so").path }
+
+fun requireOpenClIncludeDir(path: String?): String {
+    require(path != null) {
+        "LLAMA_ANDROID_BACKEND=opencl requires OpenCL headers. Set LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps with include/CL/cl.h, or set LLAMA_ANDROID_OPENCL_INCLUDE_DIR=/path/to/include."
+    }
+    val header = File(path, "CL/cl.h")
+    require(header.isFile) {
+        "LLAMA_ANDROID_BACKEND=opencl expected OpenCL header at ${header.path}. Set LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps or LLAMA_ANDROID_OPENCL_INCLUDE_DIR=/path/to/include."
+    }
+    return File(path).absolutePath
+}
+
+fun requireOpenClLibrary(path: String?): String {
+    require(path != null) {
+        "LLAMA_ANDROID_BACKEND=opencl requires Android arm64 libOpenCL.so. Set LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps with jniLibs/arm64-v8a/libOpenCL.so, or set LLAMA_ANDROID_OPENCL_LIBRARY=/path/to/libOpenCL.so."
+    }
+    val library = File(path)
+    require(library.isFile) {
+        "LLAMA_ANDROID_BACKEND=opencl expected Android arm64 libOpenCL.so at ${library.path}. Set LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps or LLAMA_ANDROID_OPENCL_LIBRARY=/path/to/libOpenCL.so."
+    }
+    return library.absolutePath
 }
 
 android {
@@ -46,17 +76,15 @@ android {
                         arguments += "-DGGML_OPENCL=OFF"
                     }
                     "opencl" -> {
+                        val includeDir = requireOpenClIncludeDir(openclIncludeDir)
+                        val library = requireOpenClLibrary(openclLibrary)
                         arguments += "-DGGML_IFAIRY_LUT_CPU=OFF"
                         arguments += "-DGGML_OPENCL=ON"
                         arguments += "-DGGML_OPENCL_USE_ADRENO_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_ADRENO", true)) "ON" else "OFF"}"
                         arguments += "-DGGML_OPENCL_EMBED_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_EMBED_KERNELS", true)) "ON" else "OFF"}"
                         arguments += "-DGGML_OPENCL_TARGET_VERSION=${envValue("LLAMA_ANDROID_OPENCL_TARGET_VERSION") ?: "300"}"
-                        envValue("LLAMA_ANDROID_OPENCL_INCLUDE_DIR")?.let {
-                            arguments += "-DOpenCL_INCLUDE_DIR=$it"
-                        }
-                        envValue("LLAMA_ANDROID_OPENCL_LIBRARY")?.let {
-                            arguments += "-DOpenCL_LIBRARY=$it"
-                        }
+                        arguments += "-DOpenCL_INCLUDE_DIR=$includeDir"
+                        arguments += "-DOpenCL_LIBRARY=$library"
                     }
                 }
             }

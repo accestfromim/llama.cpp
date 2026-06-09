@@ -1,12 +1,34 @@
+import java.io.File
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
-val bundledAssetDir = System.getenv("LLAMA_ANDROID_BUNDLED_ASSETS") ?: "/tmp/llama-android-assets"
-val usePrebuiltLlama = System.getenv("LLAMA_ANDROID_USE_PREBUILT_LLAMA") == "true"
-val prebuiltLlamaJniLibs = System.getenv("LLAMA_ANDROID_PREBUILT_JNILIBS")
-val extraJniLibs = System.getenv("LLAMA_ANDROID_EXTRA_JNILIBS")
+fun envValue(name: String): String? = System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
+
+val bundledAssetDir = envValue("LLAMA_ANDROID_BUNDLED_ASSETS") ?: "/tmp/llama-android-assets"
+val usePrebuiltLlama = envValue("LLAMA_ANDROID_USE_PREBUILT_LLAMA") == "true"
+val prebuiltLlamaJniLibs = envValue("LLAMA_ANDROID_PREBUILT_JNILIBS")
+val extraJniLibs = envValue("LLAMA_ANDROID_EXTRA_JNILIBS")
+val llamaAndroidBackend = envValue("LLAMA_ANDROID_BACKEND")?.lowercase() ?: "cpu"
+val openclRoot = envValue("LLAMA_ANDROID_OPENCL_ROOT")
+val openclJniLibs = envValue("LLAMA_ANDROID_OPENCL_JNILIBS")
+    ?: openclRoot?.let { File(it, "jniLibs").path }
+val openclPackagingJniLibs = if (llamaAndroidBackend == "opencl") openclJniLibs else null
+val extraJniLibDirs = listOf(openclPackagingJniLibs, extraJniLibs).filterNotNull().distinct()
+
+if (llamaAndroidBackend == "opencl") {
+    require(extraJniLibDirs.isNotEmpty()) {
+        "LLAMA_ANDROID_BACKEND=opencl requires OpenCL dependencies. Set LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps, or set LLAMA_ANDROID_OPENCL_INCLUDE_DIR, LLAMA_ANDROID_OPENCL_LIBRARY, and LLAMA_ANDROID_OPENCL_JNILIBS=/path/to/jniLibs."
+    }
+    val hasOpenClLibrary = extraJniLibDirs.any {
+        File(it, "arm64-v8a/libOpenCL.so").isFile
+    }
+    require(hasOpenClLibrary) {
+        "LLAMA_ANDROID_BACKEND=opencl expected arm64-v8a/libOpenCL.so under one of: ${extraJniLibDirs.joinToString()}. Use an Android arm64 libOpenCL.so, not a host x86_64 library."
+    }
+}
 
 android {
     namespace = "com.example.llama"
@@ -59,7 +81,7 @@ android {
         "src/main/assets",
         bundledAssetDir,
     )
-    extraJniLibs?.trim()?.takeIf { it.isNotEmpty() }?.let {
+    extraJniLibDirs.forEach {
         sourceSets.getByName("main").jniLibs.srcDir(it)
     }
     if (usePrebuiltLlama) {

@@ -197,21 +197,36 @@ OpenCL 后端需要 CMake 找到 OpenCL headers 和 `libOpenCL.so`。Android NDK
 - 推荐模型量化：`Q4_0`，并在 `llama-quantize` 时加 `--pure`。
 - Known issue：Adreno 6xx 目前不工作。
 
-创建 OpenCL 工作目录：
+当前分支已经可以验证 Android Gradle/CMake 的 OpenCL 依赖接线和 APK packaging。完整 iFairy OpenCL kernel 行为需要后续合并 `origin/OpenCL` 或等价 OpenCL 实现后再测；依赖目录和构建命令保持一致。
+
+准备一个外部 OpenCL 依赖目录。不要把这个目录提交到仓库：
+
+```text
+opencl-deps/
+├── include/
+│   └── CL/
+│       └── cl.h
+└── jniLibs/
+    └── arm64-v8a/
+        └── libOpenCL.so
+```
+
+下面示例把依赖放到 Android 示例目录下的 `opencl-deps/`。也可以放到任意仓库外路径，只要构建时设置 `LLAMA_ANDROID_OPENCL_ROOT`。
 
 ```bash
 export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/30.0.14904198"
-export OPENCL_ANDROID_ROOT="$HOME/android-opencl"
-mkdir -p "$OPENCL_ANDROID_ROOT"
-cd "$OPENCL_ANDROID_ROOT"
+cd /path/to/llama.cpp/examples/llama.android
+export LLAMA_ANDROID_OPENCL_ROOT="$PWD/opencl-deps"
+mkdir -p "$LLAMA_ANDROID_OPENCL_ROOT/include" \
+  "$LLAMA_ANDROID_OPENCL_ROOT/jniLibs/arm64-v8a"
 ```
 
-安装 OpenCL headers 到 NDK sysroot：
+安装 OpenCL headers 到外部依赖目录：
 
 ```bash
 git clone --depth 1 https://github.com/KhronosGroup/OpenCL-Headers
 cp -r OpenCL-Headers/CL \
-  "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/"
+  "$LLAMA_ANDROID_OPENCL_ROOT/include/"
 ```
 
 交叉编译 OpenCL ICD loader：
@@ -222,7 +237,7 @@ git clone --depth 1 https://github.com/KhronosGroup/OpenCL-ICD-Loader
 cmake -S OpenCL-ICD-Loader -B OpenCL-ICD-Loader/build-android -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
-  -DOPENCL_ICD_LOADER_HEADERS_DIR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+  -DOPENCL_ICD_LOADER_HEADERS_DIR="$LLAMA_ANDROID_OPENCL_ROOT/include" \
   -DANDROID_ABI=arm64-v8a \
   -DANDROID_PLATFORM=android-24 \
   -DANDROID_STL=c++_shared
@@ -230,19 +245,23 @@ cmake -S OpenCL-ICD-Loader -B OpenCL-ICD-Loader/build-android -G Ninja \
 cmake --build OpenCL-ICD-Loader/build-android
 ```
 
-准备给 Gradle 使用的路径：
+复制 Android arm64 版 `libOpenCL.so`，并检查目录布局：
 
 ```bash
-mkdir -p "$OPENCL_ANDROID_ROOT/jniLibs/arm64-v8a"
 cp OpenCL-ICD-Loader/build-android/libOpenCL.so \
-  "$OPENCL_ANDROID_ROOT/jniLibs/arm64-v8a/libOpenCL.so"
+  "$LLAMA_ANDROID_OPENCL_ROOT/jniLibs/arm64-v8a/libOpenCL.so"
 
-export LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
-export LLAMA_ANDROID_OPENCL_LIBRARY="$OPENCL_ANDROID_ROOT/jniLibs/arm64-v8a/libOpenCL.so"
-export LLAMA_ANDROID_EXTRA_JNILIBS="$OPENCL_ANDROID_ROOT/jniLibs"
+test -f "$LLAMA_ANDROID_OPENCL_ROOT/include/CL/cl.h"
+test -f "$LLAMA_ANDROID_OPENCL_ROOT/jniLibs/arm64-v8a/libOpenCL.so"
 ```
 
-`LLAMA_ANDROID_EXTRA_JNILIBS` 会把 `arm64-v8a/libOpenCL.so` 打进 APK。不要把 `$OPENCL_ANDROID_ROOT` 或其中二进制提交到仓库。
+`LLAMA_ANDROID_OPENCL_ROOT` 会自动推导：
+
+- CMake include dir: `$LLAMA_ANDROID_OPENCL_ROOT/include`
+- CMake library: `$LLAMA_ANDROID_OPENCL_ROOT/jniLibs/arm64-v8a/libOpenCL.so`
+- APK packaged JNI root: `$LLAMA_ANDROID_OPENCL_ROOT/jniLibs`
+
+如果测试同事已经提供了 `opencl-deps/` 目录，不需要重新 clone/编译 Khronos 仓库，直接设置 `LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps` 即可。
 
 ## 8. OpenCL 后端构建
 
@@ -256,9 +275,7 @@ cd /path/to/llama.cpp/examples/llama.android
 
 ```bash
 LLAMA_ANDROID_BACKEND=opencl \
-LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$LLAMA_ANDROID_OPENCL_INCLUDE_DIR" \
-LLAMA_ANDROID_OPENCL_LIBRARY="$LLAMA_ANDROID_OPENCL_LIBRARY" \
-LLAMA_ANDROID_EXTRA_JNILIBS="$LLAMA_ANDROID_EXTRA_JNILIBS" \
+LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps \
 LLAMA_ANDROID_OPENCL_ADRENO=1 \
 LLAMA_ANDROID_OPENCL_EMBED_KERNELS=1 \
 LLAMA_ANDROID_OPENCL_TARGET_VERSION=300 \
@@ -269,12 +286,22 @@ LLAMA_ANDROID_OPENCL_TARGET_VERSION=300 \
 
 ```bash
 LLAMA_ANDROID_BACKEND=opencl \
-LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$LLAMA_ANDROID_OPENCL_INCLUDE_DIR" \
-LLAMA_ANDROID_OPENCL_LIBRARY="$LLAMA_ANDROID_OPENCL_LIBRARY" \
-LLAMA_ANDROID_EXTRA_JNILIBS="$LLAMA_ANDROID_EXTRA_JNILIBS" \
+LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps \
 LLAMA_ANDROID_OPENCL_ADRENO=0 \
   ./gradlew :app:assembleDebug --stacktrace
 ```
+
+如果依赖目录不是标准布局，可以显式指定三段路径：
+
+```bash
+LLAMA_ANDROID_BACKEND=opencl \
+LLAMA_ANDROID_OPENCL_INCLUDE_DIR=/path/to/include \
+LLAMA_ANDROID_OPENCL_LIBRARY=/path/to/libOpenCL.so \
+LLAMA_ANDROID_OPENCL_JNILIBS=/path/to/jniLibs \
+  ./gradlew :app:assembleDebug --stacktrace
+```
+
+`LLAMA_ANDROID_OPENCL_JNILIBS` 和 `LLAMA_ANDROID_EXTRA_JNILIBS` 都会把 native dependency 加进 APK；OpenCL 模式下至少要有一个目录包含 `arm64-v8a/libOpenCL.so`。Gradle 会在配置阶段检查 `include/CL/cl.h` 和 `arm64-v8a/libOpenCL.so`，缺失时直接报错。
 
 检查 APK 是否包含 native 库：
 
@@ -288,6 +315,14 @@ unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E 'libllama-android|l
 ./gradlew :app:clean
 rm -rf llama/.cxx app/.cxx
 ```
+
+给测试同事的交付清单：
+
+- 当前源码 commit 或分支名。
+- `opencl-deps/` 目录，且包含 `include/CL/cl.h` 和 `jniLibs/arm64-v8a/libOpenCL.so`。
+- 构建命令：`LLAMA_ANDROID_BACKEND=opencl LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps ./gradlew :app:assembleDebug --stacktrace`。
+- APK 内容检查：确认 `libllama-android.so` 和 `libOpenCL.so` 都在 `app-debug.apk` 中。
+- 设备 smoke：安装 APK 后用 `adb logcat -s LLAMA_ANDROID` 观察 OpenCL 初始化日志；若失败，先用 CPU APK 确认 app 和模型路径正常。
 
 ## 9. 打包内置模型
 
@@ -392,7 +427,7 @@ LLAMA_ANDROID_PREBUILT_JNILIBS=/path/to/jniLibs \
 如果预编译库依赖 `libOpenCL.so`，同时传：
 
 ```bash
-LLAMA_ANDROID_EXTRA_JNILIBS=/path/to/opencl-jniLibs
+LLAMA_ANDROID_OPENCL_JNILIBS=/path/to/opencl-jniLibs
 ```
 
 ## Troubleshooting
@@ -402,10 +437,11 @@ LLAMA_ANDROID_EXTRA_JNILIBS=/path/to/opencl-jniLibs
 - NDK 找不到：安装时加 `--channel=1`，并确认 `ndk/30.0.14904198/source.properties` 中 revision 是 `30.0.14904198-beta1`。
 - licenses 未接受：运行 `yes | sdkmanager --licenses`。
 - Gradle 仍用旧 SDK：重新写 `local.properties`，内容只保留 `sdk.dir=/your/Android/Sdk`。
-- OpenCL headers 找不到：确认 `LLAMA_ANDROID_OPENCL_INCLUDE_DIR` 指向包含 `CL/cl.h` 的目录。
-- OpenCL library 找不到：确认 `LLAMA_ANDROID_OPENCL_LIBRARY` 指向 arm64 Android 版 `libOpenCL.so`，不是 x86_64 host 版。
+- OpenCL root 找不到：确认 `LLAMA_ANDROID_OPENCL_ROOT` 指向包含 `include/CL/cl.h` 和 `jniLibs/arm64-v8a/libOpenCL.so` 的目录。
+- OpenCL headers 找不到：确认 `LLAMA_ANDROID_OPENCL_INCLUDE_DIR` 指向包含 `CL/cl.h` 的目录，或使用标准 `LLAMA_ANDROID_OPENCL_ROOT` 布局。
+- OpenCL library 找不到：确认 `LLAMA_ANDROID_OPENCL_LIBRARY` 指向 Android arm64 版 `libOpenCL.so`，不是 x86_64 host 版。
 - OpenCL 被 CMake 强制关闭：确认 OpenCL 构建命令使用 `LLAMA_ANDROID_BACKEND=opencl`，该模式会设置 `GGML_IFAIRY_LUT_CPU=OFF`。
-- APK 中没有 `libOpenCL.so`：确认 `LLAMA_ANDROID_EXTRA_JNILIBS` 指向包含 `arm64-v8a/libOpenCL.so` 的目录。
+- APK 中没有 `libOpenCL.so`：确认 `LLAMA_ANDROID_OPENCL_ROOT/jniLibs`、`LLAMA_ANDROID_OPENCL_JNILIBS` 或 `LLAMA_ANDROID_EXTRA_JNILIBS` 指向包含 `arm64-v8a/libOpenCL.so` 的目录。
 - OpenCL runtime 找不到设备：确认目标 Android 设备支持 OpenCL 2.0+ 和 FP16；Adreno 6xx 目前是 known issue。
 - Adreno kernel 报错：用 `LLAMA_ANDROID_OPENCL_ADRENO=0` 重新构建排查。
 - APK 太大：减少 bundled models，或用 app Settings 手动导入 `.gguf`。
@@ -425,9 +461,7 @@ OpenCL 路径：
 
 ```bash
 LLAMA_ANDROID_BACKEND=opencl \
-LLAMA_ANDROID_OPENCL_INCLUDE_DIR="$LLAMA_ANDROID_OPENCL_INCLUDE_DIR" \
-LLAMA_ANDROID_OPENCL_LIBRARY="$LLAMA_ANDROID_OPENCL_LIBRARY" \
-LLAMA_ANDROID_EXTRA_JNILIBS="$LLAMA_ANDROID_EXTRA_JNILIBS" \
+LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps \
   ./gradlew :app:assembleDebug --stacktrace
 
 unzip -l app/build/outputs/apk/debug/app-debug.apk | grep -E 'libllama-android|libOpenCL'
