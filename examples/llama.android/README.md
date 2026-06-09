@@ -355,6 +355,13 @@ LLAMA_ANDROID_BUNDLED_ASSETS=/path/to/assets \
 
 当前 app 会自动识别并安装这些内置模型名：`ifairy.gguf`、`bitnet_b1_58_700m.gguf`、`llama_700m.gguf`。其他 `models/*.gguf` 可以被打进 APK，但若要自动安装或参与内置 benchmark，需要同步扩展 app 中的 bundled model 列表。
 
+不打包模型时，可以在 app 里手动导入 `.gguf`：
+
+1. 打开 app 的 Settings。
+2. 点击 `Import`，通过 Android 文件选择器选中本地 `.gguf`。
+3. app 会把模型复制到私有目录 `filesDir/models/`，不会直接从临时 picker URI 推理。
+4. 在 Settings 的 internal models 列表中选择模型，点击 `Load`。
+
 ## 11. 安装与 smoke test
 
 确认设备：
