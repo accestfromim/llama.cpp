@@ -1424,8 +1424,12 @@ void ggml_compute_forward_mul_mat(
         enum ggml_ifairy_lut_impl impl        = cfg->impl;
         const bool                fairy2i_f32 = src1->type == GGML_TYPE_F32 && ggml_ifairy_lut_is_fairy2i_weight(src0);
         if (impl == GGML_IFAIRY_LUT_IMPL_AUTO) {
-            // Keep auto mode conservative for Fairy2i decode quality while still allowing explicit lut16 selection.
+#if defined(__aarch64__) && defined(__ARM_NEON)
             impl = fairy2i_f32 ? GGML_IFAIRY_LUT_IMPL_LUT_C : GGML_IFAIRY_LUT_IMPL_LUT16;
+#else
+            (void) fairy2i_f32;
+            impl = GGML_IFAIRY_LUT_IMPL_LUT16;
+#endif
         }
         if (impl == GGML_IFAIRY_LUT_IMPL_LUT_C && src1->type != GGML_TYPE_F32) {
             if (cfg->dbg) {
