@@ -13,6 +13,7 @@
 #include "binary-ops.h"
 #include "vec.h"
 #include "ops.h"
+#include "ifairy-fuse.h"
 #include "ggml.h"
 #ifdef GGML_IFAIRY_LUT_CPU
 #    include "ggml-ifairy-lut-impl.h"
@@ -721,7 +722,25 @@ static void ggml_ifairy_lut_prepare_cgraph_indexes(const struct ggml_cgraph *   
                                                    const struct ggml_ifairy_lut_threadpool_config * cfg) {
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_MUL_MAT) {
+        if (!node) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2) {
+            if (!cfg || !cfg->lut_explicit) {
+                continue;
+            }
+            for (int src = 1; src <= 4; ++src) {
+                struct ggml_tensor * weight = node->src[src];
+                const struct ifairy_lut_extra * extra = weight ? (const struct ifairy_lut_extra *) weight->extra : NULL;
+                if (weight && (!extra || !extra->packed_w)) {
+                    ggml_ifairy_lut_transform_tensor(weight, NULL);
+                }
+            }
+            continue;
+        }
+
+        if (node->op != GGML_OP_MUL_MAT) {
             continue;
         }
 
@@ -2363,7 +2382,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             break;
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
-                GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 not implemented");
+#ifdef GGML_IFAIRY_LUT_CPU
+                const struct ggml_ifairy_lut_threadpool_config * cfg = &params->threadpool->ifairy_lut_cfg;
+                const bool use_lut = cfg->lut_enabled && cfg->lut_explicit;
+                const bool lut_c   = cfg->impl != GGML_IFAIRY_LUT_IMPL_LUT16;
+                if (!use_lut || !ggml_compute_forward_ifairy_wide_linear_w2_lut(params, tensor, lut_c)) {
+                    ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
+                }
+#else
+                ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
+#endif
             }
             break;
         case GGML_OP_ROPE:
@@ -2772,7 +2800,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
-                n_tasks = 1;
+                n_tasks = n_threads;
             } break;
         case GGML_OP_CLAMP:
             {
@@ -3293,7 +3321,13 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {
-                        cur = 0;
+                        const struct ggml_tensor * x = node->src[0];
+                        GGML_ASSERT(x && x->type == GGML_TYPE_F32);
+                        GGML_ASSERT(x->ne[0] % QK_IFAIRY64 == 0);
+
+                        const size_t q_row_size = ggml_row_size(GGML_TYPE_IFAIRY64_Q16, x->ne[0]);
+                        const size_t q_bytes    = GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_CACHE_LINE);
+                        cur                     = MAX(q_bytes, ggml_ifairy_wide_linear_w2_lut_wsize(node));
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {

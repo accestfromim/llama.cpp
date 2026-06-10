@@ -4146,30 +4146,26 @@ struct ggml_tensor * ggml_ifairy_mul(struct ggml_context * ctx, struct ggml_tens
 
 struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
                                                 struct ggml_tensor *  x,
-                                                struct ggml_tensor *  x_conj,
                                                 struct ggml_tensor *  u_s0,
                                                 struct ggml_tensor *  u_s1,
                                                 struct ggml_tensor *  w_s0,
                                                 struct ggml_tensor *  w_s1,
                                                 struct ggml_tensor *  bias) {
     GGML_ASSERT(x);
-    GGML_ASSERT(x_conj);
     GGML_ASSERT(u_s0);
     GGML_ASSERT(u_s1);
     GGML_ASSERT(w_s0);
     GGML_ASSERT(w_s1);
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
-    GGML_ASSERT(x_conj->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_are_same_shape(x, x_conj));
 
     GGML_ASSERT(u_s0->type == GGML_TYPE_IFAIRY64);
     GGML_ASSERT(u_s1->type == GGML_TYPE_IFAIRY64);
     GGML_ASSERT(w_s0->type == GGML_TYPE_IFAIRY64);
     GGML_ASSERT(w_s1->type == GGML_TYPE_IFAIRY64);
 
-    GGML_ASSERT(ggml_can_mul_mat(u_s0, x_conj));
-    GGML_ASSERT(ggml_can_mul_mat(u_s1, x_conj));
+    GGML_ASSERT(ggml_can_mul_mat(u_s0, x));
+    GGML_ASSERT(ggml_can_mul_mat(u_s1, x));
     GGML_ASSERT(ggml_can_mul_mat(w_s0, x));
     GGML_ASSERT(ggml_can_mul_mat(w_s1, x));
 
@@ -4191,12 +4187,11 @@ struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
 
     result->op     = GGML_OP_IFAIRY_WIDE_LINEAR_W2;
     result->src[0] = x;
-    result->src[1] = x_conj;
-    result->src[2] = u_s0;
-    result->src[3] = u_s1;
-    result->src[4] = w_s0;
-    result->src[5] = w_s1;
-    result->src[6] = bias;
+    result->src[1] = u_s0;
+    result->src[2] = u_s1;
+    result->src[3] = w_s0;
+    result->src[4] = w_s1;
+    result->src[5] = bias;
 
     return result;
 }

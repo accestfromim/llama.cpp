@@ -1658,6 +1658,155 @@ static void fill_ifairy_backend_act_f32(std::vector<float> & act_f32, int64_t N,
     }
 }
 
+static bool run_ifairy64_wide_linear_w2_backend(std::vector<uint32_t> &             packed_out,
+                                                int64_t                             M,
+                                                int64_t                             N,
+                                                int64_t                             K,
+                                                const std::vector<block_ifairy64> & u_s0_data,
+                                                const std::vector<block_ifairy64> & u_s1_data,
+                                                const std::vector<block_ifairy64> & w_s0_data,
+                                                const std::vector<block_ifairy64> & w_s1_data,
+                                                const std::vector<float> &          x_data,
+                                                const std::vector<float> &          x_conj_data,
+                                                const std::vector<float> *          bias_data,
+                                                bool                                fused) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, 4);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * x_conj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * u_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * u_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * bias   = bias_data ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * M) : nullptr;
+
+    ggml_tensor * out = nullptr;
+    if (fused) {
+        out = ggml_ifairy_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
+    } else {
+        ggml_tensor * u = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, u_s0, x_conj), ggml_mul_mat(ctx, u_s1, x_conj));
+        ggml_tensor * w = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, w_s0, x), ggml_mul_mat(ctx, w_s1, x));
+        out             = ggml_ifairy_add(ctx, u, w);
+        if (bias) {
+            out = ggml_ifairy_merge(ctx, ggml_add(ctx, ggml_ifairy_split(ctx, out), bias));
+        }
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
+    ggml_backend_tensor_set(x_conj, x_conj_data.data(), 0, x_conj_data.size() * sizeof(float));
+    ggml_backend_tensor_set(u_s0, u_s0_data.data(), 0, u_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(u_s1, u_s1_data.data(), 0, u_s1_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s0, w_s0_data.data(), 0, w_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s1, w_s1_data.data(), 0, w_s1_data.size() * sizeof(block_ifairy64));
+    if (bias) {
+        ggml_backend_tensor_set(bias, bias_data->data(), 0, bias_data->size() * sizeof(float));
+    }
+
+    const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        std::vector<float> out_data((size_t) M * (size_t) N);
+        ggml_backend_tensor_get(out, out_data.data(), 0, out_data.size() * sizeof(float));
+        packed_out.resize(out_data.size());
+        memcpy(packed_out.data(), out_data.data(), out_data.size() * sizeof(float));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return ok;
+}
+
+static bool test_ifairy64_wide_linear_w2_fused() {
+    printf("\n=== Test 5.5: iFairy64 fused wide linear W2 ===\n");
+
+    const int64_t M = 7;
+    const int64_t K = 2 * QK_IFAIRY64;
+
+    std::vector<block_ifairy64> u_s0;
+    std::vector<block_ifairy64> u_s1;
+    std::vector<block_ifairy64> w_s0;
+    std::vector<block_ifairy64> w_s1;
+    fill_ifairy64_backend_weights(u_s0, M, K);
+    fill_ifairy64_backend_weights(u_s1, M, K);
+    fill_ifairy64_backend_weights(w_s0, M, K);
+    fill_ifairy64_backend_weights(w_s1, M, K);
+
+    for (size_t i = 0; i < u_s0.size(); ++i) {
+        u_s0[i].d_real = GGML_FP32_TO_FP16(0.050f + 0.001f * (float) (i % 5));
+        u_s0[i].d_imag = GGML_FP32_TO_FP16(0.040f + 0.001f * (float) (i % 3));
+        u_s1[i].d_real = GGML_FP32_TO_FP16(0.035f + 0.001f * (float) (i % 7));
+        u_s1[i].d_imag = GGML_FP32_TO_FP16(0.030f + 0.001f * (float) (i % 2));
+        w_s0[i].d_real = GGML_FP32_TO_FP16(0.045f + 0.001f * (float) (i % 4));
+        w_s0[i].d_imag = GGML_FP32_TO_FP16(0.025f + 0.001f * (float) (i % 6));
+        w_s1[i].d_real = GGML_FP32_TO_FP16(0.055f + 0.001f * (float) (i % 3));
+        w_s1[i].d_imag = GGML_FP32_TO_FP16(0.020f + 0.001f * (float) (i % 5));
+    }
+
+    std::vector<float> bias((size_t) 2 * (size_t) M);
+    for (int64_t i = 0; i < 2 * M; ++i) {
+        bias[(size_t) i] = (float) (i - M) / 32.0f;
+    }
+
+    const int64_t              n_cases[]    = { 1, 3 };
+    const std::vector<float> * bias_cases[] = { nullptr, &bias };
+    for (int64_t N : n_cases) {
+        std::vector<float> x;
+        fill_ifairy_backend_act_f32(x, N, K);
+
+        std::vector<float> x_conj(x.size());
+        for (size_t i = 0; i < x.size(); ++i) {
+            const ggml_bf16_t * in = (const ggml_bf16_t *) &x[i];
+            ggml_bf16_t *       out = (ggml_bf16_t *) &x_conj[i];
+            out[0]                  = in[0];
+            out[1]                  = GGML_FP32_TO_BF16(-GGML_BF16_TO_FP32(in[1]));
+        }
+
+        for (const std::vector<float> * bias_case : bias_cases) {
+            std::vector<uint32_t> out_fused;
+            std::vector<uint32_t> out_reference;
+            if (!run_ifairy64_wide_linear_w2_backend(out_fused, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
+                                                      bias_case, true) ||
+                !run_ifairy64_wide_linear_w2_backend(out_reference, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
+                                                      bias_case, false)) {
+                return false;
+            }
+
+            if (!compare_packed_complex_outputs(out_fused.data(), out_reference.data(), out_reference.size(), 1e-2f)) {
+                fprintf(stderr, "Fused wide linear W2 mismatch (N=%lld, %s bias)\n", (long long) N,
+                        bias_case ? "with" : "without");
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 static void quantize_ifairy_backend_act_q16(std::vector<block_ifairy_q16> & act_q16,
                                             const std::vector<float> &      act_f32,
                                             int64_t                         N,
@@ -2231,6 +2380,7 @@ int main(int argc, char ** argv) {
 
         bool         verbose     = false;
         bool         lut_only    = false;
+        bool         fused_only  = false;
         bool         lut_bench   = false;
         const char * vecdot_mode = NULL;
         int64_t      bench_M     = 4096;
@@ -2250,6 +2400,10 @@ int main(int argc, char ** argv) {
             }
             if (strcmp(argv[i], "--ifairy-lut-only") == 0) {
                 lut_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-fused-only") == 0) {
+                fused_only = true;
                 continue;
             }
             if (strcmp(argv[i], "--ifairy-lut-backend-bench") == 0) {
@@ -2293,6 +2447,10 @@ int main(int argc, char ** argv) {
 
         if (lut_only) {
             return run_ifairy_lut_only_tests();
+        }
+
+        if (fused_only) {
+            return test_ifairy64_wide_linear_w2_fused() ? 0 : 1;
         }
 
         if (lut_bench) {
@@ -2399,6 +2557,11 @@ int main(int argc, char ** argv) {
 
         if (!test_ifairy64_lut_backend_f32_vs_q16()) {
             fprintf(stderr, "Test 5.4 FAILED\n");
+            num_failed++;
+        }
+
+        if (!test_ifairy64_wide_linear_w2_fused()) {
+            fprintf(stderr, "Test 5.5 FAILED\n");
             num_failed++;
         }
 

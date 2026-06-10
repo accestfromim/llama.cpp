@@ -14179,14 +14179,15 @@ struct llm_build_fairy2i : public llm_graph_context {
                                      ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
             GGML_ASSERT(linear.U[0] && linear.W[0]);
 
-            const bool can_fuse_w2 = llama_fairy2i_fused_wide_linear_w2_enabled() && linear.U[1] && linear.W[1] &&
+            const bool can_fuse_w2 = llama_fairy2i_fused_wide_linear_w2_enabled() && loras->empty() && linear.U[1] &&
+                                     linear.W[1] &&
                                      linear.U[0]->type == GGML_TYPE_IFAIRY64 &&
                                      linear.U[1]->type == GGML_TYPE_IFAIRY64 &&
                                      linear.W[0]->type == GGML_TYPE_IFAIRY64 &&
                                      linear.W[1]->type == GGML_TYPE_IFAIRY64;
             if (can_fuse_w2) {
-                ggml_tensor * y = ggml_ifairy_wide_linear_w2(ctx0, x, x_conj, linear.U[0], linear.U[1], linear.W[0],
-                                                             linear.W[1], bias);
+                ggml_tensor * y =
+                    ggml_ifairy_wide_linear_w2(ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
                 cb(y, name, il);
                 return y;
             }

@@ -1681,7 +1681,6 @@ extern "C" {
 
     GGML_API struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
                                                              struct ggml_tensor *  x,
-                                                             struct ggml_tensor *  x_conj,
                                                              struct ggml_tensor *  u_s0,
                                                              struct ggml_tensor *  u_s1,
                                                              struct ggml_tensor *  w_s0,
