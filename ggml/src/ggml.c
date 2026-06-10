@@ -4136,6 +4136,58 @@ struct ggml_tensor * ggml_ifairy_mul(struct ggml_context * ctx, struct ggml_tens
     return ggml_ifairy_mul_impl(ctx, a, b, false);
 }
 
+struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
+                                                struct ggml_tensor *  x,
+                                                struct ggml_tensor *  u_s0,
+                                                struct ggml_tensor *  u_s1,
+                                                struct ggml_tensor *  w_s0,
+                                                struct ggml_tensor *  w_s1,
+                                                struct ggml_tensor *  bias) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(u_s0);
+    GGML_ASSERT(u_s1);
+    GGML_ASSERT(w_s0);
+    GGML_ASSERT(w_s1);
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(u_s0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(u_s1->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w_s0->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(w_s1->type == GGML_TYPE_IFAIRY64);
+
+    GGML_ASSERT(ggml_can_mul_mat(u_s0, x));
+    GGML_ASSERT(ggml_can_mul_mat(u_s1, x));
+    GGML_ASSERT(ggml_can_mul_mat(w_s0, x));
+    GGML_ASSERT(ggml_can_mul_mat(w_s1, x));
+
+    GGML_ASSERT(u_s0->ne[1] == u_s1->ne[1]);
+    GGML_ASSERT(u_s0->ne[1] == w_s0->ne[1]);
+    GGML_ASSERT(u_s0->ne[1] == w_s1->ne[1]);
+
+    const int64_t ne[4] = { u_s0->ne[1], x->ne[1], x->ne[2], x->ne[3] };
+
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT((2 * ne[0]) % bias->ne[0] == 0);
+        GGML_ASSERT(ne[1] % bias->ne[1] == 0);
+        GGML_ASSERT(ne[2] % bias->ne[2] == 0);
+        GGML_ASSERT(ne[3] % bias->ne[3] == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_IFAIRY_WIDE_LINEAR_W2;
+    result->src[0] = x;
+    result->src[1] = u_s0;
+    result->src[2] = u_s1;
+    result->src[3] = w_s0;
+    result->src[4] = w_s1;
+    result->src[5] = bias;
+
+    return result;
+}
+
 struct ggml_tensor * ggml_ifairy_split(struct ggml_context * ctx, struct ggml_tensor * a) {
     return ggml_ifairy_split_impl(ctx, a);
 }
