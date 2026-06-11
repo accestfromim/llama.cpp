@@ -46,6 +46,9 @@ static inline float ifairy_bf16_to_f32(ushort x) {
     return as_float(((uint) x) << 16);
 }
 
+// Applies iFairy RoPE on bf16-pair complex containers. The low/high bf16
+// halves are treated as the two NeoX rotary channels x and x + n_dims / 2,
+// and the output is written in split F32 layout.
 kernel void kernel_ifairy_rope(global void *  src0,
                                ulong          offset0,
                                global int *   src1,

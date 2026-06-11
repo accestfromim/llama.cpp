@@ -3122,7 +3122,9 @@ static bool ggml_opencl_can_ifairy_rope(const struct ggml_tensor * op) {
         return false;
     }
 
-    // CPU iFairy RoPE currently only supports the default ggml_ifairy_rope() parameters.
+    // ggml_ifairy_rope uses mode 0 for its packed-complex path. The two bf16
+    // halves already represent the half-split rotary pair in real-expanded space.
+    // Keep the first OpenCL path limited to the default Llama RoPE parameters.
     if (freq_base != 10000.0f || freq_scale != 1.0f || ext_factor != 0.0f || attn_factor != 1.0f || beta_fast != 0.0f ||
         beta_slow != 0.0f) {
         return false;

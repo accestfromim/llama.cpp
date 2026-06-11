@@ -185,6 +185,8 @@ class MainViewModel(
         private const val E2E_LONG_DECODE_STATUS_FILE_NAME = "builtin_models_e2e_long_decode_64p_1024g.status"
         private const val POWER_BENCH_OUTPUT_FILE_NAME = "builtin_models_power_bench.csv"
         private const val POWER_BENCH_STATUS_FILE_NAME = "builtin_models_power_bench.status"
+        private const val GENERATE_STATUS_FILE_SUFFIX = ".status"
+        private const val GENERATE_OUTPUT_FILE_SUFFIX = ".txt"
         private const val DEFAULT_POWER_BENCH_DURATION_MS = 30L * 60L * 1000L
         private const val DEFAULT_POWER_BENCH_THREADS = 6
         private const val DEFAULT_POWER_BENCH_AFFINITY_PROFILE = 0
@@ -268,6 +270,10 @@ class MainViewModel(
     private var benchmarkPresetOverride: BenchPreset? = null
     private var powerBenchDurationMs: Long = DEFAULT_POWER_BENCH_DURATION_MS
     private var batteryCapacityMah: Double? = null
+    private var automationGeneratePrompt: String = "Hello"
+    private var automationGenerateMaxTokens: Int = 16
+    private var automationGenerateFormatChat: Boolean = true
+    private var automationGenerateOutputPrefix: String = "adb_generate"
     private var runtimeBenchConfig = RuntimeBenchConfig()
     private val powerBenchOutputFileNames = mutableMapOf<String, String>()
 
@@ -368,6 +374,10 @@ class MainViewModel(
             ?.map { it.trim() }
             ?.filter { it.isNotEmpty() }
             ?.toSet()
+        val generatePrompt = extras.getString("codex_prompt")
+        val generateMaxTokens = extras.getIntOrSentinel("codex_max_tokens")
+        val generateFormatChat = extras.getIntOrSentinel("codex_format_chat")
+        val generateOutputPrefix = extras.getString("codex_output_prefix")?.trim()?.takeIf { it.isNotEmpty() }
         val nextRuntimeBenchConfig = runtimeBenchConfig.copy(
             nCtx = if (nCtx >= 0) nCtx else runtimeBenchConfig.nCtx,
             nBatch = if (nBatch >= 0) nBatch else runtimeBenchConfig.nBatch,
@@ -413,7 +423,11 @@ class MainViewModel(
             powerDurationMinutes == null &&
             configuredBatteryCapacityMah == null &&
             modelFilter.isNullOrEmpty() &&
-            presetFilter.isNullOrEmpty()
+            presetFilter.isNullOrEmpty() &&
+            generatePrompt == null &&
+            generateMaxTokens < 0 &&
+            generateFormatChat < 0 &&
+            generateOutputPrefix == null
         ) {
             return
         }
@@ -457,6 +471,22 @@ class MainViewModel(
         if (configuredBatteryCapacityMah != null && configuredBatteryCapacityMah > 0.0) {
             batteryCapacityMah = configuredBatteryCapacityMah
             log("Battery capacity override: ${formatCsvDecimal(configuredBatteryCapacityMah)} mAh")
+        }
+        if (generatePrompt != null) {
+            automationGeneratePrompt = generatePrompt
+            log("Automation generate prompt override: ${generatePrompt.take(80)}")
+        }
+        if (generateMaxTokens > 0) {
+            automationGenerateMaxTokens = generateMaxTokens.coerceIn(1, 512)
+            log("Automation generate max tokens override: $automationGenerateMaxTokens")
+        }
+        if (generateFormatChat >= 0) {
+            automationGenerateFormatChat = generateFormatChat != 0
+            log("Automation generate format_chat override: $automationGenerateFormatChat")
+        }
+        if (generateOutputPrefix != null) {
+            automationGenerateOutputPrefix = sanitizeFileName(generateOutputPrefix)
+            log("Automation generate output prefix override: $automationGenerateOutputPrefix")
         }
         runtimeBenchConfig = nextRuntimeBenchConfig
 
@@ -831,6 +861,73 @@ class MainViewModel(
                 "sched_debug=${formatOverride(config.schedDebug)}, opencl_supports_debug=${formatOverride(config.openclSupportsDebug)}, " +
                 "force_cpu=${formatOverride(config.forceCpu)}"
         )
+    }
+
+    private suspend fun runAutomationGenerate() {
+        if (isGenerating || isBenchmarking || llamaAndroid.isGenerating()) {
+            modelError = "Generation or benchmark already in progress"
+            return
+        }
+
+        val context = requireNotNull(appContext) { "App context is not initialized" }
+        val model = importedModel ?: error("No imported model available")
+        val outputPrefix = sanitizeFileName(automationGenerateOutputPrefix)
+        val statusFileName = outputPrefix + GENERATE_STATUS_FILE_SUFFIX
+        val outputFileName = outputPrefix + GENERATE_OUTPUT_FILE_SUFFIX
+
+        isBenchmarking = true
+        try {
+            writeBenchStatus(context, statusFileName, "running")
+            applyCurrentRuntimeBenchConfig()
+            if (modelLoadState == ModelLoadState.LOADED) {
+                unloadModelInternal()
+            }
+            loadModelInternal(model)
+
+            val generated = StringBuilder()
+            val startMs = SystemClock.elapsedRealtime()
+            llamaAndroid
+                .send(
+                    automationGeneratePrompt,
+                    automationGenerateMaxTokens,
+                    automationGenerateFormatChat,
+                )
+                .collect { piece ->
+                    generated.append(piece)
+                }
+            val elapsedMs = SystemClock.elapsedRealtime() - startMs
+
+            writeGenerateOutput(
+                context = context,
+                fileName = outputFileName,
+                model = model,
+                elapsedMs = elapsedMs,
+                generatedText = generated.toString(),
+            )
+            writeBenchStatus(
+                context,
+                statusFileName,
+                buildString {
+                    appendLine("completed")
+                    appendLine("output=$outputFileName")
+                    appendLine("generated_chars=${generated.length}")
+                    appendLine("elapsed_ms=$elapsedMs")
+                },
+            )
+            log("Automation generate completed: output=$outputFileName chars=${generated.length} elapsed_ms=$elapsedMs")
+        } catch (throwable: Throwable) {
+            writeBenchStatus(
+                context,
+                statusFileName,
+                buildString {
+                    appendLine("failed")
+                    appendLine(throwable.message ?: throwable::class.java.simpleName)
+                },
+            )
+            logError("runAutomationGenerate() failed", throwable)
+        } finally {
+            isBenchmarking = false
+        }
     }
 
     private suspend fun runBundledE2eBenchmarks() {
@@ -1588,6 +1685,7 @@ class MainViewModel(
                 }
             }
             "bench",
+            "generate",
             "smoke" -> when (modelLoadState) {
                 ModelLoadState.IMPORTED,
                 ModelLoadState.LOADED -> maybeRunPendingAutomation()
@@ -1623,6 +1721,11 @@ class MainViewModel(
                 pendingAutomationAction = null
                 log("Running automation power benchmark")
                 viewModelScope.launch { runBundledPowerBenchmarks() }
+            }
+            "generate" -> {
+                pendingAutomationAction = null
+                log("Running automation generate prompt")
+                viewModelScope.launch { runAutomationGenerate() }
             }
             "smoke" -> {
                 log("Running automation smoke prompt")
@@ -1978,6 +2081,33 @@ class MainViewModel(
     private suspend fun writeBenchStatus(context: Context, fileName: String, status: String) = withContext(Dispatchers.IO) {
         val benchDir = prepareBenchDirectory(context)
         File(benchDir, fileName).writeText(status)
+    }
+
+    private suspend fun writeGenerateOutput(
+        context: Context,
+        fileName: String,
+        model: ImportedModel,
+        elapsedMs: Long,
+        generatedText: String,
+    ) = withContext(Dispatchers.IO) {
+        val benchDir = prepareBenchDirectory(context)
+        File(benchDir, fileName).writeText(
+            buildString {
+                appendLine("model=${model.fileName}")
+                appendLine("prompt=$automationGeneratePrompt")
+                appendLine("max_tokens=$automationGenerateMaxTokens")
+                appendLine("format_chat=$automationGenerateFormatChat")
+                appendLine("force_cpu=${runtimeBenchConfig.forceCpu}")
+                appendLine("elapsed_ms=$elapsedMs")
+                appendLine("generated_chars=${generatedText.length}")
+                appendLine("output_begin")
+                append(generatedText)
+                if (!generatedText.endsWith('\n')) {
+                    appendLine()
+                }
+                appendLine("output_end")
+            },
+        )
     }
 
     private fun prepareBenchDirectory(context: Context): File {
