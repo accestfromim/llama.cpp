@@ -654,10 +654,11 @@ void ggml_vec_dot_ifairy64_q16_K(int                        n,
     UNUSED(by);
     UNUSED(bs);
 
-    const block_ifairy64 * GGML_RESTRICT     w = (const block_ifairy64 *) vx;
-    const block_ifairy64_q16 * GGML_RESTRICT x = (const block_ifairy64_q16 *) vy;
+    const block_ifairy64 * GGML_RESTRICT   w = (const block_ifairy64 *) vx;
+    const block_ifairy_q16 * GGML_RESTRICT x = (const block_ifairy_q16 *) vy;
 
     GGML_ASSERT(n % QK_IFAIRY64 == 0);
+    GGML_ASSERT(n % QK_IFAIRY == 0);
 
     const int nb = n / QK_IFAIRY64;
 
@@ -676,10 +677,11 @@ void ggml_vec_dot_ifairy64_q16_K(int                        n,
     const int8x16_t  v_lut_wi = vld1q_s8(lut_wi_data);
 
     for (int i = 0; i < nb; ++i) {
-        const block_ifairy64_q16 * x_block = &x[i];
+        const block_ifairy_q16 * x_block = &x[i / 4];
+        const int                x_base  = (i % 4) * QK_IFAIRY64;
 
-        const int8_t * GGML_RESTRICT x_r_ptr = (const int8_t *) x_block->x_real;
-        const int8_t * GGML_RESTRICT x_i_ptr = (const int8_t *) x_block->x_imag;
+        const int8_t * GGML_RESTRICT x_r_ptr = (const int8_t *) x_block->x_real + x_base;
+        const int8_t * GGML_RESTRICT x_i_ptr = (const int8_t *) x_block->x_imag + x_base;
 
         const uint8x16_t packed = vld1q_u8(w[i].qs);
 
@@ -742,10 +744,11 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
     UNUSED(by);
     UNUSED(bs);
 
-    const block_ifairy64 * GGML_RESTRICT     w = (const block_ifairy64 *) vx;
-    const block_ifairy64_q16 * GGML_RESTRICT x = (const block_ifairy64_q16 *) vy;
+    const block_ifairy64 * GGML_RESTRICT    w = (const block_ifairy64 *) vx;
+    const block_ifairy_q16 * GGML_RESTRICT  x = (const block_ifairy_q16 *) vy;
 
     GGML_ASSERT(n % QK_IFAIRY64 == 0);
+    GGML_ASSERT(n % QK_IFAIRY == 0);
 
     const int nb = n / QK_IFAIRY64;
 
@@ -753,7 +756,8 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
     float sum_imag_total = 0.0f;
 
     for (int i = 0; i < nb; ++i) {
-        const block_ifairy64_q16 * x_block = &x[i];
+        const block_ifairy_q16 * x_block = &x[i / 4];
+        const int                x_base  = (i % 4) * QK_IFAIRY64;
 
         int32_t sum_ac = 0;
         int32_t sum_ad = 0;
@@ -785,8 +789,8 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
                         GGML_UNREACHABLE();
                 }
 
-                const int xr = (int) ((const int8_t *) x_block->x_real)[idx];
-                const int xi = (int) ((const int8_t *) x_block->x_imag)[idx];
+                const int xr = (int) ((const int8_t *) x_block->x_real)[x_base + idx];
+                const int xi = (int) ((const int8_t *) x_block->x_imag)[x_base + idx];
 
                 sum_ac += xr * wr;
                 sum_ad += xi * wr;
