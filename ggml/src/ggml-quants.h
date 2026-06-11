@@ -30,9 +30,6 @@ GGML_API void quantize_row_q5_K_ref(const float * GGML_RESTRICT x, block_q5_K * 
 GGML_API void quantize_row_q6_K_ref(const float * GGML_RESTRICT x, block_q6_K * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_ifairy_q16_ref(const float * GGML_RESTRICT x, block_ifairy_q16 * GGML_RESTRICT y, int64_t k);
-GGML_API void quantize_row_ifairy64_q16_ref(const float * GGML_RESTRICT   x,
-                                            block_ifairy64_q16 * GGML_RESTRICT y,
-                                            int64_t                         k);
 GGML_API void quantize_row_ifairy_q16_tensor_ref(const float * GGML_RESTRICT      x,
                                                  block_ifairy_q16 * GGML_RESTRICT y,
                                                  int64_t                          k);
@@ -72,9 +69,6 @@ GGML_API void dequantize_row_q5_K(const block_q5_K * GGML_RESTRICT x, float * GG
 GGML_API void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_q8_K(const block_q8_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_ifairy_q16(const block_ifairy_q16 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
-GGML_API void dequantize_row_ifairy64_q16(const block_ifairy64_q16 * GGML_RESTRICT x,
-                                          float * GGML_RESTRICT                    y,
-                                          int64_t                                  k);
 
 GGML_API void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
