@@ -292,6 +292,14 @@ typedef struct {
 
 static_assert(sizeof(block_ifairy_q16) == 2 * sizeof(ggml_half) + QK_IFAIRY * 2, "wrong ifairy_q16 block size/padding");
 
+typedef struct {
+    uint8_t   x_real[QK_IFAIRY64], x_imag[QK_IFAIRY64];
+    ggml_half d_real, d_imag;
+} block_ifairy64_q16;
+
+static_assert(sizeof(block_ifairy64_q16) == 2 * sizeof(ggml_half) + QK_IFAIRY64 * 2,
+              "wrong ifairy64_q16 block size/padding");
+
 //
 // Super-block quantization structures
 //

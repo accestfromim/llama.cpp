@@ -86,6 +86,7 @@ option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"         
 option(GGML_ALL_WARNINGS_3RD_PARTY "ggml: enable all compiler warnings in 3rd party libs" OFF)
 option(GGML_GPROF                  "ggml: enable gprof"                                   OFF)
 option(GGML_IFAIRY_LUT_CPU         "ggml: enable iFairy 3-weight LUT (CPU-only route)"     ON)
+option(GGML_IFAIRY_FUSE_AVX512     "ggml: enable AVX512 iFairy fused wide-linear kernel"   OFF)
 
 # build
 option(GGML_FATAL_WARNINGS    "ggml: enable -Werror flag"    OFF)
