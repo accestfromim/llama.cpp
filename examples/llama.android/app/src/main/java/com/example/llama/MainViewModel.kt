@@ -79,6 +79,7 @@ private data class BenchSummary(
     val presetLabel: String,
     val promptTokens: Int,
     val genTokens: Int,
+    val repetitions: Int,
     val ppTps: Double,
     val tgTps: Double,
     val ppStd: Double,
@@ -152,11 +153,19 @@ private data class PowerBenchSummary(
 )
 
 private data class RuntimeBenchConfig(
+    val nCtx: Int = -1,
+    val nBatch: Int = -1,
+    val nUbatch: Int = -1,
     val nThreads: Int = -1,
     val nThreadsBatch: Int = -1,
     val affinityProfile: Int = -1,
     val disableIFairyLut: Int = -1,
     val enableIFairyVecdotActTensor: Int = -1,
+    val generationPriority: Int = -99,
+    val batchPriority: Int = -99,
+    val schedDebug: Int = -1,
+    val openclSupportsDebug: Int = -1,
+    val forceCpu: Int = -1,
 )
 
 class MainViewModel(
@@ -256,6 +265,7 @@ class MainViewModel(
     private var benchmarkModelFilter: Set<String>? = null
     private var benchmarkPresetFilter: Set<String>? = null
     private var benchmarkRepetitionsOverride: Int? = null
+    private var benchmarkPresetOverride: BenchPreset? = null
     private var powerBenchDurationMs: Long = DEFAULT_POWER_BENCH_DURATION_MS
     private var batteryCapacityMah: Double? = null
     private var runtimeBenchConfig = RuntimeBenchConfig()
@@ -279,6 +289,7 @@ class MainViewModel(
 
         val appContext = context.applicationContext
         this.appContext = appContext
+        llamaAndroid.configureNativeLibraryDir(appContext.applicationInfo.nativeLibraryDir)
         refreshAvailableModels(appContext)
 
         val bundledAssets = bundledAssetsAvailable(appContext)
@@ -336,8 +347,14 @@ class MainViewModel(
         val enableIFairyVecdotActTensor = extras.getIntOrSentinel("codex_enable_ifairy_vecdot_act_tensor")
         val generationPriority = extras.getIntOrSentinel("codex_generation_priority", -99)
         val batchPriority = extras.getIntOrSentinel("codex_batch_priority", -99)
+        val schedDebug = extras.getIntOrSentinel("codex_sched_debug")
+        val openclSupportsDebug = extras.getIntOrSentinel("codex_opencl_supports_debug")
+        val forceCpu = extras.getIntOrSentinel("codex_force_cpu")
         val benchCooldownMs = extras.getIntOrSentinel("codex_bench_cooldown_ms")
         val benchRepetitions = extras.getIntOrSentinel("codex_bench_repetitions")
+        val benchPromptTokens = extras.getIntOrSentinel("codex_bench_pp")
+        val benchGenTokens = extras.getIntOrSentinel("codex_bench_tg")
+        val benchPromptLength = extras.getIntOrSentinel("codex_bench_pl")
         val powerDurationMs = extras.getLongOrNull("codex_power_duration_ms")
         val powerDurationMinutes = extras.getLongOrNull("codex_power_duration_minutes")
         val configuredBatteryCapacityMah = extras.getDoubleOrNull("codex_battery_capacity_mah")
@@ -352,6 +369,9 @@ class MainViewModel(
             ?.filter { it.isNotEmpty() }
             ?.toSet()
         val nextRuntimeBenchConfig = runtimeBenchConfig.copy(
+            nCtx = if (nCtx >= 0) nCtx else runtimeBenchConfig.nCtx,
+            nBatch = if (nBatch >= 0) nBatch else runtimeBenchConfig.nBatch,
+            nUbatch = if (nUbatch >= 0) nUbatch else runtimeBenchConfig.nUbatch,
             nThreads = if (nThreads >= 0) nThreads else runtimeBenchConfig.nThreads,
             nThreadsBatch = if (nThreadsBatch >= 0) nThreadsBatch else runtimeBenchConfig.nThreadsBatch,
             affinityProfile = if (affinityProfile >= 0) affinityProfile else runtimeBenchConfig.affinityProfile,
@@ -361,6 +381,11 @@ class MainViewModel(
             } else {
                 runtimeBenchConfig.enableIFairyVecdotActTensor
             },
+            generationPriority = if (generationPriority != -99) generationPriority else runtimeBenchConfig.generationPriority,
+            batchPriority = if (batchPriority != -99) batchPriority else runtimeBenchConfig.batchPriority,
+            schedDebug = if (schedDebug >= 0) schedDebug else runtimeBenchConfig.schedDebug,
+            openclSupportsDebug = if (openclSupportsDebug >= 0) openclSupportsDebug else runtimeBenchConfig.openclSupportsDebug,
+            forceCpu = if (forceCpu >= 0) forceCpu else runtimeBenchConfig.forceCpu,
         )
 
         if (
@@ -373,8 +398,14 @@ class MainViewModel(
                 disableIFairyLut,
                 affinityProfile,
                 enableIFairyVecdotActTensor,
+                schedDebug,
+                openclSupportsDebug,
+                forceCpu,
                 benchCooldownMs,
                 benchRepetitions,
+                benchPromptTokens,
+                benchGenTokens,
+                benchPromptLength,
             ).all { it < 0 } &&
             generationPriority == -99 &&
             batchPriority == -99 &&
@@ -404,6 +435,20 @@ class MainViewModel(
             benchmarkRepetitionsOverride = benchRepetitions
             log("Benchmark repetitions override: $benchRepetitions")
         }
+        if (benchPromptTokens > 0 || benchGenTokens > 0 || benchPromptLength > 0) {
+            val promptTokens = if (benchPromptTokens > 0) benchPromptTokens else 8
+            val genTokens = if (benchGenTokens > 0) benchGenTokens else 2
+            val promptLength = if (benchPromptLength > 0) benchPromptLength else 1
+            val repetitions = benchmarkRepetitionsOverride ?: 1
+            benchmarkPresetOverride = BenchPreset(
+                label = "adb_custom",
+                promptTokens = promptTokens,
+                genTokens = genTokens,
+                pl = promptLength,
+                repetitions = repetitions,
+            )
+            log("Benchmark custom preset: prompt=$promptTokens decode=$genTokens pl=$promptLength repetitions=$repetitions")
+        }
         val resolvedPowerDurationMs = powerDurationMs ?: powerDurationMinutes?.let { it * 60L * 1000L }
         if (resolvedPowerDurationMs != null && resolvedPowerDurationMs > 0L) {
             powerBenchDurationMs = resolvedPowerDurationMs
@@ -428,6 +473,9 @@ class MainViewModel(
                     enableIFairyVecdotActTensor = enableIFairyVecdotActTensor,
                     generationPriority = generationPriority,
                     batchPriority = batchPriority,
+                    schedDebug = schedDebug,
+                    openclSupportsDebug = openclSupportsDebug,
+                    forceCpu = forceCpu,
                 )
             }.onSuccess {
                 log(
@@ -436,6 +484,9 @@ class MainViewModel(
                         "n_threads_batch=${formatOverride(nThreadsBatch)}, disable_ifairy_lut=${formatOverride(disableIFairyLut)}, " +
                         "affinity_profile=${formatOverride(affinityProfile)}, " +
                         "ifairy_vecdot_act_tensor=${formatOverride(enableIFairyVecdotActTensor)}, " +
+                        "sched_debug=${formatOverride(schedDebug)}, " +
+                        "opencl_supports_debug=${formatOverride(openclSupportsDebug)}, " +
+                        "force_cpu=${formatOverride(forceCpu)}, " +
                         "bench_cooldown_ms=${formatOverride(benchCooldownMs)}, " +
                         "bench_repetitions=${formatOverride(benchRepetitions)}, " +
                         "power_duration_ms=${powerDurationMs ?: "default"}, " +
@@ -707,6 +758,7 @@ class MainViewModel(
 
         isBenchmarking = true
         try {
+            applyCurrentRuntimeBenchConfig()
             val context = requireNotNull(appContext) { "App context is not initialized" }
             val summaries = mutableListOf<BenchSummary>()
             writeBenchStatus(context, BENCH_STATUS_FILE_NAME, "running")
@@ -748,6 +800,37 @@ class MainViewModel(
         } finally {
             isBenchmarking = false
         }
+    }
+
+    private suspend fun applyCurrentRuntimeBenchConfig() {
+        val config = runtimeBenchConfig
+        llamaAndroid.configureRuntime(
+            nCtx = config.nCtx,
+            nBatch = config.nBatch,
+            nUbatch = config.nUbatch,
+            nThreads = config.nThreads,
+            nThreadsBatch = config.nThreadsBatch,
+            disableIFairyLut = config.disableIFairyLut,
+            affinityProfile = config.affinityProfile,
+            enableIFairyVecdotActTensor = config.enableIFairyVecdotActTensor,
+            generationPriority = config.generationPriority,
+            batchPriority = config.batchPriority,
+            schedDebug = config.schedDebug,
+            openclSupportsDebug = config.openclSupportsDebug,
+            forceCpu = config.forceCpu,
+        )
+        log(
+            "Applied runtime config before benchmark load: " +
+                "n_ctx=${formatOverride(config.nCtx)}, n_batch=${formatOverride(config.nBatch)}, " +
+                "n_ubatch=${formatOverride(config.nUbatch)}, n_threads=${formatOverride(config.nThreads)}, " +
+                "n_threads_batch=${formatOverride(config.nThreadsBatch)}, disable_ifairy_lut=${formatOverride(config.disableIFairyLut)}, " +
+                "affinity_profile=${formatOverride(config.affinityProfile)}, " +
+                "ifairy_vecdot_act_tensor=${formatOverride(config.enableIFairyVecdotActTensor)}, " +
+                "generation_priority=${formatOverride(config.generationPriority, -99)}, " +
+                "batch_priority=${formatOverride(config.batchPriority, -99)}, " +
+                "sched_debug=${formatOverride(config.schedDebug)}, opencl_supports_debug=${formatOverride(config.openclSupportsDebug)}, " +
+                "force_cpu=${formatOverride(config.forceCpu)}"
+        )
     }
 
     private suspend fun runBundledE2eBenchmarks() {
@@ -914,8 +997,11 @@ class MainViewModel(
     }
 
     private suspend fun warmupBenchIfNeeded() {
-        log("Warmup benchmark: prompt=8 decode=4")
-        runCatching { llamaAndroid.bench(pp = 8, tg = 4, pl = 1, nr = 1) }
+        val preset = benchmarkPresetOverride ?: BenchPreset("warmup", 8, 4, 1, 1)
+        log("Warmup benchmark: prompt=${preset.promptTokens} decode=${preset.genTokens}")
+        runCatching {
+            llamaAndroid.bench(pp = preset.promptTokens, tg = preset.genTokens, pl = preset.pl, nr = 1)
+        }
             .onFailure { logError("warmupBenchIfNeeded() failed", it) }
     }
 
@@ -1233,6 +1319,7 @@ class MainViewModel(
             presetLabel = preset.label,
             promptTokens = preset.promptTokens,
             genTokens = preset.genTokens,
+            repetitions = preset.repetitions,
             ppTps = promptTps,
             tgTps = decodeTps,
             ppStd = promptStd,
@@ -1513,12 +1600,13 @@ class MainViewModel(
     private fun maybeRunPendingAutomation() {
         when (pendingAutomationAction) {
             "bench" -> {
-                pendingAutomationAction = null
                 log("Running automation benchmark for selected model")
                 if (modelLoadState != ModelLoadState.LOADED) {
                     loadImportedModel()
                 } else {
-                    bench(8, 4, 1)
+                    pendingAutomationAction = null
+                    val preset = benchmarkPresetOverride ?: BenchPreset("custom", 8, 4, 1, 1)
+                    bench(preset.promptTokens, preset.genTokens, preset.pl, preset.repetitions)
                 }
             }
             "builtin_bench" -> {
@@ -1537,11 +1625,11 @@ class MainViewModel(
                 viewModelScope.launch { runBundledPowerBenchmarks() }
             }
             "smoke" -> {
-                pendingAutomationAction = null
                 log("Running automation smoke prompt")
                 if (modelLoadState != ModelLoadState.LOADED) {
                     loadImportedModel()
                 } else {
+                    pendingAutomationAction = null
                     updatePrompt("Hello")
                     send()
                 }
@@ -1643,6 +1731,7 @@ class MainViewModel(
     }
 
     private fun benchmarkTargetPresets(): List<BenchPreset> {
+        benchmarkPresetOverride?.let { return listOf(it) }
         val filter = benchmarkPresetFilter
         val presets = if (filter.isNullOrEmpty()) {
             BENCH_PRESETS
@@ -1717,7 +1806,7 @@ class MainViewModel(
                             summary.presetLabel,
                             summary.promptTokens.toString(),
                             summary.genTokens.toString(),
-                            BENCH_PRESETS.first { it.label == summary.presetLabel }.repetitions.toString(),
+                            summary.repetitions.toString(),
                             formatCsvDecimal(summary.ppTps),
                             formatCsvDecimal(summary.tgTps),
                             formatCsvDecimal(summary.promptLatencyMs),

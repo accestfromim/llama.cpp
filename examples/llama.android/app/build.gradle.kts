@@ -7,18 +7,28 @@ plugins {
 
 fun envValue(name: String): String? = System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
 
+fun envFlag(name: String, default: Boolean): Boolean {
+    return when (System.getenv(name)?.trim()?.lowercase()) {
+        null, "" -> default
+        "1", "true", "yes", "on" -> true
+        "0", "false", "no", "off" -> false
+        else -> throw IllegalArgumentException("$name must be 1/0, true/false, yes/no, or on/off")
+    }
+}
+
 val bundledAssetDir = envValue("LLAMA_ANDROID_BUNDLED_ASSETS") ?: "/tmp/llama-android-assets"
 val usePrebuiltLlama = envValue("LLAMA_ANDROID_USE_PREBUILT_LLAMA") == "true"
 val prebuiltLlamaJniLibs = envValue("LLAMA_ANDROID_PREBUILT_JNILIBS")
 val extraJniLibs = envValue("LLAMA_ANDROID_EXTRA_JNILIBS")
 val llamaAndroidBackend = envValue("LLAMA_ANDROID_BACKEND")?.lowercase() ?: "cpu"
+val useSystemOpenCl = envFlag("LLAMA_ANDROID_OPENCL_SYSTEM_LIBRARY", false)
 val openclRoot = envValue("LLAMA_ANDROID_OPENCL_ROOT")
 val openclJniLibs = envValue("LLAMA_ANDROID_OPENCL_JNILIBS")
     ?: openclRoot?.let { File(it, "jniLibs").path }
-val openclPackagingJniLibs = if (llamaAndroidBackend == "opencl") openclJniLibs else null
+val openclPackagingJniLibs = if (llamaAndroidBackend == "opencl" && !useSystemOpenCl) openclJniLibs else null
 val extraJniLibDirs = listOf(openclPackagingJniLibs, extraJniLibs).filterNotNull().distinct()
 
-if (llamaAndroidBackend == "opencl") {
+if (llamaAndroidBackend == "opencl" && !useSystemOpenCl) {
     require(extraJniLibDirs.isNotEmpty()) {
         "LLAMA_ANDROID_BACKEND=opencl requires OpenCL dependencies. Set LLAMA_ANDROID_OPENCL_ROOT=/path/to/opencl-deps, or set LLAMA_ANDROID_OPENCL_INCLUDE_DIR, LLAMA_ANDROID_OPENCL_LIBRARY, and LLAMA_ANDROID_OPENCL_JNILIBS=/path/to/jniLibs."
     }
@@ -76,6 +86,14 @@ android {
     }
     androidResources {
         noCompress += listOf("gguf")
+    }
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+            if (useSystemOpenCl) {
+                excludes += "**/libOpenCL.so"
+            }
+        }
     }
     sourceSets.getByName("main").assets.srcDirs(
         "src/main/assets",

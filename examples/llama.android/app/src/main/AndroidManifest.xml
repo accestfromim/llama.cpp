@@ -15,6 +15,9 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.LlamaAndroid"
         >
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
 
         <activity
             android:name=".MainActivity"

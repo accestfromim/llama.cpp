@@ -78,9 +78,19 @@ struct runtime_overrides {
     int enable_ifairy_vecdot_act_tensor = -1;
     int generation_priority = -99;
     int batch_priority = -99;
+    int sched_debug = -1;
+    int opencl_supports_debug = -1;
+    int force_cpu = -1;
 };
 
 static runtime_overrides g_runtime_overrides;
+
+static void enable_android_opencl_ifairy64_gate() {
+#ifdef GGML_USE_OPENCL
+    setenv("GGML_OPENCL_IFAIRY64", "1", 1);
+    LOGi("Runtime toggle: GGML_OPENCL_IFAIRY64=1 for OpenCL build");
+#endif
+}
 
 struct effective_runtime_config {
     int n_ctx = -1;
@@ -217,6 +227,8 @@ static mobile_profile choose_mobile_profile(const llama_model * model) {
 }
 
 static void apply_mobile_runtime_toggles(const mobile_profile & profile) {
+    enable_android_opencl_ifairy64_gate();
+
     const bool disable_ifairy_lut = g_runtime_overrides.disable_ifairy_lut >= 0
             ? g_runtime_overrides.disable_ifairy_lut != 0
             : profile.disable_ifairy_lut;
@@ -666,6 +678,7 @@ static void log_callback(ggml_log_level level, const char * fmt, void * data) {
             level == GGML_LOG_LEVEL_ERROR ? ANDROID_LOG_ERROR :
             level == GGML_LOG_LEVEL_WARN  ? ANDROID_LOG_WARN  :
             level == GGML_LOG_LEVEL_INFO  ? ANDROID_LOG_INFO  :
+            g_runtime_overrides.sched_debug >= 0 ? ANDROID_LOG_INFO :
                                             ANDROID_LOG_DEBUG;
 
     __android_log_write(android_level, TAG_LLAMA_COMPLEX, fmt);
@@ -675,6 +688,10 @@ extern "C"
 JNIEXPORT jlong JNICALL
 Java_android_llama_cpp_LLamaAndroid_load_1model(JNIEnv *env, jobject, jstring filename) {
     llama_model_params model_params = llama_model_default_params();
+    if (g_runtime_overrides.force_cpu > 0) {
+        model_params.n_gpu_layers = 0;
+        LOGi("Runtime override: forcing CPU model load with n_gpu_layers=0");
+    }
 
     auto path_to_model = env->GetStringUTFChars(filename, 0);
     LOGi("Loading model from %s", path_to_model);
@@ -853,7 +870,10 @@ Java_android_llama_cpp_LLamaAndroid_configure_1runtime(
         jint affinity_profile,
         jint enable_ifairy_vecdot_act_tensor,
         jint generation_priority,
-        jint batch_priority
+        jint batch_priority,
+        jint sched_debug,
+        jint opencl_supports_debug,
+        jint force_cpu
 ) {
     g_runtime_overrides.n_ctx = n_ctx;
     g_runtime_overrides.n_batch = n_batch;
@@ -865,8 +885,33 @@ Java_android_llama_cpp_LLamaAndroid_configure_1runtime(
     g_runtime_overrides.enable_ifairy_vecdot_act_tensor = enable_ifairy_vecdot_act_tensor;
     g_runtime_overrides.generation_priority = generation_priority;
     g_runtime_overrides.batch_priority = batch_priority;
+    g_runtime_overrides.sched_debug = sched_debug;
+    g_runtime_overrides.opencl_supports_debug = opencl_supports_debug;
+    g_runtime_overrides.force_cpu = force_cpu;
 
-    LOGi("Configured runtime overrides: n_ctx=%d n_batch=%d n_ubatch=%d n_threads=%d n_threads_batch=%d disable_ifairy_lut=%d affinity_profile=%d (%s) enable_ifairy_vecdot_act_tensor=%d generation_priority=%d batch_priority=%d",
+    if (g_runtime_overrides.sched_debug >= 0) {
+        char value[16];
+        snprintf(value, sizeof(value), "%d", g_runtime_overrides.sched_debug);
+        setenv("GGML_SCHED_DEBUG", value, 1);
+    } else {
+        unsetenv("GGML_SCHED_DEBUG");
+    }
+
+    if (g_runtime_overrides.opencl_supports_debug >= 0) {
+        char value[16];
+        snprintf(value, sizeof(value), "%d", g_runtime_overrides.opencl_supports_debug);
+        setenv("GGML_OPENCL_SUPPORTS_DEBUG", value, 1);
+        const char * debug_file = "/sdcard/Android/data/com.example.llama/files/bench/opencl_supports_debug.log";
+        setenv("GGML_OPENCL_SUPPORTS_DEBUG_FILE", debug_file, 1);
+        if (g_runtime_overrides.opencl_supports_debug != 0) {
+            unlink(debug_file);
+        }
+    } else {
+        unsetenv("GGML_OPENCL_SUPPORTS_DEBUG");
+        unsetenv("GGML_OPENCL_SUPPORTS_DEBUG_FILE");
+    }
+
+    LOGi("Configured runtime overrides: n_ctx=%d n_batch=%d n_ubatch=%d n_threads=%d n_threads_batch=%d disable_ifairy_lut=%d affinity_profile=%d (%s) enable_ifairy_vecdot_act_tensor=%d generation_priority=%d batch_priority=%d sched_debug=%d opencl_supports_debug=%d force_cpu=%d",
             g_runtime_overrides.n_ctx,
             g_runtime_overrides.n_batch,
             g_runtime_overrides.n_ubatch,
@@ -877,7 +922,10 @@ Java_android_llama_cpp_LLamaAndroid_configure_1runtime(
             affinity_profile_name(g_runtime_overrides.affinity_profile),
             g_runtime_overrides.enable_ifairy_vecdot_act_tensor,
             g_runtime_overrides.generation_priority,
-            g_runtime_overrides.batch_priority);
+            g_runtime_overrides.batch_priority,
+            g_runtime_overrides.sched_debug,
+            g_runtime_overrides.opencl_supports_debug,
+            g_runtime_overrides.force_cpu);
 }
 
 extern "C"
@@ -1118,6 +1166,10 @@ Java_android_llama_cpp_LLamaAndroid_free_1sampler(JNIEnv *, jobject, jlong sampl
 extern "C"
 JNIEXPORT void JNICALL
 Java_android_llama_cpp_LLamaAndroid_backend_1init(JNIEnv *, jobject) {
+    enable_android_opencl_ifairy64_gate();
+    LOGi("OpenCL env before backend init: OCL_ICD_FILENAMES=%s OCL_ICD_ENABLE_TRACE=%s",
+            getenv("OCL_ICD_FILENAMES") ? getenv("OCL_ICD_FILENAMES") : "<unset>",
+            getenv("OCL_ICD_ENABLE_TRACE") ? getenv("OCL_ICD_ENABLE_TRACE") : "<unset>");
     llama_backend_init();
 }
 

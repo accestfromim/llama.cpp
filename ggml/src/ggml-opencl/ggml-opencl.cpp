@@ -3236,7 +3236,82 @@ static bool ggml_opencl_supports_ifairy_op(const struct ggml_tensor * op) {
     }
 }
 
-static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+#ifdef __ANDROID__
+static bool ggml_opencl_supports_debug_enabled(void) {
+    const char * env = getenv("GGML_OPENCL_SUPPORTS_DEBUG");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
+static void ggml_opencl_tensor_brief(char * buf, size_t buf_size, const struct ggml_tensor * t) {
+    if (t == nullptr) {
+        snprintf(buf, buf_size, "null");
+        return;
+    }
+
+    snprintf(buf, buf_size,
+             "%s/%s/%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] contig=%d rows=%d view=%d off=%zu",
+             t->name,
+             ggml_op_name(t->op),
+             ggml_type_name(t->type),
+             (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+             t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+             ggml_is_contiguous(t) ? 1 : 0,
+             ggml_is_contiguous_rows(t) ? 1 : 0,
+             t->view_src != nullptr ? 1 : 0,
+             t->view_offs);
+}
+
+static void ggml_opencl_log_unsupported_op(const struct ggml_tensor * op) {
+    if (!ggml_opencl_supports_debug_enabled()) {
+        return;
+    }
+
+    static std::atomic<int> budget { 512 };
+    const int slot = budget.fetch_sub(1);
+    if (slot <= 0) {
+        return;
+    }
+
+    char src0[512];
+    char src1[512];
+    char src2[512];
+    ggml_opencl_tensor_brief(src0, sizeof(src0), op->src[0]);
+    ggml_opencl_tensor_brief(src1, sizeof(src1), op->src[1]);
+    ggml_opencl_tensor_brief(src2, sizeof(src2), op->src[2]);
+
+    char op_extra[64] = "";
+    if (op->op == GGML_OP_UNARY) {
+        snprintf(op_extra, sizeof(op_extra), "/%s", ggml_unary_op_name(ggml_get_unary_op(op)));
+    }
+
+    char line[2048];
+    snprintf(line, sizeof(line),
+             "ggml_opencl_supports_op=false op=%s%s name=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] contig=%d rows=%d view=%d off=%zu src0={%s} src1={%s} src2={%s}\n",
+             ggml_op_name(op->op), op_extra, op->name, ggml_type_name(op->type),
+             (long long) op->ne[0], (long long) op->ne[1], (long long) op->ne[2], (long long) op->ne[3],
+             op->nb[0], op->nb[1], op->nb[2], op->nb[3],
+             ggml_is_contiguous(op) ? 1 : 0,
+             ggml_is_contiguous_rows(op) ? 1 : 0,
+             op->view_src != nullptr ? 1 : 0,
+             op->view_offs,
+             src0, src1, src2);
+
+    GGML_LOG_INFO("%s", line);
+
+    const char * path = getenv("GGML_OPENCL_SUPPORTS_DEBUG_FILE");
+    if (path != nullptr && path[0] != '\0') {
+        std::ofstream out(path, std::ios::app);
+        if (out) {
+            out << line;
+        }
+    }
+}
+#else
+static void ggml_opencl_log_unsupported_op(const struct ggml_tensor *) {
+}
+#endif
+
+static bool ggml_opencl_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
 
@@ -3473,6 +3548,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         default:
             return false;
     }
+}
+
+static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    const bool supported = ggml_opencl_supports_op_impl(dev, op);
+    if (!supported) {
+        ggml_opencl_log_unsupported_op(op);
+    }
+    return supported;
 }
 
 // Forward declaration - implementation appears later in the file.

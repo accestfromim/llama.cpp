@@ -1,6 +1,7 @@
 package android.llama.cpp
 
 import android.os.Debug
+import android.system.Os
 import android.util.Log
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -10,6 +11,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
@@ -51,14 +53,40 @@ class LLamaAndroid {
         }
 
         private val instance: LLamaAndroid = LLamaAndroid()
+        @Volatile
+        private var nativeLibraryDir: String? = null
 
         fun instance(): LLamaAndroid = instance
+
+        fun configureNativeLibraryDir(path: String?) {
+            nativeLibraryDir = path
+            Log.i(LOG_TAG, "Native library dir configured: ${path ?: "<unset>"}")
+        }
+
+        private fun configureOpenCLIcd() {
+            val icdVendor = nativeLibraryDir
+                ?.let { File(it, "libOpenCL_adreno.so") }
+            runCatching {
+                if (icdVendor?.isFile == true) {
+                    Os.setenv("OCL_ICD_FILENAMES", icdVendor.absolutePath, true)
+                    Os.unsetenv("OCL_ICD_ENABLE_TRACE")
+                    Log.i(LOG_TAG, "OpenCL ICD vendor configured: OCL_ICD_FILENAMES=${icdVendor.absolutePath}")
+                } else {
+                    Os.unsetenv("OCL_ICD_FILENAMES")
+                    Os.unsetenv("OCL_ICD_ENABLE_TRACE")
+                    Log.i(LOG_TAG, "OpenCL ICD vendor left to Android system libOpenCL")
+                }
+            }.onFailure { throwable ->
+                Log.w(LOG_TAG, "OpenCL ICD vendor configuration failed", throwable)
+            }
+        }
     }
 
     private val runLoop: CoroutineDispatcher = Executors.newSingleThreadExecutor {
         thread(start = false, name = "Llm-RunLoop") {
             Log.d(LOG_TAG, "Dedicated thread for native code: ${Thread.currentThread().name}")
 
+            configureOpenCLIcd()
             System.loadLibrary("llama-android")
             log_to_android()
             backend_init()
@@ -74,6 +102,10 @@ class LLamaAndroid {
     }.asCoroutineDispatcher()
 
     private var state: State = State.Idle
+
+    fun configureNativeLibraryDir(path: String?) {
+        Companion.configureNativeLibraryDir(path)
+    }
 
     @Volatile
     private var stopRequested: Boolean = false
@@ -104,6 +136,9 @@ class LLamaAndroid {
         enableIFairyVecdotActTensor: Int,
         generationPriority: Int,
         batchPriority: Int,
+        schedDebug: Int,
+        openclSupportsDebug: Int,
+        forceCpu: Int,
     )
     private external fun bench_model(
         context: Long,
@@ -156,6 +191,9 @@ class LLamaAndroid {
         enableIFairyVecdotActTensor: Int = -1,
         generationPriority: Int = -99,
         batchPriority: Int = -99,
+        schedDebug: Int = -1,
+        openclSupportsDebug: Int = -1,
+        forceCpu: Int = -1,
     ) {
         withContext(runLoop) {
             configure_runtime(
@@ -169,6 +207,9 @@ class LLamaAndroid {
                 enableIFairyVecdotActTensor,
                 generationPriority,
                 batchPriority,
+                schedDebug,
+                openclSupportsDebug,
+                forceCpu,
             )
         }
     }
