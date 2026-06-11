@@ -83,8 +83,8 @@ static inline void ggml_ifairy64_lut_apply_pair_component(const ifairy64_lut_wti
                                                           const __m256 &                v_b,
                                                           __m256 &                      acc_lo,
                                                           __m256 &                      acc_hi) {
-    (void) wt0;
-    (void) wt1;
+    GGML_UNUSED(wt0);
+    GGML_UNUSED(wt1);
     for (int half = 0; half < 2; ++half) {
         const __m128i s0_a = half == 0 ? _mm256_castsi256_si128(sum0_lo) : _mm256_castsi256_si128(sum0_hi);
         const __m128i s0_b = half == 0 ? _mm256_extracti128_si256(sum0_lo, 1) : _mm256_extracti128_si256(sum0_hi, 1);
@@ -267,19 +267,19 @@ bool ggml_ifairy64_lut_qgemm_four_cpu(int          m,
                                       dst_row_stride, pack_bf16, /*negate_imag_scale*/ false, /*add*/ true);
     return true;
 #else
-    (void) m;
-    (void) k;
-    (void) n;
-    (void) packed_u0;
-    (void) packed_u1;
-    (void) packed_w0;
-    (void) packed_w1;
-    (void) lut;
-    (void) lut_scales;
-    (void) dst;
-    (void) dst_col_stride;
-    (void) dst_row_stride;
-    (void) pack_bf16;
+    GGML_UNUSED(m);
+    GGML_UNUSED(k);
+    GGML_UNUSED(n);
+    GGML_UNUSED(packed_u0);
+    GGML_UNUSED(packed_u1);
+    GGML_UNUSED(packed_w0);
+    GGML_UNUSED(packed_w1);
+    GGML_UNUSED(lut);
+    GGML_UNUSED(lut_scales);
+    GGML_UNUSED(dst);
+    GGML_UNUSED(dst_col_stride);
+    GGML_UNUSED(dst_row_stride);
+    GGML_UNUSED(pack_bf16);
     return false;
 #endif
 }
