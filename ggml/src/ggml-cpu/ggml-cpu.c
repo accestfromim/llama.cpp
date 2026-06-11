@@ -2385,7 +2385,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 #ifdef GGML_IFAIRY_LUT_CPU
                 const struct ggml_ifairy_lut_threadpool_config * cfg = &params->threadpool->ifairy_lut_cfg;
                 const bool use_lut = cfg->lut_enabled && cfg->lut_explicit;
-                const bool lut_c   = cfg->impl != GGML_IFAIRY_LUT_IMPL_LUT16;
+                const bool lut_c   = cfg->impl == GGML_IFAIRY_LUT_IMPL_LUT_C;
                 if (!use_lut || !ggml_compute_forward_ifairy_wide_linear_w2_lut(params, tensor, lut_c)) {
                     ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
                 }
