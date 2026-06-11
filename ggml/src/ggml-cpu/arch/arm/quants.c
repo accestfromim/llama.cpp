@@ -130,10 +130,7 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 #endif
 }
 
-static void quantize_row_ifairy_q16_impl(const float * GGML_RESTRICT x,
-                                         void * GGML_RESTRICT        vy,
-                                         int64_t                     k,
-                                         float                       k_scale_q8) {
+void quantize_row_ifairy_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_IFAIRY == 0);
     const int nb = k / QK_IFAIRY;
 
@@ -176,8 +173,8 @@ static void quantize_row_ifairy_q16_impl(const float * GGML_RESTRICT x,
         const float max_r = vmaxvq_f32(max_real);
         const float max_i = vmaxvq_f32(max_imag);
 
-        const float iscale_r = k_scale_q8 / max_r;
-        const float iscale_i = k_scale_q8 / max_i;
+        const float iscale_r = 42.6f / max_r;
+        const float iscale_i = 42.6f / max_i;
 
         y[ib].d_real = GGML_CPU_FP32_TO_FP16(1.f / iscale_r);
         y[ib].d_imag = GGML_CPU_FP32_TO_FP16(1.f / iscale_i);
@@ -219,17 +216,8 @@ static void quantize_row_ifairy_q16_impl(const float * GGML_RESTRICT x,
     }
 #else
     GGML_UNUSED(nb);
-    GGML_UNUSED(k_scale_q8);
     quantize_row_ifairy_q16_ref(x, y, k);
 #endif
-}
-
-void quantize_row_ifairy_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_ifairy_q16_impl(x, y, k, 42.6f);
-}
-
-void quantize_row_ifairy_q16_q127(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_ifairy_q16_impl(x, y, k, 127.0f);
 }
 
 void quantize_row_ifairy_q16_lut_c(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
@@ -377,18 +365,15 @@ void quantize_row_ifairy_q16_lut_c(const float * GGML_RESTRICT x, void * GGML_RE
 #endif
 }
 
-static void quantize_row_ifairy_q16_tensor_impl(const float * GGML_RESTRICT x,
-                                                void * GGML_RESTRICT        vy,
-                                                int64_t                     k,
-                                                float                       k_scale_q8,
-                                                int                         qmax) {
+void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_IFAIRY == 0);
     const int nb = k / QK_IFAIRY;
 
     block_ifairy_q16 * GGML_RESTRICT y = vy;
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
-    const float32x4_t vmin_init = vdupq_n_f32(1e-5f);
+    const float32x4_t vmin_init  = vdupq_n_f32(1e-5f);
+    const float       k_scale_q8 = 42.6f;
 
     float32x4_t max_real = vmin_init;
     float32x4_t max_imag = vmin_init;
@@ -427,11 +412,9 @@ static void quantize_row_ifairy_q16_tensor_impl(const float * GGML_RESTRICT x,
     const ggml_half d_real = GGML_CPU_FP32_TO_FP16(1.f / iscale_r);
     const ggml_half d_imag = GGML_CPU_FP32_TO_FP16(1.f / iscale_i);
 
-    // pass 2: quantize per block with shared scale and clamp to the selected range.
+    // pass 2: quantize per block with shared scale; clamp to [-42, 42] so 3-way sums fit int8 LUT entries.
     const float32x4_t vs_r = vdupq_n_f32(iscale_r);
     const float32x4_t vs_i = vdupq_n_f32(iscale_i);
-    const int32x4_t   vq_hi = vdupq_n_s32(qmax);
-    const int32x4_t   vq_lo = vnegq_s32(vq_hi);
 
     for (int ib = 0; ib < nb; ++ib) {
         const uint16_t * GGML_RESTRICT src = (const uint16_t *) (x + ib * QK_IFAIRY);
@@ -443,6 +426,8 @@ static void quantize_row_ifairy_q16_tensor_impl(const float * GGML_RESTRICT x,
         y[ib].d_imag = d_imag;
 
         __asm__ volatile(
+            "movi           v7.4s, #42\n"
+            "neg            v8.4s, v7.4s\n"
             "1:\n"
             "ld1            {v0.8h}, [%[src]], #16\n"
             "ushll          v1.4s, v0.4h, #0\n"
@@ -455,10 +440,10 @@ static void quantize_row_ifairy_q16_tensor_impl(const float * GGML_RESTRICT x,
             "fmul           v4.4s, v4.4s, %[si].4s\n"
             "fcvtns         v3.4s, v3.4s\n"
             "fcvtns         v4.4s, v4.4s\n"
-            "smax           v3.4s, v3.4s, %[qlo].4s\n"
-            "smin           v3.4s, v3.4s, %[qhi].4s\n"
-            "smax           v4.4s, v4.4s, %[qlo].4s\n"
-            "smin           v4.4s, v4.4s, %[qhi].4s\n"
+            "smax           v3.4s, v3.4s, v8.4s\n"
+            "smin           v3.4s, v3.4s, v7.4s\n"
+            "smax           v4.4s, v4.4s, v8.4s\n"
+            "smin           v4.4s, v4.4s, v7.4s\n"
             "sqxtn          v5.4h, v3.4s\n"
             "sqxtn          v6.4h, v4.4s\n"
             "sqxtn          v5.8b, v5.8h\n"
@@ -468,70 +453,13 @@ static void quantize_row_ifairy_q16_tensor_impl(const float * GGML_RESTRICT x,
             "subs           %w[cnt], %w[cnt], #4\n"
             "b.gt           1b\n"
             : [src] "+r"(src), [yr] "+r"(yr), [yi] "+r"(yi), [cnt] "+r"(cnt)
-            : [sr] "w"(vs_r), [si] "w"(vs_i), [qlo] "w"(vq_lo), [qhi] "w"(vq_hi)
-            : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "cc", "memory");
+            : [sr] "w"(vs_r), [si] "w"(vs_i)
+            : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "cc", "memory");
     }
 #else
-    float max_real = 1e-5f;
-    float max_imag = 1e-5f;
-
-    for (int64_t j = 0; j < k; ++j) {
-        const float * x_com = x + j;
-
-        const ggml_bf16_t x_real_bf16 = ((const ggml_bf16_t *) (x_com))[0];
-        const ggml_bf16_t x_imag_bf16 = ((const ggml_bf16_t *) (x_com))[1];
-
-        const float x_real = GGML_BF16_TO_FP32(x_real_bf16);
-        const float x_imag = GGML_BF16_TO_FP32(x_imag_bf16);
-
-        max_real = fmaxf(max_real, fabsf(x_real));
-        max_imag = fmaxf(max_imag, fabsf(x_imag));
-    }
-
-    const float scale_real = max_real / k_scale_q8;
-    const float scale_imag = max_imag / k_scale_q8;
-
-    const float inv_scale_real = 1.0f / scale_real;
-    const float inv_scale_imag = 1.0f / scale_imag;
-
-    const ggml_half d_real = GGML_CPU_FP32_TO_FP16(scale_real);
-    const ggml_half d_imag = GGML_CPU_FP32_TO_FP16(scale_imag);
-
-    for (int ib = 0; ib < nb; ++ib) {
-        y[ib].d_real = d_real;
-        y[ib].d_imag = d_imag;
-
-        int8_t * xr_out = (int8_t *) y[ib].x_real;
-        int8_t * xi_out = (int8_t *) y[ib].x_imag;
-
-        for (int j = 0; j < QK_IFAIRY; ++j) {
-            const float * x_com = x + (int64_t) ib * QK_IFAIRY + j;
-
-            const ggml_bf16_t xr_bf16 = ((const ggml_bf16_t *) (x_com))[0];
-            const ggml_bf16_t xi_bf16 = ((const ggml_bf16_t *) (x_com))[1];
-
-            const float xr = GGML_BF16_TO_FP32(xr_bf16);
-            const float xi = GGML_BF16_TO_FP32(xi_bf16);
-
-            int vr = (int) lrintf(xr * inv_scale_real);
-            int vi = (int) lrintf(xi * inv_scale_imag);
-
-            vr = vr > qmax ? qmax : (vr < -qmax ? -qmax : vr);
-            vi = vi > qmax ? qmax : (vi < -qmax ? -qmax : vi);
-
-            xr_out[j] = (int8_t) vr;
-            xi_out[j] = (int8_t) vi;
-        }
-    }
+    GGML_UNUSED(nb);
+    quantize_row_ifairy_q16_tensor_ref(x, y, k);
 #endif
-}
-
-void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_ifairy_q16_tensor_impl(x, y, k, 42.6f, 42);
-}
-
-void quantize_row_ifairy_q16_tensor_q127(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_ifairy_q16_tensor_impl(x, y, k, 127.0f, 127);
 }
 
 // placeholder implementation for Apple targets

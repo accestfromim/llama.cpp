@@ -1423,11 +1423,9 @@ void ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const enum ggml_type vec_dot_type      = type_traits_cpu[src0->type].vec_dot_type;
-    const bool           ifairy64_act_q127 = src0->type == GGML_TYPE_IFAIRY64 && vec_dot_type == GGML_TYPE_IFAIRY_Q16;
-    const ggml_from_float_t from_float =
-        ifairy64_act_q127 ? quantize_row_ifairy_q16_q127 : type_traits_cpu[vec_dot_type].from_float;
-    const int64_t vec_dot_num_rows = type_traits_cpu[src0->type].nrows;
+    enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
+    ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
+    int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -1769,8 +1767,6 @@ UseGgmlGemm1:;
         const char * ifairy_act_tensor_env = getenv("GGML_IFAIRY_VEC_DOT_ACT_TENSOR");
         const bool   ifairy_act_tensor = (src0->type == GGML_TYPE_IFAIRY) && (vec_dot_type == GGML_TYPE_IFAIRY_Q16) &&
                                          (ifairy_act_tensor_env != NULL) && (strcmp(ifairy_act_tensor_env, "0") != 0);
-        const ggml_from_float_t quantize_tensor =
-            ifairy64_act_q127 ? quantize_row_ifairy_q16_tensor_q127 : quantize_row_ifairy_q16_tensor;
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1788,8 +1784,9 @@ UseGgmlGemm1:;
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
                     if (ifairy_act_tensor) {
                         if (ith == 0) {
-                            quantize_tensor((float *) ((char *) src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11),
-                                            (void *) (wdata + i13 * nbw3 + i12 * nbw2 + i11 * nbw1), ne10);
+                            quantize_row_ifairy_q16_tensor(
+                                (float *) ((char *) src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11),
+                                (void *) (wdata + i13 * nbw3 + i12 * nbw2 + i11 * nbw1), ne10);
                         }
                     } else {
                         size_t  bs               = ggml_blck_size(vec_dot_type);
