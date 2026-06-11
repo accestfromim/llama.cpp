@@ -31,6 +31,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ifairy-fuse.cpp
         ggml-cpu/ifairy-fuse.h
         ggml-cpu/ifairy-fuse-lut.cpp
+        ggml-cpu/ifairy-fuse-lut-qgemm.cpp
+        ggml-cpu/ifairy-fuse-lut-qgemm.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp

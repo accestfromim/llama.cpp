@@ -1854,32 +1854,48 @@ static bool test_ifairy64_wide_linear_w2_fused() {
 
     const int64_t              n_cases[]    = { 1, 3 };
     const std::vector<float> * bias_cases[] = { nullptr, &bias };
-    for (int64_t N : n_cases) {
-        std::vector<float> x;
-        fill_ifairy_backend_act_f32(x, N, K);
+    const struct {
+        const char * enabled;
+        const char * impl;
+    } lut_cases[] = {
+        { "0", "lut16" },
+        { "1", "lut16" },
+        { "1", "auto" },
+    };
+    for (const auto & lut_case : lut_cases) {
+        scoped_env_var env_lut("GGML_IFAIRY_LUT");
+        scoped_env_var env_impl("GGML_IFAIRY_LUT_IMPL");
+        env_lut.set(lut_case.enabled);
+        env_impl.set(lut_case.impl);
 
-        std::vector<float> x_conj(x.size());
-        for (size_t i = 0; i < x.size(); ++i) {
-            const ggml_bf16_t * in = (const ggml_bf16_t *) &x[i];
-            ggml_bf16_t *       out = (ggml_bf16_t *) &x_conj[i];
-            out[0]                  = in[0];
-            out[1]                  = GGML_FP32_TO_BF16(-GGML_BF16_TO_FP32(in[1]));
-        }
+        for (int64_t N : n_cases) {
+            std::vector<float> x;
+            fill_ifairy_backend_act_f32(x, N, K);
 
-        for (const std::vector<float> * bias_case : bias_cases) {
-            std::vector<uint32_t> out_fused;
-            std::vector<uint32_t> out_reference;
-            if (!run_ifairy64_wide_linear_w2_backend(out_fused, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
-                                                      bias_case, true) ||
-                !run_ifairy64_wide_linear_w2_backend(out_reference, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
-                                                      bias_case, false)) {
-                return false;
+            std::vector<float> x_conj(x.size());
+            for (size_t i = 0; i < x.size(); ++i) {
+                const ggml_bf16_t * in = (const ggml_bf16_t *) &x[i];
+                ggml_bf16_t *       out = (ggml_bf16_t *) &x_conj[i];
+                out[0]                  = in[0];
+                out[1]                  = GGML_FP32_TO_BF16(-GGML_BF16_TO_FP32(in[1]));
             }
 
-            if (!compare_packed_complex_outputs(out_fused.data(), out_reference.data(), out_reference.size(), 1e-2f)) {
-                fprintf(stderr, "Fused wide linear W2 mismatch (N=%lld, %s bias)\n", (long long) N,
-                        bias_case ? "with" : "without");
-                return false;
+            for (const std::vector<float> * bias_case : bias_cases) {
+                std::vector<uint32_t> out_fused;
+                std::vector<uint32_t> out_reference;
+                if (!run_ifairy64_wide_linear_w2_backend(out_fused, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
+                                                          bias_case, true) ||
+                    !run_ifairy64_wide_linear_w2_backend(out_reference, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
+                                                          bias_case, false)) {
+                    return false;
+                }
+
+                if (!compare_packed_complex_outputs(out_fused.data(), out_reference.data(), out_reference.size(),
+                                                    1e-2f)) {
+                    fprintf(stderr, "Fused wide linear W2 mismatch (LUT=%s/%s, N=%lld, %s bias)\n", lut_case.enabled,
+                            lut_case.impl, (long long) N, bias_case ? "with" : "without");
+                    return false;
+                }
             }
         }
     }
