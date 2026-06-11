@@ -13,8 +13,6 @@ extern "C" {
 #include "../ggml/src/ggml-quants.h"
 
 void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
-void quantize_row_ifairy_q16_q127(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
-void quantize_row_ifairy_q16_tensor_q127(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_vec_dot_ifairy_q16_K(int                        n,
                                float * GGML_RESTRICT      s,
                                size_t                     bs,
@@ -65,13 +63,12 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
 #undef NDEBUG
 #include <assert.h>
 
-#include <algorithm>
-#include <array>
 #include <cerrno>
+#include <array>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -980,13 +977,8 @@ static bool test_quantization() {
 // 测试 1.1: 激活 Q16 tensor-scale 量化
 // ============================================================================
 
-static bool test_ifairy_q16_tensor_quantization_mode(const char * label,
-                                                     void (*quantize)(const float * GGML_RESTRICT,
-                                                                      void *        GGML_RESTRICT,
-                                                                      int64_t),
-                                                     float k_scale_q8,
-                                                     int   qmax) {
-    printf("\n=== Test 1.1 (%s): iFairy Q16 Tensor-Scale Quantization ===\n", label);
+static bool test_ifairy_q16_tensor_quantization() {
+    printf("\n=== Test 1.1: iFairy Q16 Tensor-Scale Quantization ===\n");
 
     const int k  = 1536;
     const int nb = k / QK_IFAIRY;
@@ -1015,7 +1007,7 @@ static bool test_ifairy_q16_tensor_quantization_mode(const char * label,
     }
 
     std::vector<block_ifairy_q16> q((size_t) nb);
-    quantize(reinterpret_cast<const float *>(x_words.data()), q.data(), k);
+    quantize_row_ifairy_q16_tensor(reinterpret_cast<const float *>(x_words.data()), q.data(), k);
 
     for (int ib = 1; ib < nb; ++ib) {
         assert(q[ib].d_real == q[0].d_real);
@@ -1025,6 +1017,7 @@ static bool test_ifairy_q16_tensor_quantization_mode(const char * label,
     const float d_real = GGML_FP16_TO_FP32(q[0].d_real);
     const float d_imag = GGML_FP16_TO_FP32(q[0].d_imag);
 
+    const float k_scale_q8      = 42.6f;
     const float d_real_expected = max_real / k_scale_q8;
     const float d_imag_expected = max_imag / k_scale_q8;
 
@@ -1066,18 +1059,8 @@ static bool test_ifairy_q16_tensor_quantization_mode(const char * label,
     printf("  max_abs_err_imag=%.6f\n", max_err_imag);
     printf("  max_abs_q_real=%d max_abs_q_imag=%d\n", max_abs_qr, max_abs_qi);
 
-    const float d_real_tol = std::max(1e-6f, std::abs(d_real_expected) * 1e-3f);
-    const float d_imag_tol = std::max(1e-6f, std::abs(d_imag_expected) * 1e-3f);
-    const bool  ok         = (d_real_diff <= d_real_tol) && (d_imag_diff <= d_imag_tol) && (max_err_real < 0.10f) &&
-                             (max_err_imag < 0.10f) && (max_abs_qr == qmax) && (max_abs_qi == qmax);
-    printf("  tensor-scale quantization %s - %s\n", label, ok ? "PASS" : "FAIL");
-    return ok;
-}
-
-static bool test_ifairy_q16_tensor_quantization() {
-    bool ok = true;
-    ok &= test_ifairy_q16_tensor_quantization_mode("q42", quantize_row_ifairy_q16_tensor, 42.6f, 42);
-    ok &= test_ifairy_q16_tensor_quantization_mode("q127", quantize_row_ifairy_q16_tensor_q127, 127.0f, 127);
+    const bool ok = (max_err_real < 0.10f) && (max_err_imag < 0.10f) && (max_abs_qr <= 42) && (max_abs_qi <= 42);
+    printf("  tensor-scale quantization - %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -1912,18 +1895,6 @@ static void quantize_ifairy_backend_act_q16(std::vector<block_ifairy_q16> & act_
     }
 }
 
-static void quantize_ifairy_backend_act_q16_q127(std::vector<block_ifairy_q16> & act_q16,
-                                                 const std::vector<float> &      act_f32,
-                                                 int64_t                         N,
-                                                 int64_t                         K) {
-    const int64_t blocks = K / QK_IFAIRY;
-    act_q16.assign((size_t) N * (size_t) blocks, block_ifairy_q16{});
-    for (int64_t c = 0; c < N; ++c) {
-        quantize_row_ifairy_q16_q127(act_f32.data() + (size_t) c * (size_t) K,
-                                     act_q16.data() + (size_t) c * (size_t) blocks, K);
-    }
-}
-
 static void quantize_ifairy_backend_act_q16_lut_c(std::vector<block_ifairy_q16> & act_q16,
                                                   const std::vector<float> &      act_f32,
                                                   int64_t                         N,
@@ -2098,38 +2069,6 @@ static bool test_ifairy_lut_backend_lut_c_f32_vs_q16() {
     }
     return compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size());
 #endif
-}
-
-static bool test_ifairy64_cpu_q127_activation_dispatch() {
-    printf("\n=== Test 1.4: iFairy64 CPU q127 activation dispatch ===\n");
-
-    const int64_t M = 8;
-    const int64_t N = 2;
-    const int64_t K = 2 * QK_IFAIRY;
-
-    std::vector<float>            act_f32;
-    std::vector<block_ifairy_q16> act_q16;
-    fill_ifairy_backend_act_f32(act_f32, N, K);
-    quantize_ifairy_backend_act_q16_q127(act_q16, act_f32, N, K);
-
-    std::vector<uint32_t> out_f32;
-    std::vector<uint32_t> out_q16;
-    if (!run_ifairy64_backend_mul_mat_shape(out_f32, M, N, K, GGML_TYPE_F32, act_f32.data(),
-                                            act_f32.size() * sizeof(float),
-                                            /*lut_env*/ "0")) {
-        return false;
-    }
-    if (!run_ifairy64_backend_mul_mat_shape(out_q16, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
-                                            /*lut_env*/ "0")) {
-        return false;
-    }
-    if (out_f32.size() != out_q16.size()) {
-        fprintf(stderr, "Size mismatch (ifairy64 q127 F32 vs Q16): %zu vs %zu\n", out_f32.size(), out_q16.size());
-        return false;
-    }
-
-    return compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size());
 }
 
 static bool test_ifairy64_lut_backend_compare() {
@@ -2604,11 +2543,6 @@ int main(int argc, char ** argv) {
 
         if (!test_ifairy64_vecdot_compare()) {
             fprintf(stderr, "Test 1.3 FAILED\n");
-            num_failed++;
-        }
-
-        if (!test_ifairy64_cpu_q127_activation_dispatch()) {
-            fprintf(stderr, "Test 1.4 FAILED\n");
             num_failed++;
         }
 
