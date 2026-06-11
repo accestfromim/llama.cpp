@@ -54,6 +54,12 @@ Status: Draft (2026-03-13)
 
 按日期追加（YYYY-MM-DD）：
 
+### 2026-06-11 (Fairy2i RoPE and non-LUT q127 activation quant)
+- 生产结论：
+  - Fairy2i `qwen2_real` attention RoPE now uses half-split / NeoX layout for Q/K, matching HF/Llama `cos/sin = cat(freqs, freqs)` semantics.
+  - Fairy2i `IFAIRY64` non-LUT CPU vecdot activation quantization now defaults to symmetric q127 (`scale = max_abs / 127`, clamp to `[-127, 127]`).
+  - LUT routing is intentionally not switched to q127; LUT table and accumulator assumptions remain tied to the existing 42.6-scaled activation path pending separate evaluation.
+
 ### 2026-03-13 (build `8d73f59a`)
 - 变更摘要：
   - 在 `src/llama-quant.cpp` 中补齐 `ifairy` bare `output` 张量的识别逻辑，使 `llama-quantize --output-tensor-type q6_k` 可以直接作用于 `ifairy.gguf` 的输出层，而不要求张量名必须是 `output.weight`。
