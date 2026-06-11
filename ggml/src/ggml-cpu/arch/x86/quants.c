@@ -605,6 +605,10 @@ void quantize_row_ifairy_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT
 #endif
 }
 
+void quantize_row_ifairy_q16_q127(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_ifairy_q16(x, y, k);
+}
+
 void quantize_row_ifairy_q16_lut_c(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_IFAIRY == 0);
     const int nb = k / QK_IFAIRY;
@@ -684,14 +688,17 @@ void quantize_row_ifairy_q16_lut_c(const float * GGML_RESTRICT x, void * GGML_RE
 #endif
 }
 
-void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+static void quantize_row_ifairy_q16_tensor_impl(const float * GGML_RESTRICT x,
+                                                void * GGML_RESTRICT        vy,
+                                                int64_t                     k,
+                                                float                       k_scale_q8,
+                                                int                         qmax) {
     assert(k % QK_IFAIRY == 0);
     const int nb = k / QK_IFAIRY;
 
     block_ifairy_q16 * GGML_RESTRICT y = vy;
 
 #if defined(__AVX2__)
-    const float      k_scale_q8 = 42.6f;
     const __m256     sign_mask  = _mm256_set1_ps(-0.0f);
     const uint32_t * src_words  = (const uint32_t *) x;
     __m256           max_r      = _mm256_set1_ps(1e-5f);
@@ -721,12 +728,69 @@ void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_R
         y[ib].d_imag                           = d_imag;
 
         ggml_ifairy_quantize_block_avx2(src_blk, (int8_t *) y[ib].x_real, (int8_t *) y[ib].x_imag, iscale_real,
-                                        iscale_imag, 42);
+                                        iscale_imag, qmax);
     }
 #else
-    GGML_UNUSED(nb);
-    quantize_row_ifairy_q16_tensor_ref(x, y, k);
+    float max_real = 1e-5f;
+    float max_imag = 1e-5f;
+
+    for (int64_t j = 0; j < k; ++j) {
+        const float * x_com = x + j;
+
+        const ggml_bf16_t x_real_bf16 = ((const ggml_bf16_t *) (x_com))[0];
+        const ggml_bf16_t x_imag_bf16 = ((const ggml_bf16_t *) (x_com))[1];
+
+        const float x_real = GGML_BF16_TO_FP32(x_real_bf16);
+        const float x_imag = GGML_BF16_TO_FP32(x_imag_bf16);
+
+        max_real = fmaxf(max_real, fabsf(x_real));
+        max_imag = fmaxf(max_imag, fabsf(x_imag));
+    }
+
+    const float scale_real = max_real / k_scale_q8;
+    const float scale_imag = max_imag / k_scale_q8;
+
+    const float inv_scale_real = 1.0f / scale_real;
+    const float inv_scale_imag = 1.0f / scale_imag;
+
+    const ggml_half d_real = GGML_CPU_FP32_TO_FP16(scale_real);
+    const ggml_half d_imag = GGML_CPU_FP32_TO_FP16(scale_imag);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        y[ib].d_real = d_real;
+        y[ib].d_imag = d_imag;
+
+        int8_t * xr_out = (int8_t *) y[ib].x_real;
+        int8_t * xi_out = (int8_t *) y[ib].x_imag;
+
+        for (int j = 0; j < QK_IFAIRY; ++j) {
+            const float * x_com = x + (int64_t) ib * QK_IFAIRY + j;
+
+            const ggml_bf16_t xr_bf16 = ((const ggml_bf16_t *) (x_com))[0];
+            const ggml_bf16_t xi_bf16 = ((const ggml_bf16_t *) (x_com))[1];
+
+            const float xr = GGML_BF16_TO_FP32(xr_bf16);
+            const float xi = GGML_BF16_TO_FP32(xi_bf16);
+
+            int vr = (int) lrintf(xr * inv_scale_real);
+            int vi = (int) lrintf(xi * inv_scale_imag);
+
+            vr = vr > qmax ? qmax : (vr < -qmax ? -qmax : vr);
+            vi = vi > qmax ? qmax : (vi < -qmax ? -qmax : vi);
+
+            xr_out[j] = (int8_t) vr;
+            xi_out[j] = (int8_t) vi;
+        }
+    }
 #endif
+}
+
+void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_ifairy_q16_tensor_impl(x, y, k, 42.6f, 42);
+}
+
+void quantize_row_ifairy_q16_tensor_q127(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_ifairy_q16_tensor_impl(x, y, k, 127.0f, 127);
 }
 
 // placeholder implementation for Apple targets

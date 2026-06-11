@@ -33,6 +33,18 @@ from convert_fairy2i_qwen2 import (
 )
 
 
+FAIRY2I_DEEPSEEK_BOS_TOKEN = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
+FAIRY2I_DEEPSEEK_USER_TOKEN = "<\uff5cUser\uff5c>"
+FAIRY2I_DEEPSEEK_ASSISTANT_TOKEN = "<\uff5cAssistant\uff5c>"
+FAIRY2I_DEEPSEEK_EOS_TOKEN = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+FAIRY2I_DEEPSEEK_CHAT_TOKENS = (
+    FAIRY2I_DEEPSEEK_BOS_TOKEN,
+    FAIRY2I_DEEPSEEK_USER_TOKEN,
+    FAIRY2I_DEEPSEEK_ASSISTANT_TOKEN,
+    FAIRY2I_DEEPSEEK_EOS_TOKEN,
+)
+
+
 def round_up_even_tile_vocab(vocab_size: int) -> int:
     complex_tile = 2 * TILE64
     return round_up(vocab_size, complex_tile)
@@ -56,6 +68,131 @@ def llama_token_type(token_id: int, token_text: str, special_ids: set[int]) -> g
     if re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", token_text):
         return gguf.TokenType.BYTE
     return gguf.TokenType.CONTROL if token_id in special_ids else gguf.TokenType.NORMAL
+
+
+def token_config_text(tokenizer_config: dict, token_name: str) -> str | None:
+    token = tokenizer_config.get(f"{token_name}_token")
+    if isinstance(token, str):
+        return token
+    if isinstance(token, dict):
+        content = token.get("content")
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def token_id_for_text(reverse_vocab: dict[int, str], token_text: str) -> int | None:
+    for token_id, vocab_text in reverse_vocab.items():
+        if vocab_text == token_text:
+            return token_id
+    return None
+
+
+def resolve_special_token_id(
+    token_name: str,
+    config: dict,
+    tokenizer_config: dict,
+    reverse_vocab: dict[int, str],
+    padded_vocab_size: int,
+) -> int:
+    config_token_id = config.get(f"{token_name}_token_id")
+    token_text = token_config_text(tokenizer_config, token_name)
+
+    token_id = None
+    if isinstance(config_token_id, int) and config_token_id >= 0:
+        if token_text is None or reverse_vocab.get(config_token_id) == token_text:
+            token_id = config_token_id
+
+    if token_id is None and token_text is not None:
+        token_id = token_id_for_text(reverse_vocab, token_text)
+
+    if token_id is None and isinstance(config_token_id, int) and config_token_id >= 0:
+        token_id = config_token_id
+
+    if token_id is None:
+        raise ValueError(f"could not resolve {token_name}_token_id")
+    if token_id >= padded_vocab_size:
+        raise ValueError(f"{token_name}_token_id={token_id} is outside padded vocab {padded_vocab_size}")
+    return token_id
+
+
+def normalize_fairy2i_chat_template(chat_template: str) -> str:
+    if "add_generation_prompt" in chat_template:
+        return chat_template
+    if not all(token in chat_template for token in FAIRY2I_DEEPSEEK_CHAT_TOKENS):
+        return chat_template
+
+    assistant_token_literal = repr(FAIRY2I_DEEPSEEK_ASSISTANT_TOKEN)
+    generation_prompt = "{% if add_generation_prompt %}{{ " + assistant_token_literal + " }}{% endif %}"
+    return chat_template.rstrip("\n") + generation_prompt
+
+
+def normalize_fairy2i_chat_template_value(
+    chat_template: str | list[dict[str, str]],
+) -> str | list[dict[str, str]]:
+    if isinstance(chat_template, str):
+        return normalize_fairy2i_chat_template(chat_template)
+    if isinstance(chat_template, list):
+        normalized_templates: list[dict[str, str]] = []
+        for choice in chat_template:
+            if not isinstance(choice, dict):
+                raise ValueError("chat_template list entries must be objects")
+            normalized_choice = dict(choice)
+            template = normalized_choice.get("template")
+            if isinstance(template, str):
+                normalized_choice["template"] = normalize_fairy2i_chat_template(template)
+            normalized_templates.append(normalized_choice)
+        return normalized_templates
+    raise ValueError(f"bad chat_template type: {type(chat_template).__name__}")
+
+
+def load_fairy2i_chat_template(model_dir: Path, tokenizer_config: dict) -> str | list[dict[str, str]] | None:
+    chat_template = None
+    chat_template_jinja = model_dir / "chat_template.jinja"
+    chat_template_json = model_dir / "chat_template.json"
+
+    if chat_template_jinja.is_file():
+        chat_template = chat_template_jinja.read_text(encoding="utf-8")
+    elif chat_template_json.is_file():
+        chat_template_data = json.loads(chat_template_json.read_text(encoding="utf-8"))
+        chat_template = chat_template_data.get("chat_template")
+    else:
+        chat_template = tokenizer_config.get("chat_template")
+
+    if chat_template is None:
+        return None
+    if not isinstance(chat_template, (str, list)):
+        raise ValueError(f"bad chat_template type: {type(chat_template).__name__}")
+    return normalize_fairy2i_chat_template_value(chat_template)
+
+
+def add_fairy2i_llama_tokenizer_metadata(
+    model_dir: Path,
+    config: dict,
+    tokenizer_config: dict,
+    writer: gguf.GGUFWriter,
+    reverse_vocab: dict[int, str],
+    padded_vocab_size: int,
+) -> None:
+    writer.add_bos_token_id(
+        resolve_special_token_id("bos", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+    writer.add_eos_token_id(
+        resolve_special_token_id("eos", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+    writer.add_unk_token_id(
+        resolve_special_token_id("unk", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+    writer.add_pad_token_id(
+        resolve_special_token_id("pad", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+
+    writer.add_add_bos_token(False)
+    writer.add_add_sep_token(False)
+
+    chat_template = load_fairy2i_chat_template(model_dir, tokenizer_config)
+    if chat_template is not None:
+        writer.add_chat_template(chat_template)
 
 
 def set_vocab_llama_bpe_padded(
@@ -142,9 +279,14 @@ def set_vocab_llama_bpe_padded(
     writer.add_token_list(tokens)
     writer.add_token_scores(scores)
     writer.add_token_types(toktypes)
-
-    special_vocab = gguf.SpecialVocab(model_dir, n_vocab=padded_vocab_size)
-    special_vocab.add_to_gguf(writer)
+    add_fairy2i_llama_tokenizer_metadata(
+        model_dir,
+        config,
+        tokenizer_config,
+        writer,
+        reverse_vocab,
+        padded_vocab_size,
+    )
 
     if "add_prefix_space" in tokenizer_config:
         writer.add_add_space_prefix(tokenizer_config["add_prefix_space"])
