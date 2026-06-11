@@ -3479,6 +3479,30 @@ int main(int argc, char ** argv) {
                 fused_only = true;
                 continue;
             }
+            if (strcmp(argv[i], "--ifairy-opencl-add-only") == 0) {
+                opencl_add_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-mul-only") == 0) {
+                opencl_mul_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-rmsnorm-only") == 0) {
+                opencl_rmsnorm_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-rmsnorm-bench") == 0) {
+                opencl_rmsnorm_bench = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-ifairy64-mulmat-only") == 0) {
+                opencl_ifairy64_mulmat_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-ifairy64-mulmat-bench") == 0) {
+                opencl_ifairy64_mulmat_bench = true;
+                continue;
+            }
             if (strcmp(argv[i], "--ifairy-lut-backend-bench") == 0) {
                 lut_bench = true;
                 if (i + 6 >= argc) {
