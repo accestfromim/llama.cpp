@@ -29,38 +29,53 @@ static inline __m256 ggml_ifairy64_lut_madd(const __m256 & x, const __m256 & y, 
 #    endif
 }
 
-static inline void ggml_ifairy64_lut_accumulate_pair_channel(const ifairy64_lut_wtile_16 * wt0,
-                                                             const ifairy64_lut_wtile_16 * wt1,
-                                                             const int8_t *                lut_blk,
-                                                             int                           channel_offset,
-                                                             __m256i &                     sum0_lo,
-                                                             __m256i &                     sum0_hi,
-                                                             __m256i &                     sum1_lo,
-                                                             __m256i &                     sum1_hi) {
-    sum0_lo = _mm256_setzero_si256();
-    sum0_hi = _mm256_setzero_si256();
-    sum1_lo = _mm256_setzero_si256();
-    sum1_hi = _mm256_setzero_si256();
+static inline void ggml_ifairy64_lut_accumulate_pair_channels(const ifairy64_lut_wtile_16 * wt0,
+                                                              const ifairy64_lut_wtile_16 * wt1,
+                                                              const int8_t *                lut_blk,
+                                                              __m256i &                     sum0_r_lo,
+                                                              __m256i &                     sum0_r_hi,
+                                                              __m256i &                     sum1_r_lo,
+                                                              __m256i &                     sum1_r_hi,
+                                                              __m256i &                     sum0_i_lo,
+                                                              __m256i &                     sum0_i_hi,
+                                                              __m256i &                     sum1_i_lo,
+                                                              __m256i &                     sum1_i_hi) {
+    sum0_r_lo = _mm256_setzero_si256();
+    sum0_r_hi = _mm256_setzero_si256();
+    sum1_r_lo = _mm256_setzero_si256();
+    sum1_r_hi = _mm256_setzero_si256();
+    sum0_i_lo = _mm256_setzero_si256();
+    sum0_i_hi = _mm256_setzero_si256();
+    sum1_i_lo = _mm256_setzero_si256();
+    sum1_i_hi = _mm256_setzero_si256();
     const __m256i one      = _mm256_set1_epi8(1);
     const __m256i mask_idx = _mm256_set1_epi8(0x0f);
 
     for (int byte_idx = 0; byte_idx < QK_IFAIRY64_GROUPS_PER_BLOCK / 2; ++byte_idx) {
         const int8_t * lut_base = lut_blk + (size_t) byte_idx * 2u * k_ifairy_lut_group_bytes;
-        const __m256i lut_0     = _mm256_loadu_si256((const __m256i *) (lut_base + channel_offset));
-        const __m256i lut_1     = _mm256_loadu_si256((const __m256i *) (lut_base + 64 + channel_offset));
+        const __m256i lut_0_r   = _mm256_loadu_si256((const __m256i *) lut_base);
+        const __m256i lut_1_r   = _mm256_loadu_si256((const __m256i *) (lut_base + 64));
+        const __m256i lut_0_i   = _mm256_loadu_si256((const __m256i *) (lut_base + 32));
+        const __m256i lut_1_i   = _mm256_loadu_si256((const __m256i *) (lut_base + 96));
 
-#    define GGML_IFAIRY64_LUT_ACCUMULATE(wt, suffix)                                                              \
-        do {                                                                                                      \
-            const __m256i packed = _mm256_broadcastsi128_si256(                                                   \
-                _mm_load_si128((const __m128i *) &(wt)->qs[byte_idx]));                                           \
-            const __m256i idx_lo  = _mm256_and_si256(packed, mask_idx);                                           \
-            const __m256i idx_hi  = _mm256_and_si256(_mm256_srli_epi16(packed, 4), mask_idx);                    \
-            const __m256i out_0 = _mm256_shuffle_epi8(lut_0, idx_lo);                                             \
-            const __m256i out_1 = _mm256_shuffle_epi8(lut_1, idx_hi);                                             \
-            sum##suffix##_lo = _mm256_add_epi16(                                                                 \
-                sum##suffix##_lo, _mm256_maddubs_epi16(one, _mm256_unpacklo_epi8(out_0, out_1)));                \
-            sum##suffix##_hi = _mm256_add_epi16(                                                                 \
-                sum##suffix##_hi, _mm256_maddubs_epi16(one, _mm256_unpackhi_epi8(out_0, out_1)));                \
+#    define GGML_IFAIRY64_LUT_ACCUMULATE(wt, suffix)                                                               \
+        do {                                                                                                       \
+            const __m256i packed = _mm256_broadcastsi128_si256(                                                    \
+                _mm_load_si128((const __m128i *) &(wt)->qs[byte_idx]));                                            \
+            const __m256i idx_lo = _mm256_and_si256(packed, mask_idx);                                             \
+            const __m256i idx_hi = _mm256_and_si256(_mm256_srli_epi16(packed, 4), mask_idx);                       \
+            const __m256i out_0_r = _mm256_shuffle_epi8(lut_0_r, idx_lo);                                          \
+            const __m256i out_1_r = _mm256_shuffle_epi8(lut_1_r, idx_hi);                                          \
+            sum##suffix##_r_lo = _mm256_add_epi16(                                                                \
+                sum##suffix##_r_lo, _mm256_maddubs_epi16(one, _mm256_unpacklo_epi8(out_0_r, out_1_r)));           \
+            sum##suffix##_r_hi = _mm256_add_epi16(                                                                \
+                sum##suffix##_r_hi, _mm256_maddubs_epi16(one, _mm256_unpackhi_epi8(out_0_r, out_1_r)));           \
+            const __m256i out_0_i = _mm256_shuffle_epi8(lut_0_i, idx_lo);                                          \
+            const __m256i out_1_i = _mm256_shuffle_epi8(lut_1_i, idx_hi);                                          \
+            sum##suffix##_i_lo = _mm256_add_epi16(                                                                \
+                sum##suffix##_i_lo, _mm256_maddubs_epi16(one, _mm256_unpacklo_epi8(out_0_i, out_1_i)));           \
+            sum##suffix##_i_hi = _mm256_add_epi16(                                                                \
+                sum##suffix##_i_hi, _mm256_maddubs_epi16(one, _mm256_unpackhi_epi8(out_0_i, out_1_i)));           \
         } while (false)
 
         GGML_IFAIRY64_LUT_ACCUMULATE(wt0, 0);
@@ -113,18 +128,21 @@ static inline void ggml_ifairy64_lut_accumulate_pair(const ifairy64_lut_wtile_16
                                                      __m256 &                      acc_r_hi,
                                                      __m256 &                      acc_i_lo,
                                                      __m256 &                      acc_i_hi) {
-    __m256i sum0_lo;
-    __m256i sum0_hi;
-    __m256i sum1_lo;
-    __m256i sum1_hi;
+    __m256i sum0_r_lo;
+    __m256i sum0_r_hi;
+    __m256i sum1_r_lo;
+    __m256i sum1_r_hi;
+    __m256i sum0_i_lo;
+    __m256i sum0_i_hi;
+    __m256i sum1_i_lo;
+    __m256i sum1_i_hi;
 
-    ggml_ifairy64_lut_accumulate_pair_channel(wt0, wt1, lut_blk, 0, sum0_lo, sum0_hi, sum1_lo, sum1_hi);
-    ggml_ifairy64_lut_apply_pair_component(wt0, wt1, sum0_lo, sum0_hi, sum1_lo, sum1_hi, wt0->d_real, wt0->d_imag,
-                                           wt1->d_real, wt1->d_imag, v_lr, v_li, acc_r_lo, acc_r_hi);
-
-    ggml_ifairy64_lut_accumulate_pair_channel(wt0, wt1, lut_blk, 32, sum0_lo, sum0_hi, sum1_lo, sum1_hi);
-    ggml_ifairy64_lut_apply_pair_component(wt0, wt1, sum0_lo, sum0_hi, sum1_lo, sum1_hi, wt0->d_imag, wt0->d_real,
-                                           wt1->d_imag, wt1->d_real, v_lr, v_li, acc_i_lo, acc_i_hi);
+    ggml_ifairy64_lut_accumulate_pair_channels(wt0, wt1, lut_blk, sum0_r_lo, sum0_r_hi, sum1_r_lo, sum1_r_hi,
+                                               sum0_i_lo, sum0_i_hi, sum1_i_lo, sum1_i_hi);
+    ggml_ifairy64_lut_apply_pair_component(wt0, wt1, sum0_r_lo, sum0_r_hi, sum1_r_lo, sum1_r_hi, wt0->d_real,
+                                           wt0->d_imag, wt1->d_real, wt1->d_imag, v_lr, v_li, acc_r_lo, acc_r_hi);
+    ggml_ifairy64_lut_apply_pair_component(wt0, wt1, sum0_i_lo, sum0_i_hi, sum1_i_lo, sum1_i_hi, wt0->d_imag,
+                                           wt0->d_real, wt1->d_imag, wt1->d_real, v_lr, v_li, acc_i_lo, acc_i_hi);
 }
 
 static inline void ggml_ifairy64_lut_store_pair(int            tile,
