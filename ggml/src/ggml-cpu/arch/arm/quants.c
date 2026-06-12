@@ -235,6 +235,13 @@ void quantize_row_ifairy_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT
 #endif
 }
 
+void quantize_row_ifairy64_q16(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    assert(k % QK_IFAIRY64 == 0);
+    block_ifairy64_q16 * GGML_RESTRICT y = vy;
+
+    quantize_row_ifairy64_q16_ref(x, y, k);
+}
+
 void quantize_row_ifairy_q16_lut_c(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(k % QK_IFAIRY == 0);
     const int nb = k / QK_IFAIRY;

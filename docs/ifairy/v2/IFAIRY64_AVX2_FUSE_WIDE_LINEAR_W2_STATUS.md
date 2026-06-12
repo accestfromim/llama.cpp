@@ -499,16 +499,3 @@ No NaN, invalid output, or quality regression was observed. The high absolute
 PPL at context 256 is an existing property of this single-chunk test setup,
 not a regression introduced by shared channel index decoding.
 
-## 7. Next Work
-
-- Validate the shared-channel-index kernel on an AVX2-only CPU with only 16 YMM
-  registers.
-- Profile the remaining pair-pass weight streaming, scale restoration, and K64
-  activation quantization costs.
-- Investigate generic non-fused LUT16 performance separately from the fused-LUT
-  production path.
-- Measure thread affinity, polling, and graph-barrier costs for 8-thread
-  decode.
-- Test the full-width AVX512 kernel on hardware with native 512-bit execution.
-- Evaluate whether a lower-register-pressure four-weight or super-block kernel
-  can reuse the shared LUT without regressing decode.

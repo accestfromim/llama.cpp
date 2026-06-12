@@ -1097,6 +1097,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
+    "GLU",
+
     "IFAIRY_ROPE",
     "IFAIRY_SPLIT",
     "IFAIRY_MERGE",

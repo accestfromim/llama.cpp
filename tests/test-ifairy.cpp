@@ -2134,10 +2134,10 @@ static bool test_ifairy64_lut_backend_compare() {
 
 static bool test_ifairy64_lut_backend_f32_vs_q16() {
 #if !GGML_IFAIRY_LUT_TEST_BACKEND_ENABLED
-    printf("\n=== Test 5.4: iFairy64 LUT backend F32 vs Q16 (SKIP: backend not enabled on this platform) ===\n");
+    printf("\n=== Test 5.4: iFairy64 backend F32 vs Q16 (SKIP: backend not enabled on this platform) ===\n");
     return true;
 #else
-    printf("\n=== Test 5.4: iFairy64 LUT backend F32 vs Q16 ===\n");
+    printf("\n=== Test 5.4: iFairy64 backend F32 vs Q16 ===\n");
 
     const int64_t M = 8;
     const int64_t N = 2;
