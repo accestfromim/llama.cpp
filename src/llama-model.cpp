@@ -40,6 +40,11 @@ static bool llama_fairy2i_merged_output_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
+static bool llama_fairy2i_fused_wide_linear_w2_enabled() {
+    const char * env = getenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";

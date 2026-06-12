@@ -36,7 +36,8 @@ static void ggml_backend_blas_mul_mat(ggml_backend_blas_context * ctx, struct gg
     const enum ggml_type type = src0->type;
 
     // complex ifairy kernels are not supported by the BLAS path
-    if (type == GGML_TYPE_IFAIRY || type == GGML_TYPE_IFAIRY_Q16 || type == GGML_TYPE_IFAIRY64) {
+    if (type == GGML_TYPE_IFAIRY || type == GGML_TYPE_IFAIRY_Q16 || type == GGML_TYPE_IFAIRY64 ||
+        type == GGML_TYPE_IFAIRY64_Q16) {
         GGML_ABORT("%s: unsupported tensor type for BLAS backend", __func__);
     }
 
@@ -408,7 +409,8 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
             const struct ggml_tensor * src0 = op->src[0];
             const struct ggml_tensor * src1 = op->src[1];
 
-            if (src0->type == GGML_TYPE_IFAIRY || src0->type == GGML_TYPE_IFAIRY_Q16 || src0->type == GGML_TYPE_IFAIRY64) {
+            if (src0->type == GGML_TYPE_IFAIRY || src0->type == GGML_TYPE_IFAIRY_Q16 ||
+                src0->type == GGML_TYPE_IFAIRY64 || src0->type == GGML_TYPE_IFAIRY64_Q16) {
                 return false;
             }
 
