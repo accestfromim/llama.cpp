@@ -949,6 +949,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL,
         .from_float_ref           = quantize_row_ifairy64_from_float_ref,
     },
+    [GGML_TYPE_IFAIRY64_Q16] = {
+        .type_name                = "ifairy64_q16",
+        .blck_size                = QK_IFAIRY64,
+        .type_size                = sizeof(block_ifairy64_q16),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1100,6 +1106,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "IFAIRY_ADD",
     "IFAIRY_RMS_NORM",
     "IFAIRY_MUL",
+    "IFAIRY_WIDE_LINEAR_W2",
 };
 
 // static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
@@ -1210,6 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ifairy_add(x, y)",
     "ifairy_rms_norm(x)",
     "ifairy_mul(x,y)",
+    "ifairy_wide_linear_w2(x)",
 };
 
 // static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
