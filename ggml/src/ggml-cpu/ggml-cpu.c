@@ -46,6 +46,11 @@ extern struct ggml_tensor * ggml_debug_last_node;
 #include <syscall.h>
 #endif
 
+#if defined(__aarch64__) && defined(__linux__)
+#include <pthread.h>
+#include <sys/auxv.h>
+#endif
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif

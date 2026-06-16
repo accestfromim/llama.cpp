@@ -1,5 +1,6 @@
 #include "ifairy-fuse.h"
 #include "ifairy-fuse-lut-qgemm.h"
+#include "ifairy-fuse-lut-qgemm.h"
 
 #ifdef GGML_IFAIRY_LUT_CPU
 
@@ -9,9 +10,14 @@
 
 #include <algorithm>
 #include <math.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__AVX2__)
+#    include <immintrin.h>
+#endif
 
 static inline float ggml_ifairy_wide_linear_lut_bias_at(const struct ggml_tensor * bias,
                                                          int64_t                    i0,
@@ -35,7 +41,62 @@ static bool ggml_ifairy_wide_linear_w2_have_packed_weights(const struct ggml_ten
     return true;
 }
 
-static void ggml_ifairy64_lut_quantize_block_q16_64(const float * x, block_ifairy64_q16 * y) {
+static void ggml_ifairy64_lut_quantize_block_q16_64(const float * x, block_ifairy64_q16 * y, bool use_avx2) {
+#if defined(__AVX2__)
+    if (use_avx2) {
+        const uint32_t * src_words = (const uint32_t *) x;
+        const __m256     sign_mask = _mm256_set1_ps(-0.0f);
+        const __m256i    imag_mask = _mm256_set1_epi32((int) 0xffff0000u);
+        __m256           max_real  = _mm256_set1_ps(1e-5f);
+        __m256           max_imag  = _mm256_set1_ps(1e-5f);
+
+        for (int j = 0; j < QK_IFAIRY64; j += 8) {
+            const __m256i words = _mm256_loadu_si256((const __m256i *) (src_words + j));
+            const __m256  real  = _mm256_castsi256_ps(_mm256_slli_epi32(words, 16));
+            const __m256  imag  = _mm256_castsi256_ps(_mm256_and_si256(words, imag_mask));
+            max_real = _mm256_max_ps(max_real, _mm256_andnot_ps(sign_mask, real));
+            max_imag = _mm256_max_ps(max_imag, _mm256_andnot_ps(sign_mask, imag));
+        }
+
+        alignas(32) float maxima_real[8];
+        alignas(32) float maxima_imag[8];
+        _mm256_store_ps(maxima_real, max_real);
+        _mm256_store_ps(maxima_imag, max_imag);
+        float scalar_max_real = maxima_real[0];
+        float scalar_max_imag = maxima_imag[0];
+        for (int lane = 1; lane < 8; ++lane) {
+            scalar_max_real = std::max(scalar_max_real, maxima_real[lane]);
+            scalar_max_imag = std::max(scalar_max_imag, maxima_imag[lane]);
+        }
+
+        const float iscale_real = 63.0f / scalar_max_real;
+        const float iscale_imag = 63.0f / scalar_max_imag;
+        y->d_real               = GGML_FP32_TO_FP16(1.0f / iscale_real);
+        y->d_imag               = GGML_FP32_TO_FP16(1.0f / iscale_imag);
+
+        const __m256  scale_real = _mm256_set1_ps(iscale_real);
+        const __m256  scale_imag = _mm256_set1_ps(iscale_imag);
+        const __m256i qmin       = _mm256_set1_epi32(-63);
+        const __m256i qmax       = _mm256_set1_epi32(63);
+        for (int j = 0; j < QK_IFAIRY64; j += 8) {
+            const __m256i words = _mm256_loadu_si256((const __m256i *) (src_words + j));
+            const __m256  real  = _mm256_castsi256_ps(_mm256_slli_epi32(words, 16));
+            const __m256  imag  = _mm256_castsi256_ps(_mm256_and_si256(words, imag_mask));
+            const __m256i qr =
+                _mm256_max_epi32(qmin, _mm256_min_epi32(qmax, _mm256_cvtps_epi32(_mm256_mul_ps(real, scale_real))));
+            const __m256i qi =
+                _mm256_max_epi32(qmin, _mm256_min_epi32(qmax, _mm256_cvtps_epi32(_mm256_mul_ps(imag, scale_imag))));
+            const __m128i qr16 = _mm_packs_epi32(_mm256_castsi256_si128(qr), _mm256_extracti128_si256(qr, 1));
+            const __m128i qi16 = _mm_packs_epi32(_mm256_castsi256_si128(qi), _mm256_extracti128_si256(qi, 1));
+            _mm_storel_epi64((__m128i *) (y->x_real + j), _mm_packs_epi16(qr16, qr16));
+            _mm_storel_epi64((__m128i *) (y->x_imag + j), _mm_packs_epi16(qi16, qi16));
+        }
+        return;
+    }
+#else
+    (void) use_avx2;
+#endif
+
     float max_real = 1e-5f;
     float max_imag = 1e-5f;
     for (int j = 0; j < QK_IFAIRY64; ++j) {
@@ -122,8 +183,8 @@ bool ggml_compute_forward_ifairy_wide_linear_w2_lut(const struct ggml_compute_pa
     const int64_t groups              = weight_blocks * QK_IFAIRY64_GROUPS_PER_BLOCK;
     const size_t  q_bytes             = GGML_PAD((size_t) N * (size_t) weight_blocks * sizeof(block_ifairy64_q16), 64);
     const size_t  lut_bytes           = (size_t) N * (size_t) groups * k_ifairy_lut_group_bytes;
-    const size_t  scale_bytes         = (size_t) N * (size_t) weight_blocks * 2u * sizeof(float);
-    const size_t  shared_bytes        = GGML_PAD(lut_bytes + scale_bytes, 64);
+    const size_t  shared_bytes        =
+        GGML_PAD(lut_bytes + (size_t) N * (size_t) weight_blocks * 2u * sizeof(float), 64);
     const size_t  need                = ggml_ifairy_wide_linear_w2_lut_wsize(dst);
 
     if (!params->wdata || params->wsize < need) {
@@ -136,17 +197,30 @@ bool ggml_compute_forward_ifairy_wide_linear_w2_lut(const struct ggml_compute_pa
     float *              scales = (float *) (shared + lut_bytes);
     float *              output = (float *) (shared + shared_bytes);
 
-    for (int64_t ir = 0; ir < N; ++ir) {
-        const float * x_row = (const float *) ((const char *) x->data + ir * x->nb[1]);
-        block_ifairy64_q16 * q_row = q_x + ir * weight_blocks;
-        float * scale_row = scales + ir * weight_blocks * 2;
-        int8_t * lut_row = (int8_t *) lut + ir * groups * k_ifairy_lut_group_bytes;
+    if (N >= params->nth) {
+        for (int64_t ir = params->ith; ir < N; ir += params->nth) {
+            const float * x_row = (const float *) ((const char *) x->data + ir * x->nb[1]);
+            block_ifairy64_q16 * q_row = q_x + ir * weight_blocks;
+            for (int64_t ib = 0; ib < weight_blocks; ++ib) {
+                ggml_ifairy64_lut_quantize_block_q16_64(x_row + ib * QK_IFAIRY64, q_row + ib, true);
+            }
+        }
+        ggml_ifairy64_lut_preprocess_ex_q16_64_lut16((int) M, (int) K, (int) N, q_x,
+                                                       (size_t) weight_blocks * sizeof(block_ifairy64_q16), scales,
+                                                       lut, params->ith, params->nth);
+    } else {
+        for (int64_t ir = 0; ir < N; ++ir) {
+            const float * x_row = (const float *) ((const char *) x->data + ir * x->nb[1]);
+            block_ifairy64_q16 * q_row = q_x + ir * weight_blocks;
+            float * scale_row = scales + ir * weight_blocks * 2;
+            int8_t * lut_row = (int8_t *) lut + ir * groups * k_ifairy_lut_group_bytes;
 
-        for (int64_t ib = params->ith; ib < weight_blocks; ib += params->nth) {
-            ggml_ifairy64_lut_quantize_block_q16_64(x_row + ib * QK_IFAIRY64, q_row + ib);
-            ggml_ifairy64_lut_preprocess_q16_64_block_lut16(
-                q_row + ib, scale_row + ib * 2,
-                lut_row + ib * QK_IFAIRY64_GROUPS_PER_BLOCK * k_ifairy_lut_group_bytes);
+            for (int64_t ib = params->ith; ib < weight_blocks; ib += params->nth) {
+                ggml_ifairy64_lut_quantize_block_q16_64(x_row + ib * QK_IFAIRY64, q_row + ib, false);
+                ggml_ifairy64_lut_preprocess_q16_64_block_lut16(
+                    q_row + ib, scale_row + ib * 2,
+                    lut_row + ib * QK_IFAIRY64_GROUPS_PER_BLOCK * k_ifairy_lut_group_bytes);
+            }
         }
     }
     ggml_barrier(params->threadpool);
@@ -169,24 +243,25 @@ bool ggml_compute_forward_ifairy_wide_linear_w2_lut(const struct ggml_compute_pa
     const void * packed_w1 = (const uint8_t *) extra_w1->packed_w + (size_t) tile0 * packed_tile_bytes;
     const bool qgemm_ok = ggml_ifairy64_lut_qgemm_four_cpu(
         (int) nrows, (int) K, (int) N, packed_u0, packed_u1, packed_w0, packed_w1, lut, scales, output + row0 * 2,
-        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), /*pack_bf16*/ false);
+        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
     if (!qgemm_ok) {
         return false;
     }
 
     for (int64_t col = 0; col < N; ++col) {
+        const int64_t i1 = col % x->ne[1];
+        const int64_t i2 = (col / x->ne[1]) % x->ne[2];
+        const int64_t i3 = col / (x->ne[1] * x->ne[2]);
+        const float * output_col = output + col * M * 2;
+        char * dst_col = (char *) dst->data + col * dst->nb[1];
         for (int64_t row = row0; row < row1; ++row) {
-            const int64_t index = col * M + row;
-            const int64_t i1    = (index / M) % x->ne[1];
-            const int64_t i2    = ((index / M) / x->ne[1]) % x->ne[2];
-            const int64_t i3    = (index / M) / (x->ne[1] * x->ne[2]);
-            float real          = output[index * 2 + 0];
-            float imag          = output[index * 2 + 1];
+            float real = output_col[row * 2 + 0];
+            float imag = output_col[row * 2 + 1];
             if (bias) {
                 real += ggml_ifairy_wide_linear_lut_bias_at(bias, row, i1, i2, i3);
                 imag += ggml_ifairy_wide_linear_lut_bias_at(bias, row + M, i1, i2, i3);
             }
-            ggml_bf16_t * out = (ggml_bf16_t *) ((char *) dst->data + (index / M) * dst->nb[1] + row * dst->nb[0]);
+            ggml_bf16_t * out = (ggml_bf16_t *) (dst_col + row * dst->nb[0]);
             out[0]             = GGML_FP32_TO_BF16(real);
             out[1]             = GGML_FP32_TO_BF16(imag);
         }

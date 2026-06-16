@@ -64,9 +64,11 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
 #include <assert.h>
 
 #include <cerrno>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -1645,6 +1647,79 @@ static bool run_ifairy64_backend_mul_mat_shape(std::vector<uint32_t> & packed_ou
     return run_ifairy_backend_mul_mat_shape_with_weights(packed_out, M, N, K, GGML_TYPE_IFAIRY64, weights.data(),
                                                          weights.size() * sizeof(block_ifairy64), act_type, act_data,
                                                          act_bytes, lut_env);
+}
+
+static bool run_ifairy64_mul_mat_shape_on_backend(std::vector<uint32_t> &              packed_out,
+                                                  ggml_backend_t                       backend,
+                                                  int64_t                              M,
+                                                  int64_t                              N,
+                                                  int64_t                              K,
+                                                  const std::vector<block_ifairy64> &  weights,
+                                                  const std::vector<float> &           act_f32,
+                                                  bool                                 require_supported) {
+    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY) != 0) {
+        fprintf(stderr, "Invalid ifairy64 OpenCL test shape: M=%lld N=%lld K=%lld\n",
+                (long long) M, (long long) N, (long long) K);
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for IFAIRY64 MUL_MAT backend run\n");
+        return false;
+    }
+
+    struct ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    struct ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    struct ggml_tensor * out = ggml_mul_mat(ctx, w, a);
+    ggml_set_name(w, "ifairy64_w");
+    ggml_set_name(a, "ifairy64_a");
+    ggml_set_name(out, "ifairy64_out");
+
+    if (require_supported && !ggml_backend_supports_op(backend, out)) {
+        fprintf(stderr, "%s does not support IFAIRY64 MUL_MAT positive case M=%lld N=%lld K=%lld\n",
+                ggml_backend_name(backend), (long long) M, (long long) N, (long long) K);
+        ggml_free(ctx);
+        return false;
+    }
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate backend buffer for IFAIRY64 MUL_MAT on %s\n", ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(a, act_f32.data(), 0, act_f32.size() * sizeof(float));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "IFAIRY64 MUL_MAT graph compute failed on %s\n", ggml_backend_name(backend));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> out_f32((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_f32.data(), 0, ggml_nbytes(out));
+
+    packed_out.resize(out_f32.size());
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+        memcpy(&packed_out[i], &out_f32[i], sizeof(uint32_t));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
 }
 
 static void fill_ifairy_backend_act_f32(std::vector<float> & act_f32, int64_t N, int64_t K) {
