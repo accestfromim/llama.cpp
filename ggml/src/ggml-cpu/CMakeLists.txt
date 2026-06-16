@@ -19,11 +19,20 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         set(GGML_CPU_NAME ggml-cpu)
     endif()
 
+    if (GGML_IFAIRY_FUSE_AVX512 AND NOT GGML_AVX512)
+        message(FATAL_ERROR "GGML_IFAIRY_FUSE_AVX512 requires GGML_AVX512")
+    endif()
+
     ggml_add_backend_library(${GGML_CPU_NAME})
 
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
+        ggml-cpu/ifairy-fuse.cpp
+        ggml-cpu/ifairy-fuse.h
+        ggml-cpu/ifairy-fuse-lut.cpp
+        ggml-cpu/ifairy-fuse-lut-qgemm.cpp
+        ggml-cpu/ifairy-fuse-lut-qgemm.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -615,6 +624,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
+    if (GGML_IFAIRY_FUSE_AVX512)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IFAIRY_FUSE_AVX512)
+    endif()
 
     if (EMSCRIPTEN)
         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")
