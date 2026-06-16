@@ -104,8 +104,8 @@ static_assert(sizeof(struct ifairy64_lut_wtile_16) == 320, "wrong ifairy64_lut_w
 //   - `GGML_IFAIRY_LUT=0/1` (enable/disable)
 //   - `GGML_IFAIRY_LUT_DEBUG=0/1` (debug logging)
 //   - `GGML_IFAIRY_LUT_IMPL=auto|lut16|lut_c` (optional impl selection; `lut_c` uses 42.6-scaled Q8 activations
-//     when src1 is F32; otherwise falls back to lut16). In `auto`, Fairy2i F32 activations default to `lut_c`;
-//     set `GGML_IFAIRY_LUT_IMPL=lut16` to force lut16.
+//     when src1 is F32; otherwise falls back to lut16). In `auto`, Fairy2i F32 activations default to `lut_c` on
+//     aarch64+NEON and to `lut16` on x86; set `GGML_IFAIRY_LUT_IMPL=lut16` or `lut_c` to force either path.
 
 void   ggml_ifairy_lut_init(void);
 void   ggml_ifairy_lut_free(void);

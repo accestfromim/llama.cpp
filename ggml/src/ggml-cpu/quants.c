@@ -14,6 +14,10 @@
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
 #define GROUP_MAX_EPS_IQ2_S 1e-8f
@@ -639,6 +643,38 @@ void ggml_vec_dot_ifairy_q16_K_generic(int                        n,
     ((ggml_bf16_t *) s)[1] = GGML_FP32_TO_BF16(sum_imag_total);
 }
 
+#if defined(__AVX2__)
+static inline void ggml_ifairy64_dot_part_avx2(const __m128i                  codes,
+                                               const __m128i                  lut_wr,
+                                               const __m128i                  lut_wi,
+                                               const __m256i                  one,
+                                               const int8_t * GGML_RESTRICT   x_r_ptr,
+                                               const int8_t * GGML_RESTRICT   x_i_ptr,
+                                               __m256i *                      acc_ac,
+                                               __m256i *                      acc_ad,
+                                               __m256i *                      acc_bc,
+                                               __m256i *                      acc_bd) {
+    const __m128i wr8  = _mm_shuffle_epi8(lut_wr, codes);
+    const __m128i wi8  = _mm_shuffle_epi8(lut_wi, codes);
+    const __m256i wr16 = _mm256_cvtepi8_epi16(wr8);
+    const __m256i wi16 = _mm256_cvtepi8_epi16(wi8);
+    const __m256i xr16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *) x_r_ptr));
+    const __m256i xi16 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *) x_i_ptr));
+
+    *acc_ac = _mm256_add_epi32(*acc_ac, _mm256_madd_epi16(_mm256_mullo_epi16(xr16, wr16), one));
+    *acc_ad = _mm256_add_epi32(*acc_ad, _mm256_madd_epi16(_mm256_mullo_epi16(xi16, wr16), one));
+    *acc_bc = _mm256_add_epi32(*acc_bc, _mm256_madd_epi16(_mm256_mullo_epi16(xr16, wi16), one));
+    *acc_bd = _mm256_add_epi32(*acc_bd, _mm256_madd_epi16(_mm256_mullo_epi16(xi16, wi16), one));
+}
+
+static inline int32_t ggml_ifairy64_hsum_i32_avx2(const __m256i acc) {
+    __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    sum         = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(2, 3, 0, 1)));
+    sum         = _mm_add_epi32(sum, _mm_shuffle_epi32(sum, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtsi128_si32(sum);
+}
+#endif
+
 void ggml_vec_dot_ifairy64_q16_K(int                        n,
                                  float * GGML_RESTRICT      s,
                                  size_t                     bs,
@@ -711,6 +747,68 @@ void ggml_vec_dot_ifairy64_q16_K(int                        n,
         const int32_t sum_ad = vaddvq_s32(acc_ad);
         const int32_t sum_bc = vaddvq_s32(acc_bc);
         const int32_t sum_bd = vaddvq_s32(acc_bd);
+
+        const float w_real = GGML_CPU_FP16_TO_FP32(w[i].d_real);
+        const float w_imag = GGML_CPU_FP16_TO_FP32(w[i].d_imag);
+        const float x_real = GGML_CPU_FP16_TO_FP32(x_block->d_real);
+        const float x_imag = GGML_CPU_FP16_TO_FP32(x_block->d_imag);
+
+        sum_real_total += w_real * x_real * (float) sum_ac + w_imag * x_imag * (float) sum_bd;
+        sum_imag_total += w_imag * x_real * (float) sum_bc - w_real * x_imag * (float) sum_ad;
+    }
+
+    ((ggml_bf16_t *) s)[0] = GGML_FP32_TO_BF16(sum_real_total);
+    ((ggml_bf16_t *) s)[1] = GGML_FP32_TO_BF16(sum_imag_total);
+#elif defined(__AVX2__)
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_ifairy64 * GGML_RESTRICT     w = (const block_ifairy64 *) vx;
+    const block_ifairy64_q16 * GGML_RESTRICT x = (const block_ifairy64_q16 *) vy;
+
+    GGML_ASSERT(n % QK_IFAIRY64 == 0);
+
+    const int nb = n / QK_IFAIRY64;
+
+    float sum_real_total = 0.0f;
+    float sum_imag_total = 0.0f;
+
+    const __m128i v_mask = _mm_set1_epi8(0x03);
+    const __m128i v_lut_wr =
+        _mm_setr_epi8(-1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m128i v_lut_wi =
+        _mm_setr_epi8(0, 0, -1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m256i v_one = _mm256_set1_epi16(1);
+
+    for (int i = 0; i < nb; ++i) {
+        const block_ifairy64_q16 * x_block = &x[i];
+
+        const int8_t * GGML_RESTRICT x_r_ptr = (const int8_t *) x_block->x_real;
+        const int8_t * GGML_RESTRICT x_i_ptr = (const int8_t *) x_block->x_imag;
+
+        const __m128i packed = _mm_loadu_si128((const __m128i *) w[i].qs);
+
+        __m256i acc_ac = _mm256_setzero_si256();
+        __m256i acc_ad = _mm256_setzero_si256();
+        __m256i acc_bc = _mm256_setzero_si256();
+        __m256i acc_bd = _mm256_setzero_si256();
+
+        ggml_ifairy64_dot_part_avx2(_mm_and_si128(packed, v_mask), v_lut_wr, v_lut_wi, v_one,
+                                    x_r_ptr + 0, x_i_ptr + 0, &acc_ac, &acc_ad, &acc_bc, &acc_bd);
+        ggml_ifairy64_dot_part_avx2(_mm_and_si128(_mm_srli_epi16(packed, 2), v_mask), v_lut_wr, v_lut_wi, v_one,
+                                    x_r_ptr + 16, x_i_ptr + 16, &acc_ac, &acc_ad, &acc_bc, &acc_bd);
+        ggml_ifairy64_dot_part_avx2(_mm_and_si128(_mm_srli_epi16(packed, 4), v_mask), v_lut_wr, v_lut_wi, v_one,
+                                    x_r_ptr + 32, x_i_ptr + 32, &acc_ac, &acc_ad, &acc_bc, &acc_bd);
+        ggml_ifairy64_dot_part_avx2(_mm_and_si128(_mm_srli_epi16(packed, 6), v_mask), v_lut_wr, v_lut_wi, v_one,
+                                    x_r_ptr + 48, x_i_ptr + 48, &acc_ac, &acc_ad, &acc_bc, &acc_bd);
+
+        const int32_t sum_ac = ggml_ifairy64_hsum_i32_avx2(acc_ac);
+        const int32_t sum_ad = ggml_ifairy64_hsum_i32_avx2(acc_ad);
+        const int32_t sum_bc = ggml_ifairy64_hsum_i32_avx2(acc_bc);
+        const int32_t sum_bd = ggml_ifairy64_hsum_i32_avx2(acc_bd);
 
         const float w_real = GGML_CPU_FP16_TO_FP32(w[i].d_real);
         const float w_imag = GGML_CPU_FP16_TO_FP32(w[i].d_imag);
