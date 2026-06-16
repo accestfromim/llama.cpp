@@ -462,6 +462,42 @@ static void ggml_ifairy64_lut_preprocess_lut16_one(const block_ifairy_q16 * act_
     }
 }
 
+static void ggml_ifairy64_lut_preprocess_q16_64_lut16_one(const block_ifairy64_q16 * act_blocks,
+                                                          int64_t                    blocks,
+                                                          float *                    scales_out,
+                                                          int8_t *                   lut_out,
+                                                          int64_t                    g0,
+                                                          int64_t                    gstep) {
+    for (int64_t blk = 0; blk < blocks; ++blk) {
+        scales_out[blk * 2 + 0] = GGML_FP16_TO_FP32(act_blocks[blk].d_real);
+        scales_out[blk * 2 + 1] = GGML_FP16_TO_FP32(act_blocks[blk].d_imag);
+    }
+
+    const int64_t groups = blocks * QK_IFAIRY64_GROUPS_PER_BLOCK;
+    for (int64_t g = g0; g < groups; g += gstep) {
+        const int64_t blk       = g / QK_IFAIRY64_GROUPS_PER_BLOCK;
+        const int64_t base_off  = (g % QK_IFAIRY64_GROUPS_PER_BLOCK) * 2;
+        const int     xr0       = ggml_ifairy_u8_to_s8_int(act_blocks[blk].x_real[base_off + 0]);
+        const int     xi0       = ggml_ifairy_u8_to_s8_int(act_blocks[blk].x_imag[base_off + 0]);
+        const int     xr1       = ggml_ifairy_u8_to_s8_int(act_blocks[blk].x_real[base_off + 1]);
+        const int     xi1       = ggml_ifairy_u8_to_s8_int(act_blocks[blk].x_imag[base_off + 1]);
+        int8_t *      tbl       = lut_out + (size_t) g * k_ifairy_lut_group_bytes;
+
+        ggml_ifairy_lut_fill_group_lut16(xr0, xi0, xr1, xi1, tbl);
+    }
+}
+
+void ggml_ifairy64_lut_preprocess_q16_64_block_lut16(const void * act_block,
+                                                     void *       lut_scales,
+                                                     void *       lut_block) {
+    if (!act_block || !lut_scales || !lut_block) {
+        return;
+    }
+
+    ggml_ifairy64_lut_preprocess_q16_64_lut16_one((const block_ifairy64_q16 *) act_block, 1, (float *) lut_scales,
+                                                   (int8_t *) lut_block, 0, 1);
+}
+
 static void ggml_ifairy_lut_preprocess_lut16(int          m,
                                              int          k,
                                              int          n,
@@ -577,6 +613,43 @@ void ggml_ifairy64_lut_preprocess_ex_lut16(int          m,
     ggml_ifairy64_lut_preprocess_lut16(m, k, n, act, act_stride, lut_scales, lut_buf, ith, nth);
 }
 
+void ggml_ifairy64_lut_preprocess_ex_q16_64_lut16(int          m,
+                                                  int          k,
+                                                  int          n,
+                                                  const void * act,
+                                                  size_t       act_stride,
+                                                  void *       lut_scales,
+                                                  void *       lut_buf,
+                                                  int          ith,
+                                                  int          nth) {
+    (void) m;
+    if (!act || !lut_scales || !lut_buf) {
+        return;
+    }
+
+    nth = std::max(nth, 1);
+    if (ith < 0 || ith >= nth) {
+        return;
+    }
+
+    const int64_t blocks       = k / QK_IFAIRY64;
+    const int64_t groups       = blocks * QK_IFAIRY64_GROUPS_PER_BLOCK;
+    const bool    shard_by_col = n >= nth;
+    const int     col_start    = shard_by_col ? ith : 0;
+    const int     col_step     = shard_by_col ? nth : 1;
+    const int64_t g0           = shard_by_col ? 0 : ith;
+    const int64_t gstep        = shard_by_col ? 1 : (int64_t) nth;
+
+    for (int col = col_start; col < n; col += col_step) {
+        const uint8_t *            act_col_bytes = (const uint8_t *) act + (size_t) col * act_stride;
+        const block_ifairy64_q16 * act_blocks    = (const block_ifairy64_q16 *) act_col_bytes;
+        float * scales_out = (float *) lut_scales + (size_t) col * (size_t) blocks * 2u;
+        int8_t * lut_out = (int8_t *) ((uint8_t *) lut_buf + (size_t) col * (size_t) groups * k_ifairy_lut_group_bytes);
+
+        ggml_ifairy64_lut_preprocess_q16_64_lut16_one(act_blocks, blocks, scales_out, lut_out, g0, gstep);
+    }
+}
+
 void ggml_ifairy64_lut_preprocess_ex_lut_c(int          m,
                                            int          k,
                                            int          n,
@@ -604,17 +677,18 @@ static inline void ggml_ifairy_lut_decode_lane_scalar(const uint8_t  code,
 }
 
 #if defined(__AVX2__)
-static inline void ggml_ifairy_lut_apply_tile_sums_avx2(const struct ifairy_lut_wtile_16 * wt,
-                                                        const __m256i &                       sum_01_lo,
-                                                        const __m256i &                       sum_01_hi,
-                                                        const __m256i &                       sum_23_lo,
-                                                        const __m256i &                       sum_23_hi,
-                                                        const __m256 &                        v_lr,
-                                                        const __m256 &                        v_li,
-                                                        __m256 &                              acc_r_lo,
-                                                        __m256 &                              acc_r_hi,
-                                                        __m256 &                              acc_i_lo,
-                                                        __m256 &                              acc_i_hi) {
+template <typename wtile_type>
+static inline void ggml_ifairy_lut_apply_tile_sums_avx2(const wtile_type * wt,
+                                                        const __m256i &   sum_01_lo,
+                                                        const __m256i &   sum_01_hi,
+                                                        const __m256i &   sum_23_lo,
+                                                        const __m256i &   sum_23_hi,
+                                                        const __m256 &    v_lr,
+                                                        const __m256 &    v_li,
+                                                        __m256 &          acc_r_lo,
+                                                        __m256 &          acc_r_hi,
+                                                        __m256 &          acc_i_lo,
+                                                        __m256 &          acc_i_hi) {
     const __m128i sum_ac_lo_s16 = _mm256_castsi256_si128(sum_01_lo);
     const __m128i sum_bd_lo_s16 = _mm256_extracti128_si256(sum_01_lo, 1);
     const __m128i sum_ac_hi_s16 = _mm256_castsi256_si128(sum_01_hi);
@@ -634,10 +708,10 @@ static inline void ggml_ifairy_lut_apply_tile_sums_avx2(const struct ifairy_lut_
     const __m256 v_bd_lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(sum_bd_lo_s16));
     const __m256 v_bd_hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(sum_bd_hi_s16));
 
-    const __m256 wr_lo = _mm256_load_ps(wt->d_real + 0);
-    const __m256 wr_hi = _mm256_load_ps(wt->d_real + 8);
-    const __m256 wi_lo = _mm256_load_ps(wt->d_imag + 0);
-    const __m256 wi_hi = _mm256_load_ps(wt->d_imag + 8);
+    const __m256 wr_lo = ggml_ifairy_lut_load_scale8_avx2(wt->d_real + 0);
+    const __m256 wr_hi = ggml_ifairy_lut_load_scale8_avx2(wt->d_real + 8);
+    const __m256 wi_lo = ggml_ifairy_lut_load_scale8_avx2(wt->d_imag + 0);
+    const __m256 wi_hi = ggml_ifairy_lut_load_scale8_avx2(wt->d_imag + 8);
 
 #    ifdef __FMA__
     acc_r_lo = _mm256_fmadd_ps(v_ac_lo, _mm256_mul_ps(v_lr, wr_lo), acc_r_lo);
@@ -758,22 +832,23 @@ static inline void ggml_ifairy_lut_accumulate_single_tile_avx2(const struct ifai
                                          acc_r_hi, acc_i_lo, acc_i_hi);
 }
 
-static inline void ggml_ifairy_lut_accumulate_tile_pair_avx2(const struct ifairy_lut_wtile_16 * wt0,
-                                                             const struct ifairy_lut_wtile_16 * wt1,
-                                                             const int8_t *                     lut_blk,
-                                                             int                                num_bytes,
-                                                             const __m256i &                    one,
-                                                             const __m256i &                    mask_idx,
-                                                             const __m256 &                     v_lr,
-                                                             const __m256 &                     v_li,
-                                                             __m256 &                           acc0_r_lo,
-                                                             __m256 &                           acc0_r_hi,
-                                                             __m256 &                           acc0_i_lo,
-                                                             __m256 &                           acc0_i_hi,
-                                                             __m256 &                           acc1_r_lo,
-                                                             __m256 &                           acc1_r_hi,
-                                                             __m256 &                           acc1_i_lo,
-                                                             __m256 &                           acc1_i_hi) {
+template <typename wtile_type>
+static inline void ggml_ifairy_lut_accumulate_tile_pair_avx2(const wtile_type * wt0,
+                                                             const wtile_type * wt1,
+                                                             const int8_t *    lut_blk,
+                                                             int               num_bytes,
+                                                             const __m256i &   one,
+                                                             const __m256i &   mask_idx,
+                                                             const __m256 &    v_lr,
+                                                             const __m256 &    v_li,
+                                                             __m256 &          acc0_r_lo,
+                                                             __m256 &          acc0_r_hi,
+                                                             __m256 &          acc0_i_lo,
+                                                             __m256 &          acc0_i_hi,
+                                                             __m256 &          acc1_r_lo,
+                                                             __m256 &          acc1_r_hi,
+                                                             __m256 &          acc1_i_lo,
+                                                             __m256 &          acc1_i_hi) {
     __m256i sum0_01_lo = _mm256_setzero_si256();
     __m256i sum0_01_hi = _mm256_setzero_si256();
     __m256i sum0_23_lo = _mm256_setzero_si256();
@@ -1899,6 +1974,75 @@ void ggml_ifairy64_lut_qgemm_lut16(int          m,
         ggml_ifairy_lut_qgemm_lut16_one(blocks, groups_per_block, groups, m, wtiles, lut_col, scales, dst_col,
                                         dst_row_stride, pack_bf16, add);
     }
+}
+
+void ggml_ifairy64_lut_qgemm_pair_lut16(int          m,
+                                        int          k,
+                                        int          n,
+                                        const void * packed_wtiles0,
+                                        const void * packed_wtiles1,
+                                        const void * lut,
+                                        const void * lut_scales,
+                                        float *      dst,
+                                        size_t       dst_col_stride,
+                                        size_t       dst_row_stride,
+                                        bool         pack_bf16) {
+    if (!packed_wtiles0 || !packed_wtiles1 || !dst || !lut || !lut_scales || m <= 0 || k <= 0 || n <= 0) {
+        return;
+    }
+
+#if defined(__AVX2__)
+    const int64_t blocks           = k / QK_IFAIRY64;
+    const int64_t groups_per_block = QK_IFAIRY64_GROUPS_PER_BLOCK;
+    const int64_t groups           = blocks * groups_per_block;
+    const int     tiles            = (m + 15) / 16;
+    const int     num_bytes        = (int) groups_per_block / 2;
+    const __m256i one              = _mm256_set1_epi8(1);
+    const __m256i mask_idx         = _mm256_set1_epi8(0x0f);
+    const auto *  wtiles0          = (const ifairy64_lut_wtile_16 *) packed_wtiles0;
+    const auto *  wtiles1          = (const ifairy64_lut_wtile_16 *) packed_wtiles1;
+
+    for (int col = 0; col < n; ++col) {
+        const int8_t * lut_col = (const int8_t *) lut + (size_t) col * (size_t) groups * k_ifairy_lut_group_bytes;
+        const float *  scales  = (const float *) lut_scales + (size_t) col * (size_t) blocks * 2u;
+        uint8_t *      dst_col = (uint8_t *) dst + (size_t) col * dst_col_stride;
+
+        for (int tile = 0; tile < tiles; ++tile) {
+            __m256 acc0_r_lo = _mm256_setzero_ps();
+            __m256 acc0_r_hi = _mm256_setzero_ps();
+            __m256 acc0_i_lo = _mm256_setzero_ps();
+            __m256 acc0_i_hi = _mm256_setzero_ps();
+            __m256 acc1_r_lo = _mm256_setzero_ps();
+            __m256 acc1_r_hi = _mm256_setzero_ps();
+            __m256 acc1_i_lo = _mm256_setzero_ps();
+            __m256 acc1_i_hi = _mm256_setzero_ps();
+
+            for (int64_t blk = 0; blk < blocks; ++blk) {
+                const ifairy64_lut_wtile_16 * wt0 = wtiles0 + (size_t) tile * (size_t) blocks + (size_t) blk;
+                const ifairy64_lut_wtile_16 * wt1 = wtiles1 + (size_t) tile * (size_t) blocks + (size_t) blk;
+                const int8_t * lut_blk =
+                    lut_col + (size_t) blk * (size_t) groups_per_block * k_ifairy_lut_group_bytes;
+                const __m256 v_lr = _mm256_set1_ps(scales[blk * 2 + 0]);
+                const __m256 v_li = _mm256_set1_ps(scales[blk * 2 + 1]);
+
+                ggml_ifairy_lut_accumulate_tile_pair_avx2(wt0, wt1, lut_blk, num_bytes, one, mask_idx, v_lr, v_li,
+                                                          acc0_r_lo, acc0_r_hi, acc0_i_lo, acc0_i_hi, acc1_r_lo,
+                                                          acc1_r_hi, acc1_i_lo, acc1_i_hi);
+            }
+
+            ggml_ifairy_lut_store_tile_avx2(tile, m, dst_col, dst_row_stride, pack_bf16,
+                                            _mm256_add_ps(acc0_r_lo, acc1_r_lo),
+                                            _mm256_add_ps(acc0_r_hi, acc1_r_hi),
+                                            _mm256_add_ps(acc0_i_lo, acc1_i_lo),
+                                            _mm256_add_ps(acc0_i_hi, acc1_i_hi));
+        }
+    }
+#else
+    ggml_ifairy64_lut_qgemm_lut16(m, k, n, packed_wtiles0, lut, lut_scales, dst, dst_col_stride, dst_row_stride,
+                                  pack_bf16, false);
+    ggml_ifairy64_lut_qgemm_lut16(m, k, n, packed_wtiles1, lut, lut_scales, dst, dst_col_stride, dst_row_stride,
+                                  pack_bf16, true);
+#endif
 }
 
 void ggml_ifairy64_lut_qgemm_fused_lut16(int          m,
