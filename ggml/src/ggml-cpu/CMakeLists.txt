@@ -109,10 +109,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
+        set(GGML_IFAIRY_DOTPROD_SOURCE ggml-cpu/arch/arm/quants-ifairy-dotprod.c)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/arm/quants.c
+            ggml-cpu/arch/arm/quants-ifairy.c
+            ${GGML_IFAIRY_DOTPROD_SOURCE}
             ggml-cpu/arch/arm/repack.cpp
             )
+
+        if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+            set_source_files_properties(${GGML_IFAIRY_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+        endif()
 
         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
             message(FATAL_ERROR "MSVC is not supported for ARM, use clang")
