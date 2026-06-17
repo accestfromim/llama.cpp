@@ -16,6 +16,9 @@
 #ifdef GGML_USE_FAIRY2I_CPU
 #    include "fairy2i/fairy2i-cpu.h"
 #endif
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+#    include "legacy-ifairy/legacy-ifairy-cpu.h"
+#endif
 #include "ggml.h"
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
 #    include "ggml-ifairy-lut-impl.h"
@@ -774,7 +777,7 @@ static void ggml_fairy2i_lut_prepare_cgraph_indexes(const struct ggml_cgraph *  
             continue;
         }
 
-        if (node->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2 || node->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2) {
+        if (node->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2) {
             if (!cfg || !cfg->lut_explicit) {
                 continue;
             }
@@ -2442,7 +2445,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             }
             break;
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
-        case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
 #ifdef GGML_USE_FAIRY2I_CPU
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
@@ -2458,6 +2460,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 }
 #else
                 GGML_ABORT("%s requires GGML_FAIRY2I_CPU", ggml_op_name(tensor->op));
+#endif
+            }
+            break;
+        case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
+            {
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+                const bool use_lut = false;
+                const bool lut_c   = false;
+                if (!ggml_legacy_ifairy_cpu_compute_wide_linear_w2(params, tensor, use_lut, lut_c)) {
+                    GGML_ABORT("%s failed", ggml_op_name(tensor->op));
+                }
+#else
+                GGML_ABORT("%s requires GGML_LEGACY_IFAIRY_CPU", ggml_op_name(tensor->op));
 #endif
             }
             break;
@@ -3401,10 +3416,17 @@ struct ggml_cplan ggml_graph_plan(
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
-                case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {
 #ifdef GGML_USE_FAIRY2I_CPU
                         cur = ggml_fairy2i_cpu_work_size(node, n_tasks);
+#else
+                        cur = 0;
+#endif
+                    } break;
+                case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
+                    {
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+                        cur = ggml_legacy_ifairy_cpu_work_size(node, n_tasks);
 #else
                         cur = 0;
 #endif

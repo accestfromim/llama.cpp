@@ -1,19 +1,19 @@
-#include "ifairy-fuse.h"
-#include "fairy2i/wide-linear.h"
+#include "wide-linear.h"
 
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "quants.h"
 
+#include <math.h>
 #include <stdint.h>
 
-struct ggml_ifairy_complex_acc {
+struct ggml_fairy2i_complex_acc {
     float real;
     float imag;
 };
 
-static inline void ggml_ifairy64_fuse_accumulate_block_scalar(const block_ifairy64 *      w,
-                                                               const block_ifairy64_q16 * x,
+static inline void ggml_fairy2i_tile64_fuse_accumulate_block_scalar(const block_fairy2i_tile64_v2 *      w,
+                                                               const block_fairy2i_act_q16_64 * x,
                                                                int32_t                     sums[4]) {
     for (int part = 0; part < 4; ++part) {
         for (int lane = 0; lane < 16; ++lane) {
@@ -47,7 +47,7 @@ static inline void ggml_ifairy64_fuse_accumulate_block_scalar(const block_ifairy
 }
 
 #if defined(__AVX2__)
-static inline int32_t ggml_ifairy_hsum_i16x8_avx2(__m128i v) {
+static inline int32_t ggml_fairy2i_hsum_i16x8_avx2(__m128i v) {
     const __m128i ones = _mm_set1_epi16(1);
     __m128i       s32  = _mm_madd_epi16(v, ones);
     s32                = _mm_add_epi32(s32, _mm_shuffle_epi32(s32, _MM_SHUFFLE(1, 0, 3, 2)));
@@ -55,13 +55,13 @@ static inline int32_t ggml_ifairy_hsum_i16x8_avx2(__m128i v) {
     return _mm_cvtsi128_si32(s32);
 }
 
-static inline __m256i ggml_ifairy64_pack_weight_pair(const block_ifairy64 * w0, const block_ifairy64 * w1) {
+static inline __m256i ggml_fairy2i_tile64_pack_weight_pair(const block_fairy2i_tile64_v2 * w0, const block_fairy2i_tile64_v2 * w1) {
     const __m128i packed0 = _mm_loadu_si128((const __m128i *) w0->qs);
     const __m128i packed1 = _mm_loadu_si128((const __m128i *) w1->qs);
     return _mm256_inserti128_si256(_mm256_castsi128_si256(packed0), packed1, 1);
 }
 
-static inline void ggml_ifairy64_fuse_accumulate_code_pair_avx2(__m256i        codes,
+static inline void ggml_fairy2i_tile64_fuse_accumulate_code_pair_avx2(__m256i        codes,
                                                                  __m256i        xr,
                                                                  __m256i        xi,
                                                                  __m256i        neg_xr,
@@ -84,14 +84,14 @@ static inline void ggml_ifairy64_fuse_accumulate_code_pair_avx2(__m256i        c
     acc[3] = _mm256_add_epi16(acc[3], _mm256_maddubs_epi16(madd_ones, _mm256_blendv_epi8(zero, signed_xi, imag_mask)));
 }
 
-static inline void ggml_ifairy64_fuse_accumulate_block_four_avx2(const block_ifairy64 *      u0,
-                                                                  const block_ifairy64 *      u1,
-                                                                  const block_ifairy64 *      w0,
-                                                                  const block_ifairy64 *      w1,
-                                                                  const block_ifairy64_q16 * x,
+static inline void ggml_fairy2i_tile64_fuse_accumulate_block_four_avx2(const block_fairy2i_tile64_v2 *      u0,
+                                                                  const block_fairy2i_tile64_v2 *      u1,
+                                                                  const block_fairy2i_tile64_v2 *      w0,
+                                                                  const block_fairy2i_tile64_v2 *      w1,
+                                                                  const block_fairy2i_act_q16_64 * x,
                                                                   int32_t                      sums[4][4]) {
-    const __m256i packed_u  = ggml_ifairy64_pack_weight_pair(u0, u1);
-    const __m256i packed_w  = ggml_ifairy64_pack_weight_pair(w0, w1);
+    const __m256i packed_u  = ggml_fairy2i_tile64_pack_weight_pair(u0, u1);
+    const __m256i packed_w  = ggml_fairy2i_tile64_pack_weight_pair(w0, w1);
     const __m256i zero      = _mm256_setzero_si256();
     const __m256i one_byte  = _mm256_set1_epi8(1);
     const __m256i two_byte  = _mm256_set1_epi8(2);
@@ -110,26 +110,26 @@ static inline void ggml_ifairy64_fuse_accumulate_block_four_avx2(const block_ifa
 
         const __m256i codes_u = _mm256_and_si256(_mm256_srli_epi16(packed_u, 2 * part), code_mask);
         const __m256i codes_w = _mm256_and_si256(_mm256_srli_epi16(packed_w, 2 * part), code_mask);
-        ggml_ifairy64_fuse_accumulate_code_pair_avx2(codes_u, xr, xi, neg_xr, neg_xi, zero, one_byte, two_byte,
+        ggml_fairy2i_tile64_fuse_accumulate_code_pair_avx2(codes_u, xr, xi, neg_xr, neg_xi, zero, one_byte, two_byte,
                                                       madd_ones, acc_u);
-        ggml_ifairy64_fuse_accumulate_code_pair_avx2(codes_w, xr, xi, neg_xr, neg_xi, zero, one_byte, two_byte,
+        ggml_fairy2i_tile64_fuse_accumulate_code_pair_avx2(codes_w, xr, xi, neg_xr, neg_xi, zero, one_byte, two_byte,
                                                       madd_ones, acc_w);
     }
 
     for (int channel = 0; channel < 4; ++channel) {
-        sums[0][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm256_castsi256_si128(acc_u[channel]));
-        sums[1][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm256_extracti128_si256(acc_u[channel], 1));
-        sums[2][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm256_castsi256_si128(acc_w[channel]));
-        sums[3][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm256_extracti128_si256(acc_w[channel], 1));
+        sums[0][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm256_castsi256_si128(acc_u[channel]));
+        sums[1][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm256_extracti128_si256(acc_u[channel], 1));
+        sums[2][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm256_castsi256_si128(acc_w[channel]));
+        sums[3][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm256_extracti128_si256(acc_w[channel], 1));
     }
 }
 #endif
 
 #if defined(GGML_USE_FAIRY2I_CPU_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
-static inline __attribute__((always_inline)) __m512i ggml_ifairy64_pack_weight_four_avx512(const block_ifairy64 * u0,
-                                                                                            const block_ifairy64 * u1,
-                                                                                            const block_ifairy64 * w0,
-                                                                                            const block_ifairy64 * w1) {
+static inline __attribute__((always_inline)) __m512i ggml_fairy2i_tile64_pack_weight_four_avx512(const block_fairy2i_tile64_v2 * u0,
+                                                                                            const block_fairy2i_tile64_v2 * u1,
+                                                                                            const block_fairy2i_tile64_v2 * w0,
+                                                                                            const block_fairy2i_tile64_v2 * w1) {
     __m512i packed = _mm512_castsi128_si512(_mm_loadu_si128((const __m128i *) u0->qs));
     packed         = _mm512_inserti32x4(packed, _mm_loadu_si128((const __m128i *) u1->qs), 1);
     packed         = _mm512_inserti32x4(packed, _mm_loadu_si128((const __m128i *) w0->qs), 2);
@@ -137,15 +137,15 @@ static inline __attribute__((always_inline)) __m512i ggml_ifairy64_pack_weight_f
     return packed;
 }
 
-static inline __attribute__((always_inline)) __m512i ggml_ifairy64_fuse_apply_sign_avx512(__m512i   values,
+static inline __attribute__((always_inline)) __m512i ggml_fairy2i_tile64_fuse_apply_sign_avx512(__m512i   values,
                                                                                           __mmask64 positive) {
     return _mm512_mask_sub_epi8(values, ~positive, _mm512_setzero_si512(), values);
 }
 
-static inline __attribute__((always_inline)) void ggml_ifairy64_fuse_accumulate_block_four_avx512(
-    const block_ifairy64 * u0, const block_ifairy64 * u1, const block_ifairy64 * w0, const block_ifairy64 * w1,
-    const block_ifairy64_q16 * x, int32_t sums[4][4]) {
-    const __m512i packed    = ggml_ifairy64_pack_weight_four_avx512(u0, u1, w0, w1);
+static inline __attribute__((always_inline)) void ggml_fairy2i_tile64_fuse_accumulate_block_four_avx512(
+    const block_fairy2i_tile64_v2 * u0, const block_fairy2i_tile64_v2 * u1, const block_fairy2i_tile64_v2 * w0, const block_fairy2i_tile64_v2 * w1,
+    const block_fairy2i_act_q16_64 * x, int32_t sums[4][4]) {
+    const __m512i packed    = ggml_fairy2i_tile64_pack_weight_four_avx512(u0, u1, w0, w1);
     const __m512i one_byte  = _mm512_set1_epi8(1);
     const __m512i two_byte  = _mm512_set1_epi8(2);
     const __m512i code_mask = _mm512_set1_epi8(3);
@@ -164,8 +164,8 @@ static inline __attribute__((always_inline)) void ggml_ifairy64_fuse_accumulate_
         const __mmask64 imag     = _mm512_test_epi8_mask(codes, two_byte);
         const __mmask64 real     = ~imag;
 
-        const __m512i signed_xr = ggml_ifairy64_fuse_apply_sign_avx512(xr, positive);
-        const __m512i signed_xi = ggml_ifairy64_fuse_apply_sign_avx512(xi, positive);
+        const __m512i signed_xr = ggml_fairy2i_tile64_fuse_apply_sign_avx512(xr, positive);
+        const __m512i signed_xi = ggml_fairy2i_tile64_fuse_apply_sign_avx512(xi, positive);
 
         acc[0] = _mm512_add_epi16(acc[0], _mm512_maddubs_epi16(madd_ones, _mm512_maskz_mov_epi8(real, signed_xr)));
         acc[1] = _mm512_add_epi16(acc[1], _mm512_maddubs_epi16(madd_ones, _mm512_maskz_mov_epi8(real, signed_xi)));
@@ -174,19 +174,19 @@ static inline __attribute__((always_inline)) void ggml_ifairy64_fuse_accumulate_
     }
 
     for (int channel = 0; channel < 4; ++channel) {
-        sums[0][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm512_castsi512_si128(acc[channel]));
-        sums[1][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm512_extracti32x4_epi32(acc[channel], 1));
-        sums[2][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm512_extracti32x4_epi32(acc[channel], 2));
-        sums[3][channel] = ggml_ifairy_hsum_i16x8_avx2(_mm512_extracti32x4_epi32(acc[channel], 3));
+        sums[0][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm512_castsi512_si128(acc[channel]));
+        sums[1][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm512_extracti32x4_epi32(acc[channel], 1));
+        sums[2][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm512_extracti32x4_epi32(acc[channel], 2));
+        sums[3][channel] = ggml_fairy2i_hsum_i16x8_avx2(_mm512_extracti32x4_epi32(acc[channel], 3));
     }
 }
 #endif
 
-static inline void ggml_ifairy64_fuse_apply_branch(const block_ifairy64 *          w,
-                                                    const block_ifairy64_q16 *      x,
+static inline void ggml_fairy2i_tile64_fuse_apply_branch(const block_fairy2i_tile64_v2 *          w,
+                                                    const block_fairy2i_act_q16_64 *      x,
                                                     const int32_t                   sums[4],
                                                     bool                            conjugate_input,
-                                                    struct ggml_ifairy_complex_acc * acc) {
+                                                    struct ggml_fairy2i_complex_acc * acc) {
     const float xr = GGML_FP16_TO_FP32(x->d_real);
     const float xi = GGML_FP16_TO_FP32(x->d_imag);
     const float wr = GGML_FP16_TO_FP32(w->d_real);
@@ -201,35 +201,35 @@ static inline void ggml_ifairy64_fuse_apply_branch(const block_ifairy64 *       
     }
 }
 
-static inline void ggml_ifairy64_fuse_accumulate_four(const block_ifairy64 *          u0,
-                                                       const block_ifairy64 *          u1,
-                                                       const block_ifairy64 *          w0,
-                                                       const block_ifairy64 *          w1,
-                                                       const block_ifairy64_q16 *      x,
+static inline void ggml_fairy2i_tile64_fuse_accumulate_four(const block_fairy2i_tile64_v2 *          u0,
+                                                       const block_fairy2i_tile64_v2 *          u1,
+                                                       const block_fairy2i_tile64_v2 *          w0,
+                                                       const block_fairy2i_tile64_v2 *          w1,
+                                                       const block_fairy2i_act_q16_64 *      x,
                                                        int64_t                         blocks,
-                                                       struct ggml_ifairy_complex_acc * acc) {
+                                                       struct ggml_fairy2i_complex_acc * acc) {
     for (int64_t ib = 0; ib < blocks; ++ib) {
         int32_t sums[4][4] = {};
 
 #if defined(GGML_USE_FAIRY2I_CPU_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
-        ggml_ifairy64_fuse_accumulate_block_four_avx512(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
+        ggml_fairy2i_tile64_fuse_accumulate_block_four_avx512(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #elif defined(__AVX2__)
-        ggml_ifairy64_fuse_accumulate_block_four_avx2(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
+        ggml_fairy2i_tile64_fuse_accumulate_block_four_avx2(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #else
-        ggml_ifairy64_fuse_accumulate_block_scalar(&u0[ib], &x[ib], sums[0]);
-        ggml_ifairy64_fuse_accumulate_block_scalar(&u1[ib], &x[ib], sums[1]);
-        ggml_ifairy64_fuse_accumulate_block_scalar(&w0[ib], &x[ib], sums[2]);
-        ggml_ifairy64_fuse_accumulate_block_scalar(&w1[ib], &x[ib], sums[3]);
+        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&u0[ib], &x[ib], sums[0]);
+        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&u1[ib], &x[ib], sums[1]);
+        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&w0[ib], &x[ib], sums[2]);
+        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&w1[ib], &x[ib], sums[3]);
 #endif
 
-        ggml_ifairy64_fuse_apply_branch(&u0[ib], &x[ib], sums[0], false, acc);
-        ggml_ifairy64_fuse_apply_branch(&u1[ib], &x[ib], sums[1], false, acc);
-        ggml_ifairy64_fuse_apply_branch(&w0[ib], &x[ib], sums[2], true, acc);
-        ggml_ifairy64_fuse_apply_branch(&w1[ib], &x[ib], sums[3], true, acc);
+        ggml_fairy2i_tile64_fuse_apply_branch(&u0[ib], &x[ib], sums[0], false, acc);
+        ggml_fairy2i_tile64_fuse_apply_branch(&u1[ib], &x[ib], sums[1], false, acc);
+        ggml_fairy2i_tile64_fuse_apply_branch(&w0[ib], &x[ib], sums[2], true, acc);
+        ggml_fairy2i_tile64_fuse_apply_branch(&w1[ib], &x[ib], sums[3], true, acc);
     }
 }
 
-static inline float ggml_ifairy_wide_linear_bias_at(const struct ggml_tensor * bias,
+static inline float ggml_fairy2i_wide_linear_bias_at(const struct ggml_tensor * bias,
                                                      int64_t                    i0,
                                                      int64_t                    i1,
                                                      int64_t                    i2,
@@ -241,10 +241,66 @@ static inline float ggml_ifairy_wide_linear_bias_at(const struct ggml_tensor * b
 }
 
 static inline bool ggml_fairy2i_wide_linear_weight_type(enum ggml_type type) {
-    return type == GGML_TYPE_FAIRY2I_TILE64_V2 || type == GGML_TYPE_IFAIRY64;
+    return type == GGML_TYPE_FAIRY2I_TILE64_V2;
 }
 
-void ggml_compute_forward_ifairy_wide_linear_w2(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+static inline int8_t ggml_fairy2i_quant_i8(float x) {
+    const int q = (int) nearbyintf(x);
+    if (q < -127) {
+        return -127;
+    }
+    if (q > 127) {
+        return 127;
+    }
+    return (int8_t) q;
+}
+
+static void ggml_fairy2i_quantize_row_act_q16_64(const float * x, void * vy, int64_t k) {
+    GGML_ASSERT(k % QK_FAIRY2I_ACT_Q16_64 == 0);
+
+    block_fairy2i_act_q16_64 * y  = (block_fairy2i_act_q16_64 *) vy;
+    const int64_t             nb = k / QK_FAIRY2I_ACT_Q16_64;
+
+    for (int64_t i = 0; i < nb; i++) {
+        float max_real = 1e-5f;
+        float max_imag = 1e-5f;
+
+        for (int j = 0; j < QK_FAIRY2I_ACT_Q16_64; ++j) {
+            const float * x_com = x + j;
+
+            const ggml_bf16_t x_real_bf16 = ((const ggml_bf16_t *) (x_com))[0];
+            const ggml_bf16_t x_imag_bf16 = ((const ggml_bf16_t *) (x_com))[1];
+
+            const float x_real = GGML_BF16_TO_FP32(x_real_bf16);
+            const float x_imag = GGML_BF16_TO_FP32(x_imag_bf16);
+
+            max_real = fmaxf(max_real, fabsf(x_real));
+            max_imag = fmaxf(max_imag, fabsf(x_imag));
+        }
+
+        const float iscale_real = 127.f / max_real;
+        const float iscale_imag = 127.f / max_imag;
+
+        for (int j = 0; j < QK_FAIRY2I_ACT_Q16_64; ++j) {
+            const float * x_com = x + j;
+
+            const ggml_bf16_t x_real_bf16 = ((const ggml_bf16_t *) (x_com))[0];
+            const ggml_bf16_t x_imag_bf16 = ((const ggml_bf16_t *) (x_com))[1];
+
+            const float x_real = GGML_BF16_TO_FP32(x_real_bf16);
+            const float x_imag = GGML_BF16_TO_FP32(x_imag_bf16);
+
+            y[i].x_real[j] = ggml_fairy2i_quant_i8(iscale_real * x_real);
+            y[i].x_imag[j] = ggml_fairy2i_quant_i8(iscale_imag * x_imag);
+        }
+
+        y[i].d_real = GGML_FP32_TO_FP16(1.f / iscale_real);
+        y[i].d_imag = GGML_FP32_TO_FP16(1.f / iscale_imag);
+        x += QK_FAIRY2I_ACT_Q16_64;
+    }
+}
+
+void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * x      = dst->src[0];
     const struct ggml_tensor * u_s0   = dst->src[1];
     const struct ggml_tensor * u_s1   = dst->src[2];
@@ -268,17 +324,17 @@ void ggml_compute_forward_ifairy_wide_linear_w2(const struct ggml_compute_params
     const int64_t K          = x->ne[0];
     const int64_t M          = dst->ne[0];
     const int64_t act_rows   = ggml_nrows(x);
-    const int64_t blocks     = K / QK_IFAIRY64;
-    const size_t  q_row_size = ggml_row_size(GGML_TYPE_IFAIRY64_Q16, K);
+    const int64_t blocks     = K / QK_FAIRY2I_TILE64;
+    const size_t  q_row_size = ggml_row_size(GGML_TYPE_FAIRY2I_ACT_Q16_64, K);
     const size_t  q_bytes    = GGML_PAD((size_t) act_rows * q_row_size, 64);
 
-    GGML_ASSERT(K % QK_IFAIRY64 == 0);
+    GGML_ASSERT(K % QK_FAIRY2I_TILE64 == 0);
     GGML_ASSERT(params->wdata && params->wsize >= q_bytes);
 
-    block_ifairy64_q16 * q_x = (block_ifairy64_q16 *) params->wdata;
+    block_fairy2i_act_q16_64 * q_x = (block_fairy2i_act_q16_64 *) params->wdata;
     for (int64_t ir = params->ith; ir < act_rows; ir += params->nth) {
-        quantize_row_ifairy64_q16((const float *) ((const char *) x->data + ir * x->nb[1]),
-                                  (char *) q_x + ir * q_row_size, K);
+        ggml_fairy2i_quantize_row_act_q16_64(
+            (const float *) ((const char *) x->data + ir * x->nb[1]), (char *) q_x + ir * q_row_size, K);
     }
     ggml_barrier(params->threadpool);
 
@@ -293,26 +349,22 @@ void ggml_compute_forward_ifairy_wide_linear_w2(const struct ggml_compute_params
         const int64_t i2      = (act_row / x->ne[1]) % x->ne[2];
         const int64_t i3      = act_row / (x->ne[1] * x->ne[2]);
 
-        const block_ifairy64 * u0_row = (const block_ifairy64 *) u_s0->data + row * blocks;
-        const block_ifairy64 * u1_row = (const block_ifairy64 *) u_s1->data + row * blocks;
-        const block_ifairy64 * w0_row = (const block_ifairy64 *) w_s0->data + row * blocks;
-        const block_ifairy64 * w1_row = (const block_ifairy64 *) w_s1->data + row * blocks;
-        const block_ifairy64_q16 * xq = (const block_ifairy64_q16 *) ((const char *) q_x + act_row * q_row_size);
+        const block_fairy2i_tile64_v2 * u0_row = (const block_fairy2i_tile64_v2 *) u_s0->data + row * blocks;
+        const block_fairy2i_tile64_v2 * u1_row = (const block_fairy2i_tile64_v2 *) u_s1->data + row * blocks;
+        const block_fairy2i_tile64_v2 * w0_row = (const block_fairy2i_tile64_v2 *) w_s0->data + row * blocks;
+        const block_fairy2i_tile64_v2 * w1_row = (const block_fairy2i_tile64_v2 *) w_s1->data + row * blocks;
+        const block_fairy2i_act_q16_64 * xq = (const block_fairy2i_act_q16_64 *) ((const char *) q_x + act_row * q_row_size);
 
-        struct ggml_ifairy_complex_acc acc = { 0.0f, 0.0f };
-        ggml_ifairy64_fuse_accumulate_four(u0_row, u1_row, w0_row, w1_row, xq, blocks, &acc);
+        struct ggml_fairy2i_complex_acc acc = { 0.0f, 0.0f };
+        ggml_fairy2i_tile64_fuse_accumulate_four(u0_row, u1_row, w0_row, w1_row, xq, blocks, &acc);
 
         if (bias) {
-            acc.real += ggml_ifairy_wide_linear_bias_at(bias, row, i1, i2, i3);
-            acc.imag += ggml_ifairy_wide_linear_bias_at(bias, row + M, i1, i2, i3);
+            acc.real += ggml_fairy2i_wide_linear_bias_at(bias, row, i1, i2, i3);
+            acc.imag += ggml_fairy2i_wide_linear_bias_at(bias, row + M, i1, i2, i3);
         }
 
         ggml_bf16_t * out = (ggml_bf16_t *) ((char *) dst->data + act_row * dst->nb[1] + row * dst->nb[0]);
         out[0]             = GGML_FP32_TO_BF16(acc.real);
         out[1]             = GGML_FP32_TO_BF16(acc.imag);
     }
-}
-
-void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    ggml_compute_forward_ifairy_wide_linear_w2(params, dst);
 }

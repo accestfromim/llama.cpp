@@ -22,6 +22,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     if (GGML_FAIRY2I_CPU_AVX512 AND NOT GGML_AVX512)
         message(FATAL_ERROR "GGML_FAIRY2I_CPU_AVX512 requires GGML_AVX512")
     endif()
+    if (GGML_LEGACY_IFAIRY_CPU_AVX512 AND NOT GGML_AVX512)
+        message(FATAL_ERROR "GGML_LEGACY_IFAIRY_CPU_AVX512 requires GGML_AVX512")
+    endif()
 
     ggml_add_backend_library(${GGML_CPU_NAME})
 
@@ -57,9 +60,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/fairy2i/fairy2i-cpu.cpp
             ggml-cpu/fairy2i/fairy2i-cpu.h
-            ggml-cpu/fairy2i/wide-linear.h
-            ggml-cpu/ifairy-fuse.cpp
-            ggml-cpu/ifairy-fuse.h)
+            ggml-cpu/fairy2i/wide-linear.cpp
+            ggml-cpu/fairy2i/wide-linear.h)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/legacy-ifairy/legacy-ifairy-cpu.cpp
+            ggml-cpu/legacy-ifairy/legacy-ifairy-cpu.h
+            ggml-cpu/legacy-ifairy/wide-linear.cpp
+            ggml-cpu/legacy-ifairy/wide-linear.h)
     endif()
 
     if (GGML_FAIRY2I_CPU_LUT)
@@ -125,12 +135,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/arm/repack.cpp
             )
 
-        if (GGML_FAIRY2I_CPU)
+        if (GGML_FAIRY2I_CPU OR GGML_LEGACY_IFAIRY_CPU)
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/arch/arm/quants-ifairy.c)
         endif()
 
-        if (GGML_FAIRY2I_CPU AND GGML_FAIRY2I_CPU_ARM_DOTPROD)
+        if ((GGML_FAIRY2I_CPU AND GGML_FAIRY2I_CPU_ARM_DOTPROD) OR
+            (GGML_LEGACY_IFAIRY_CPU AND GGML_LEGACY_IFAIRY_CPU_ARM_DOTPROD))
             set(GGML_IFAIRY_DOTPROD_SOURCE ggml-cpu/arch/arm/quants-ifairy-dotprod.c)
             list(APPEND GGML_CPU_SOURCES
                 ${GGML_IFAIRY_DOTPROD_SOURCE})
