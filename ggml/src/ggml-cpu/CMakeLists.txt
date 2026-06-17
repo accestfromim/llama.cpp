@@ -150,19 +150,33 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/arm/repack.cpp
             )
 
-        if (GGML_FAIRY2I_CPU OR GGML_LEGACY_IFAIRY_CPU)
+        if (GGML_FAIRY2I_CPU)
             list(APPEND GGML_CPU_SOURCES
-                ggml-cpu/arch/arm/quants-ifairy.c)
+                ggml-cpu/fairy2i/arm/fairy2i-quants.c)
         endif()
 
-        if ((GGML_FAIRY2I_CPU AND GGML_FAIRY2I_CPU_ARM_DOTPROD) OR
-            (GGML_LEGACY_IFAIRY_CPU AND GGML_LEGACY_IFAIRY_CPU_ARM_DOTPROD))
-            set(GGML_IFAIRY_DOTPROD_SOURCE ggml-cpu/arch/arm/quants-ifairy-dotprod.c)
+        if (GGML_FAIRY2I_CPU AND GGML_FAIRY2I_CPU_ARM_DOTPROD)
+            set(GGML_FAIRY2I_DOTPROD_SOURCE ggml-cpu/fairy2i/arm/fairy2i-dotprod.c)
             list(APPEND GGML_CPU_SOURCES
-                ${GGML_IFAIRY_DOTPROD_SOURCE})
+                ${GGML_FAIRY2I_DOTPROD_SOURCE})
 
             if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
-                set_source_files_properties(${GGML_IFAIRY_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+                set_source_files_properties(${GGML_FAIRY2I_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+            endif()
+        endif()
+
+        if (GGML_LEGACY_IFAIRY_CPU)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/legacy-ifairy/arm/ifairy-quants.c)
+        endif()
+
+        if (GGML_LEGACY_IFAIRY_CPU AND GGML_LEGACY_IFAIRY_CPU_ARM_DOTPROD)
+            set(GGML_LEGACY_IFAIRY_DOTPROD_SOURCE ggml-cpu/legacy-ifairy/arm/ifairy-dotprod.c)
+            list(APPEND GGML_CPU_SOURCES
+                ${GGML_LEGACY_IFAIRY_DOTPROD_SOURCE})
+
+            if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+                set_source_files_properties(${GGML_LEGACY_IFAIRY_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
             endif()
         endif()
 

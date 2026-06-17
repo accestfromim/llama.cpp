@@ -7,7 +7,7 @@
 
 #include "../../ggml-cpu-impl.h"
 #include "../../quants.h"
-#include "quants-ifairy.h"
+#include "ifairy-quants.h"
 
 bool ggml_vec_dot_ifairy_q16_K_dotprod_available(void) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD) && defined(__aarch64__)

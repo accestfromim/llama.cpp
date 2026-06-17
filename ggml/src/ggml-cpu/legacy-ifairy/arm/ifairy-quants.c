@@ -7,7 +7,7 @@
 
 #include "../../ggml-cpu-impl.h"
 #include "../../quants.h"
-#include "quants-ifairy.h"
+#include "ifairy-quants.h"
 
 #include <assert.h>
 #include <pthread.h>
