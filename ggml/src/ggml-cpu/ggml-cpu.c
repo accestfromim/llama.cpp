@@ -1381,9 +1381,12 @@ UseGgmlGemm1:;
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-        const char * ifairy_act_tensor_env = getenv("GGML_IFAIRY_VEC_DOT_ACT_TENSOR");
-        const bool   ifairy_act_tensor = (src0->type == GGML_TYPE_IFAIRY) && (vec_dot_type == GGML_TYPE_IFAIRY_Q16) &&
-                                         (ifairy_act_tensor_env != NULL) && (strcmp(ifairy_act_tensor_env, "0") != 0);
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+        const bool src1_quantized_by_backend = ggml_legacy_ifairy_cpu_try_quantize_mul_mat_src1(
+            params, src0, src1, vec_dot_type, wdata, nbw1, nbw2, nbw3);
+#else
+        const bool src1_quantized_by_backend = false;
+#endif
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1396,16 +1399,10 @@ UseGgmlGemm1:;
             }
         }
 #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    if (ifairy_act_tensor) {
-                        if (ith == 0) {
-                            quantize_row_ifairy_q16_tensor(
-                                (float *) ((char *) src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11),
-                                (void *) (wdata + i13 * nbw3 + i12 * nbw2 + i11 * nbw1), ne10);
-                        }
-                    } else {
+        if (!src1_quantized_by_backend) {
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
                         size_t  bs               = ggml_blck_size(vec_dot_type);
                         int64_t ne10_block_start = (ith * ne10 / bs) / nth;
                         int64_t ne10_block_end   = ((ith + 1) * ne10 / bs) / nth;
