@@ -12,4 +12,3 @@ def token_looks_special(token: str | bytes) -> bool:
         or (token_text.startswith("<｜") and token_text.endswith("｜>"))
         or (token_text.startswith("<") and token_text.endswith(">"))
     )
-

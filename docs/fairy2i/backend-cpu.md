@@ -80,4 +80,3 @@ ctest --test-dir build-rel-fairy2i --output-on-failure -R test-ifairy
 ```
 
 The semantic invariant remains `w * conj(x)`.
-

@@ -39,4 +39,3 @@ def test_write_tile64_v2_metadata() -> None:
     assert writer.values["fairy2i.attn.layout"] == "llama_real"
     assert writer.values["fairy2i.tokenizer.profile"] == "llama_bpe"
     assert writer.values["fairy2i.vocab.padding_multiple"] == 128
-

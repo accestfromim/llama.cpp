@@ -64,4 +64,3 @@ def load_fairy2i_chat_template(model_dir: Path, tokenizer_config: dict) -> str |
     if not isinstance(chat_template, (str, list)):
         raise ValueError(f"bad chat_template type: {type(chat_template).__name__}")
     return normalize_fairy2i_chat_template_value(chat_template)
-

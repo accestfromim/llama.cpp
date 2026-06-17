@@ -9,4 +9,3 @@ def undo_llama_permute(weight: torch.Tensor, n_head: int) -> torch.Tensor:
         .swapaxes(1, 2)
         .reshape(weight.shape)
     )
-

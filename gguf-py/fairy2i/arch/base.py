@@ -17,4 +17,3 @@ class Fairy2IArchAdapter(Protocol):
     info: Fairy2IArchInfo
 
     def match(self, config: dict) -> bool: ...
-

@@ -71,4 +71,3 @@ def write_metadata(writer: gguf.GGUFWriter, metadata: Fairy2IMetadata) -> None:
         writer.add_uint32("fairy2i.vocab.padded_size", metadata.vocab_padded_size)
     if metadata.vocab_padding_multiple is not None:
         writer.add_uint32("fairy2i.vocab.padding_multiple", metadata.vocab_padding_multiple)
-

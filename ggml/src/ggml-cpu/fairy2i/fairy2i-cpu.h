@@ -24,4 +24,3 @@ bool ggml_fairy2i_cpu_compute_wide_linear_w2(
 #ifdef __cplusplus
 }
 #endif
-

@@ -14,4 +14,3 @@ INFO = Fairy2IArchInfo(
 
 def match(config: dict) -> bool:
     return config.get("model_type") in INFO.hf_model_types
-

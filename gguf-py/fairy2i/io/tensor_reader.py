@@ -59,4 +59,3 @@ def add_optional_vector_tensor(
     writer.add_tensor(gguf_name, tensor, raw_dtype=gguf.GGMLQuantizationType.F32)
     del tensor
     gc.collect()
-
