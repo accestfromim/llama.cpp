@@ -23,19 +23,31 @@ split into its own model envelope and backend path.
 - Fairy2i options and environment variables must not be required to enable old
   iFairy vecdot, W2 fused, or LUT execution.
 - Legacy CPU coverage lives in `tests/test-legacy-ifairy.cpp` and the
-  `test-legacy-ifairy` CTest target.
+  `test-legacy-ifairy` CTest target. Direct-only coverage lives in
+  `tests/test-legacy-ifairy-direct.cpp` and the `test-legacy-ifairy-direct`
+  CTest target.
+- Legacy tensor-scale vecdot policy, W2 direct fuse, and LUT dispatch are owned
+  by `ggml/src/ggml-cpu/legacy-ifairy/`.
 - Each independently reviewable compatibility fix is tested and committed
   before the next fix starts.
 
 Current legacy-only validation:
 
 ```bash
+cmake -B build-ifairy-direct \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_FAIRY2I=OFF \
+  -DGGML_LEGACY_IFAIRY_CPU=ON \
+  -DGGML_LEGACY_IFAIRY_CPU_LUT=OFF
+cmake --build build-ifairy-direct --target test-legacy-ifairy-direct -j 4
+ctest --test-dir build-ifairy-direct --output-on-failure -R legacy-ifairy-direct
+
 cmake -B build-ifairy-legacy \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_FAIRY2I=OFF \
   -DGGML_LEGACY_IFAIRY_CPU=ON \
   -DGGML_LEGACY_IFAIRY_CPU_LUT=ON
-cmake --build build-ifairy-legacy --target test-legacy-ifairy -j 4
+cmake --build build-ifairy-legacy --target test-legacy-ifairy test-legacy-ifairy-direct -j 4
 GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy
 ```
 
