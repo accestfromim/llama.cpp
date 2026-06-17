@@ -92,7 +92,7 @@ New files should include:
 - `general.architecture = 'fairy2i'`
 - `fairy2i.schema_version = 1`
 - `fairy2i.base_arch`
-- `fairy2i.quant.format = 'ifairy64'`
+- `fairy2i.quant.format = 'fairy2i_tile64_v2'`
 - `fairy2i.quant.variant = 'tile64_v2'`
 - `fairy2i.attn.layout = 'llama_real'` for Llama or `qwen2_real` for Qwen2
 - `fairy2i.tokenizer.profile`

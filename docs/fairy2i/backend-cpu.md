@@ -14,12 +14,14 @@ GGML_FAIRY2I_CPU_AVX512=OFF
 GGML_FAIRY2I_CPU_ARM_DOTPROD=ON
 ```
 
-Deprecated aliases are still accepted:
+Legacy iFairy aliases are still accepted, but only as legacy options:
 
 ```cmake
-GGML_IFAIRY_LUT_CPU      -> GGML_FAIRY2I_CPU_LUT
-GGML_IFAIRY_FUSE_AVX512 -> GGML_FAIRY2I_CPU_AVX512
+GGML_IFAIRY_LUT_CPU      -> GGML_LEGACY_IFAIRY_LUT_CPU
+GGML_IFAIRY_FUSE_AVX512 -> GGML_LEGACY_IFAIRY_AVX512
 ```
+
+They do not enable Fairy2i CPU features.
 
 When `GGML_FAIRY2I_CPU_LUT=ON`, CMake keeps the historical CPU-only LUT
 behavior and disables accelerator backends.
@@ -56,17 +58,17 @@ ggml/src/ggml-cpu/fairy2i/fairy2i-cpu.h
 ggml/src/ggml-cpu/fairy2i/fairy2i-cpu.cpp
 ```
 
-`ggml-cpu.c` calls this shim for `GGML_OP_IFAIRY_WIDE_LINEAR_W2` work-size and
-compute dispatch. The existing optimized implementation files remain in their
-current locations for compatibility, but they are no longer compiled unless
-`GGML_FAIRY2I_CPU` is enabled.
+`ggml-cpu.c` calls this shim for `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` work-size and
+compute dispatch. A temporary legacy bridge still accepts the old op while the
+legacy iFairy backend is being isolated.
 
 ## Current Limits
 
-- `GGML_TYPE_IFAIRY64` remains the storage type for tile64_v2 weights.
-- Existing `GGML_OP_IFAIRY_*` op ids are retained for ABI stability.
-- LUT configuration and threadpool fields are still in `ggml-cpu.c`; moving
-  them into the Fairy2i CPU module is a follow-up refactor.
+- `GGML_TYPE_FAIRY2I_TILE64_V2` is the storage type for new tile64_v2 weights.
+- New graph code uses `GGML_OP_COMPLEX_*` plus
+  `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`.
+- LUT configuration and threadpool fields now use Fairy2i naming, while the
+  low-level kernel files are still being migrated.
 - Reference/planner/dispatch split is started by the shim but not yet a full
   kernel registry.
 
