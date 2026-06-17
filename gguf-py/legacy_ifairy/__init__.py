@@ -1,0 +1,1 @@
+"""Legacy iFairy compatibility helpers."""

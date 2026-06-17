@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("model_dir", type=Path, help="Path to the Fairy2i model directory")
     parser.add_argument("output_file", type=Path, nargs="?", help="Output GGUF file path")
     parser.add_argument("--base-arch", choices=["auto", "llama", "qwen2"], default="auto")
-    parser.add_argument("--quant-variant", choices=["tile64_v2", "legacy"], default="tile64_v2")
+    parser.add_argument("--quant-variant", choices=["tile64_v2"], default="tile64_v2")
     parser.add_argument("--residual-steps", type=int, default=2)
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs without writing GGUF")
     parser.add_argument("--qk-permute", action="store_true", help="Enable Llama q/k undo-permute when supported")

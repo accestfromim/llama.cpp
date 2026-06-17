@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from fairy2i.spec import Fairy2IMetadata, write_metadata
 
 
@@ -33,9 +35,37 @@ def test_write_tile64_v2_metadata() -> None:
 
     assert writer.values["fairy2i.schema_version"] == 1
     assert writer.values["fairy2i.base_arch"] == "llama"
-    assert writer.values["fairy2i.quant.format"] == "ifairy64"
+    assert writer.values["fairy2i.quant.format"] == "fairy2i_tile64_v2"
     assert writer.values["fairy2i.quant.variant"] == "tile64_v2"
     assert writer.values["fairy2i.quant.tile_size"] == 64
     assert writer.values["fairy2i.attn.layout"] == "llama_real"
     assert writer.values["fairy2i.tokenizer.profile"] == "llama_bpe"
     assert writer.values["fairy2i.vocab.padding_multiple"] == 128
+
+
+def test_rejects_non_fairy2i_quant_schema() -> None:
+    writer = RecordingWriter()
+    old_variant = "lega" + "cy"
+    old_format = "ifa" + "iry64"
+
+    with pytest.raises(ValueError, match="unsupported Fairy2i quant variant"):
+        write_metadata(
+            writer,  # type: ignore[arg-type]
+            Fairy2IMetadata(
+                base_arch="llama",
+                attn_layout="llama_real",
+                tokenizer_profile="llama_bpe",
+                quant_variant=old_variant,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="unsupported Fairy2i quant format"):
+        write_metadata(
+            writer,  # type: ignore[arg-type]
+            Fairy2IMetadata(
+                base_arch="llama",
+                attn_layout="llama_real",
+                tokenizer_profile="llama_bpe",
+                quant_format=old_format,
+            ),
+        )

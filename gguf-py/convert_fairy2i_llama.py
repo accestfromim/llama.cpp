@@ -23,9 +23,9 @@ import torch
 
 from fairy2i.io.tensor_reader import TensorReader, add_optional_vector_tensor, load_weight_map
 from fairy2i.quant.tile64_v2 import (
-    QK_IFAIRY,
+    FAIRY2I_TILE64,
     TILE64,
-    quantize_linear_to_ifairy64_stages,
+    quantize_linear_to_fairy2i_tile64_v2_stages,
     round_up,
 )
 from fairy2i.quant.widely_linear import undo_llama_permute
@@ -360,7 +360,7 @@ def main(argv: list[str] | None = None) -> None:
     if ff_real % 2 != 0:
         raise ValueError(f"intermediate_size must be even, got {ff_real}")
     ff_complex = ff_real // 2
-    ff_complex_padded = round_up(ff_complex, QK_IFAIRY)
+    ff_complex_padded = round_up(ff_complex, FAIRY2I_TILE64)
 
     print(
         "Fairy2i Llama conversion: "
@@ -386,7 +386,7 @@ def main(argv: list[str] | None = None) -> None:
     writer.add_head_count_kv(n_head_kv)
     writer.add_layer_norm_rms_eps(float(config["rms_norm_eps"]))
     add_rope_metadata(config, writer)
-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_IFAIRY)
+    writer.add_file_type(gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2)
     writer.add_vocab_size(vocab_padded)
     write_metadata(
         writer,
@@ -477,12 +477,12 @@ def main(argv: list[str] | None = None) -> None:
             out_target = ff_complex_padded if out_c == ff_complex else out_c
             in_target = ff_complex_padded if in_c == ff_complex else in_c
 
-            packed = quantize_linear_to_ifairy64_stages(w, out_target, in_target)
+            packed = quantize_linear_to_fairy2i_tile64_v2_stages(w, out_target, in_target)
             for stage_name, stage_data in packed.items():
                 writer.add_tensor(
                     f"blk.{il}.{gguf_base}.{stage_name}",
                     stage_data,
-                    raw_dtype=gguf.GGMLQuantizationType.IFAIRY64,
+                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
                 )
 
             del w, packed
