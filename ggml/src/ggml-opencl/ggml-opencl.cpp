@@ -349,14 +349,8 @@ struct ggml_backend_opencl_context {
     cl_context context;
     cl_command_queue queue;
 
-    cl_mem ifairy64_act_q_scratch = nullptr;
-    cl_mem ifairy64_act_d_scratch = nullptr;
-    size_t ifairy64_act_q_capacity = 0;
-    size_t ifairy64_act_d_capacity = 0;
-    cl_mem fairy2i_tile64_act_q_scratch = nullptr;
-    cl_mem fairy2i_tile64_act_d_scratch = nullptr;
-    size_t fairy2i_tile64_act_q_capacity = 0;
-    size_t fairy2i_tile64_act_d_capacity = 0;
+    ggml_opencl_fairy2i_state fairy2i;
+    ggml_opencl_legacy_ifairy_state legacy_ifairy;
 
     cl_program program_add;
     cl_program program_add_id;
@@ -370,22 +364,6 @@ struct ggml_backend_opencl_context {
     cl_program program_get_rows;
     cl_program program_set_rows;
     cl_program program_glu;
-    cl_program program_complex_add;
-    cl_program program_complex_merge;
-    cl_program program_complex_mul;
-    cl_program program_complex_relu2;
-    cl_program program_complex_rms_norm;
-    cl_program program_complex_rope;
-    cl_program program_complex_split;
-    cl_program program_fairy2i_tile64;
-    cl_program program_ifairy_add;
-    cl_program program_ifairy_merge;
-    cl_program program_ifairy64;
-    cl_program program_ifairy_mul;
-    cl_program program_ifairy_relu2;
-    cl_program program_ifairy_rope;
-    cl_program program_ifairy_rms_norm;
-    cl_program program_ifairy_split;
     cl_program program_im2col_f16;
     cl_program program_im2col_f32;
     cl_program program_mul_mat_Ab_Bi_8x4;
@@ -441,30 +419,6 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_neg_f32;
     cl_kernel kernel_div, kernel_div_row, kernel_div_f16, kernel_div_row_f16;
     cl_kernel kernel_sub, kernel_sub_row, kernel_sub_f16, kernel_sub_row_f16;
-    cl_kernel kernel_complex_add;
-    cl_kernel kernel_complex_merge;
-    cl_kernel kernel_complex_mul;
-    cl_kernel kernel_complex_relu2;
-    cl_kernel kernel_complex_rms_norm, kernel_complex_rms_norm_mul;
-    cl_kernel kernel_complex_rope;
-    cl_kernel kernel_complex_split;
-    cl_kernel kernel_fairy2i_tile64_q16_quantize_block127;
-    cl_kernel kernel_fairy2i_tile64_mul_mat_f32_q16;
-    cl_kernel kernel_fairy2i_tile64_mul_mat_f32_direct;
-    cl_kernel kernel_fairy2i_tile64_mul_vec_f32_q16;
-    cl_kernel kernel_fairy2i_tile64_mul_vec4_f32_q16;
-    cl_kernel kernel_ifairy_add;
-    cl_kernel kernel_ifairy_merge;
-    cl_kernel kernel_ifairy_q16_quantize_block127;
-    cl_kernel kernel_ifairy64_mul_mat_f32_q16;
-    cl_kernel kernel_ifairy64_mul_mat_f32_direct;
-    cl_kernel kernel_ifairy64_mul_vec_f32_q16;
-    cl_kernel kernel_ifairy64_mul_vec4_f32_q16;
-    cl_kernel kernel_ifairy_mul;
-    cl_kernel kernel_ifairy_relu2;
-    cl_kernel kernel_ifairy_rope;
-    cl_kernel kernel_ifairy_rms_norm, kernel_ifairy_rms_norm_mul;
-    cl_kernel kernel_ifairy_split;
     cl_kernel kernel_add_id;
     cl_kernel kernel_scale;
     cl_kernel kernel_silu, kernel_silu_4;
@@ -645,71 +599,71 @@ struct ggml_backend_opencl_context {
     void ensure_ifairy64_act_scratch(size_t act_q_size, size_t act_d_size) {
         cl_int err;
 
-        if (ifairy64_act_q_capacity < act_q_size) {
-            if (ifairy64_act_q_scratch != nullptr) {
-                CL_CHECK(clReleaseMemObject(ifairy64_act_q_scratch));
+        if (legacy_ifairy.ifairy64_act_q_capacity < act_q_size) {
+            if (legacy_ifairy.ifairy64_act_q_scratch != nullptr) {
+                CL_CHECK(clReleaseMemObject(legacy_ifairy.ifairy64_act_q_scratch));
             }
-            ifairy64_act_q_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_q_size, NULL, &err);
+            legacy_ifairy.ifairy64_act_q_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_q_size, NULL, &err);
             CL_CHECK(err);
-            ifairy64_act_q_capacity = act_q_size;
+            legacy_ifairy.ifairy64_act_q_capacity = act_q_size;
         }
 
-        if (ifairy64_act_d_capacity < act_d_size) {
-            if (ifairy64_act_d_scratch != nullptr) {
-                CL_CHECK(clReleaseMemObject(ifairy64_act_d_scratch));
+        if (legacy_ifairy.ifairy64_act_d_capacity < act_d_size) {
+            if (legacy_ifairy.ifairy64_act_d_scratch != nullptr) {
+                CL_CHECK(clReleaseMemObject(legacy_ifairy.ifairy64_act_d_scratch));
             }
-            ifairy64_act_d_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_d_size, NULL, &err);
+            legacy_ifairy.ifairy64_act_d_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_d_size, NULL, &err);
             CL_CHECK(err);
-            ifairy64_act_d_capacity = act_d_size;
+            legacy_ifairy.ifairy64_act_d_capacity = act_d_size;
         }
     }
 
     void release_ifairy64_act_scratch() {
-        if (ifairy64_act_q_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(ifairy64_act_q_scratch));
-            ifairy64_act_q_scratch = nullptr;
+        if (legacy_ifairy.ifairy64_act_q_scratch != nullptr) {
+            CL_CHECK(clReleaseMemObject(legacy_ifairy.ifairy64_act_q_scratch));
+            legacy_ifairy.ifairy64_act_q_scratch = nullptr;
         }
-        if (ifairy64_act_d_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(ifairy64_act_d_scratch));
-            ifairy64_act_d_scratch = nullptr;
+        if (legacy_ifairy.ifairy64_act_d_scratch != nullptr) {
+            CL_CHECK(clReleaseMemObject(legacy_ifairy.ifairy64_act_d_scratch));
+            legacy_ifairy.ifairy64_act_d_scratch = nullptr;
         }
-        ifairy64_act_q_capacity = 0;
-        ifairy64_act_d_capacity = 0;
+        legacy_ifairy.ifairy64_act_q_capacity = 0;
+        legacy_ifairy.ifairy64_act_d_capacity = 0;
     }
 
     void ensure_fairy2i_tile64_act_scratch(size_t act_q_size, size_t act_d_size) {
         cl_int err;
 
-        if (fairy2i_tile64_act_q_capacity < act_q_size) {
-            if (fairy2i_tile64_act_q_scratch != nullptr) {
-                CL_CHECK(clReleaseMemObject(fairy2i_tile64_act_q_scratch));
+        if (fairy2i.fairy2i_tile64_act_q_capacity < act_q_size) {
+            if (fairy2i.fairy2i_tile64_act_q_scratch != nullptr) {
+                CL_CHECK(clReleaseMemObject(fairy2i.fairy2i_tile64_act_q_scratch));
             }
-            fairy2i_tile64_act_q_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_q_size, NULL, &err);
+            fairy2i.fairy2i_tile64_act_q_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_q_size, NULL, &err);
             CL_CHECK(err);
-            fairy2i_tile64_act_q_capacity = act_q_size;
+            fairy2i.fairy2i_tile64_act_q_capacity = act_q_size;
         }
 
-        if (fairy2i_tile64_act_d_capacity < act_d_size) {
-            if (fairy2i_tile64_act_d_scratch != nullptr) {
-                CL_CHECK(clReleaseMemObject(fairy2i_tile64_act_d_scratch));
+        if (fairy2i.fairy2i_tile64_act_d_capacity < act_d_size) {
+            if (fairy2i.fairy2i_tile64_act_d_scratch != nullptr) {
+                CL_CHECK(clReleaseMemObject(fairy2i.fairy2i_tile64_act_d_scratch));
             }
-            fairy2i_tile64_act_d_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_d_size, NULL, &err);
+            fairy2i.fairy2i_tile64_act_d_scratch = clCreateBuffer(context, CL_MEM_READ_WRITE, act_d_size, NULL, &err);
             CL_CHECK(err);
-            fairy2i_tile64_act_d_capacity = act_d_size;
+            fairy2i.fairy2i_tile64_act_d_capacity = act_d_size;
         }
     }
 
     void release_fairy2i_tile64_act_scratch() {
-        if (fairy2i_tile64_act_q_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(fairy2i_tile64_act_q_scratch));
-            fairy2i_tile64_act_q_scratch = nullptr;
+        if (fairy2i.fairy2i_tile64_act_q_scratch != nullptr) {
+            CL_CHECK(clReleaseMemObject(fairy2i.fairy2i_tile64_act_q_scratch));
+            fairy2i.fairy2i_tile64_act_q_scratch = nullptr;
         }
-        if (fairy2i_tile64_act_d_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(fairy2i_tile64_act_d_scratch));
-            fairy2i_tile64_act_d_scratch = nullptr;
+        if (fairy2i.fairy2i_tile64_act_d_scratch != nullptr) {
+            CL_CHECK(clReleaseMemObject(fairy2i.fairy2i_tile64_act_d_scratch));
+            fairy2i.fairy2i_tile64_act_d_scratch = nullptr;
         }
-        fairy2i_tile64_act_q_capacity = 0;
-        fairy2i_tile64_act_d_capacity = 0;
+        fairy2i.fairy2i_tile64_act_q_capacity = 0;
+        fairy2i.fairy2i_tile64_act_d_capacity = 0;
     }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -860,10 +814,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("complex_add.cl");
 #endif
-        backend_ctx->program_complex_add =
+        backend_ctx->fairy2i.program_complex_add =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_complex_add = clCreateKernel(backend_ctx->program_complex_add, "kernel_complex_add", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_add = clCreateKernel(backend_ctx->fairy2i.program_complex_add, "kernel_complex_add", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -876,10 +830,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("complex_merge.cl");
 #endif
-        backend_ctx->program_complex_merge =
+        backend_ctx->fairy2i.program_complex_merge =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_complex_merge = clCreateKernel(backend_ctx->program_complex_merge, "kernel_complex_merge", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_merge = clCreateKernel(backend_ctx->fairy2i.program_complex_merge, "kernel_complex_merge", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -892,23 +846,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("fairy2i_tile64.cl");
 #endif
-        backend_ctx->program_fairy2i_tile64 =
+        backend_ctx->fairy2i.program_fairy2i_tile64 =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_fairy2i_tile64_q16_quantize_block127 =
-                      clCreateKernel(backend_ctx->program_fairy2i_tile64, "kernel_fairy2i_tile64_q16_quantize_block127", &err),
+        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_q16_quantize_block127 =
+                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_q16_quantize_block127", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_fairy2i_tile64_mul_mat_f32_q16 =
-                      clCreateKernel(backend_ctx->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_q16", &err),
+        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_q16 =
+                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_q16", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_fairy2i_tile64_mul_mat_f32_direct =
-                      clCreateKernel(backend_ctx->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_direct", &err),
+        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_direct =
+                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_direct", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_fairy2i_tile64_mul_vec_f32_q16 =
-                      clCreateKernel(backend_ctx->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec_f32_q16", &err),
+        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec_f32_q16 =
+                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec_f32_q16", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_fairy2i_tile64_mul_vec4_f32_q16 =
-                      clCreateKernel(backend_ctx->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec4_f32_q16", &err),
+        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec4_f32_q16 =
+                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec4_f32_q16", &err),
                   err));
         GGML_LOG_CONT(".");
     }
@@ -922,10 +876,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("complex_mul.cl");
 #endif
-        backend_ctx->program_complex_mul =
+        backend_ctx->fairy2i.program_complex_mul =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_complex_mul = clCreateKernel(backend_ctx->program_complex_mul, "kernel_complex_mul", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_mul = clCreateKernel(backend_ctx->fairy2i.program_complex_mul, "kernel_complex_mul", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -938,10 +892,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("complex_relu2.cl");
 #endif
-        backend_ctx->program_complex_relu2 =
+        backend_ctx->fairy2i.program_complex_relu2 =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_complex_relu2 = clCreateKernel(backend_ctx->program_complex_relu2, "kernel_complex_relu2", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_relu2 = clCreateKernel(backend_ctx->fairy2i.program_complex_relu2, "kernel_complex_relu2", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -954,11 +908,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("complex_rms_norm.cl");
 #endif
-        backend_ctx->program_complex_rms_norm =
+        backend_ctx->fairy2i.program_complex_rms_norm =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_complex_rms_norm     = clCreateKernel(backend_ctx->program_complex_rms_norm, "kernel_complex_rms_norm", &err), err));
-        CL_CHECK((backend_ctx->kernel_complex_rms_norm_mul = clCreateKernel(backend_ctx->program_complex_rms_norm, "kernel_complex_rms_norm_mul", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_rms_norm     = clCreateKernel(backend_ctx->fairy2i.program_complex_rms_norm, "kernel_complex_rms_norm", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_rms_norm_mul = clCreateKernel(backend_ctx->fairy2i.program_complex_rms_norm, "kernel_complex_rms_norm_mul", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -971,10 +925,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("complex_rope.cl");
 #endif
-        backend_ctx->program_complex_rope =
+        backend_ctx->fairy2i.program_complex_rope =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_complex_rope = clCreateKernel(backend_ctx->program_complex_rope, "kernel_complex_rope", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_rope = clCreateKernel(backend_ctx->fairy2i.program_complex_rope, "kernel_complex_rope", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -987,10 +941,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("complex_split.cl");
 #endif
-        backend_ctx->program_complex_split =
+        backend_ctx->fairy2i.program_complex_split =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_complex_split = clCreateKernel(backend_ctx->program_complex_split, "kernel_complex_split", &err), err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_complex_split = clCreateKernel(backend_ctx->fairy2i.program_complex_split, "kernel_complex_split", &err), err));
         GGML_LOG_CONT(".");
     }
 #endif
@@ -1005,10 +959,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy_add.cl");
 #endif
-        backend_ctx->program_ifairy_add =
+        backend_ctx->legacy_ifairy.program_ifairy_add =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_add = clCreateKernel(backend_ctx->program_ifairy_add, "kernel_ifairy_add", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_add = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_add, "kernel_ifairy_add", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1021,10 +975,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy_merge.cl");
 #endif
-        backend_ctx->program_ifairy_merge =
+        backend_ctx->legacy_ifairy.program_ifairy_merge =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_merge = clCreateKernel(backend_ctx->program_ifairy_merge, "kernel_ifairy_merge", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_merge = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_merge, "kernel_ifairy_merge", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1037,23 +991,23 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy64.cl");
 #endif
-        backend_ctx->program_ifairy64 =
+        backend_ctx->legacy_ifairy.program_ifairy64 =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_q16_quantize_block127 =
-                      clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy_q16_quantize_block127", &err),
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_q16_quantize_block127 =
+                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy_q16_quantize_block127", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_ifairy64_mul_mat_f32_q16 =
-                      clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy64_mul_mat_f32_q16", &err),
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_mat_f32_q16 =
+                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_mat_f32_q16", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_ifairy64_mul_mat_f32_direct =
-                      clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy64_mul_mat_f32_direct", &err),
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_mat_f32_direct =
+                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_mat_f32_direct", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_ifairy64_mul_vec_f32_q16 =
-                      clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy64_mul_vec_f32_q16", &err),
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_vec_f32_q16 =
+                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_vec_f32_q16", &err),
                   err));
-        CL_CHECK((backend_ctx->kernel_ifairy64_mul_vec4_f32_q16 =
-                      clCreateKernel(backend_ctx->program_ifairy64, "kernel_ifairy64_mul_vec4_f32_q16", &err),
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_vec4_f32_q16 =
+                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_vec4_f32_q16", &err),
                   err));
         GGML_LOG_CONT(".");
     }
@@ -1067,10 +1021,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy_mul.cl");
 #endif
-        backend_ctx->program_ifairy_mul =
+        backend_ctx->legacy_ifairy.program_ifairy_mul =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_mul = clCreateKernel(backend_ctx->program_ifairy_mul, "kernel_ifairy_mul", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_mul = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_mul, "kernel_ifairy_mul", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1083,10 +1037,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy_relu2.cl");
 #endif
-        backend_ctx->program_ifairy_relu2 =
+        backend_ctx->legacy_ifairy.program_ifairy_relu2 =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_relu2 = clCreateKernel(backend_ctx->program_ifairy_relu2, "kernel_ifairy_relu2", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_relu2 = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_relu2, "kernel_ifairy_relu2", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1099,10 +1053,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy_rope.cl");
 #endif
-        backend_ctx->program_ifairy_rope =
+        backend_ctx->legacy_ifairy.program_ifairy_rope =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_rope = clCreateKernel(backend_ctx->program_ifairy_rope, "kernel_ifairy_rope", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_rope = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_rope, "kernel_ifairy_rope", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1115,11 +1069,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy_rms_norm.cl");
 #endif
-        backend_ctx->program_ifairy_rms_norm =
+        backend_ctx->legacy_ifairy.program_ifairy_rms_norm =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_rms_norm     = clCreateKernel(backend_ctx->program_ifairy_rms_norm, "kernel_ifairy_rms_norm", &err), err));
-        CL_CHECK((backend_ctx->kernel_ifairy_rms_norm_mul = clCreateKernel(backend_ctx->program_ifairy_rms_norm, "kernel_ifairy_rms_norm_mul", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_rms_norm     = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_rms_norm, "kernel_ifairy_rms_norm", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_rms_norm_mul = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_rms_norm, "kernel_ifairy_rms_norm_mul", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -1132,10 +1086,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
 #else
         const std::string kernel_src = read_file("ifairy_split.cl");
 #endif
-        backend_ctx->program_ifairy_split =
+        backend_ctx->legacy_ifairy.program_ifairy_split =
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
-        CL_CHECK((backend_ctx->kernel_ifairy_split = clCreateKernel(backend_ctx->program_ifairy_split, "kernel_ifairy_split", &err), err));
+        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_split = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_split, "kernel_ifairy_split", &err), err));
         GGML_LOG_CONT(".");
     }
 #endif
@@ -5683,7 +5637,7 @@ static void ggml_cl_ifairy_add(ggml_backend_t backend, const ggml_tensor * src0,
     GGML_ASSERT(ggml_opencl_can_complex_add_family(dst));
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
-    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_ADD ? backend_ctx->kernel_complex_add : backend_ctx->kernel_ifairy_add;
+    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_ADD ? backend_ctx->fairy2i.kernel_complex_add : backend_ctx->legacy_ifairy.kernel_ifairy_add;
     GGML_ASSERT(kernel != nullptr);
     ggml_cl_ifairy_binary(backend, src0, src1, dst, kernel);
 }
@@ -5692,7 +5646,7 @@ static void ggml_cl_ifairy_mul(ggml_backend_t backend, const ggml_tensor * src0,
     GGML_ASSERT(ggml_opencl_can_complex_mul_family(dst));
 
     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
-    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_MUL ? backend_ctx->kernel_complex_mul : backend_ctx->kernel_ifairy_mul;
+    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_MUL ? backend_ctx->fairy2i.kernel_complex_mul : backend_ctx->legacy_ifairy.kernel_ifairy_mul;
     GGML_ASSERT(kernel != nullptr);
     ggml_cl_ifairy_binary(backend, src0, src1, dst, kernel);
 }
@@ -5736,7 +5690,7 @@ static void ggml_cl_ifairy_rms_norm(ggml_backend_t backend, const ggml_tensor * 
     const cl_ulong nb2 = dst->nb[2];
     const cl_ulong nb3 = dst->nb[3];
 
-    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_RMSNORM ? backend_ctx->kernel_complex_rms_norm : backend_ctx->kernel_ifairy_rms_norm;
+    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_RMSNORM ? backend_ctx->fairy2i.kernel_complex_rms_norm : backend_ctx->legacy_ifairy.kernel_ifairy_rms_norm;
     GGML_ASSERT(kernel != nullptr);
     const int nth = ggml_cl_ifairy_rms_norm_nth(backend_ctx, kernel);
 
@@ -5777,7 +5731,7 @@ static void ggml_cl_ifairy_relu2(ggml_backend_t backend, const ggml_tensor * src
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
-    cl_kernel kernel = ggml_get_unary_op(dst) == GGML_UNARY_OP_COMPLEX_RELU2 ? backend_ctx->kernel_complex_relu2 : backend_ctx->kernel_ifairy_relu2;
+    cl_kernel kernel = ggml_get_unary_op(dst) == GGML_UNARY_OP_COMPLEX_RELU2 ? backend_ctx->fairy2i.kernel_complex_relu2 : backend_ctx->legacy_ifairy.kernel_ifairy_relu2;
     GGML_ASSERT(kernel != nullptr);
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
@@ -5826,7 +5780,7 @@ static void ggml_cl_ifairy_split(ggml_backend_t backend, const ggml_tensor * src
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
-    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_SPLIT ? backend_ctx->kernel_complex_split : backend_ctx->kernel_ifairy_split;
+    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_SPLIT ? backend_ctx->fairy2i.kernel_complex_split : backend_ctx->legacy_ifairy.kernel_ifairy_split;
     GGML_ASSERT(kernel != nullptr);
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
@@ -5881,7 +5835,7 @@ static void ggml_cl_ifairy_merge(ggml_backend_t backend, const ggml_tensor * src
     cl_ulong offset0 = extra0->offset + src0->view_offs;
     cl_ulong offsetd = extrad->offset + dst->view_offs;
 
-    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_MERGE ? backend_ctx->kernel_complex_merge : backend_ctx->kernel_ifairy_merge;
+    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_MERGE ? backend_ctx->fairy2i.kernel_complex_merge : backend_ctx->legacy_ifairy.kernel_ifairy_merge;
     GGML_ASSERT(kernel != nullptr);
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
@@ -6055,16 +6009,16 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
                                       ggml_opencl_legacy_ifairy64_mul_mat_impl_env();
     const enum ggml_type weight_type = src0->type;
 
-    cl_kernel kernel_quantize = fairy2i ? backend_ctx->kernel_fairy2i_tile64_q16_quantize_block127 :
-                                          backend_ctx->kernel_ifairy_q16_quantize_block127;
-    cl_kernel kernel_direct = fairy2i ? backend_ctx->kernel_fairy2i_tile64_mul_mat_f32_direct :
-                                        backend_ctx->kernel_ifairy64_mul_mat_f32_direct;
-    cl_kernel kernel_gemv2 = fairy2i ? backend_ctx->kernel_fairy2i_tile64_mul_vec_f32_q16 :
-                                       backend_ctx->kernel_ifairy64_mul_vec_f32_q16;
-    cl_kernel kernel_gemv4 = fairy2i ? backend_ctx->kernel_fairy2i_tile64_mul_vec4_f32_q16 :
-                                       backend_ctx->kernel_ifairy64_mul_vec4_f32_q16;
-    cl_kernel kernel_gemm = fairy2i ? backend_ctx->kernel_fairy2i_tile64_mul_mat_f32_q16 :
-                                      backend_ctx->kernel_ifairy64_mul_mat_f32_q16;
+    cl_kernel kernel_quantize = fairy2i ? backend_ctx->fairy2i.kernel_fairy2i_tile64_q16_quantize_block127 :
+                                          backend_ctx->legacy_ifairy.kernel_ifairy_q16_quantize_block127;
+    cl_kernel kernel_direct = fairy2i ? backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_direct :
+                                        backend_ctx->legacy_ifairy.kernel_ifairy64_mul_mat_f32_direct;
+    cl_kernel kernel_gemv2 = fairy2i ? backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec_f32_q16 :
+                                       backend_ctx->legacy_ifairy.kernel_ifairy64_mul_vec_f32_q16;
+    cl_kernel kernel_gemv4 = fairy2i ? backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec4_f32_q16 :
+                                       backend_ctx->legacy_ifairy.kernel_ifairy64_mul_vec4_f32_q16;
+    cl_kernel kernel_gemm = fairy2i ? backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_q16 :
+                                      backend_ctx->legacy_ifairy.kernel_ifairy64_mul_mat_f32_q16;
     GGML_ASSERT(kernel_quantize != nullptr);
     GGML_ASSERT(kernel_direct != nullptr);
     GGML_ASSERT(kernel_gemv2 != nullptr);
@@ -6098,8 +6052,8 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
     } else {
         backend_ctx->ensure_ifairy64_act_scratch(act_q_size, act_d_size);
     }
-    cl_mem act_q = fairy2i ? backend_ctx->fairy2i_tile64_act_q_scratch : backend_ctx->ifairy64_act_q_scratch;
-    cl_mem act_d = fairy2i ? backend_ctx->fairy2i_tile64_act_d_scratch : backend_ctx->ifairy64_act_d_scratch;
+    cl_mem act_q = fairy2i ? backend_ctx->fairy2i.fairy2i_tile64_act_q_scratch : backend_ctx->legacy_ifairy.ifairy64_act_q_scratch;
+    cl_mem act_d = fairy2i ? backend_ctx->fairy2i.fairy2i_tile64_act_d_scratch : backend_ctx->legacy_ifairy.ifairy64_act_d_scratch;
     GGML_ASSERT(act_q != nullptr);
     GGML_ASSERT(act_d != nullptr);
 
@@ -7154,7 +7108,7 @@ static void ggml_opencl_op_ifairy_rms_norm_fused(ggml_backend_t backend, ggml_te
     const cl_ulong nb2 = dst->nb[2];
     const cl_ulong nb3 = dst->nb[3];
 
-    cl_kernel kernel = backend_ctx->kernel_ifairy_rms_norm_mul;
+    cl_kernel kernel = backend_ctx->legacy_ifairy.kernel_ifairy_rms_norm_mul;
     const int nth = ggml_cl_ifairy_rms_norm_nth(backend_ctx, kernel);
 
     size_t global_work_size[] = {(size_t) ne01 * nth, (size_t) ne02, (size_t) ne03};
@@ -9875,7 +9829,7 @@ static void ggml_cl_ifairy_rope(ggml_backend_t backend, const ggml_tensor * src0
     memcpy(&beta_fast,   (int32_t *) dst->op_params + 9, sizeof(float));
     memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
 
-    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_ROPE ? backend_ctx->kernel_complex_rope : backend_ctx->kernel_ifairy_rope;
+    cl_kernel kernel = dst->op == GGML_OP_COMPLEX_ROPE ? backend_ctx->fairy2i.kernel_complex_rope : backend_ctx->legacy_ifairy.kernel_ifairy_rope;
     GGML_ASSERT(kernel != nullptr);
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
