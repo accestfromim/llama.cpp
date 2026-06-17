@@ -618,19 +618,6 @@ struct ggml_backend_opencl_context {
         }
     }
 
-    void release_ifairy64_act_scratch() {
-        if (legacy_ifairy.ifairy64_act_q_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(legacy_ifairy.ifairy64_act_q_scratch));
-            legacy_ifairy.ifairy64_act_q_scratch = nullptr;
-        }
-        if (legacy_ifairy.ifairy64_act_d_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(legacy_ifairy.ifairy64_act_d_scratch));
-            legacy_ifairy.ifairy64_act_d_scratch = nullptr;
-        }
-        legacy_ifairy.ifairy64_act_q_capacity = 0;
-        legacy_ifairy.ifairy64_act_d_capacity = 0;
-    }
-
     void ensure_fairy2i_tile64_act_scratch(size_t act_q_size, size_t act_d_size) {
         cl_int err;
 
@@ -651,19 +638,6 @@ struct ggml_backend_opencl_context {
             CL_CHECK(err);
             fairy2i.fairy2i_tile64_act_d_capacity = act_d_size;
         }
-    }
-
-    void release_fairy2i_tile64_act_scratch() {
-        if (fairy2i.fairy2i_tile64_act_q_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(fairy2i.fairy2i_tile64_act_q_scratch));
-            fairy2i.fairy2i_tile64_act_q_scratch = nullptr;
-        }
-        if (fairy2i.fairy2i_tile64_act_d_scratch != nullptr) {
-            CL_CHECK(clReleaseMemObject(fairy2i.fairy2i_tile64_act_d_scratch));
-            fairy2i.fairy2i_tile64_act_d_scratch = nullptr;
-        }
-        fairy2i.fairy2i_tile64_act_q_capacity = 0;
-        fairy2i.fairy2i_tile64_act_d_capacity = 0;
     }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -701,8 +675,8 @@ struct ggml_backend_opencl_context {
             write_profiling_info();
             profiling_info.clear();
 #endif
-            release_ifairy64_act_scratch();
-            release_fairy2i_tile64_act_scratch();
+            ggml_opencl_legacy_ifairy_release_scratch(&legacy_ifairy);
+            ggml_opencl_fairy2i_release_scratch(&fairy2i);
         }
     }
 };
@@ -805,293 +779,13 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
     }
 
 #ifdef GGML_USE_FAIRY2I_OPENCL
-    // complex_add
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "complex_add.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("complex_add.cl");
-#endif
-        backend_ctx->fairy2i.program_complex_add =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_add = clCreateKernel(backend_ctx->fairy2i.program_complex_add, "kernel_complex_add", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // complex_merge
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "complex_merge.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("complex_merge.cl");
-#endif
-        backend_ctx->fairy2i.program_complex_merge =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_merge = clCreateKernel(backend_ctx->fairy2i.program_complex_merge, "kernel_complex_merge", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // fairy2i_tile64
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "fairy2i_tile64.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("fairy2i_tile64.cl");
-#endif
-        backend_ctx->fairy2i.program_fairy2i_tile64 =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_q16_quantize_block127 =
-                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_q16_quantize_block127", &err),
-                  err));
-        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_q16 =
-                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_q16", &err),
-                  err));
-        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_direct =
-                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_direct", &err),
-                  err));
-        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec_f32_q16 =
-                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec_f32_q16", &err),
-                  err));
-        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec4_f32_q16 =
-                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec4_f32_q16", &err),
-                  err));
-        GGML_LOG_CONT(".");
-    }
-
-    // complex_mul
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "complex_mul.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("complex_mul.cl");
-#endif
-        backend_ctx->fairy2i.program_complex_mul =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_mul = clCreateKernel(backend_ctx->fairy2i.program_complex_mul, "kernel_complex_mul", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // complex_relu2
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "complex_relu2.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("complex_relu2.cl");
-#endif
-        backend_ctx->fairy2i.program_complex_relu2 =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_relu2 = clCreateKernel(backend_ctx->fairy2i.program_complex_relu2, "kernel_complex_relu2", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // complex_rms_norm
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "complex_rms_norm.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("complex_rms_norm.cl");
-#endif
-        backend_ctx->fairy2i.program_complex_rms_norm =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_rms_norm     = clCreateKernel(backend_ctx->fairy2i.program_complex_rms_norm, "kernel_complex_rms_norm", &err), err));
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_rms_norm_mul = clCreateKernel(backend_ctx->fairy2i.program_complex_rms_norm, "kernel_complex_rms_norm_mul", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // complex_rope
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "complex_rope.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("complex_rope.cl");
-#endif
-        backend_ctx->fairy2i.program_complex_rope =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_rope = clCreateKernel(backend_ctx->fairy2i.program_complex_rope, "kernel_complex_rope", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // complex_split
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "complex_split.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("complex_split.cl");
-#endif
-        backend_ctx->fairy2i.program_complex_split =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->fairy2i.kernel_complex_split = clCreateKernel(backend_ctx->fairy2i.program_complex_split, "kernel_complex_split", &err), err));
-        GGML_LOG_CONT(".");
-    }
+    ggml_opencl_fairy2i_load_kernels(&backend_ctx->fairy2i, backend_ctx->context, backend_ctx->device, compile_opts,
+                                     build_program_from_source);
 #endif
 
 #ifdef GGML_USE_LEGACY_IFAIRY_OPENCL
-    // ifairy_add
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy_add.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy_add.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy_add =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_add = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_add, "kernel_ifairy_add", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // ifairy_merge
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy_merge.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy_merge.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy_merge =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_merge = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_merge, "kernel_ifairy_merge", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // ifairy64
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy64.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy64.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy64 =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_q16_quantize_block127 =
-                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy_q16_quantize_block127", &err),
-                  err));
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_mat_f32_q16 =
-                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_mat_f32_q16", &err),
-                  err));
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_mat_f32_direct =
-                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_mat_f32_direct", &err),
-                  err));
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_vec_f32_q16 =
-                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_vec_f32_q16", &err),
-                  err));
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy64_mul_vec4_f32_q16 =
-                      clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy64, "kernel_ifairy64_mul_vec4_f32_q16", &err),
-                  err));
-        GGML_LOG_CONT(".");
-    }
-
-    // ifairy_mul
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy_mul.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy_mul.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy_mul =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_mul = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_mul, "kernel_ifairy_mul", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // ifairy_relu2
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy_relu2.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy_relu2.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy_relu2 =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_relu2 = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_relu2, "kernel_ifairy_relu2", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // ifairy_rope
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy_rope.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy_rope.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy_rope =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_rope = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_rope, "kernel_ifairy_rope", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // ifairy_rms_norm
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy_rms_norm.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy_rms_norm.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy_rms_norm =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_rms_norm     = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_rms_norm, "kernel_ifairy_rms_norm", &err), err));
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_rms_norm_mul = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_rms_norm, "kernel_ifairy_rms_norm_mul", &err), err));
-        GGML_LOG_CONT(".");
-    }
-
-    // ifairy_split
-    {
-#ifdef GGML_OPENCL_EMBED_KERNELS
-        const std::string kernel_src {
-            #include "ifairy_split.cl.h"
-        };
-#else
-        const std::string kernel_src = read_file("ifairy_split.cl");
-#endif
-        backend_ctx->legacy_ifairy.program_ifairy_split =
-            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
-
-        CL_CHECK((backend_ctx->legacy_ifairy.kernel_ifairy_split = clCreateKernel(backend_ctx->legacy_ifairy.program_ifairy_split, "kernel_ifairy_split", &err), err));
-        GGML_LOG_CONT(".");
-    }
+    ggml_opencl_legacy_ifairy_load_kernels(&backend_ctx->legacy_ifairy, backend_ctx->context, backend_ctx->device,
+                                           compile_opts, build_program_from_source);
 #endif
 
     // clamp

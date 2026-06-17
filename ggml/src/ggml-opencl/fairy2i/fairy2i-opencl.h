@@ -10,6 +10,7 @@
 #include <CL/cl.h>
 
 #include <cstddef>
+#include <string>
 
 struct ggml_opencl_fairy2i_state {
     cl_mem fairy2i_tile64_act_q_scratch = nullptr;
@@ -41,6 +42,21 @@ struct ggml_opencl_fairy2i_state {
     cl_kernel kernel_fairy2i_tile64_mul_vec4_f32_q16 = nullptr;
 };
 
+#ifndef GGML_OPENCL_PROGRAM_BUILDER_DEFINED
+#    define GGML_OPENCL_PROGRAM_BUILDER_DEFINED
+using ggml_opencl_program_builder = cl_program (*)(cl_context ctx,
+                                                   cl_device_id dev,
+                                                   const char * program_buffer,
+                                                   const std::string & compile_opts);
+#endif
+
 bool ggml_opencl_fairy2i_compile_enabled(void);
 const char * ggml_opencl_fairy2i_runtime_env(void);
 const char * ggml_opencl_fairy2i_tile64_mul_mat_impl_env(void);
+
+void ggml_opencl_fairy2i_load_kernels(ggml_opencl_fairy2i_state * state,
+                                      cl_context context,
+                                      cl_device_id device,
+                                      const std::string & compile_opts,
+                                      ggml_opencl_program_builder build_program);
+void ggml_opencl_fairy2i_release_scratch(ggml_opencl_fairy2i_state * state);
