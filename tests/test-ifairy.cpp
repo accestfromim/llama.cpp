@@ -83,7 +83,7 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
 #    pragma warning(disable : 4244 4267)  // possible loss of data
 #endif
 
-#if defined(GGML_IFAIRY_LUT_CPU) && \
+#if defined(GGML_USE_FAIRY2I_CPU_LUT) && \
     ((defined(__aarch64__) && defined(__ARM_NEON)) || defined(__x86_64__) || defined(_M_X64))
 #    define GGML_IFAIRY_LUT_TEST_BACKEND_ENABLED 1
 #else

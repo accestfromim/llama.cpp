@@ -125,7 +125,7 @@ static inline void ggml_ifairy64_fuse_accumulate_block_four_avx2(const block_ifa
 }
 #endif
 
-#if defined(GGML_IFAIRY_FUSE_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(GGML_USE_FAIRY2I_CPU_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
 static inline __attribute__((always_inline)) __m512i ggml_ifairy64_pack_weight_four_avx512(const block_ifairy64 * u0,
                                                                                             const block_ifairy64 * u1,
                                                                                             const block_ifairy64 * w0,
@@ -211,7 +211,7 @@ static inline void ggml_ifairy64_fuse_accumulate_four(const block_ifairy64 *    
     for (int64_t ib = 0; ib < blocks; ++ib) {
         int32_t sums[4][4] = {};
 
-#if defined(GGML_IFAIRY_FUSE_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(GGML_USE_FAIRY2I_CPU_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
         ggml_ifairy64_fuse_accumulate_block_four_avx512(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #elif defined(__AVX2__)
         ggml_ifairy64_fuse_accumulate_block_four_avx2(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);

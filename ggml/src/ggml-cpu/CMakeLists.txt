@@ -648,11 +648,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     endif()
 
     if (GGML_FAIRY2I_CPU_LUT)
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IFAIRY_LUT_CPU GGML_USE_FAIRY2I_CPU_LUT)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_LUT)
     endif()
 
     if (GGML_FAIRY2I_CPU_AVX512)
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IFAIRY_FUSE_AVX512)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_AVX512)
     endif()
 
     if (EMSCRIPTEN)
