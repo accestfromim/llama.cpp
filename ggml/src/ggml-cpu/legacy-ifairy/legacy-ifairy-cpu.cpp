@@ -28,7 +28,14 @@ size_t ggml_legacy_ifairy_cpu_work_size(const struct ggml_tensor * dst, int n_ta
     GGML_ASSERT(x->ne[0] % ggml_blck_size(GGML_TYPE_IFAIRY64) == 0);
 
     const size_t q_row_size = ggml_row_size(GGML_TYPE_IFAIRY64_Q16, x->ne[0]);
-    return GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_LEGACY_IFAIRY_CPU_CACHE_LINE);
+    const size_t q_bytes    = GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_LEGACY_IFAIRY_CPU_CACHE_LINE);
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+    const size_t lut_bytes = ggml_ifairy_wide_linear_w2_lut_wsize(dst);
+    return q_bytes > lut_bytes ? q_bytes : lut_bytes;
+#else
+    return q_bytes;
+#endif
 }
 
 bool ggml_legacy_ifairy_cpu_compute_wide_linear_w2(
@@ -36,12 +43,18 @@ bool ggml_legacy_ifairy_cpu_compute_wide_linear_w2(
     struct ggml_tensor *                dst,
     bool                                use_lut,
     bool                                lut_c) {
-    GGML_UNUSED(use_lut);
-    GGML_UNUSED(lut_c);
-
     if (!ggml_legacy_ifairy_cpu_supports_op(dst)) {
         return false;
     }
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+    if (use_lut && ggml_compute_forward_ifairy_wide_linear_w2_lut(params, dst, lut_c)) {
+        return true;
+    }
+#else
+    GGML_UNUSED(use_lut);
+    GGML_UNUSED(lut_c);
+#endif
 
     ggml_compute_forward_ifairy_wide_linear_w2(params, dst);
     return true;

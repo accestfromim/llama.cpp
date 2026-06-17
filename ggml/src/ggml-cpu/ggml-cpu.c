@@ -24,6 +24,9 @@
 #    include "ggml-ifairy-lut-impl.h"
 #    include "ggml-fairy2i-lut.h"
 #endif
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+#    include "ggml-ifairy-lut.h"
+#endif
 
 // debug helper: last node being computed (for crash diagnostics)
 extern struct ggml_tensor * ggml_debug_last_node;
@@ -816,6 +819,44 @@ static void ggml_fairy2i_lut_prepare_cgraph_indexes(const struct ggml_cgraph *  
         }
 
         ggml_fairy2i_lut_transform_tensor(src0, NULL);
+    }
+}
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+static void ggml_legacy_ifairy_lut_prepare_cgraph_indexes(const struct ggml_cgraph * cgraph) {
+    if (!ggml_ifairy_env_enabled("GGML_IFAIRY_LUT")) {
+        return;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (!node) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2) {
+            for (int src = 1; src <= 4; ++src) {
+                struct ggml_tensor * weight = node->src[src];
+                const struct ifairy_lut_extra * extra = weight ? (const struct ifairy_lut_extra *) weight->extra : NULL;
+                if (weight && (!extra || !extra->packed_w)) {
+                    ggml_ifairy_lut_transform_tensor(weight, NULL);
+                }
+            }
+            continue;
+        }
+
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+
+        struct ggml_tensor * src0 = node->src[0];
+        struct ggml_tensor * src1 = node->src[1];
+        if (!src0 || !src1 || !ggml_ifairy_lut_can_mul_mat(src0, src1, node)) {
+            continue;
+        }
+
+        ggml_ifairy_lut_transform_tensor(src0, NULL);
     }
 }
 #endif
@@ -2466,8 +2507,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
 #ifdef GGML_USE_LEGACY_IFAIRY_CPU
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+                const char * impl_env = getenv("GGML_IFAIRY_LUT_IMPL");
+                const bool use_lut = ggml_ifairy_env_enabled("GGML_IFAIRY_LUT");
+                const bool lut_c   = impl_env && strcmp(impl_env, "lut_c") == 0;
+#else
                 const bool use_lut = false;
                 const bool lut_c   = false;
+#endif
                 if (!ggml_legacy_ifairy_cpu_compute_wide_linear_w2(params, tensor, use_lut, lut_c)) {
                     GGML_ABORT("%s failed", ggml_op_name(tensor->op));
                 }
@@ -3824,6 +3871,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     const struct ggml_fairy2i_lut_threadpool_config * cfg = &threadpool->fairy2i_lut_cfg;
     ggml_fairy2i_lut_prepare_cgraph_indexes(cgraph, cfg);
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+    ggml_legacy_ifairy_lut_prepare_cgraph_indexes(cgraph);
 #endif
 
 #ifdef GGML_USE_OPENMP

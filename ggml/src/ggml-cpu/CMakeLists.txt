@@ -72,6 +72,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/legacy-ifairy/wide-linear.h)
     endif()
 
+    if (GGML_LEGACY_IFAIRY_CPU_LUT)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/legacy-ifairy/wide-linear-lut.cpp
+            ggml-cpu/legacy-ifairy/lut-qgemm.cpp
+            ggml-cpu/legacy-ifairy/lut-qgemm.h)
+    endif()
+
     if (GGML_FAIRY2I_CPU_LUT)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/ifairy-fuse-lut.cpp
