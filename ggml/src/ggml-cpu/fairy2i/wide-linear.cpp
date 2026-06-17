@@ -6,6 +6,8 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 struct ggml_fairy2i_complex_acc {
     float real;
@@ -201,26 +203,40 @@ static inline void ggml_fairy2i_tile64_fuse_apply_branch(const block_fairy2i_til
     }
 }
 
+static inline void ggml_fairy2i_tile64_fuse_accumulate_block_four_scalar(const block_fairy2i_tile64_v2 * u0,
+                                                                         const block_fairy2i_tile64_v2 * u1,
+                                                                         const block_fairy2i_tile64_v2 * w0,
+                                                                         const block_fairy2i_tile64_v2 * w1,
+                                                                         const block_fairy2i_act_q16_64 * x,
+                                                                         int32_t sums[4][4]) {
+    ggml_fairy2i_tile64_fuse_accumulate_block_scalar(u0, x, sums[0]);
+    ggml_fairy2i_tile64_fuse_accumulate_block_scalar(u1, x, sums[1]);
+    ggml_fairy2i_tile64_fuse_accumulate_block_scalar(w0, x, sums[2]);
+    ggml_fairy2i_tile64_fuse_accumulate_block_scalar(w1, x, sums[3]);
+}
+
 static inline void ggml_fairy2i_tile64_fuse_accumulate_four(const block_fairy2i_tile64_v2 *          u0,
                                                        const block_fairy2i_tile64_v2 *          u1,
                                                        const block_fairy2i_tile64_v2 *          w0,
                                                        const block_fairy2i_tile64_v2 *          w1,
                                                        const block_fairy2i_act_q16_64 *      x,
                                                        int64_t                         blocks,
+                                                       bool                            force_scalar,
                                                        struct ggml_fairy2i_complex_acc * acc) {
     for (int64_t ib = 0; ib < blocks; ++ib) {
         int32_t sums[4][4] = {};
 
+        if (force_scalar) {
+            ggml_fairy2i_tile64_fuse_accumulate_block_four_scalar(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
+        } else {
 #if defined(GGML_USE_FAIRY2I_CPU_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
-        ggml_fairy2i_tile64_fuse_accumulate_block_four_avx512(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
+            ggml_fairy2i_tile64_fuse_accumulate_block_four_avx512(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #elif defined(__AVX2__)
-        ggml_fairy2i_tile64_fuse_accumulate_block_four_avx2(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
+            ggml_fairy2i_tile64_fuse_accumulate_block_four_avx2(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #else
-        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&u0[ib], &x[ib], sums[0]);
-        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&u1[ib], &x[ib], sums[1]);
-        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&w0[ib], &x[ib], sums[2]);
-        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&w1[ib], &x[ib], sums[3]);
+            ggml_fairy2i_tile64_fuse_accumulate_block_four_scalar(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #endif
+        }
 
         ggml_fairy2i_tile64_fuse_apply_branch(&u0[ib], &x[ib], sums[0], false, acc);
         ggml_fairy2i_tile64_fuse_apply_branch(&u1[ib], &x[ib], sums[1], false, acc);
@@ -242,6 +258,11 @@ static inline float ggml_fairy2i_wide_linear_bias_at(const struct ggml_tensor * 
 
 static inline bool ggml_fairy2i_wide_linear_weight_type(enum ggml_type type) {
     return type == GGML_TYPE_FAIRY2I_TILE64_V2;
+}
+
+static inline bool ggml_fairy2i_test_force_scalar(void) {
+    const char * env = getenv("GGML_FAIRY2I_TEST_FORCE_SCALAR");
+    return env && strcmp(env, "0") != 0;
 }
 
 static inline int8_t ggml_fairy2i_quant_i8(float x) {
@@ -327,6 +348,7 @@ void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * para
     const int64_t blocks     = K / QK_FAIRY2I_TILE64;
     const size_t  q_row_size = ggml_row_size(GGML_TYPE_FAIRY2I_ACT_Q16_64, K);
     const size_t  q_bytes    = GGML_PAD((size_t) act_rows * q_row_size, 64);
+    const bool    force_scalar = ggml_fairy2i_test_force_scalar();
 
     GGML_ASSERT(K % QK_FAIRY2I_TILE64 == 0);
     GGML_ASSERT(params->wdata && params->wsize >= q_bytes);
@@ -356,7 +378,7 @@ void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * para
         const block_fairy2i_act_q16_64 * xq = (const block_fairy2i_act_q16_64 *) ((const char *) q_x + act_row * q_row_size);
 
         struct ggml_fairy2i_complex_acc acc = { 0.0f, 0.0f };
-        ggml_fairy2i_tile64_fuse_accumulate_four(u0_row, u1_row, w0_row, w1_row, xq, blocks, &acc);
+        ggml_fairy2i_tile64_fuse_accumulate_four(u0_row, u1_row, w0_row, w1_row, xq, blocks, force_scalar, &acc);
 
         if (bias) {
             acc.real += ggml_fairy2i_wide_linear_bias_at(bias, row, i1, i2, i3);

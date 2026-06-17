@@ -1,4 +1,4 @@
-// Fairy2i CPU backend smoke tests.
+// Fairy2i CPU backend tests.
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -9,16 +9,313 @@ extern "C" {
 #include "../ggml/src/ggml-common.h"
 }
 
+#ifndef GGML_FP16_TO_FP32
+#    define GGML_FP16_TO_FP32 ggml_fp16_to_fp32
+#endif
+#ifndef GGML_FP32_TO_FP16
+#    define GGML_FP32_TO_FP16 ggml_fp32_to_fp16
+#endif
+#ifndef GGML_BF16_TO_FP32
+#    define GGML_BF16_TO_FP32 ggml_bf16_to_fp32
+#endif
+#ifndef GGML_FP32_TO_BF16
+#    define GGML_FP32_TO_BF16 ggml_fp32_to_bf16
+#endif
+
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <string>
 #include <vector>
 
-static bool test_fairy2i_wide_linear_w2_zero() {
-    constexpr int64_t K = QK_FAIRY2I_TILE64;
-    constexpr int64_t M = 4;
-    constexpr int64_t N = 3;
+class scoped_env_var {
+public:
+    explicit scoped_env_var(const char * name) : name(name) {
+        const char * value = getenv(name);
+        if (value) {
+            had_old = true;
+            old     = value;
+        }
+    }
+
+    ~scoped_env_var() {
+        if (had_old) {
+            set(old.c_str());
+        } else {
+            unset();
+        }
+    }
+
+    void set(const char * value) {
+#ifdef _WIN32
+        _putenv_s(name, value ? value : "");
+#else
+        setenv(name, value ? value : "", 1);
+#endif
+    }
+
+    void unset() {
+#ifdef _WIN32
+        _putenv_s(name, "");
+#else
+        unsetenv(name);
+#endif
+    }
+
+private:
+    const char * name;
+    bool         had_old = false;
+    std::string  old;
+};
+
+struct fairy2i_w2_case {
+    int64_t M;
+    int64_t N;
+    int64_t K;
+    bool    bias;
+};
+
+struct fairy2i_w2_data {
+    std::vector<float>                   x;
+    std::vector<float>                   bias;
+    std::vector<block_fairy2i_tile64_v2> u_s0;
+    std::vector<block_fairy2i_tile64_v2> u_s1;
+    std::vector<block_fairy2i_tile64_v2> w_s0;
+    std::vector<block_fairy2i_tile64_v2> w_s1;
+};
+
+static uint32_t pack_bf16_pair(float real, float imag) {
+    ggml_bf16_t pair[2];
+    pair[0] = GGML_FP32_TO_BF16(real);
+    pair[1] = GGML_FP32_TO_BF16(imag);
+
+    uint32_t word;
+    memcpy(&word, pair, sizeof(word));
+    return word;
+}
+
+static float pack_complex_bf16(float real, float imag) {
+    const uint32_t word = pack_bf16_pair(real, imag);
+    float          packed;
+    memcpy(&packed, &word, sizeof(packed));
+    return packed;
+}
+
+static void unpack_bf16_pair(uint32_t word, float & real, float & imag) {
+    ggml_bf16_t pair[2];
+    memcpy(pair, &word, sizeof(word));
+    real = GGML_BF16_TO_FP32(pair[0]);
+    imag = GGML_BF16_TO_FP32(pair[1]);
+}
+
+static void set_fairy2i_code(block_fairy2i_tile64_v2 & blk, int idx, uint8_t code) {
+    const int lane = idx % 16;
+    const int part = idx / 16;
+    blk.qs[lane] &= (uint8_t) ~(0x3u << (2 * part));
+    blk.qs[lane] |= (uint8_t) ((code & 0x3u) << (2 * part));
+}
+
+static uint8_t get_fairy2i_code(const block_fairy2i_tile64_v2 & blk, int idx) {
+    const int lane = idx % 16;
+    const int part = idx / 16;
+    return (uint8_t) ((blk.qs[lane] >> (2 * part)) & 0x3u);
+}
+
+static void fill_fairy2i_weights(std::vector<block_fairy2i_tile64_v2> & weights, int64_t M, int64_t K, int salt) {
+    const int64_t blocks = K / QK_FAIRY2I_TILE64;
+    weights.assign((size_t) M * (size_t) blocks, block_fairy2i_tile64_v2{});
+
+    for (int64_t row = 0; row < M; ++row) {
+        for (int64_t ib = 0; ib < blocks; ++ib) {
+            block_fairy2i_tile64_v2 blk{};
+            blk.d_real = GGML_FP32_TO_FP16(0.021f + 0.003f * (float) ((row + ib + salt) % 7));
+            blk.d_imag = GGML_FP32_TO_FP16(0.017f + 0.002f * (float) ((2 * row + ib + salt) % 5));
+            for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
+                const uint8_t code = (uint8_t) ((j + 3 * row + 5 * ib + salt) & 0x3);
+                set_fairy2i_code(blk, j, code);
+            }
+            weights[(size_t) row * (size_t) blocks + (size_t) ib] = blk;
+        }
+    }
+}
+
+static std::vector<float> make_fairy2i_input(int64_t N, int64_t K) {
+    std::vector<float> x((size_t) N * (size_t) K);
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t k = 0; k < K; ++k) {
+            const float real = (float) (((k + 7 * n) % 19) - 9) / 8.0f;
+            const float imag = (float) (((2 * k + 5 * n) % 23) - 11) / 9.0f;
+            x[(size_t) n * (size_t) K + (size_t) k] = pack_complex_bf16(real, imag);
+        }
+    }
+    return x;
+}
+
+static std::vector<float> make_fairy2i_bias(int64_t M) {
+    std::vector<float> bias((size_t) 2 * (size_t) M);
+    for (int64_t row = 0; row < M; ++row) {
+        bias[(size_t) row]     = (float) (row - M / 2) / 32.0f;
+        bias[(size_t) row + M] = (float) (M - 2 * row) / 40.0f;
+    }
+    return bias;
+}
+
+static fairy2i_w2_data make_fairy2i_w2_data(const fairy2i_w2_case & tc) {
+    fairy2i_w2_data data;
+    data.x = make_fairy2i_input(tc.N, tc.K);
+    if (tc.bias) {
+        data.bias = make_fairy2i_bias(tc.M);
+    }
+    fill_fairy2i_weights(data.u_s0, tc.M, tc.K, 1);
+    fill_fairy2i_weights(data.u_s1, tc.M, tc.K, 5);
+    fill_fairy2i_weights(data.w_s0, tc.M, tc.K, 9);
+    fill_fairy2i_weights(data.w_s1, tc.M, tc.K, 13);
+    return data;
+}
+
+static int8_t fairy2i_quant_i8(float x) {
+    const int q = (int) nearbyintf(x);
+    if (q < -127) {
+        return -127;
+    }
+    if (q > 127) {
+        return 127;
+    }
+    return (int8_t) q;
+}
+
+static void quantize_fairy2i_act_q16_64(
+    std::vector<block_fairy2i_act_q16_64> & out, const std::vector<float> & x, int64_t N, int64_t K) {
+    const int64_t blocks = K / QK_FAIRY2I_ACT_Q16_64;
+    out.assign((size_t) N * (size_t) blocks, block_fairy2i_act_q16_64{});
+
+    for (int64_t n = 0; n < N; ++n) {
+        const float * x_row = x.data() + (size_t) n * (size_t) K;
+        for (int64_t ib = 0; ib < blocks; ++ib) {
+            block_fairy2i_act_q16_64 & q = out[(size_t) n * (size_t) blocks + (size_t) ib];
+            float max_real = 1e-5f;
+            float max_imag = 1e-5f;
+            for (int j = 0; j < QK_FAIRY2I_ACT_Q16_64; ++j) {
+                const ggml_bf16_t * value = (const ggml_bf16_t *) (x_row + ib * QK_FAIRY2I_ACT_Q16_64 + j);
+                max_real = fmaxf(max_real, fabsf(GGML_BF16_TO_FP32(value[0])));
+                max_imag = fmaxf(max_imag, fabsf(GGML_BF16_TO_FP32(value[1])));
+            }
+
+            const float iscale_real = 127.0f / max_real;
+            const float iscale_imag = 127.0f / max_imag;
+            q.d_real = GGML_FP32_TO_FP16(1.0f / iscale_real);
+            q.d_imag = GGML_FP32_TO_FP16(1.0f / iscale_imag);
+
+            for (int j = 0; j < QK_FAIRY2I_ACT_Q16_64; ++j) {
+                const ggml_bf16_t * value = (const ggml_bf16_t *) (x_row + ib * QK_FAIRY2I_ACT_Q16_64 + j);
+                q.x_real[j] = (uint8_t) fairy2i_quant_i8(iscale_real * GGML_BF16_TO_FP32(value[0]));
+                q.x_imag[j] = (uint8_t) fairy2i_quant_i8(iscale_imag * GGML_BF16_TO_FP32(value[1]));
+            }
+        }
+    }
+}
+
+static void fairy2i_accumulate_block_scalar(
+    const block_fairy2i_tile64_v2 & w, const block_fairy2i_act_q16_64 & x, int32_t sums[4]) {
+    for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
+        const uint8_t code = get_fairy2i_code(w, j);
+        const int     xr   = (int) ((const int8_t *) x.x_real)[j];
+        const int     xi   = (int) ((const int8_t *) x.x_imag)[j];
+
+        switch (code) {
+            case 0:
+                sums[0] -= xr;
+                sums[1] -= xi;
+                break;
+            case 1:
+                sums[0] += xr;
+                sums[1] += xi;
+                break;
+            case 2:
+                sums[2] -= xr;
+                sums[3] -= xi;
+                break;
+            case 3:
+                sums[2] += xr;
+                sums[3] += xi;
+                break;
+        }
+    }
+}
+
+static void fairy2i_apply_branch(
+    const block_fairy2i_tile64_v2 & w, const block_fairy2i_act_q16_64 & x, const int32_t sums[4], bool conjugate_input,
+    float & acc_real, float & acc_imag) {
+    const float xr = GGML_FP16_TO_FP32(x.d_real);
+    const float xi = GGML_FP16_TO_FP32(x.d_imag);
+    const float wr = GGML_FP16_TO_FP32(w.d_real);
+    const float wi = GGML_FP16_TO_FP32(w.d_imag);
+
+    if (conjugate_input) {
+        acc_real += (float) sums[0] * (xr * wr) + (float) sums[3] * (xi * wi);
+        acc_imag += (float) sums[2] * (xr * wi) - (float) sums[1] * (xi * wr);
+    } else {
+        acc_real += (float) sums[0] * (xr * wr) - (float) sums[3] * (xi * wi);
+        acc_imag += (float) sums[2] * (xr * wi) + (float) sums[1] * (xi * wr);
+    }
+}
+
+static std::vector<uint32_t> fairy2i_w2_scalar_reference(const fairy2i_w2_case & tc, const fairy2i_w2_data & data) {
+    const int64_t blocks = tc.K / QK_FAIRY2I_TILE64;
+    std::vector<block_fairy2i_act_q16_64> q_x;
+    quantize_fairy2i_act_q16_64(q_x, data.x, tc.N, tc.K);
+
+    std::vector<uint32_t> out((size_t) tc.M * (size_t) tc.N);
+    for (int64_t n = 0; n < tc.N; ++n) {
+        for (int64_t row = 0; row < tc.M; ++row) {
+            float real = 0.0f;
+            float imag = 0.0f;
+            for (int64_t ib = 0; ib < blocks; ++ib) {
+                const block_fairy2i_act_q16_64 & x =
+                    q_x[(size_t) n * (size_t) blocks + (size_t) ib];
+                const size_t w_idx = (size_t) row * (size_t) blocks + (size_t) ib;
+
+                int32_t sums[4][4] = {};
+                fairy2i_accumulate_block_scalar(data.u_s0[w_idx], x, sums[0]);
+                fairy2i_accumulate_block_scalar(data.u_s1[w_idx], x, sums[1]);
+                fairy2i_accumulate_block_scalar(data.w_s0[w_idx], x, sums[2]);
+                fairy2i_accumulate_block_scalar(data.w_s1[w_idx], x, sums[3]);
+
+                fairy2i_apply_branch(data.u_s0[w_idx], x, sums[0], false, real, imag);
+                fairy2i_apply_branch(data.u_s1[w_idx], x, sums[1], false, real, imag);
+                fairy2i_apply_branch(data.w_s0[w_idx], x, sums[2], true, real, imag);
+                fairy2i_apply_branch(data.w_s1[w_idx], x, sums[3], true, real, imag);
+            }
+
+            if (tc.bias) {
+                real += data.bias[(size_t) row];
+                imag += data.bias[(size_t) row + (size_t) tc.M];
+            }
+
+            out[(size_t) n * (size_t) tc.M + (size_t) row] = pack_bf16_pair(real, imag);
+        }
+    }
+    return out;
+}
+
+static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
+                                   const fairy2i_w2_case & tc,
+                                   const fairy2i_w2_data & data,
+                                   bool                    lut_enabled,
+                                   bool                    force_scalar) {
+    scoped_env_var env_lut("GGML_FAIRY2I_LUT");
+    scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
+    scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
+    env_lut.set(lut_enabled ? "1" : "0");
+    env_impl.set("lut16");
+    if (force_scalar) {
+        env_force_scalar.set("1");
+    } else {
+        env_force_scalar.unset();
+    }
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
@@ -28,7 +325,7 @@ static bool test_fairy2i_wide_linear_w2_zero() {
     ggml_backend_cpu_set_n_threads(backend, 4);
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/16 * 1024 * 1024,
+        /*.mem_size   =*/32 * 1024 * 1024,
         /*.mem_buffer =*/NULL,
         /*.no_alloc   =*/true,
     };
@@ -39,15 +336,16 @@ static bool test_fairy2i_wide_linear_w2_zero() {
         return false;
     }
 
-    ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
-    ggml_tensor * u_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, K, M);
-    ggml_tensor * u_s1 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, K, M);
-    ggml_tensor * w_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, K, M);
-    ggml_tensor * w_s1 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, K, M);
-    ggml_tensor * out  = ggml_fairy2i_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, NULL);
+    ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * u_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * u_s1 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s1 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * bias = tc.bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tc.M) : nullptr;
+    ggml_tensor * y    = ggml_fairy2i_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gf, y);
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
     if (!buf) {
@@ -57,15 +355,14 @@ static bool test_fairy2i_wide_linear_w2_zero() {
         return false;
     }
 
-    const size_t blocks = (size_t) M * (size_t) K / QK_FAIRY2I_TILE64;
-    std::vector<float>                   x_data((size_t) N * (size_t) K, 0.0f);
-    std::vector<block_fairy2i_tile64_v2> weights(blocks);
-
-    ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
-    ggml_backend_tensor_set(u_s0, weights.data(), 0, weights.size() * sizeof(block_fairy2i_tile64_v2));
-    ggml_backend_tensor_set(u_s1, weights.data(), 0, weights.size() * sizeof(block_fairy2i_tile64_v2));
-    ggml_backend_tensor_set(w_s0, weights.data(), 0, weights.size() * sizeof(block_fairy2i_tile64_v2));
-    ggml_backend_tensor_set(w_s1, weights.data(), 0, weights.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(x, data.x.data(), 0, data.x.size() * sizeof(float));
+    ggml_backend_tensor_set(u_s0, data.u_s0.data(), 0, data.u_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(u_s1, data.u_s1.data(), 0, data.u_s1.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w_s0, data.w_s0.data(), 0, data.w_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w_s1, data.w_s1.data(), 0, data.w_s1.size() * sizeof(block_fairy2i_tile64_v2));
+    if (bias) {
+        ggml_backend_tensor_set(bias, data.bias.data(), 0, data.bias.size() * sizeof(float));
+    }
 
     const ggml_status status = ggml_backend_graph_compute(backend, gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -76,22 +373,141 @@ static bool test_fairy2i_wide_linear_w2_zero() {
         return false;
     }
 
-    std::vector<float> out_data((size_t) M * (size_t) N, -1.0f);
-    ggml_backend_tensor_get(out, out_data.data(), 0, out_data.size() * sizeof(float));
+    std::vector<float> out_f32((size_t) tc.M * (size_t) tc.N);
+    ggml_backend_tensor_get(y, out_f32.data(), 0, out_f32.size() * sizeof(float));
 
-    bool ok = true;
-    for (float v : out_data) {
-        if (v != 0.0f) {
-            ok = false;
-            break;
-        }
-    }
+    out.resize(out_f32.size());
+    memcpy(out.data(), out_f32.data(), out_f32.size() * sizeof(float));
 
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     ggml_backend_free(backend);
+    return true;
+}
 
-    printf("  fairy2i wide_linear_w2 zero - %s\n", ok ? "PASS" : "FAIL");
+static bool compare_exact(const char * label, const std::vector<uint32_t> & actual, const std::vector<uint32_t> & expected) {
+    if (actual.size() != expected.size()) {
+        fprintf(stderr, "%s size mismatch: %zu vs %zu\n", label, actual.size(), expected.size());
+        return false;
+    }
+
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (actual[i] != expected[i]) {
+            float ar, ai, er, ei;
+            unpack_bf16_pair(actual[i], ar, ai);
+            unpack_bf16_pair(expected[i], er, ei);
+            fprintf(stderr,
+                    "%s mismatch at index %zu: actual=0x%08x expected=0x%08x actual=(%.7g,%.7g) "
+                    "expected=(%.7g,%.7g)\n",
+                    label, i, actual[i], expected[i], ar, ai, er, ei);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool compare_packed_complex(
+    const char * label, const std::vector<uint32_t> & actual, const std::vector<uint32_t> & expected, float max_error) {
+    if (actual.size() != expected.size()) {
+        fprintf(stderr, "%s size mismatch: %zu vs %zu\n", label, actual.size(), expected.size());
+        return false;
+    }
+
+    float  max_diff = 0.0f;
+    size_t max_idx  = 0;
+    int    max_ch   = 0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        float ar, ai, er, ei;
+        unpack_bf16_pair(actual[i], ar, ai);
+        unpack_bf16_pair(expected[i], er, ei);
+        const float dr = fabsf(ar - er);
+        const float di = fabsf(ai - ei);
+        if (dr > max_diff) {
+            max_diff = dr;
+            max_idx  = i;
+            max_ch   = 0;
+        }
+        if (di > max_diff) {
+            max_diff = di;
+            max_idx  = i;
+            max_ch   = 1;
+        }
+    }
+
+    if (max_diff > max_error) {
+        float ar, ai, er, ei;
+        unpack_bf16_pair(actual[max_idx], ar, ai);
+        unpack_bf16_pair(expected[max_idx], er, ei);
+        fprintf(stderr,
+                "%s max diff %.7g exceeds %.7g at index %zu channel=%s actual=(%.7g,%.7g) expected=(%.7g,%.7g)\n",
+                label, max_diff, max_error, max_idx, max_ch == 0 ? "real" : "imag", ar, ai, er, ei);
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_fairy2i_wide_linear_w2_variants() {
+    const int64_t Ms[] = { 7, 23 };
+    const int64_t Ks[] = { 64, 128, 256 };
+    const int64_t Ns[] = { 1, 4 };
+
+    int  cases_run = 0;
+    bool ok        = true;
+    const bool compare_scalar_default = ggml_cpu_has_avx2() != 0;
+
+    for (int64_t M : Ms) {
+        for (int64_t K : Ks) {
+            for (int64_t N : Ns) {
+                for (bool with_bias : { false, true }) {
+                    const fairy2i_w2_case tc = { M, N, K, with_bias };
+                    const fairy2i_w2_data data = make_fairy2i_w2_data(tc);
+                    const std::vector<uint32_t> ref = fairy2i_w2_scalar_reference(tc, data);
+
+                    std::vector<uint32_t> direct;
+                    std::vector<uint32_t> direct_scalar;
+                    std::vector<uint32_t> lut;
+                    if (!run_fairy2i_w2_backend(direct, tc, data, false, false)) {
+                        return false;
+                    }
+                    if (compare_scalar_default && !run_fairy2i_w2_backend(direct_scalar, tc, data, false, true)) {
+                        return false;
+                    }
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+                    if (!run_fairy2i_w2_backend(lut, tc, data, true, false)) {
+                        return false;
+                    }
+#endif
+
+                    char label[160];
+                    snprintf(label, sizeof(label), "reference vs direct M=%lld N=%lld K=%lld bias=%d",
+                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    ok = compare_exact(label, direct, ref) && ok;
+
+                    if (compare_scalar_default) {
+                        snprintf(label, sizeof(label), "forced scalar vs default AVX2 M=%lld N=%lld K=%lld bias=%d",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias);
+                        ok = compare_exact(label, direct_scalar, direct) && ok;
+                    }
+
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+                    snprintf(label, sizeof(label), "direct vs LUT M=%lld N=%lld K=%lld bias=%d",
+                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    ok = compare_packed_complex(label, lut, direct, 1e-2f) && ok;
+#endif
+                    ++cases_run;
+                }
+            }
+        }
+    }
+
+    if (!compare_scalar_default) {
+        printf("  Fairy2i W2 scalar/default-AVX2 compare skipped: CPU backend lacks AVX2\n");
+    }
+#if !defined(GGML_USE_FAIRY2I_CPU_LUT)
+    printf("  Fairy2i W2 LUT compare skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+#endif
+    printf("  Fairy2i W2 variant matrix: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -103,8 +519,8 @@ int main() {
     printf("========================================\n");
 
     int num_failed = 0;
-    if (!test_fairy2i_wide_linear_w2_zero()) {
-        fprintf(stderr, "Fairy2i W2 zero test FAILED\n");
+    if (!test_fairy2i_wide_linear_w2_variants()) {
+        fprintf(stderr, "Fairy2i W2 variant matrix FAILED\n");
         ++num_failed;
     }
 
