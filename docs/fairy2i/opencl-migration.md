@@ -32,6 +32,17 @@ GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL=auto|gemm|gemv2|gemv4|direct
 
 The legacy names do not enable Fairy2i OpenCL kernels.
 
+## Behavior Matrix
+
+| Build options | Kernels copied or embedded | Runtime gate |
+| --- | --- | --- |
+| `GGML_FAIRY2I_OPENCL=OFF`, `GGML_LEGACY_IFAIRY_OPENCL=OFF` | no Fairy2i or iFairy kernels | none |
+| `GGML_FAIRY2I_OPENCL=ON`, `GGML_LEGACY_IFAIRY_OPENCL=OFF` | `complex_*`, `fairy2i_tile64` | `GGML_OPENCL_FAIRY2I=1` |
+| `GGML_FAIRY2I_OPENCL=OFF`, `GGML_LEGACY_IFAIRY_OPENCL=ON` | `ifairy*`, `ifairy64` | `GGML_OPENCL_IFAIRY64=1` |
+| both specialized gates on | both kernel sets | each runtime gate controls its own path |
+
+`GGML_OPENCL_EMBED_KERNELS=ON` is the only mode that requires Python3.
+
 ## Kernel Names
 
 Fairy2i-only builds copy or embed these specialized kernels:
@@ -87,6 +98,29 @@ ggml_opencl_legacy_ifairy_supports(...)
 They preserve current restrictions: F32 packed-BF16 complex tensors, contiguous
 no-view tensors, default complex RoPE parameters, F32 output, and tile64
 matmul with OpenCL's current 256-wide activation staging.
+
+## Troubleshooting
+
+- No Fairy2i OpenCL execution: check `GGML_FAIRY2I_OPENCL=ON` at build time and
+  `GGML_OPENCL_FAIRY2I=1` at runtime.
+- No legacy iFairy OpenCL execution: check `GGML_LEGACY_IFAIRY_OPENCL=ON` and
+  `GGML_OPENCL_IFAIRY64=1`.
+- OpenCL rejects a complex op: check dtype is `F32`, tensors are contiguous,
+  and none of the tensors are views.
+- OpenCL rejects complex RoPE: only default RoPE parameters and no `src2` are
+  currently supported.
+- OpenCL rejects tile64 matmul: current staging requires
+  `K % GGML_OPENCL_TILE64_ACT_Q16_STAGING_BLOCK == 0`; the block is 256.
+
+## Review Checklist
+
+- Clean OpenCL builds do not copy or embed `complex_*`, `fairy2i_tile64`, or
+  `ifairy*` kernels.
+- Fairy2i OpenCL code uses `fairy2i` or `complex` names; legacy iFairy code
+  keeps `ifairy` names.
+- Capability rejects identify build gate, runtime gate, dtype/view/contiguity,
+  shape, RoPE parameter, staging-block, or missing-extra causes.
+- Runtime smoke tests are skipped, not passed, when no OpenCL device exists.
 
 ## Validation
 

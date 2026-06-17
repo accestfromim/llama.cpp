@@ -30,6 +30,10 @@ split into its own model envelope and backend path.
   CTest target.
 - Legacy tensor-scale vecdot policy, W2 direct fuse, and LUT dispatch are owned
   by `ggml/src/ggml-cpu/legacy-ifairy/`.
+- Deprecated CMake aliases `GGML_IFAIRY_LUT_CPU` and
+  `GGML_IFAIRY_FUSE_AVX512` map only to legacy iFairy CPU options.
+- OpenCL `GGML_OPENCL_IFAIRY64` is legacy-only; Fairy2i OpenCL uses
+  `GGML_OPENCL_FAIRY2I`.
 - Each independently reviewable compatibility fix is tested and committed
   before the next fix starts.
 

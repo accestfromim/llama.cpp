@@ -113,6 +113,37 @@ GGML_FAIRY2I_LUT=1 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY
 sources. Those files are owned by the CPU backend feature gates; model loading
 does not eagerly prepack Fairy2i LUT weights.
 
+## Name Migration Table
+
+| Legacy / transitional name | Replacement or scope |
+| --- | --- |
+| `GGML_IFAIRY_LUT_CPU` | `GGML_LEGACY_IFAIRY_CPU_LUT` |
+| `GGML_IFAIRY_FUSE_AVX512` | `GGML_LEGACY_IFAIRY_CPU_AVX512` |
+| `GGML_OPENCL_IFAIRY64` | legacy iFairy OpenCL runtime only |
+| `GGML_OPENCL_FAIRY2I` | Fairy2i OpenCL runtime only |
+| `GGML_TYPE_IFAIRY64` | legacy iFairy tile64 storage |
+| `GGML_TYPE_FAIRY2I_TILE64_V2` | Fairy2i tile64_v2 storage |
+| `GGML_OP_IFAIRY_WIDE_LINEAR_W2` | legacy iFairy W2 |
+| `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` | Fairy2i W2 |
+
+## Compatibility Matrix
+
+| Configuration | Expected behavior |
+| --- | --- |
+| Fairy2i CPU only | runs `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`; legacy iFairy ops are unsupported |
+| legacy iFairy CPU only | runs legacy vecdot and W2; Fairy2i ops are unsupported |
+| Fairy2i OpenCL only | copies/embeds `complex_*` and `fairy2i_tile64` kernels only |
+| legacy iFairy OpenCL only | copies/embeds `ifairy*` kernels only |
+| clean OpenCL | copies/embeds neither Fairy2i nor legacy iFairy kernels |
+
+## Review Checklist
+
+- New Fairy2i paths use `fairy2i`, `FAIRY2I`, or `complex` names.
+- Legacy iFairy paths keep `ifairy`, `IFAIRY`, and old runtime env names.
+- Old aliases map only to legacy options.
+- Feature-off builds do not compile specialized CPU/OpenCL execution sources.
+- Search gates and targeted tests are recorded with each commit.
+
 ## OpenCL Scope
 
 OpenCL is part of the full decoupling scope. Build and runtime migration details

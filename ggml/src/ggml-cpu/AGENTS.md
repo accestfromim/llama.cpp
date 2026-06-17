@@ -1,4 +1,4 @@
-# ggml/src/ggml-cpu/AGENTS.md (iFairy ARM 3W LUT rules)
+# ggml/src/ggml-cpu/AGENTS.md (Fairy2i / legacy iFairy CPU rules)
 
 This directory is hot-path CPU code. Prefer minimal diffs, keep routing conditions explicit, and always preserve correctness.
 
@@ -8,22 +8,35 @@ Must match the ggml baseline exactly: compute `w * conj(x)` (NOT `w * x`). See `
 
 ## Current routing constraints (as implemented)
 
-- Compile-time: `GGML_IFAIRY_LUT_CPU` (CPU-only; CMake disables other backends when enabled)
+- Compile-time, Fairy2i: `GGML_FAIRY2I_CPU`, `GGML_FAIRY2I_CPU_LUT`, `GGML_FAIRY2I_CPU_AVX512`,
+  `GGML_FAIRY2I_CPU_ARM_DOTPROD`
+- Compile-time, legacy iFairy: `GGML_LEGACY_IFAIRY_CPU`, `GGML_LEGACY_IFAIRY_CPU_LUT`,
+  `GGML_LEGACY_IFAIRY_CPU_AVX512`, `GGML_LEGACY_IFAIRY_CPU_ARM_DOTPROD`
+- Deprecated aliases: `GGML_IFAIRY_LUT_CPU` maps only to `GGML_LEGACY_IFAIRY_CPU_LUT`, and
+  `GGML_IFAIRY_FUSE_AVX512` maps only to `GGML_LEGACY_IFAIRY_CPU_AVX512`
+- CPU LUT options are CPU-only; CMake disables accelerator backends when either Fairy2i or legacy iFairy
+  CPU LUT is enabled
 - Platform: LUT route requires `__aarch64__` + `__ARM_NEON` (otherwise fall back)
 - Shape gate: `K % QK_K == 0` with `QK_K=256`
 - Supported activations: `GGML_TYPE_F32` (bf16-pair complex container) or `GGML_TYPE_IFAIRY_Q16`
 - Output type: `GGML_TYPE_F32` (written as bf16-pair when `pack_bf16=true`)
 
 Primary integration points:
-- `ggml/src/ggml-cpu/ggml-cpu.c::ggml_compute_forward_mul_mat()`
-- LUT implementation: `ggml/src/ggml-ifairy-lut.h`, `ggml/src/ggml-ifairy-lut.cpp`, `ggml/src/ggml-ifairy-lut-{transform,preprocess,qgemm}.cpp`
+- Fairy2i CPU module: `ggml/src/ggml-cpu/fairy2i/`
+- Legacy iFairy CPU module: `ggml/src/ggml-cpu/legacy-ifairy/`
+- Root-level LUT helpers such as `ggml/src/ggml-fairy2i-lut*.cpp` and
+  `ggml/src/ggml-ifairy-lut*.cpp` are CPU backend sources listed from
+  `ggml/src/ggml-cpu/CMakeLists.txt`, not `ggml-base` sources
 - Index encoding: `ggml/src/ggml-quants.c` (3W 6-bit pattern)
 
 ## Runtime toggles (current implementation)
 
-- `GGML_IFAIRY_LUT=0/1` (enable unless explicitly set to `0`)
-- `GGML_IFAIRY_LUT_DEBUG=0/1`
-- `GGML_IFAIRY_LUT_IMPL=auto|lut16|lut_c` (optional; `lut_c` uses 42.6-scaled Q8 activations)
+- Fairy2i: `GGML_FAIRY2I_LUT=0/1`, `GGML_FAIRY2I_LUT_DEBUG=0/1`,
+  `GGML_FAIRY2I_LUT_IMPL=auto|lut16|lut_c`
+- Legacy iFairy: `GGML_IFAIRY_LUT=0/1`, `GGML_IFAIRY_LUT_DEBUG=0/1`,
+  `GGML_IFAIRY_LUT_IMPL=auto|lut16|lut_c`
+- Legacy tensor-scale vecdot policy remains under `GGML_IFAIRY_VEC_DOT_ACT_TENSOR`, but the route is
+  owned by `ggml-cpu/legacy-ifairy/`, not the generic matmul policy in `ggml-cpu.c`
 
 V2 keeps a single production LUT path and removes layout/kernel/tiling knobs to reduce surface area. Do not add new knobs unless strictly necessary.
 
@@ -35,19 +48,24 @@ Follow repo-root `AGENTS.md` for `git clang-format` / `clang-tidy` (diff-only, a
 
 ## Validation gates (required for any LUT change)
 
-1) Release build:
-- `cmake --build build-rel -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)` (multi-config: add `--config Release`)
-- `cmake --build build-rel-lut -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)` (multi-config: add `--config Release`)
+1) Fairy2i release build/test:
+- `cmake --build build-rel-fairy2i --target test-fairy2i -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)`
+- `GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i`
 
-2) Unit/functional test:
-- `./build-rel/bin/test-ifairy`
-- `./build-rel-lut/bin/test-ifairy`
+2) Legacy direct build/test:
+- `cmake --build build-ifairy-direct --target test-legacy-ifairy-direct -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)`
+- `ctest --test-dir build-ifairy-direct --output-on-failure -R legacy-ifairy-direct`
 
-3) CLI sanity (quick smoke) + bench tok/s baseline:
+3) Legacy LUT/full build/test:
+- `cmake --build build-ifairy-legacy --target test-legacy-ifairy test-legacy-ifairy-direct -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)`
+- `GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy`
+
+4) CLI sanity (quick smoke) + bench tok/s baseline when old iFairy weights are available:
 - `GGML_IFAIRY_LUT=1 ./build-rel-lut/bin/llama-cli -m models/Fairy-plus-minus-i-700M/ifairy.gguf --gpu-layers 0 -t 4 -b 1 -p "I believe life is" -n 16 -no-cnv`
 - `GGML_IFAIRY_LUT=1 ./build-rel-lut/bin/llama-bench -m models/Fairy-plus-minus-i-700M/ifairy.gguf --threads 4 --n-prompt 128 --n-gen 256 -ngl 0 --device none --repetitions 3`
 
-Edge-case regression coverage is in `tests/test-ifairy.cpp` (alignment, small/large dims, env semantics, transform concurrency).
+Edge-case regression coverage is in `tests/test-fairy2i.cpp`, `tests/test-legacy-ifairy-direct.cpp`,
+and `tests/test-legacy-ifairy.cpp`.
 
 ## Performance claims
 
