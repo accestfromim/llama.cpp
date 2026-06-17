@@ -145,6 +145,9 @@ bool ggml_fairy2i_cpu_compute(const struct ggml_compute_params * params, struct 
 }
 
 bool ggml_fairy2i_cpu_try_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    // See fairy2i-cpu.h for the reserved MUL_MAT contract. Returning false
+    // keeps generic CPU matmul semantics unchanged until Fairy2i tile64 MUL_MAT
+    // is implemented as an explicit CPU extension path.
     GGML_UNUSED(params);
     GGML_UNUSED(dst);
     return false;
