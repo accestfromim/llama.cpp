@@ -24,6 +24,7 @@ import torch
 from safetensors import safe_open
 
 import gguf
+from fairy2i.spec import Fairy2IMetadata, write_metadata
 from gguf.constants import QK_IFAIRY
 
 
@@ -588,7 +589,7 @@ def get_rope_theta(config: dict) -> float:
     return 10000.0
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Convert Qwen2-based Fairy2i Hugging Face weights to GGUF")
     parser.add_argument("model_dir", type=Path, help="Path to Qwen2-based Fairy2i model directory")
     parser.add_argument("output_file", type=Path, help="Output GGUF file path")
@@ -616,7 +617,7 @@ def main() -> None:
         help="Quantization/export variant. tile64_v2 matches the training-side QAT kernel; legacy keeps the old 256-wide iFairy packing for comparison.",
     )
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.residual_steps != 2:
         raise ValueError("only --residual-steps 2 is currently supported")
@@ -668,13 +669,18 @@ def main() -> None:
     else:
         writer.add_file_type(gguf.LlamaFileType.ALL_F32)
     writer.add_vocab_size(int(config["vocab_size"]))
-    writer.add_uint32("fairy2i.quant.residual_steps", args.residual_steps)
-    writer.add_string("fairy2i.quant.codebook", "{+/-1,+/-i}")
-    writer.add_string("fairy2i.quant.variant", quant_variant)
-    writer.add_string("fairy2i.attn.layout", "qwen2_real")
-    if quant_variant == "tile64_v2":
-        writer.add_uint32("fairy2i.quant.tile_size", TILE64)
-        writer.add_string("fairy2i.quant.scale_stat", "dominant_mean_abs")
+    write_metadata(
+        writer,
+        Fairy2IMetadata(
+            base_arch="qwen2",
+            base_model_type=config.get("model_type"),
+            base_architecture=(config.get("architectures") or [None])[0],
+            attn_layout="qwen2_real",
+            tokenizer_profile="qwen2",
+            quant_variant=quant_variant,
+            residual_steps=args.residual_steps,
+        ),
+    )
 
     if verbose:
         print("adding token embedding")

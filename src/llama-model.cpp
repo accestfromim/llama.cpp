@@ -1667,6 +1667,8 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 if (attn_layout == "legacy_complex") {
                     fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_LEGACY_COMPLEX;
+                } else if (attn_layout == "llama_real") {
+                    fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL;
                 } else if (attn_layout == "qwen2_real") {
                     fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL;
                 } else {
@@ -14122,7 +14124,8 @@ struct llm_build_ifairy : public llm_graph_context {
 struct llm_build_fairy2i : public llm_graph_context {
     llm_build_fairy2i(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
         const int64_t n_embd_head = hparams.n_embd_head_v;
-        const bool    use_real_attn = model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL;
+        const bool    use_real_attn = model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL ||
+                                      model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL;
 
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head % 2 == 0);

@@ -4,10 +4,10 @@
 Convert a Llama-based Fairy2i Hugging Face checkpoint to GGUF.
 
 This converter is for checkpoints whose dense BF16 Linear weights are trained
-with the QATLinearComplexPhaseV2 tile64 quantization kernel. It reuses the
-Fairy2i tile64_v2 packer from convert_fairy2i_qwen2.py, but exports a Llama
-BPE tokenizer and pads the vocabulary so the optional Fairy2i output tensor
-shape checks stay 64-aligned while token ids remain stable.
+with the QATLinearComplexPhaseV2 tile64 quantization kernel. It uses the shared
+Fairy2i tile64_v2 packer, exports a Llama BPE tokenizer, and pads the
+vocabulary so the optional Fairy2i output tensor shape checks stay 64-aligned
+while token ids remain stable.
 """
 
 import argparse
@@ -21,33 +21,23 @@ import gguf
 import numpy as np
 import torch
 
-from convert_fairy2i_qwen2 import (
+from fairy2i.io.tensor_reader import TensorReader, add_optional_vector_tensor, load_weight_map
+from fairy2i.quant.tile64_v2 import (
     QK_IFAIRY,
     TILE64,
-    TensorReader,
-    add_optional_vector_tensor,
-    load_weight_map,
     quantize_linear_to_ifairy64_stages,
     round_up,
-    undo_llama_permute,
 )
+from fairy2i.quant.widely_linear import undo_llama_permute
+from fairy2i.spec import Fairy2IMetadata, write_metadata
+from fairy2i.tokenizer.chat_template import load_fairy2i_chat_template
 
 
-FAIRY2I_DEEPSEEK_BOS_TOKEN = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
-FAIRY2I_DEEPSEEK_USER_TOKEN = "<\uff5cUser\uff5c>"
-FAIRY2I_DEEPSEEK_ASSISTANT_TOKEN = "<\uff5cAssistant\uff5c>"
-FAIRY2I_DEEPSEEK_EOS_TOKEN = "<\uff5cend\u2581of\u2581sentence\uff5c>"
-FAIRY2I_DEEPSEEK_CHAT_TOKENS = (
-    FAIRY2I_DEEPSEEK_BOS_TOKEN,
-    FAIRY2I_DEEPSEEK_USER_TOKEN,
-    FAIRY2I_DEEPSEEK_ASSISTANT_TOKEN,
-    FAIRY2I_DEEPSEEK_EOS_TOKEN,
-)
+FAIRY2I_VOCAB_PADDING_MULTIPLE = 2 * TILE64
 
 
 def round_up_even_tile_vocab(vocab_size: int) -> int:
-    complex_tile = 2 * TILE64
-    return round_up(vocab_size, complex_tile)
+    return round_up(vocab_size, FAIRY2I_VOCAB_PADDING_MULTIPLE)
 
 
 def token_looks_special(token: str | bytes) -> bool:
@@ -114,56 +104,6 @@ def resolve_special_token_id(
     if token_id >= padded_vocab_size:
         raise ValueError(f"{token_name}_token_id={token_id} is outside padded vocab {padded_vocab_size}")
     return token_id
-
-
-def normalize_fairy2i_chat_template(chat_template: str) -> str:
-    if "add_generation_prompt" in chat_template:
-        return chat_template
-    if not all(token in chat_template for token in FAIRY2I_DEEPSEEK_CHAT_TOKENS):
-        return chat_template
-
-    assistant_token_literal = repr(FAIRY2I_DEEPSEEK_ASSISTANT_TOKEN)
-    generation_prompt = "{% if add_generation_prompt %}{{ " + assistant_token_literal + " }}{% endif %}"
-    return chat_template.rstrip("\n") + generation_prompt
-
-
-def normalize_fairy2i_chat_template_value(
-    chat_template: str | list[dict[str, str]],
-) -> str | list[dict[str, str]]:
-    if isinstance(chat_template, str):
-        return normalize_fairy2i_chat_template(chat_template)
-    if isinstance(chat_template, list):
-        normalized_templates: list[dict[str, str]] = []
-        for choice in chat_template:
-            if not isinstance(choice, dict):
-                raise ValueError("chat_template list entries must be objects")
-            normalized_choice = dict(choice)
-            template = normalized_choice.get("template")
-            if isinstance(template, str):
-                normalized_choice["template"] = normalize_fairy2i_chat_template(template)
-            normalized_templates.append(normalized_choice)
-        return normalized_templates
-    raise ValueError(f"bad chat_template type: {type(chat_template).__name__}")
-
-
-def load_fairy2i_chat_template(model_dir: Path, tokenizer_config: dict) -> str | list[dict[str, str]] | None:
-    chat_template = None
-    chat_template_jinja = model_dir / "chat_template.jinja"
-    chat_template_json = model_dir / "chat_template.json"
-
-    if chat_template_jinja.is_file():
-        chat_template = chat_template_jinja.read_text(encoding="utf-8")
-    elif chat_template_json.is_file():
-        chat_template_data = json.loads(chat_template_json.read_text(encoding="utf-8"))
-        chat_template = chat_template_data.get("chat_template")
-    else:
-        chat_template = tokenizer_config.get("chat_template")
-
-    if chat_template is None:
-        return None
-    if not isinstance(chat_template, (str, list)):
-        raise ValueError(f"bad chat_template type: {type(chat_template).__name__}")
-    return normalize_fairy2i_chat_template_value(chat_template)
 
 
 def add_fairy2i_llama_tokenizer_metadata(
@@ -376,7 +316,7 @@ def validate_checkpoint(config: dict, weight_map: dict[str, str]) -> None:
         raise KeyError(f"missing {len(missing)} required tensors: {preview}")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Convert Llama-based Fairy2i HF weights to GGUF")
     parser.add_argument("model_dir", type=Path, help="Path to the Llama-based Fairy2i model directory")
     parser.add_argument("output_file", type=Path, nargs="?", help="Output GGUF file path")
@@ -393,7 +333,7 @@ def main() -> None:
     )
     parser.add_argument("--qk-permute", action="store_true", help="Enable Llama q/k undo-permute during conversion")
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.residual_steps != 2:
         raise ValueError("only --residual-steps 2 is currently supported")
@@ -448,14 +388,20 @@ def main() -> None:
     add_rope_metadata(config, writer)
     writer.add_file_type(gguf.LlamaFileType.MOSTLY_IFAIRY)
     writer.add_vocab_size(vocab_padded)
-    writer.add_uint32("fairy2i.quant.residual_steps", args.residual_steps)
-    writer.add_string("fairy2i.quant.codebook", "{+/-1,+/-i}")
-    writer.add_string("fairy2i.quant.variant", "tile64_v2")
-    writer.add_uint32("fairy2i.quant.tile_size", TILE64)
-    writer.add_string("fairy2i.quant.scale_stat", "dominant_mean_abs")
-    writer.add_string("fairy2i.attn.layout", "qwen2_real")
-    writer.add_uint32("fairy2i.vocab.original_size", vocab_original)
-    writer.add_uint32("fairy2i.vocab.padded_size", vocab_padded)
+    write_metadata(
+        writer,
+        Fairy2IMetadata(
+            base_arch="llama",
+            base_model_type=config.get("model_type"),
+            base_architecture=(config.get("architectures") or [None])[0],
+            attn_layout="llama_real",
+            tokenizer_profile="llama_bpe",
+            residual_steps=args.residual_steps,
+            vocab_original_size=vocab_original,
+            vocab_padded_size=vocab_padded,
+            vocab_padding_multiple=FAIRY2I_VOCAB_PADDING_MULTIPLE,
+        ),
+    )
 
     if args.verbose:
         print("adding token embedding")
