@@ -655,6 +655,18 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_AVX512)
     endif()
 
+    if (GGML_LEGACY_IFAIRY_CPU)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_CPU)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU_LUT)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_CPU_LUT)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU_AVX512)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_CPU_AVX512)
+    endif()
+
     if (EMSCRIPTEN)
         set_target_properties(${GGML_CPU_NAME} PROPERTIES COMPILE_FLAGS "-msimd128")
     endif()
