@@ -14,7 +14,7 @@
 #include "vec.h"
 #include "ops.h"
 #ifdef GGML_USE_FAIRY2I_CPU
-#    include "ifairy-fuse.h"
+#    include "fairy2i/fairy2i-cpu.h"
 #endif
 #include "ggml.h"
 #ifdef GGML_IFAIRY_LUT_CPU
@@ -2419,12 +2419,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 const struct ggml_ifairy_lut_threadpool_config * cfg = &params->threadpool->ifairy_lut_cfg;
                 const bool use_lut = cfg->lut_enabled && cfg->lut_explicit;
                 const bool lut_c   = cfg->impl == GGML_IFAIRY_LUT_IMPL_LUT_C;
-                if (!use_lut || !ggml_compute_forward_ifairy_wide_linear_w2_lut(params, tensor, lut_c)) {
-                    ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
-                }
 #else
-                ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
+                const bool use_lut = false;
+                const bool lut_c   = false;
 #endif
+                if (!ggml_fairy2i_cpu_compute_wide_linear_w2(params, tensor, use_lut, lut_c)) {
+                    GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 failed");
+                }
 #else
                 GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 requires GGML_FAIRY2I_CPU");
 #endif
@@ -3358,17 +3359,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {
 #ifdef GGML_USE_FAIRY2I_CPU
-                        const struct ggml_tensor * x = node->src[0];
-                        GGML_ASSERT(x && x->type == GGML_TYPE_F32);
-                        GGML_ASSERT(x->ne[0] % QK_IFAIRY64 == 0);
-
-                        const size_t q_row_size = ggml_row_size(GGML_TYPE_IFAIRY64_Q16, x->ne[0]);
-                        const size_t q_bytes    = GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_CACHE_LINE);
-#ifdef GGML_IFAIRY_LUT_CPU
-                        cur                     = MAX(q_bytes, ggml_ifairy_wide_linear_w2_lut_wsize(node));
-#else
-                        cur                     = q_bytes;
-#endif
+                        cur = ggml_fairy2i_cpu_work_size(node, n_tasks);
 #else
                         cur = 0;
 #endif
