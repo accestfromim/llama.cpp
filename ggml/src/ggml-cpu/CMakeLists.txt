@@ -74,10 +74,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (GGML_LEGACY_IFAIRY_CPU_LUT)
         list(APPEND GGML_CPU_SOURCES
-            ggml-ifairy-lut.cpp
-            ggml-ifairy-lut-preprocess.cpp
-            ggml-ifairy-lut-qgemm.cpp
-            ggml-ifairy-lut-transform.cpp
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut.cpp
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut-preprocess.cpp
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut-qgemm.cpp
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut-transform.cpp
             ggml-cpu/legacy-ifairy/wide-linear-lut.cpp
             ggml-cpu/legacy-ifairy/lut-qgemm.cpp
             ggml-cpu/legacy-ifairy/lut-qgemm.h)
@@ -85,10 +85,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (GGML_FAIRY2I_CPU_LUT)
         list(APPEND GGML_CPU_SOURCES
-            ggml-fairy2i-lut.cpp
-            ggml-fairy2i-lut-preprocess.cpp
-            ggml-fairy2i-lut-qgemm.cpp
-            ggml-fairy2i-lut-transform.cpp
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut.cpp
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut-preprocess.cpp
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut-qgemm.cpp
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut-transform.cpp
             ggml-cpu/fairy2i/wide-linear-lut.cpp
             ggml-cpu/fairy2i/lut-qgemm.cpp
             ggml-cpu/fairy2i/lut-qgemm.h)
@@ -96,6 +96,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+    if (GGML_LEGACY_IFAIRY_CPU_LUT)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/legacy-ifairy/lut)
+    endif()
+    if (GGML_FAIRY2I_CPU_LUT)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/fairy2i/lut)
+    endif()
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)

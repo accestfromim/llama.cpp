@@ -9,7 +9,7 @@
 // Include internal quantization headers for ifairy types
 extern "C" {
 #include "../ggml/src/ggml-common.h"
-#include "../ggml/src/ggml-ifairy-lut.h"
+#include "../ggml/src/ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut.h"
 #include "../ggml/src/ggml-quants.h"
 
 void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);

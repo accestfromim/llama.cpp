@@ -6,7 +6,7 @@
 #    else
 #        define GGML_COMMON_DECL_C
 #    endif
-#    include "ggml-common.h"
+#    include "../../../ggml-common.h"
 #endif
 
 #include "ggml-backend.h"
