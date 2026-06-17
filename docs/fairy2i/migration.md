@@ -110,8 +110,15 @@ GGML_FAIRY2I_LUT=1 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY
 ```
 
 `ggml-base` no longer compiles Fairy2i or legacy iFairy LUT/QGEMM execution
-sources. Those files are owned by the CPU backend feature gates; model loading
-does not eagerly prepack Fairy2i LUT weights.
+sources. Those files live under `ggml/src/ggml-cpu/fairy2i/lut/` and
+`ggml/src/ggml-cpu/legacy-ifairy/lut/`, owned by the CPU backend feature gates;
+model loading does not eagerly prepack Fairy2i LUT weights.
+
+The full CPU feature matrix is scripted:
+
+```bash
+scripts/ci-fairy2i-cpu.sh
+```
 
 ## Name Migration Table
 
@@ -141,6 +148,7 @@ does not eagerly prepack Fairy2i LUT weights.
 - Legacy iFairy paths keep `ifairy`, `IFAIRY`, and old runtime env names.
 - Old aliases map only to legacy options.
 - Feature-off builds do not compile specialized CPU/OpenCL execution sources.
+- Fairy2i-only CPU builds do not compile legacy `quants-ifairy.*` ARM files.
 - OpenCL is Fairy2i-only; legacy iFairy compatibility belongs to CPU.
 - Search gates and targeted tests are recorded with each commit.
 

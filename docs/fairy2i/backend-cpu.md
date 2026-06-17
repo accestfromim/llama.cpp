@@ -114,15 +114,24 @@ belong to `ggml/src/ggml-cpu/legacy-ifairy/` and must remain runnable when
 The LUT files are split by runtime surface:
 
 ```text
-ggml/src/ggml-fairy2i-lut*
+ggml/src/ggml-cpu/fairy2i/lut/ggml-fairy2i-lut*
 ggml/src/ggml-cpu/fairy2i/*lut*
-ggml/src/ggml-ifairy-lut*
+ggml/src/ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut*
 ggml/src/ggml-cpu/legacy-ifairy/*lut*
 ```
 
-Those root-level LUT helper files are CPU backend sources. They are not compiled
-into `ggml-base`; `ggml-base` keeps block formats, type traits, and reference
+Those LUT helper files are CPU backend sources. They are not compiled into
+`ggml-base`; `ggml-base` keeps block formats, type traits, and reference
 quantization only.
+
+ARM files are also split by owner:
+
+```text
+ggml/src/ggml-cpu/fairy2i/arm/
+ggml/src/ggml-cpu/legacy-ifairy/arm/
+```
+
+Fairy2i-only builds no longer compile `quants-ifairy.*`.
 
 ## Migration Map
 
@@ -190,3 +199,9 @@ GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R le
 ```
 
 The semantic invariant remains `w * conj(x)`.
+
+For the complete baseline/Fairy2i/legacy matrix:
+
+```bash
+scripts/ci-fairy2i-cpu.sh
+```

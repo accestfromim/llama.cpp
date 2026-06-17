@@ -31,6 +31,10 @@ split into its own model envelope and backend path.
   CTest target.
 - Legacy tensor-scale vecdot policy, W2 direct fuse, and LUT dispatch are owned
   by `ggml/src/ggml-cpu/legacy-ifairy/`.
+- Legacy LUT helpers live under `ggml/src/ggml-cpu/legacy-ifairy/lut/`; the
+  old root-level `ggml/src/ggml-ifairy-lut*` files have moved.
+- Legacy ARM vecdot files live under `ggml/src/ggml-cpu/legacy-ifairy/arm/`;
+  Fairy2i ARM files are separate.
 - Deprecated CMake aliases `GGML_IFAIRY_LUT_CPU` and
   `GGML_IFAIRY_FUSE_AVX512` map only to legacy iFairy CPU options.
 - Fairy2i OpenCL uses `GGML_OPENCL_FAIRY2I`; legacy iFairy has no OpenCL
@@ -56,6 +60,12 @@ cmake -B build-ifairy-legacy \
   -DGGML_LEGACY_IFAIRY_CPU_LUT=ON
 cmake --build build-ifairy-legacy --target test-legacy-ifairy test-legacy-ifairy-direct -j 4
 GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy
+```
+
+The combined CPU feature matrix, including clean and Fairy2i-only builds, is:
+
+```bash
+scripts/ci-fairy2i-cpu.sh
 ```
 
 ## 目录结构

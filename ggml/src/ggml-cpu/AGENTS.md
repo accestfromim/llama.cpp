@@ -24,8 +24,9 @@ Must match the ggml baseline exactly: compute `w * conj(x)` (NOT `w * x`). See `
 Primary integration points:
 - Fairy2i CPU module: `ggml/src/ggml-cpu/fairy2i/`
 - Legacy iFairy CPU module: `ggml/src/ggml-cpu/legacy-ifairy/`
-- Root-level LUT helpers such as `ggml/src/ggml-fairy2i-lut*.cpp` and
-  `ggml/src/ggml-ifairy-lut*.cpp` are CPU backend sources listed from
+- Fairy2i LUT helpers: `ggml/src/ggml-cpu/fairy2i/lut/`
+- Legacy iFairy LUT helpers: `ggml/src/ggml-cpu/legacy-ifairy/lut/`
+- CPU execution LUT/QGEMM sources are listed from
   `ggml/src/ggml-cpu/CMakeLists.txt`, not `ggml-base` sources
 - Index encoding: `ggml/src/ggml-quants.c` (3W 6-bit pattern)
 
@@ -66,6 +67,8 @@ Follow repo-root `AGENTS.md` for `git clang-format` / `clang-tidy` (diff-only, a
 
 Edge-case regression coverage is in `tests/test-fairy2i.cpp`, `tests/test-legacy-ifairy-direct.cpp`,
 and `tests/test-legacy-ifairy.cpp`.
+
+For the full CPU feature matrix, run `scripts/ci-fairy2i-cpu.sh`.
 
 ## Performance claims
 
