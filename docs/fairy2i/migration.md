@@ -115,6 +115,10 @@ does not eagerly prepack Fairy2i LUT weights.
 
 ## OpenCL Scope
 
-OpenCL is part of the full decoupling scope. New Fairy2i OpenCL routing uses
-`GGML_OPENCL_FAIRY2I`; legacy iFairy routing keeps the older
-`GGML_OPENCL_IFAIRY64` gate until the legacy backend is isolated.
+OpenCL is part of the full decoupling scope. Build and runtime migration details
+are tracked in `docs/fairy2i/opencl-migration.md`.
+
+New Fairy2i OpenCL routing uses `GGML_FAIRY2I_OPENCL` at build time and
+`GGML_OPENCL_FAIRY2I` at runtime. Legacy iFairy OpenCL routing uses
+`GGML_LEGACY_IFAIRY_OPENCL` at build time and keeps the older
+`GGML_OPENCL_IFAIRY64` runtime gate.
