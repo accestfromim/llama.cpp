@@ -38,6 +38,10 @@
 
 #define UNUSED(x) (void)(x)
 
+#if defined(GGML_USE_FAIRY2I_OPENCL) || defined(GGML_USE_LEGACY_IFAIRY_OPENCL)
+#define GGML_USE_IFAIRY_OPENCL_SHARED_KERNELS
+#endif
+
 #define CL_CHECK(err)                                               \
     do {                                                            \
         cl_int err_ = (err);                                        \
@@ -785,6 +789,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         GGML_LOG_CONT(".");
     }
 
+#ifdef GGML_USE_IFAIRY_OPENCL_SHARED_KERNELS
     // ifairy_add
     {
 #ifdef GGML_OPENCL_EMBED_KERNELS
@@ -911,6 +916,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_ifairy_split = clCreateKernel(backend_ctx->program_ifairy_split, "kernel_ifairy_split", &err), err));
         GGML_LOG_CONT(".");
     }
+#endif
 
     // clamp
     {
@@ -1450,7 +1456,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->kernel_rope_multi_f16  = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f16", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_vision_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f32", &err), err));
         CL_CHECK((backend_ctx->kernel_rope_vision_f16 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f16", &err), err));
+#ifdef GGML_USE_IFAIRY_OPENCL_SHARED_KERNELS
         CL_CHECK((backend_ctx->kernel_ifairy_rope     = clCreateKernel(backend_ctx->program_rope, "kernel_ifairy_rope", &err), err));
+#endif
         GGML_LOG_CONT(".");
     }
 
@@ -2916,7 +2924,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 }
 
 static bool ggml_opencl_is_fairy2i_tile64_type(enum ggml_type type) {
-    return type == GGML_TYPE_IFAIRY64 || type == GGML_TYPE_FAIRY2I_TILE64_V2;
+    bool supported = false;
+    GGML_UNUSED(type);
+#ifdef GGML_USE_LEGACY_IFAIRY_OPENCL
+    supported = supported || type == GGML_TYPE_IFAIRY64;
+#endif
+#ifdef GGML_USE_FAIRY2I_OPENCL
+    supported = supported || type == GGML_TYPE_FAIRY2I_TILE64_V2;
+#endif
+    return supported;
 }
 
 static bool ggml_opencl_is_ifairy_type(enum ggml_type type) {
@@ -2951,13 +2967,21 @@ static bool ggml_opencl_is_ifairy_op(const struct ggml_tensor * op) {
 }
 
 static bool ggml_opencl_fairy2i_enabled(void) {
+#ifndef GGML_USE_FAIRY2I_OPENCL
+    return false;
+#else
     const char * env = getenv("GGML_OPENCL_FAIRY2I");
     return env != nullptr && strcmp(env, "0") != 0;
+#endif
 }
 
 static bool ggml_opencl_legacy_ifairy_enabled(void) {
+#ifndef GGML_USE_LEGACY_IFAIRY_OPENCL
+    return false;
+#else
     const char * env = getenv("GGML_OPENCL_IFAIRY64");
     return env != nullptr && strcmp(env, "0") != 0;
+#endif
 }
 
 static bool ggml_opencl_can_ifairy64_mul_mat(const struct ggml_tensor * op) {
@@ -9705,6 +9729,9 @@ static bool ggml_cl_compute_forward_ifairy(ggml_backend_t backend, ggml_tensor *
         || (src0 != nullptr && src0->extra)
         || (src1 != nullptr && src1->extra);
     if (!any_on_device) {
+        return false;
+    }
+    if (!ggml_opencl_supports_ifairy_op(tensor)) {
         return false;
     }
 

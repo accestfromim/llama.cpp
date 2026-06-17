@@ -262,6 +262,8 @@ option(GGML_OPENCL                          "ggml: use OpenCL"                  
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
 option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adreno"          ON)
+option(GGML_FAIRY2I_OPENCL                  "ggml: enable Fairy2i OpenCL kernels"             ${GGML_FAIRY2I})
+option(GGML_LEGACY_IFAIRY_OPENCL            "ggml: enable legacy iFairy OpenCL kernels"       OFF)
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "gmml: OpenCL API version to target")
 
@@ -327,6 +329,8 @@ if (GGML_FAIRY2I_CPU_LUT OR GGML_LEGACY_IFAIRY_CPU_LUT)
         GGML_OPENCL_PROFILING
         GGML_OPENCL_EMBED_KERNELS
         GGML_OPENCL_USE_ADRENO_KERNELS
+        GGML_FAIRY2I_OPENCL
+        GGML_LEGACY_IFAIRY_OPENCL
     )
 
     foreach(opt IN LISTS _GGML_CPU_LUT_FORCED_BACKENDS)

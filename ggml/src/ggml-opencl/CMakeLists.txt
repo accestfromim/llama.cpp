@@ -1,5 +1,4 @@
 find_package(OpenCL REQUIRED)
-find_package(Python3 REQUIRED)
 
 set(TARGET_NAME ggml-opencl)
 
@@ -22,7 +21,17 @@ if (GGML_OPENCL_USE_ADRENO_KERNELS)
     add_compile_definitions(GGML_OPENCL_USE_ADRENO_KERNELS)
 endif ()
 
+if (GGML_FAIRY2I_OPENCL)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_USE_FAIRY2I_OPENCL)
+endif ()
+
+if (GGML_LEGACY_IFAIRY_OPENCL)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_OPENCL)
+endif ()
+
 if (GGML_OPENCL_EMBED_KERNELS)
+    find_package(Python3 REQUIRED)
+
     add_compile_definitions(GGML_OPENCL_EMBED_KERNELS)
 
     set(EMBED_KERNEL_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/embed_kernel.py")
@@ -68,13 +77,6 @@ set(GGML_OPENCL_KERNELS
     get_rows
     glu
     group_norm
-    ifairy_add
-    ifairy_merge
-    ifairy64
-    ifairy_mul
-    ifairy_relu2
-    ifairy_rms_norm
-    ifairy_split
     im2col_f32
     im2col_f16
     mul_mat_Ab_Bi_8x4
@@ -126,6 +128,18 @@ set(GGML_OPENCL_KERNELS
     flash_attn_f16
     flash_attn_f32
 )
+
+if (GGML_FAIRY2I_OPENCL OR GGML_LEGACY_IFAIRY_OPENCL)
+    list(APPEND GGML_OPENCL_KERNELS
+        ifairy_add
+        ifairy_merge
+        ifairy64
+        ifairy_mul
+        ifairy_relu2
+        ifairy_rms_norm
+        ifairy_split
+    )
+endif ()
 
 foreach (K ${GGML_OPENCL_KERNELS})
     ggml_opencl_add_kernel(${K})
