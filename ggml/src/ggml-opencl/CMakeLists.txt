@@ -29,10 +29,6 @@ if (GGML_FAIRY2I_OPENCL)
     target_compile_definitions(${TARGET_NAME} PRIVATE GGML_USE_FAIRY2I_OPENCL)
 endif ()
 
-if (GGML_LEGACY_IFAIRY_OPENCL)
-    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_OPENCL)
-endif ()
-
 if (GGML_OPENCL_EMBED_KERNELS)
     find_package(Python3 REQUIRED)
 
@@ -143,19 +139,6 @@ if (GGML_FAIRY2I_OPENCL)
         complex_rope
         complex_split
         fairy2i_tile64
-    )
-endif ()
-
-if (GGML_LEGACY_IFAIRY_OPENCL)
-    list(APPEND GGML_OPENCL_KERNELS
-        ifairy_add
-        ifairy_merge
-        ifairy64
-        ifairy_mul
-        ifairy_relu2
-        ifairy_rope
-        ifairy_rms_norm
-        ifairy_split
     )
 endif ()
 
