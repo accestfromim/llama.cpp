@@ -239,6 +239,10 @@ static inline float ggml_ifairy_wide_linear_bias_at(const struct ggml_tensor * b
     return *(const float *) ptr;
 }
 
+static inline bool ggml_fairy2i_wide_linear_weight_type(enum ggml_type type) {
+    return type == GGML_TYPE_FAIRY2I_TILE64_V2 || type == GGML_TYPE_IFAIRY64;
+}
+
 void ggml_compute_forward_ifairy_wide_linear_w2(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     const struct ggml_tensor * x      = dst->src[0];
     const struct ggml_tensor * u_s0   = dst->src[1];
@@ -249,8 +253,8 @@ void ggml_compute_forward_ifairy_wide_linear_w2(const struct ggml_compute_params
 
     GGML_ASSERT(x && u_s0 && u_s1 && w_s0 && w_s1);
     GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(u_s0->type == GGML_TYPE_IFAIRY64 && u_s1->type == GGML_TYPE_IFAIRY64);
-    GGML_ASSERT(w_s0->type == GGML_TYPE_IFAIRY64 && w_s1->type == GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(ggml_fairy2i_wide_linear_weight_type(u_s0->type));
+    GGML_ASSERT(u_s0->type == u_s1->type && u_s0->type == w_s0->type && u_s0->type == w_s1->type);
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_is_contiguous(u_s0) && ggml_is_contiguous(u_s1));
     GGML_ASSERT(ggml_is_contiguous(w_s0) && ggml_is_contiguous(w_s1));

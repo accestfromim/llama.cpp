@@ -2391,36 +2391,43 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
             } break;
+        case GGML_OP_COMPLEX_RMSNORM:
         case GGML_OP_IFAIRY_RMSNORM:
             {
                 ggml_compute_forward_ifairy_rmsnorm(params, tensor);
             }
             break;
+        case GGML_OP_COMPLEX_ROPE:
         case GGML_OP_IFAIRY_ROPE:
             {
                 ggml_compute_forward_ifairy_rope(params, tensor);
             }
             break;
+        case GGML_OP_COMPLEX_SPLIT:
         case GGML_OP_IFAIRY_SPLIT:
             {
                 ggml_compute_forward_ifairy_split(params, tensor);
             }
             break;
+        case GGML_OP_COMPLEX_MERGE:
         case GGML_OP_IFAIRY_MERGE:
             {
                 ggml_compute_forward_ifairy_merge(params, tensor);
             }
             break;
+        case GGML_OP_COMPLEX_ADD:
         case GGML_OP_IFAIRY_ADD:
             {
                 ggml_compute_forward_ifairy_add(params, tensor);
             }
             break;
+        case GGML_OP_COMPLEX_MUL:
         case GGML_OP_IFAIRY_MUL:
             {
                 ggml_compute_forward_ifairy_mul(params, tensor);
             }
             break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
 #ifdef GGML_USE_FAIRY2I_CPU
@@ -2433,10 +2440,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 const bool lut_c   = false;
 #endif
                 if (!ggml_fairy2i_cpu_compute_wide_linear_w2(params, tensor, use_lut, lut_c)) {
-                    GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 failed");
+                    GGML_ABORT("%s failed", ggml_op_name(tensor->op));
                 }
 #else
-                GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 requires GGML_FAIRY2I_CPU");
+                GGML_ABORT("%s requires GGML_FAIRY2I_CPU", ggml_op_name(tensor->op));
 #endif
             }
             break;
@@ -2760,6 +2767,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_COMPLEX_RELU2:
                 case GGML_UNARY_OP_IFAIRY_RELU2:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_HARDSWISH:
@@ -2800,6 +2808,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DIV:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
+        case GGML_OP_COMPLEX_RMSNORM:
         case GGML_OP_IFAIRY_RMSNORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
@@ -2833,6 +2842,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DIAG_MASK_ZERO:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SOFT_MAX_BACK:
+        case GGML_OP_COMPLEX_ADD:
+        case GGML_OP_COMPLEX_MUL:
+        case GGML_OP_COMPLEX_SPLIT:
+        case GGML_OP_COMPLEX_ROPE:
+        case GGML_OP_COMPLEX_MERGE:
         case GGML_OP_IFAIRY_ADD:
         case GGML_OP_IFAIRY_MUL:
         case GGML_OP_IFAIRY_SPLIT:
@@ -2844,6 +2858,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = n_threads;
             } break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
                 n_tasks = n_threads;
@@ -3356,6 +3371,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
+                case GGML_OP_COMPLEX_SPLIT:
+                case GGML_OP_COMPLEX_ADD:
+                case GGML_OP_COMPLEX_MUL:
+                case GGML_OP_COMPLEX_MERGE:
+                case GGML_OP_COMPLEX_ROPE:
+                case GGML_OP_COMPLEX_RMSNORM:
                 case GGML_OP_IFAIRY_SPLIT:
                 case GGML_OP_IFAIRY_ADD:
                 case GGML_OP_IFAIRY_MUL:
@@ -3365,6 +3386,7 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;
+                case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {
 #ifdef GGML_USE_FAIRY2I_CPU

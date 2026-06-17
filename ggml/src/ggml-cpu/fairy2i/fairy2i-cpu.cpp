@@ -6,7 +6,8 @@
 static constexpr size_t GGML_FAIRY2I_CPU_CACHE_LINE = 64;
 
 bool ggml_fairy2i_cpu_supports_op(const struct ggml_tensor * dst) {
-    return dst != nullptr && dst->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2;
+    return dst != nullptr &&
+           (dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2 || dst->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2);
 }
 
 int ggml_fairy2i_cpu_n_tasks(const struct ggml_tensor * dst, int n_threads) {

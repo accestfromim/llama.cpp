@@ -569,6 +569,14 @@ extern "C" {
         GGML_OP_IFAIRY_MUL,  // 逐元素相乘，mlp中gate要用
         GGML_OP_IFAIRY_WIDE_LINEAR_W2,
 
+        GGML_OP_COMPLEX_ROPE,
+        GGML_OP_COMPLEX_SPLIT,
+        GGML_OP_COMPLEX_MERGE,
+        GGML_OP_COMPLEX_ADD,
+        GGML_OP_COMPLEX_RMSNORM,
+        GGML_OP_COMPLEX_MUL,
+        GGML_OP_FAIRY2I_WIDE_LINEAR_W2,
+
         GGML_OP_COUNT,
     };
 
@@ -589,6 +597,7 @@ extern "C" {
         GGML_UNARY_OP_HARDSIGMOID,
         GGML_UNARY_OP_EXP,
         GGML_UNARY_OP_GELU_ERF,
+        GGML_UNARY_OP_COMPLEX_RELU2,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -1083,6 +1092,8 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_elu_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_complex_relu2(struct ggml_context * ctx, struct ggml_tensor * a);
 
     GGML_API struct ggml_tensor * ggml_ifairy_relu2(struct ggml_context * ctx, struct ggml_tensor * a);
 
@@ -1668,6 +1679,34 @@ extern "C" {
                                                    struct ggml_tensor *  b,
                                                    int                   n_dims,
                                                    int                   mode);
+
+    GGML_API struct ggml_tensor * ggml_complex_rope(struct ggml_context * ctx,
+                                                    struct ggml_tensor *  a,
+                                                    struct ggml_tensor *  b,
+                                                    int                   n_dims,
+                                                    int                   mode);
+
+    GGML_API struct ggml_tensor * ggml_complex_split(struct ggml_context * ctx, struct ggml_tensor * a);
+
+    GGML_API struct ggml_tensor * ggml_complex_merge(struct ggml_context * ctx, struct ggml_tensor * a);
+
+    GGML_API struct ggml_tensor * ggml_complex_add(struct ggml_context * ctx,
+                                                   struct ggml_tensor *  a,
+                                                   struct ggml_tensor *  b);
+
+    GGML_API struct ggml_tensor * ggml_complex_mul(struct ggml_context * ctx,
+                                                   struct ggml_tensor *  a,
+                                                   struct ggml_tensor *  b);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_wide_linear_w2(struct ggml_context * ctx,
+                                                              struct ggml_tensor *  x,
+                                                              struct ggml_tensor *  u_s0,
+                                                              struct ggml_tensor *  u_s1,
+                                                              struct ggml_tensor *  w_s0,
+                                                              struct ggml_tensor *  w_s1,
+                                                              struct ggml_tensor *  bias);
+
+    GGML_API struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps);
 
     GGML_API struct ggml_tensor * ggml_ifairy_split(struct ggml_context * ctx, struct ggml_tensor * a);
 

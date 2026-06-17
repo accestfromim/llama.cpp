@@ -14140,8 +14140,8 @@ struct llm_build_fairy2i : public llm_graph_context {
 
         ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-        auto build_ifairy_conj = [&](ggml_tensor * x, int il, const char * name) -> ggml_tensor * {
-            ggml_tensor * x_split = ggml_ifairy_split(ctx0, x);
+        auto build_complex_conj = [&](ggml_tensor * x, int il, const char * name) -> ggml_tensor * {
+            ggml_tensor * x_split = ggml_complex_split(ctx0, x);
             GGML_ASSERT(x_split->ne[0] % 2 == 0);
 
             const int64_t n_half = x_split->ne[0] / 2;
@@ -14151,7 +14151,7 @@ struct llm_build_fairy2i : public llm_graph_context {
             x_imag = ggml_neg(ctx0, x_imag);
 
             ggml_tensor * x_join = ggml_concat(ctx0, x_real, x_imag, 0);
-            ggml_tensor * x_conj = ggml_ifairy_merge(ctx0, x_join);
+            ggml_tensor * x_conj = ggml_complex_merge(ctx0, x_join);
             cb(x_conj, name, il);
             return x_conj;
         };
@@ -14159,21 +14159,21 @@ struct llm_build_fairy2i : public llm_graph_context {
         auto build_fairy2i_rms_norm = [&](ggml_tensor * x, ggml_tensor * norm_w, int il,
                                           const char * name) -> ggml_tensor * {
             // Fairy2i keeps Llama2 RMSNorm semantics on the real-expanded hidden size.
-            ggml_tensor * x_split = ggml_ifairy_split(ctx0, x);
+            ggml_tensor * x_split = ggml_complex_split(ctx0, x);
             ggml_tensor * x_norm  = build_norm(x_split, norm_w, nullptr, LLM_NORM_RMS, il);
-            ggml_tensor * x_merge = ggml_ifairy_merge(ctx0, x_norm);
+            ggml_tensor * x_merge = ggml_complex_merge(ctx0, x_norm);
             cb(x_merge, name, il);
             return x_merge;
         };
 
-        auto build_ifairy_bias = [&](ggml_tensor * x, ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
+        auto build_complex_bias = [&](ggml_tensor * x, ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
             if (!bias) {
                 return x;
             }
 
-            ggml_tensor * x_split = ggml_ifairy_split(ctx0, x);
+            ggml_tensor * x_split = ggml_complex_split(ctx0, x);
             ggml_tensor * x_bias  = ggml_add(ctx0, x_split, bias);
-            ggml_tensor * x_merge = ggml_ifairy_merge(ctx0, x_bias);
+            ggml_tensor * x_merge = ggml_complex_merge(ctx0, x_bias);
             cb(x_merge, name, il);
             return x_merge;
         };
@@ -14184,25 +14184,25 @@ struct llm_build_fairy2i : public llm_graph_context {
 
             const bool can_fuse_w2 = llama_fairy2i_fused_wide_linear_w2_enabled() && loras->empty() && linear.U[1] &&
                                      linear.W[1] &&
-                                     linear.U[0]->type == GGML_TYPE_IFAIRY64 &&
-                                     linear.U[1]->type == GGML_TYPE_IFAIRY64 &&
-                                     linear.W[0]->type == GGML_TYPE_IFAIRY64 &&
-                                     linear.W[1]->type == GGML_TYPE_IFAIRY64;
+                                     linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                     linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                     linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                     linear.W[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2;
             if (can_fuse_w2) {
                 ggml_tensor * y =
-                    ggml_ifairy_wide_linear_w2(ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
+                    ggml_fairy2i_wide_linear_w2(ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
                 cb(y, name, il);
                 return y;
             }
 
             ggml_tensor * u0 = build_lora_mm(linear.U[0], x_conj);
-            ggml_tensor * u  = linear.U[1] ? ggml_ifairy_add(ctx0, u0, build_lora_mm(linear.U[1], x_conj)) : u0;
+            ggml_tensor * u  = linear.U[1] ? ggml_complex_add(ctx0, u0, build_lora_mm(linear.U[1], x_conj)) : u0;
 
             ggml_tensor * w0 = build_lora_mm(linear.W[0], x);
-            ggml_tensor * w  = linear.W[1] ? ggml_ifairy_add(ctx0, w0, build_lora_mm(linear.W[1], x)) : w0;
+            ggml_tensor * w  = linear.W[1] ? ggml_complex_add(ctx0, w0, build_lora_mm(linear.W[1], x)) : w0;
 
-            ggml_tensor * y = ggml_ifairy_add(ctx0, u, w);
-            y = build_ifairy_bias(y, bias, il, "wide_linear_bias");
+            ggml_tensor * y = ggml_complex_add(ctx0, u, w);
+            y = build_complex_bias(y, bias, il, "wide_linear_bias");
             cb(y, name, il);
             return y;
         };
@@ -14212,16 +14212,16 @@ struct llm_build_fairy2i : public llm_graph_context {
 
             ggml_tensor * cur = build_fairy2i_rms_norm(inpL, model.layers[il].attn_norm, il, "attn_norm");
 
-            ggml_tensor * cur_conj = build_ifairy_conj(cur, il, "attn_norm_conj");
+            ggml_tensor * cur_conj = build_complex_conj(cur, il, "attn_norm_conj");
 
             ggml_tensor * Qcur = build_wide_linear(model.layers[il].wq_fairy2i, cur, cur_conj, model.layers[il].bq, il, "Qcur");
             ggml_tensor * Kcur = build_wide_linear(model.layers[il].wk_fairy2i, cur, cur_conj, model.layers[il].bk, il, "Kcur");
             ggml_tensor * Vcur = build_wide_linear(model.layers[il].wv_fairy2i, cur, cur_conj, model.layers[il].bv, il, "Vcur");
 
             if (use_real_attn) {
-                Qcur = ggml_ifairy_split(ctx0, Qcur);
-                Kcur = ggml_ifairy_split(ctx0, Kcur);
-                Vcur = ggml_ifairy_split(ctx0, Vcur);
+                Qcur = ggml_complex_split(ctx0, Qcur);
+                Kcur = ggml_complex_split(ctx0, Kcur);
+                Vcur = ggml_complex_split(ctx0, Vcur);
                 cb(Qcur, "Qcur_split", il);
                 cb(Kcur, "Kcur_split", il);
                 cb(Vcur, "Vcur_split", il);
@@ -14243,27 +14243,27 @@ struct llm_build_fairy2i : public llm_graph_context {
                 cur = build_attn(inp_attn, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
                 cb(cur, "attn_out_split", il);
 
-                cur = ggml_ifairy_merge(ctx0, cur);
+                cur = ggml_complex_merge(ctx0, cur);
                 cb(cur, "attn_out", il);
             } else {
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head / 2, n_head, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head / 2, n_head_kv, n_tokens);
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head / 2, n_head_kv, n_tokens);
 
-                Qcur = ggml_ifairy_rope(ctx0, Qcur, inp_pos, n_rot, 0);
+                Qcur = ggml_complex_rope(ctx0, Qcur, inp_pos, n_rot, 0);
                 cb(Qcur, "Qcur_rope", il);
 
-                Kcur = ggml_ifairy_rope(ctx0, Kcur, inp_pos, n_rot, 0);
+                Kcur = ggml_complex_rope(ctx0, Kcur, inp_pos, n_rot, 0);
                 cb(Kcur, "Kcur_rope", il);
 
-                Vcur = ggml_ifairy_split(ctx0, Vcur);
+                Vcur = ggml_complex_split(ctx0, Vcur);
                 cb(Vcur, "Vcur_split", il);
 
-                cur = ifairy_build_attn(inp_attn, Qcur, Kcur, Vcur, kq_scale, il);
+                cur = complex_build_attn(inp_attn, Qcur, Kcur, Vcur, kq_scale, il);
                 cb(cur, "attn_out", il);
             }
 
-            ggml_tensor * cur_attn_conj = build_ifairy_conj(cur, il, "attn_out_conj");
+            ggml_tensor * cur_attn_conj = build_complex_conj(cur, il, "attn_out_conj");
             cur = build_wide_linear(model.layers[il].wo_fairy2i, cur, cur_attn_conj, model.layers[il].bo, il, "attn_proj");
 
             if (il == n_layer - 1 && inp_out_ids) {
@@ -14271,29 +14271,29 @@ struct llm_build_fairy2i : public llm_graph_context {
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
-            cur = ggml_ifairy_add(ctx0, cur, inpSA);
+            cur = ggml_complex_add(ctx0, cur, inpSA);
             cb(cur, "attn_res", il);
 
             ggml_tensor * ffn_inp = cur;
 
             cur = build_fairy2i_rms_norm(ffn_inp, model.layers[il].ffn_norm, il, "ffn_norm");
 
-            ggml_tensor * cur_ffn_conj = build_ifairy_conj(cur, il, "ffn_norm_conj");
+            ggml_tensor * cur_ffn_conj = build_complex_conj(cur, il, "ffn_norm_conj");
             ggml_tensor * gate =
                 build_wide_linear(model.layers[il].ffn_gate_fairy2i, cur, cur_ffn_conj, nullptr, il, "ffn_gate");
             ggml_tensor * up = build_wide_linear(model.layers[il].ffn_up_fairy2i, cur, cur_ffn_conj, nullptr, il, "ffn_up");
 
-            ggml_tensor * gate_s = ggml_ifairy_split(ctx0, gate);
-            ggml_tensor * up_s   = ggml_ifairy_split(ctx0, up);
+            ggml_tensor * gate_s = ggml_complex_split(ctx0, gate);
+            ggml_tensor * up_s   = ggml_complex_split(ctx0, up);
             gate_s               = ggml_silu(ctx0, gate_s);
 
             ggml_tensor * mul_s = ggml_mul(ctx0, gate_s, up_s);
-            ggml_tensor * mul   = ggml_ifairy_merge(ctx0, mul_s);
+            ggml_tensor * mul   = ggml_complex_merge(ctx0, mul_s);
 
-            ggml_tensor * mul_conj = build_ifairy_conj(mul, il, "ffn_mul_conj");
+            ggml_tensor * mul_conj = build_complex_conj(mul, il, "ffn_mul_conj");
             cur = build_wide_linear(model.layers[il].ffn_down_fairy2i, mul, mul_conj, nullptr, il, "ffn_down");
 
-            cur = ggml_ifairy_add(ctx0, cur, ffn_inp);
+            cur = ggml_complex_add(ctx0, cur, ffn_inp);
             cb(cur, "ffn_res", il);
 
             inpL = cur;
@@ -14309,15 +14309,15 @@ struct llm_build_fairy2i : public llm_graph_context {
         const bool   force_dense_output = force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0;
 
         if (has_output_fairy2i_merged && (!force_dense_output || !model.output)) {
-            ggml_tensor * cur_conj = build_ifairy_conj(cur, -1, "result_norm_conj");
+            ggml_tensor * cur_conj = build_complex_conj(cur, -1, "result_norm_conj");
             cur = build_wide_linear(model.output_fairy2i_merged, cur, cur_conj, nullptr, -1, "result_output_wide_merged");
-            cur = ggml_ifairy_split(ctx0, cur);
+            cur = ggml_complex_split(ctx0, cur);
         } else if (has_output_fairy2i && (!force_dense_output || !model.output)) {
-            ggml_tensor * cur_conj = build_ifairy_conj(cur, -1, "result_norm_conj");
+            ggml_tensor * cur_conj = build_complex_conj(cur, -1, "result_norm_conj");
             cur                    = build_wide_linear(model.output_fairy2i, cur, cur_conj, nullptr, -1, "result_output_wide");
-            cur                    = ggml_ifairy_split(ctx0, cur);
+            cur                    = ggml_complex_split(ctx0, cur);
         } else if (model.output) {
-            cur = ggml_ifairy_split(ctx0, cur);
+            cur = ggml_complex_split(ctx0, cur);
             cur = build_lora_mm(model.output, cur);
         } else {
             throw std::runtime_error("FAIRY2I output layer requires dense output tensor or output.{U,W}.s{0,1}");
