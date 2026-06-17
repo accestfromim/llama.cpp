@@ -521,6 +521,10 @@ static void quantize_row_ifairy64_from_float_ref(const float * GGML_RESTRICT x, 
     free(tmp);
 }
 
+static void quantize_row_fairy2i_tile64_v2_from_float_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    quantize_row_ifairy64_from_float_ref(x, vy, k);
+}
+
 bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
     return memcmp(guid_a, guid_b, sizeof(ggml_guid)) == 0;
 }
@@ -953,6 +957,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_name                = "ifairy64_q16",
         .blck_size                = QK_IFAIRY64,
         .type_size                = sizeof(block_ifairy64_q16),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_FAIRY2I_TILE64_V2] = {
+        .type_name                = "fairy2i_tile64_v2",
+        .blck_size                = QK_FAIRY2I_TILE64,
+        .type_size                = sizeof(block_fairy2i_tile64_v2),
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = quantize_row_fairy2i_tile64_v2_from_float_ref,
+    },
+    [GGML_TYPE_FAIRY2I_ACT_Q16_64] = {
+        .type_name                = "fairy2i_act_q16_64",
+        .blck_size                = QK_FAIRY2I_ACT_Q16_64,
+        .type_size                = sizeof(block_fairy2i_act_q16_64),
         .is_quantized             = true,
     },
 };

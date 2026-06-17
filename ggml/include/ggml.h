@@ -417,9 +417,11 @@ extern "C" {
         GGML_TYPE_MXFP4      = 39,  // MXFP4 (1 block)
         GGML_TYPE_IFAIRY     = 40,  // complex type used for the ifairy model weight
         GGML_TYPE_IFAIRY_Q16 = 41,  // complex type used for the ifairy model in activation
-        GGML_TYPE_IFAIRY64   = 42,  // complex type used for Fairy2i tile64_v2 weights
-        GGML_TYPE_IFAIRY64_Q16 = 43,  // 64-value complex activation block for Fairy2i tile64_v2 weights
-        GGML_TYPE_COUNT      = 44,
+        GGML_TYPE_IFAIRY64   = 42,  // legacy complex tile64 weights
+        GGML_TYPE_IFAIRY64_Q16 = 43,  // legacy 64-value complex activation block
+        GGML_TYPE_FAIRY2I_TILE64_V2 = 44,  // Fairy2i tile64_v2 weights
+        GGML_TYPE_FAIRY2I_ACT_Q16_64 = 45, // Fairy2i 64-value complex activation block
+        GGML_TYPE_COUNT      = 46,
     };
 
     // precision

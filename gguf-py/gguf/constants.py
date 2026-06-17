@@ -2932,6 +2932,9 @@ class GGMLQuantizationType(IntEnum):
     F16_I2  = 40 # newly added for ifairy，2-bit codes + fp16 scales
     IFAIRY  = 41 # newly added for ifairy
     IFAIRY64 = 42 # tile64 Fairy2i weight format
+    IFAIRY64_Q16 = 43
+    FAIRY2I_TILE64_V2 = 44
+    FAIRY2I_ACT_Q16_64 = 45
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -2984,6 +2987,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ1_0         = 36  # except 1d tensors
     MOSTLY_TQ2_0         = 37  # except 1d tensors
     MOSTLY_IFAIRY        = 40
+    MOSTLY_FAIRY2I_TILE64_V2 = 41
 
 
     GUESSED              = 1024  # not specified in the model file
@@ -3046,6 +3050,8 @@ class VisionProjectorType:
 QK_K = 256
 QK_IFAIRY = 256
 QK_IFAIRY64 = 64
+QK_FAIRY2I_TILE64 = 64
+QK_FAIRY2I_ACT_Q16_64 = 64
 GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F32:     (1, 4),
     GGMLQuantizationType.F16:     (1, 2),
@@ -3082,6 +3088,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F16_I2:  (QK_IFAIRY, 4 + QK_IFAIRY // 4), # newly added for ifairy
     GGMLQuantizationType.IFAIRY:  (4, 1), # newly added for ifairy
     GGMLQuantizationType.IFAIRY64:(QK_IFAIRY64, 4 + QK_IFAIRY64 // 4),
+    GGMLQuantizationType.IFAIRY64_Q16:(QK_IFAIRY64, 4 + QK_IFAIRY64 * 2),
+    GGMLQuantizationType.FAIRY2I_TILE64_V2:(QK_FAIRY2I_TILE64, 4 + QK_FAIRY2I_TILE64 // 4),
+    GGMLQuantizationType.FAIRY2I_ACT_Q16_64:(QK_FAIRY2I_ACT_Q16_64, 4 + QK_FAIRY2I_ACT_Q16_64 * 2),
 }
 
 

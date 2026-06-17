@@ -5788,6 +5788,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 }
             }
             break;
+        case GGML_TYPE_FAIRY2I_ACT_Q16_64:
+            {
+                const block_fairy2i_act_q16_64 * q = (const block_fairy2i_act_q16_64 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(q[i].d_real, i) || !validate_fp16(q[i].d_imag, i)) {
+                        return false;
+                    }
+                }
+            }
+            break;
         case GGML_TYPE_TQ1_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq1_0, data, nb);
@@ -5804,6 +5814,11 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_IFAIRY64:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL_IFAIRY(block_ifairy64, data, nb);
+            }
+            break;
+        case GGML_TYPE_FAIRY2I_TILE64_V2:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL_IFAIRY(block_fairy2i_tile64_v2, data, nb);
             }
             break;
         case GGML_TYPE_IQ1_S:
