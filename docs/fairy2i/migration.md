@@ -54,8 +54,10 @@ longer imports Qwen2 converter internals for tile64_v2 packing.
 Legacy-only:
 
 ```text
-GGML_IFAIRY_LUT_CPU
-GGML_IFAIRY_FUSE_AVX512
+GGML_LEGACY_IFAIRY_CPU
+GGML_LEGACY_IFAIRY_CPU_LUT
+GGML_LEGACY_IFAIRY_CPU_AVX512
+GGML_LEGACY_IFAIRY_CPU_ARM_DOTPROD
 ```
 
 New:
@@ -65,8 +67,16 @@ GGML_FAIRY2I_CPU_LUT
 GGML_FAIRY2I_CPU_AVX512
 ```
 
-The old names now map only to `GGML_LEGACY_IFAIRY_*` options. They do not
-enable Fairy2i features. Prefer the Fairy2i names in docs, scripts, and CI.
+The old names now map only to legacy iFairy options:
+
+```text
+GGML_IFAIRY_LUT_CPU      -> GGML_LEGACY_IFAIRY_CPU_LUT
+GGML_IFAIRY_FUSE_AVX512 -> GGML_LEGACY_IFAIRY_CPU_AVX512
+```
+
+They do not enable Fairy2i features. Legacy iFairy validation must include a
+Fairy2i-off build so old vecdot, W2 fused, and LUT execution cannot silently
+depend on `GGML_FAIRY2I*`.
 
 ## OpenCL Scope
 

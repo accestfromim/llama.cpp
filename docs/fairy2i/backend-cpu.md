@@ -17,8 +17,8 @@ GGML_FAIRY2I_CPU_ARM_DOTPROD=ON
 Legacy iFairy aliases are still accepted, but only as legacy options:
 
 ```cmake
-GGML_IFAIRY_LUT_CPU      -> GGML_LEGACY_IFAIRY_LUT_CPU
-GGML_IFAIRY_FUSE_AVX512 -> GGML_LEGACY_IFAIRY_AVX512
+GGML_IFAIRY_LUT_CPU      -> GGML_LEGACY_IFAIRY_CPU_LUT
+GGML_IFAIRY_FUSE_AVX512 -> GGML_LEGACY_IFAIRY_CPU_AVX512
 ```
 
 They do not enable Fairy2i CPU features.
@@ -59,8 +59,8 @@ ggml/src/ggml-cpu/fairy2i/fairy2i-cpu.cpp
 ```
 
 `ggml-cpu.c` calls this shim for `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` work-size and
-compute dispatch. A temporary legacy bridge still accepts the old op while the
-legacy iFairy backend is being isolated.
+compute dispatch. Legacy iFairy W2 fused and LUT execution belong to a separate
+legacy backend path and must remain runnable when `GGML_FAIRY2I=OFF`.
 
 ## Current Limits
 
