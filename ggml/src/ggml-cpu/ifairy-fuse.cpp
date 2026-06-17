@@ -1,4 +1,5 @@
 #include "ifairy-fuse.h"
+#include "fairy2i/wide-linear.h"
 
 #include "ggml-impl.h"
 #include "ggml-threading.h"
@@ -310,4 +311,8 @@ void ggml_compute_forward_ifairy_wide_linear_w2(const struct ggml_compute_params
         out[0]             = GGML_FP32_TO_BF16(acc.real);
         out[1]             = GGML_FP32_TO_BF16(acc.imag);
     }
+}
+
+void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    ggml_compute_forward_ifairy_wide_linear_w2(params, dst);
 }

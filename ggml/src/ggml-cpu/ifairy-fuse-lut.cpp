@@ -1,4 +1,5 @@
 #include "ifairy-fuse.h"
+#include "fairy2i/wide-linear.h"
 #include "ifairy-fuse-lut-qgemm.h"
 #include "ifairy-fuse-lut-qgemm.h"
 
@@ -286,3 +287,13 @@ bool ggml_compute_forward_ifairy_wide_linear_w2_lut(const struct ggml_compute_pa
 }
 
 #endif
+
+size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
+    return ggml_ifairy_wide_linear_w2_lut_wsize(dst);
+}
+
+bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * params,
+                                              struct ggml_tensor *                dst,
+                                              bool                                lut_c) {
+    return ggml_compute_forward_ifairy_wide_linear_w2_lut(params, dst, lut_c);
+}

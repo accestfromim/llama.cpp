@@ -57,6 +57,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/fairy2i/fairy2i-cpu.cpp
             ggml-cpu/fairy2i/fairy2i-cpu.h
+            ggml-cpu/fairy2i/wide-linear.h
             ggml-cpu/ifairy-fuse.cpp
             ggml-cpu/ifairy-fuse.h)
     endif()
