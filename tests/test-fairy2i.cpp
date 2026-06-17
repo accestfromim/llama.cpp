@@ -467,7 +467,6 @@ static ggml_backend_dev_t find_opencl_test_device() {
 static bool check_fairy2i_opencl_mul_mat_support(ggml_backend_dev_t dev,
                                                  const char *       label,
                                                  const char *       fairy_gate_value,
-                                                 const char *       legacy_gate_value,
                                                  enum ggml_type     weight_type,
                                                  enum ggml_type     act_type,
                                                  bool               weight_view,
@@ -477,16 +476,10 @@ static bool check_fairy2i_opencl_mul_mat_support(ggml_backend_dev_t dev,
                                                  int64_t            n,
                                                  bool               expected) {
     scoped_env_var env_fairy("GGML_OPENCL_FAIRY2I");
-    scoped_env_var env_legacy("GGML_OPENCL_IFAIRY64");
     if (fairy_gate_value) {
         env_fairy.set(fairy_gate_value);
     } else {
         env_fairy.unset();
-    }
-    if (legacy_gate_value) {
-        env_legacy.set(legacy_gate_value);
-    } else {
-        env_legacy.unset();
     }
 
     struct ggml_init_params params = {
@@ -554,9 +547,7 @@ static bool run_fairy2i_tile64_mul_mat_opencl(std::vector<uint32_t> &           
                                               const std::vector<block_fairy2i_tile64_v2> &    weights,
                                               const std::vector<float> &                      x) {
     scoped_env_var env_fairy("GGML_OPENCL_FAIRY2I");
-    scoped_env_var env_legacy("GGML_OPENCL_IFAIRY64");
     env_fairy.set("1");
-    env_legacy.unset();
 
     ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
     if (!backend) {
@@ -657,7 +648,6 @@ static bool test_fairy2i_opencl_tile64_mul_mat() {
     int num_failed = 0;
     auto support = [&](const char *   label,
                        const char *   fairy_gate_value,
-                       const char *   legacy_gate_value,
                        enum ggml_type weight_type,
                        enum ggml_type act_type,
                        bool           weight_view,
@@ -666,27 +656,33 @@ static bool test_fairy2i_opencl_tile64_mul_mat() {
                        int64_t        m,
                        int64_t        n,
                        bool           expected) {
-        if (!check_fairy2i_opencl_mul_mat_support(dev, label, fairy_gate_value, legacy_gate_value, weight_type, act_type,
-                                                  weight_view, act_view, k, m, n, expected)) {
+        if (!check_fairy2i_opencl_mul_mat_support(dev, label, fairy_gate_value, weight_type, act_type, weight_view,
+                                                  act_view, k, m, n, expected)) {
             ++num_failed;
         }
     };
 
-    support("env-unset",             nullptr, nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
-    support("legacy-env-only",       nullptr, "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
-    support("env-zero",              "0",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
-    support("contiguous-f32",        "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, true);
-    support("k64-staging-rejected",  "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 64,  7, 1, false);
-    support("act-f16",               "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F16, false, false, 256, 7, 1, false);
-    support("weight-view",           "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, true,  false, 256, 7, 1, false);
-    support("activation-view",       "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, true,  256, 7, 1, false);
-    support("legacy-dtype-rejected", "1",     nullptr, GGML_TYPE_IFAIRY64,          GGML_TYPE_F32, false, false, 256, 7, 1, false);
+    support("env-unset",       nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
+    support("env-zero",        "0",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
+    support("k64",             "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 64,  7, 1, true);
+    support("k128",            "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 128, 7, 1, true);
+    support("k192",            "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 192, 7, 1, true);
+    support("k256",            "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, true);
+    support("act-f16",         "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F16, false, false, 256, 7, 1, false);
+    support("weight-view",     "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, true,  false, 256, 7, 1, false);
+    support("activation-view", "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, true,  256, 7, 1, false);
 
-    if (!run_fairy2i_opencl_tile64_compare_case(dev, 7, 1, 256)) {
-        ++num_failed;
-    }
-    if (!run_fairy2i_opencl_tile64_compare_case(dev, 13, 4, 256)) {
-        ++num_failed;
+    const int64_t Ms[] = { 7, 23 };
+    const int64_t Ns[] = { 1, 4 };
+    const int64_t Ks[] = { 64, 128, 192, 256 };
+    for (int64_t M : Ms) {
+        for (int64_t N : Ns) {
+            for (int64_t K : Ks) {
+                if (!run_fairy2i_opencl_tile64_compare_case(dev, M, N, K)) {
+                    ++num_failed;
+                }
+            }
+        }
     }
 
     if (num_failed == 0) {

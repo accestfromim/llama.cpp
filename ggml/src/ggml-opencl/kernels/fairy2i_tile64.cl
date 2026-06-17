@@ -1,6 +1,6 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
-#define QK_FAIRY2I_ACT_Q16_STAGING 256
+#define QK_FAIRY2I_ACT_Q16_64 64
 #define QK_FAIRY2I_TILE64   64
 
 #define FAIRY2I_TILE64_TILE_M 2
@@ -35,9 +35,9 @@ static inline uint fairy2i_tile64_pack_bf16_pair(float real, float imag) {
 /**
  * Converts packed-BF16 Fairy2i activations from F32 carrier format to a SoA
  * q16 staging layout. The q buffer stores real and imaginary int8 planes for
- * each 256-value block; d stores the corresponding fp16 scale pair.
+ * each 64-value block; d stores the corresponding fp16 scale pair.
  */
-kernel void kernel_fairy2i_tile64_q16_quantize_block127(
+kernel void kernel_fairy2i_tile64_act_q16_64_quantize(
         global char * src,
         ulong         offset,
         global char * act_q,
@@ -55,7 +55,7 @@ kernel void kernel_fairy2i_tile64_q16_quantize_block127(
     const int col   = get_group_id(1);
     const int lid   = get_local_id(0);
     const int lsize = get_local_size(0);
-    const int blocks_per_col = k / QK_FAIRY2I_ACT_Q16_STAGING;
+    const int blocks_per_col = k / QK_FAIRY2I_ACT_Q16_64;
 
     if (col >= n || block >= blocks_per_col) {
         return;
@@ -63,8 +63,8 @@ kernel void kernel_fairy2i_tile64_q16_quantize_block127(
 
     float max_real = 1.0e-5f;
     float max_imag = 1.0e-5f;
-    for (int j = lid; j < QK_FAIRY2I_ACT_Q16_STAGING; j += lsize) {
-        const int k_idx = block * QK_FAIRY2I_ACT_Q16_STAGING + j;
+    for (int j = lid; j < QK_FAIRY2I_ACT_Q16_64; j += lsize) {
+        const int k_idx = block * QK_FAIRY2I_ACT_Q16_64 + j;
         const uint pair = *((global uint *) (src + (ulong) col * nb11 + (ulong) k_idx * nb10));
         const float xr = fairy2i_bf16_to_f32((ushort) (pair & 0xffffU));
         const float xi = fairy2i_bf16_to_f32((ushort) (pair >> 16));
@@ -95,9 +95,9 @@ kernel void kernel_fairy2i_tile64_q16_quantize_block127(
         vstore_half(scale_imag, 0, act_d + block_index * 2 + 1);
     }
 
-    const int q_base = block_index * (2 * QK_FAIRY2I_ACT_Q16_STAGING);
-    for (int j = lid; j < QK_FAIRY2I_ACT_Q16_STAGING; j += lsize) {
-        const int k_idx = block * QK_FAIRY2I_ACT_Q16_STAGING + j;
+    const int q_base = block_index * (2 * QK_FAIRY2I_ACT_Q16_64);
+    for (int j = lid; j < QK_FAIRY2I_ACT_Q16_64; j += lsize) {
+        const int k_idx = block * QK_FAIRY2I_ACT_Q16_64 + j;
         const uint pair = *((global uint *) (src + (ulong) col * nb11 + (ulong) k_idx * nb10));
         const float xr = fairy2i_bf16_to_f32((ushort) (pair & 0xffffU));
         const float xi = fairy2i_bf16_to_f32((ushort) (pair >> 16));
@@ -106,7 +106,7 @@ kernel void kernel_fairy2i_tile64_q16_quantize_block127(
         const int qi = fairy2i_clamp_i32((int) rint(xi * iscale_imag), -127, 127);
 
         act_q[q_base + j] = (char) qr;
-        act_q[q_base + QK_FAIRY2I_ACT_Q16_STAGING + j] = (char) qi;
+        act_q[q_base + QK_FAIRY2I_ACT_Q16_64 + j] = (char) qi;
     }
 }
 
@@ -114,7 +114,7 @@ kernel void kernel_fairy2i_tile64_q16_quantize_block127(
  * Tiled Fairy2i tile64 matmul. One work-group computes an output tile from SoA
  * FAIRY2I_TILE64 weights and SoA q16 activation staging buffers.
  */
-kernel void kernel_fairy2i_tile64_mul_mat_f32_q16(
+kernel void kernel_fairy2i_tile64_mul_mat_f32_act_q16_64(
         global uchar * w_q,
         global half  * w_d,
         global char  * act_q,
@@ -140,7 +140,7 @@ kernel void kernel_fairy2i_tile64_mul_mat_f32_q16(
     const int block_slot = lid >> 4;
     const int lane = lid & 15;
     const int nb64 = k / QK_FAIRY2I_TILE64;
-    const int nbq = k / QK_FAIRY2I_ACT_Q16_STAGING;
+    const int nbq = k / QK_FAIRY2I_ACT_Q16_64;
 
     float acc_real[FAIRY2I_TILE64_TILE_OUT];
     float acc_imag[FAIRY2I_TILE64_TILE_OUT];
@@ -152,8 +152,7 @@ kernel void kernel_fairy2i_tile64_mul_mat_f32_q16(
 
     for (int wb_base = 0; wb_base < nb64; wb_base += 4) {
         const int wb = wb_base + block_slot;
-        const int act_block = wb >> 2;
-        const int act_base = (wb & 3) * QK_FAIRY2I_TILE64;
+        const int act_block = wb;
 
         if (wb < nb64) {
 #pragma unroll
@@ -162,12 +161,12 @@ kernel void kernel_fairy2i_tile64_mul_mat_f32_q16(
                 const int local_base = (block_slot * FAIRY2I_TILE64_TILE_N + tc) * QK_FAIRY2I_TILE64;
                 if (col < n) {
                     const int act_index = col * nbq + act_block;
-                    const int q_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_STAGING) + act_base;
+                    const int q_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
 #pragma unroll
                     for (int part = 0; part < 4; ++part) {
                         const int j = lane + 16 * part;
                         act_real_tile[local_base + j] = act_q[q_base + j];
-                        act_imag_tile[local_base + j] = act_q[q_base + QK_FAIRY2I_ACT_Q16_STAGING + j];
+                        act_imag_tile[local_base + j] = act_q[q_base + QK_FAIRY2I_ACT_Q16_64 + j];
                     }
                 } else {
 #pragma unroll
@@ -483,7 +482,7 @@ kernel void kernel_fairy2i_tile64_mul_mat_f32_direct(
  * small row tile, so it can be used either for N == 1 routing or direct GEMV
  * benchmarking across multiple columns.
  */
-kernel void kernel_fairy2i_tile64_mul_vec_f32_q16(
+kernel void kernel_fairy2i_tile64_mul_vec_f32_act_q16_64(
         global uchar * w_q,
         global half  * w_d,
         global char  * act_q,
@@ -509,7 +508,7 @@ kernel void kernel_fairy2i_tile64_mul_vec_f32_q16(
     const int block_slot = lid >> 4;
     const int lane = lid & 15;
     const int nb64 = k / QK_FAIRY2I_TILE64;
-    const int nbq = k / QK_FAIRY2I_ACT_Q16_STAGING;
+    const int nbq = k / QK_FAIRY2I_ACT_Q16_64;
 
     if (col >= n) {
         return;
@@ -525,17 +524,16 @@ kernel void kernel_fairy2i_tile64_mul_vec_f32_q16(
 
     for (int wb_base = 0; wb_base < nb64; wb_base += 4) {
         const int wb = wb_base + block_slot;
-        const int act_block = wb >> 2;
-        const int act_base = (wb & 3) * QK_FAIRY2I_TILE64;
+        const int act_block = wb;
 
         if (wb < nb64) {
             const int act_index = col * nbq + act_block;
-            const int q_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_STAGING) + act_base;
+            const int q_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
 #pragma unroll
             for (int part = 0; part < 4; ++part) {
                 const int j = lane + 16 * part;
                 act_real_tile[block_slot * QK_FAIRY2I_TILE64 + j] = act_q[q_base + j];
-                act_imag_tile[block_slot * QK_FAIRY2I_TILE64 + j] = act_q[q_base + QK_FAIRY2I_ACT_Q16_STAGING + j];
+                act_imag_tile[block_slot * QK_FAIRY2I_TILE64 + j] = act_q[q_base + QK_FAIRY2I_ACT_Q16_64 + j];
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -630,7 +628,7 @@ kernel void kernel_fairy2i_tile64_mul_vec_f32_q16(
  * Fairy2i tile64 GEMV kernel with a 4-row tile. This is intentionally separate from
  * the 2-row kernel so the compiler can unroll fixed-size accumulators.
  */
-kernel void kernel_fairy2i_tile64_mul_vec4_f32_q16(
+kernel void kernel_fairy2i_tile64_mul_vec4_f32_act_q16_64(
         global uchar * w_q,
         global half  * w_d,
         global char  * act_q,
@@ -656,7 +654,7 @@ kernel void kernel_fairy2i_tile64_mul_vec4_f32_q16(
     const int block_slot = lid >> 4;
     const int lane = lid & 15;
     const int nb64 = k / QK_FAIRY2I_TILE64;
-    const int nbq = k / QK_FAIRY2I_ACT_Q16_STAGING;
+    const int nbq = k / QK_FAIRY2I_ACT_Q16_64;
 
     if (col >= n) {
         return;
@@ -672,17 +670,16 @@ kernel void kernel_fairy2i_tile64_mul_vec4_f32_q16(
 
     for (int wb_base = 0; wb_base < nb64; wb_base += 4) {
         const int wb = wb_base + block_slot;
-        const int act_block = wb >> 2;
-        const int act_base = (wb & 3) * QK_FAIRY2I_TILE64;
+        const int act_block = wb;
 
         if (wb < nb64) {
             const int act_index = col * nbq + act_block;
-            const int q_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_STAGING) + act_base;
+            const int q_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
 #pragma unroll
             for (int part = 0; part < 4; ++part) {
                 const int j = lane + 16 * part;
                 act_real_tile[block_slot * QK_FAIRY2I_TILE64 + j] = act_q[q_base + j];
-                act_imag_tile[block_slot * QK_FAIRY2I_TILE64 + j] = act_q[q_base + QK_FAIRY2I_ACT_Q16_STAGING + j];
+                act_imag_tile[block_slot * QK_FAIRY2I_TILE64 + j] = act_q[q_base + QK_FAIRY2I_ACT_Q16_64 + j];
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);

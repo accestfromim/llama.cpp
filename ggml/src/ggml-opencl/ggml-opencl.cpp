@@ -39,7 +39,19 @@
 
 #define UNUSED(x) (void)(x)
 
-static constexpr int GGML_OPENCL_TILE64_ACT_Q16_STAGING_BLOCK = 256;
+struct ggml_opencl_fairy2i_act_format {
+    int qk;
+    int q_bytes_per_block;
+    int d_bytes_per_block;
+    const char * name;
+};
+
+static constexpr ggml_opencl_fairy2i_act_format GGML_OPENCL_FAIRY2I_ACT_Q16_64 = {
+    /* .qk                = */ 64,
+    /* .q_bytes_per_block = */ 2 * 64,
+    /* .d_bytes_per_block = */ 2 * (int) sizeof(ggml_fp16_t),
+    /* .name              = */ "q16_64",
+};
 
 #define CL_CHECK(err)                                               \
     do {                                                            \
@@ -2834,11 +2846,11 @@ static bool ggml_opencl_can_tile64_mul_mat(const struct ggml_tensor * op, enum g
     }
 
     // First OpenCL target: tile64 weights staged as SoA q/d in set_tensor,
-    // F32 packed-BF16 activations staged to q16 SoA at dispatch time, F32 output.
+    // F32 packed-BF16 activations staged to q16_64 SoA at dispatch time, F32 output.
     // Kernel semantics must match the CPU path exactly:
     //   (wr + i*wi) * conj(xr + i*xi)
     // = (wr*xr + wi*xi) + i*(wi*xr - wr*xi)
-    if (src0->ne[0] % GGML_OPENCL_TILE64_ACT_Q16_STAGING_BLOCK != 0) {
+    if (src0->ne[0] % GGML_OPENCL_FAIRY2I_ACT_Q16_64.qk != 0) {
         ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_UNSUPPORTED_STAGING_BLOCK);
         return false;
     }
@@ -5499,11 +5511,11 @@ static void ggml_cl_fairy2i_tile64_mul_mat(ggml_backend_t backend, const ggml_te
     const char * impl_env = ggml_opencl_fairy2i_tile64_mul_mat_impl_env();
     const enum ggml_type weight_type = src0->type;
 
-    cl_kernel kernel_quantize = backend_ctx->fairy2i.kernel_fairy2i_tile64_q16_quantize_block127;
+    cl_kernel kernel_quantize = backend_ctx->fairy2i.kernel_fairy2i_tile64_act_q16_64_quantize;
     cl_kernel kernel_direct   = backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_direct;
-    cl_kernel kernel_gemv2    = backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec_f32_q16;
-    cl_kernel kernel_gemv4    = backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec4_f32_q16;
-    cl_kernel kernel_gemm     = backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_q16;
+    cl_kernel kernel_gemv2    = backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec_f32_act_q16_64;
+    cl_kernel kernel_gemv4    = backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_vec4_f32_act_q16_64;
+    cl_kernel kernel_gemm     = backend_ctx->fairy2i.kernel_fairy2i_tile64_mul_mat_f32_act_q16_64;
     GGML_ASSERT(kernel_quantize != nullptr);
     GGML_ASSERT(kernel_direct != nullptr);
     GGML_ASSERT(kernel_gemv2 != nullptr);
@@ -5525,12 +5537,12 @@ static void ggml_cl_fairy2i_tile64_mul_mat(ggml_backend_t backend, const ggml_te
         return;
     }
 
-    const int act_block_k = GGML_OPENCL_TILE64_ACT_Q16_STAGING_BLOCK;
-    const int act_blocks  = k / act_block_k;
+    const ggml_opencl_fairy2i_act_format & act_format = GGML_OPENCL_FAIRY2I_ACT_Q16_64;
+    const int act_blocks = k / act_format.qk;
     GGML_ASSERT(act_blocks > 0);
 
-    const size_t act_q_size = (size_t) n * (size_t) act_blocks * (size_t) act_block_k * 2;
-    const size_t act_d_size = (size_t) n * (size_t) act_blocks * 2 * sizeof(ggml_fp16_t);
+    const size_t act_q_size = (size_t) n * (size_t) act_blocks * (size_t) act_format.q_bytes_per_block;
+    const size_t act_d_size = (size_t) n * (size_t) act_blocks * (size_t) act_format.d_bytes_per_block;
 
     backend_ctx->ensure_fairy2i_tile64_act_scratch(act_q_size, act_d_size);
     cl_mem act_q = backend_ctx->fairy2i.fairy2i_tile64_act_q_scratch;

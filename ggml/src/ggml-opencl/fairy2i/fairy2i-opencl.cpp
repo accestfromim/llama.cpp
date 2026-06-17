@@ -92,20 +92,20 @@ void ggml_opencl_fairy2i_load_kernels(ggml_opencl_fairy2i_state * state,
 #endif
         state->program_fairy2i_tile64 = build_program(context, device, kernel_src.c_str(), compile_opts);
 
-        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_q16_quantize_block127 =
-                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_q16_quantize_block127", &err),
+        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_act_q16_64_quantize =
+                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_act_q16_64_quantize", &err),
                            err));
-        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_mul_mat_f32_q16 =
-                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_q16", &err),
+        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_mul_mat_f32_act_q16_64 =
+                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_act_q16_64", &err),
                            err));
         GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_mul_mat_f32_direct =
                                clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_mat_f32_direct", &err),
                            err));
-        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_mul_vec_f32_q16 =
-                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec_f32_q16", &err),
+        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_mul_vec_f32_act_q16_64 =
+                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec_f32_act_q16_64", &err),
                            err));
-        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_mul_vec4_f32_q16 =
-                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec4_f32_q16", &err),
+        GGML_OPENCL_CHECK((state->kernel_fairy2i_tile64_mul_vec4_f32_act_q16_64 =
+                               clCreateKernel(state->program_fairy2i_tile64, "kernel_fairy2i_tile64_mul_vec4_f32_act_q16_64", &err),
                            err));
         GGML_LOG_CONT(".");
     }
