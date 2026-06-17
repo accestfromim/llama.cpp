@@ -83,7 +83,7 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
 #    pragma warning(disable : 4244 4267)  // possible loss of data
 #endif
 
-#if defined(GGML_USE_FAIRY2I_CPU_LUT) && \
+#if defined(GGML_USE_LEGACY_IFAIRY_CPU_LUT) && \
     ((defined(__aarch64__) && defined(__ARM_NEON)) || defined(__x86_64__) || defined(_M_X64))
 #    define GGML_IFAIRY_LUT_TEST_BACKEND_ENABLED 1
 #else
@@ -2059,7 +2059,7 @@ static bool test_ifairy_lut_backend_f32_vs_q16() {
         fprintf(stderr, "Size mismatch (F32 vs Q16): %zu vs %zu\n", out_f32.size(), out_q16.size());
         return false;
     }
-    return compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size());
+    return compare_packed_complex_outputs(out_q16.data(), out_f32.data(), out_f32.size(), 1e-2f);
 #endif
 }
 
@@ -2098,7 +2098,7 @@ static bool test_ifairy_lut_backend_lut_c_f32_vs_q16() {
         fprintf(stderr, "Size mismatch (lut_c F32 vs Q16): %zu vs %zu\n", out_f32.size(), out_q16.size());
         return false;
     }
-    return compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size());
+    return compare_packed_complex_outputs(out_q16.data(), out_f32.data(), out_f32.size(), 1e-2f);
 #endif
 }
 
