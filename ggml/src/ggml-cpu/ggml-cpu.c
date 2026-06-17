@@ -1733,6 +1733,72 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+static bool ggml_cpu_extension_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+#ifdef GGML_USE_FAIRY2I_CPU
+    if (ggml_fairy2i_cpu_supports_op(tensor)) {
+        if (!ggml_fairy2i_cpu_compute(params, tensor)) {
+            GGML_ABORT("%s failed", ggml_op_name(tensor->op));
+        }
+        return true;
+    }
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+    if (ggml_legacy_ifairy_cpu_supports_op(tensor)) {
+        if (!ggml_legacy_ifairy_cpu_compute(params, tensor)) {
+            GGML_ABORT("%s failed", ggml_op_name(tensor->op));
+        }
+        return true;
+    }
+#endif
+
+    GGML_UNUSED(params);
+    GGML_UNUSED(tensor);
+    return false;
+}
+
+static bool ggml_cpu_extension_n_tasks(struct ggml_tensor * node, int n_threads, int * n_tasks) {
+#ifdef GGML_USE_FAIRY2I_CPU
+    if (ggml_fairy2i_cpu_supports_op(node)) {
+        *n_tasks = ggml_fairy2i_cpu_n_tasks(node, n_threads);
+        return true;
+    }
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+    if (ggml_legacy_ifairy_cpu_supports_op(node)) {
+        *n_tasks = ggml_legacy_ifairy_cpu_n_tasks(node, n_threads);
+        return true;
+    }
+#endif
+
+    GGML_UNUSED(node);
+    GGML_UNUSED(n_threads);
+    GGML_UNUSED(n_tasks);
+    return false;
+}
+
+static bool ggml_cpu_extension_work_size(struct ggml_tensor * node, int n_tasks, size_t * work_size) {
+#ifdef GGML_USE_FAIRY2I_CPU
+    if (ggml_fairy2i_cpu_supports_op(node)) {
+        *work_size = ggml_fairy2i_cpu_work_size(node, n_tasks);
+        return true;
+    }
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+    if (ggml_legacy_ifairy_cpu_supports_op(node)) {
+        *work_size = ggml_legacy_ifairy_cpu_work_size(node, n_tasks);
+        return true;
+    }
+#endif
+
+    GGML_UNUSED(node);
+    GGML_UNUSED(n_tasks);
+    GGML_UNUSED(work_size);
+    return false;
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1742,6 +1808,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
+        return;
+    }
+
+    if (ggml_cpu_extension_compute_forward(params, tensor)) {
         return;
     }
 
@@ -1968,24 +2038,12 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             break;
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
             {
-#ifdef GGML_USE_FAIRY2I_CPU
-                if (!ggml_fairy2i_cpu_compute(params, tensor)) {
-                    GGML_ABORT("%s failed", ggml_op_name(tensor->op));
-                }
-#else
                 GGML_ABORT("%s requires GGML_FAIRY2I_CPU", ggml_op_name(tensor->op));
-#endif
             }
             break;
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
-#ifdef GGML_USE_LEGACY_IFAIRY_CPU
-                if (!ggml_legacy_ifairy_cpu_compute(params, tensor)) {
-                    GGML_ABORT("%s failed", ggml_op_name(tensor->op));
-                }
-#else
                 GGML_ABORT("%s requires GGML_LEGACY_IFAIRY_CPU", ggml_op_name(tensor->op));
-#endif
             }
             break;
         case GGML_OP_ROPE:
@@ -2262,6 +2320,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     if (ggml_is_empty(node)) {
         // no need to multi-thread a no-op
         n_tasks = 1;
+        return n_tasks;
+    }
+
+    if (ggml_cpu_extension_n_tasks(node, n_threads, &n_tasks)) {
         return n_tasks;
     }
 
@@ -2843,7 +2905,8 @@ struct ggml_cplan ggml_graph_plan(
 
         size_t cur = 0;
 
-        if (!ggml_cpu_extra_work_size(n_threads, node, &cur)) {
+        if (!ggml_cpu_extra_work_size(n_threads, node, &cur) &&
+            !ggml_cpu_extension_work_size(node, n_tasks, &cur)) {
             switch (node->op) {
                 case GGML_OP_CPY:
                 case GGML_OP_DUP:
@@ -2928,20 +2991,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
-                    {
-#ifdef GGML_USE_FAIRY2I_CPU
-                        cur = ggml_fairy2i_cpu_work_size(node, n_tasks);
-#else
-                        cur = 0;
-#endif
-                    } break;
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {
-#ifdef GGML_USE_LEGACY_IFAIRY_CPU
-                        cur = ggml_legacy_ifairy_cpu_work_size(node, n_tasks);
-#else
                         cur = 0;
-#endif
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
