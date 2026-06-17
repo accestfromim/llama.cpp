@@ -3,7 +3,11 @@ find_package(OpenCL REQUIRED)
 set(TARGET_NAME ggml-opencl)
 
 ggml_add_backend_library(${TARGET_NAME}
+                         fairy2i/fairy2i-opencl.cpp
                          ggml-opencl.cpp
+                         legacy-ifairy/ifairy-opencl.cpp
+                         fairy2i/fairy2i-opencl.h
+                         legacy-ifairy/ifairy-opencl.h
                          ../../include/ggml-opencl.h)
 target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
 target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})

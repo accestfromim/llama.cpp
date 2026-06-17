@@ -8,10 +8,12 @@
 #endif
 
 #include "ggml-opencl.h"
+#include "fairy2i/fairy2i-opencl.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml.h"
+#include "legacy-ifairy/ifairy-opencl.h"
 
 #include <CL/cl.h>
 
@@ -3188,21 +3190,19 @@ static bool ggml_opencl_is_ifairy_op(const struct ggml_tensor * op) {
 }
 
 static bool ggml_opencl_fairy2i_enabled(void) {
-#ifndef GGML_USE_FAIRY2I_OPENCL
-    return false;
-#else
-    const char * env = getenv("GGML_OPENCL_FAIRY2I");
+    if (!ggml_opencl_fairy2i_compile_enabled()) {
+        return false;
+    }
+    const char * env = getenv(ggml_opencl_fairy2i_runtime_env());
     return env != nullptr && strcmp(env, "0") != 0;
-#endif
 }
 
 static bool ggml_opencl_legacy_ifairy_enabled(void) {
-#ifndef GGML_USE_LEGACY_IFAIRY_OPENCL
-    return false;
-#else
-    const char * env = getenv("GGML_OPENCL_IFAIRY64");
+    if (!ggml_opencl_legacy_ifairy_compile_enabled()) {
+        return false;
+    }
+    const char * env = getenv(ggml_opencl_legacy_ifairy_runtime_env());
     return env != nullptr && strcmp(env, "0") != 0;
-#endif
 }
 
 static bool ggml_opencl_can_ifairy64_mul_mat(const struct ggml_tensor * op) {
@@ -3546,11 +3546,10 @@ static bool ggml_opencl_legacy_ifairy_kernel_ready(const struct ggml_tensor * op
 
 static bool ggml_opencl_fairy2i_supports(const struct ggml_tensor * op, enum ggml_opencl_reject_reason * reason) {
     ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_NONE);
-#ifndef GGML_USE_FAIRY2I_OPENCL
-    GGML_UNUSED(op);
-    ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_COMPILE_DISABLED);
-    return false;
-#else
+    if (!ggml_opencl_fairy2i_compile_enabled()) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_COMPILE_DISABLED);
+        return false;
+    }
     if (!ggml_opencl_fairy2i_enabled()) {
         ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_RUNTIME_DISABLED);
         return false;
@@ -3564,16 +3563,14 @@ static bool ggml_opencl_fairy2i_supports(const struct ggml_tensor * op, enum ggm
         return false;
     }
     return true;
-#endif
 }
 
 static bool ggml_opencl_legacy_ifairy_supports(const struct ggml_tensor * op, enum ggml_opencl_reject_reason * reason) {
     ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_NONE);
-#ifndef GGML_USE_LEGACY_IFAIRY_OPENCL
-    GGML_UNUSED(op);
-    ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_COMPILE_DISABLED);
-    return false;
-#else
+    if (!ggml_opencl_legacy_ifairy_compile_enabled()) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_COMPILE_DISABLED);
+        return false;
+    }
     if (!ggml_opencl_legacy_ifairy_enabled()) {
         ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_RUNTIME_DISABLED);
         return false;
@@ -3587,7 +3584,6 @@ static bool ggml_opencl_legacy_ifairy_supports(const struct ggml_tensor * op, en
         return false;
     }
     return true;
-#endif
 }
 
 static bool ggml_opencl_supports_ifairy_op(const struct ggml_tensor * op) {
@@ -5918,7 +5914,8 @@ static void ggml_cl_ifairy64_mul_mat(ggml_backend_t backend, const ggml_tensor *
     const int n = src1->ne[1];
 
     const bool fairy2i = src0->type == GGML_TYPE_FAIRY2I_TILE64_V2;
-    const char * impl_env = fairy2i ? "GGML_OPENCL_FAIRY2I_TILE64_MUL_MAT_IMPL" : "GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL";
+    const char * impl_env = fairy2i ? ggml_opencl_fairy2i_tile64_mul_mat_impl_env() :
+                                      ggml_opencl_legacy_ifairy64_mul_mat_impl_env();
     const enum ggml_type weight_type = src0->type;
 
     cl_kernel kernel_quantize = fairy2i ? backend_ctx->kernel_fairy2i_tile64_q16_quantize_block127 :
