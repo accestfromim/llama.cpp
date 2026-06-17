@@ -129,13 +129,27 @@ set(GGML_OPENCL_KERNELS
     flash_attn_f32
 )
 
-if (GGML_FAIRY2I_OPENCL OR GGML_LEGACY_IFAIRY_OPENCL)
+if (GGML_FAIRY2I_OPENCL)
+    list(APPEND GGML_OPENCL_KERNELS
+        complex_add
+        complex_merge
+        complex_mul
+        complex_relu2
+        complex_rms_norm
+        complex_rope
+        complex_split
+        fairy2i_tile64
+    )
+endif ()
+
+if (GGML_LEGACY_IFAIRY_OPENCL)
     list(APPEND GGML_OPENCL_KERNELS
         ifairy_add
         ifairy_merge
         ifairy64
         ifairy_mul
         ifairy_relu2
+        ifairy_rope
         ifairy_rms_norm
         ifairy_split
     )
