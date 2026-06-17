@@ -447,6 +447,257 @@ static bool compare_packed_complex(
     return true;
 }
 
+static ggml_backend_dev_t find_opencl_test_device() {
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev      = ggml_backend_dev_get(i);
+        const char *       name     = ggml_backend_dev_name(dev);
+        ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+        const char *       reg_name = ggml_backend_reg_name(reg);
+
+        if ((name && strcmp(name, "GPUOpenCL") == 0) || (reg_name && strcmp(reg_name, "OpenCL") == 0)) {
+            return dev;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool check_fairy2i_opencl_mul_mat_support(ggml_backend_dev_t dev,
+                                                 const char *       label,
+                                                 const char *       fairy_gate_value,
+                                                 const char *       legacy_gate_value,
+                                                 enum ggml_type     weight_type,
+                                                 enum ggml_type     act_type,
+                                                 bool               weight_view,
+                                                 bool               act_view,
+                                                 int64_t            k,
+                                                 int64_t            m,
+                                                 int64_t            n,
+                                                 bool               expected) {
+    scoped_env_var env_fairy("GGML_OPENCL_FAIRY2I");
+    scoped_env_var env_legacy("GGML_OPENCL_IFAIRY64");
+    if (fairy_gate_value) {
+        env_fairy.set(fairy_gate_value);
+    } else {
+        env_fairy.unset();
+    }
+    if (legacy_gate_value) {
+        env_legacy.set(legacy_gate_value);
+    } else {
+        env_legacy.unset();
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for Fairy2i OpenCL support %s\n", label);
+        return false;
+    }
+
+    ggml_tensor * w_base = ggml_new_tensor_2d(ctx, weight_type, weight_view ? k * 2 : k, m);
+    ggml_tensor * x_base = ggml_new_tensor_2d(ctx, act_type, act_view ? k * 2 : k, n);
+    ggml_tensor * w      = weight_view ? ggml_view_2d(ctx, w_base, k, m, w_base->nb[1], 0) : w_base;
+    ggml_tensor * x      = act_view ? ggml_view_2d(ctx, x_base, k, n, x_base->nb[1], 0) : x_base;
+    ggml_tensor * out    = ggml_mul_mat(ctx, w, x);
+
+    const bool supported = ggml_backend_dev_supports_op(dev, out);
+    ggml_free(ctx);
+
+    if (supported != expected) {
+        fprintf(stderr, "Fairy2i OpenCL support case '%s' expected %s, got %s\n",
+                label, expected ? "supported" : "unsupported", supported ? "supported" : "unsupported");
+        return false;
+    }
+
+    printf("  %-28s : %s\n", label, supported ? "supported" : "unsupported");
+    return true;
+}
+
+static std::vector<uint32_t> fairy2i_tile64_mul_mat_scalar_reference(
+    int64_t M, int64_t N, int64_t K, const std::vector<block_fairy2i_tile64_v2> & weights, const std::vector<float> & x) {
+    const int64_t blocks = K / QK_FAIRY2I_TILE64;
+
+    std::vector<block_fairy2i_act_q16_64> q_x;
+    quantize_fairy2i_act_q16_64(q_x, x, N, K);
+
+    std::vector<uint32_t> out((size_t) M * (size_t) N);
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t row = 0; row < M; ++row) {
+            float real = 0.0f;
+            float imag = 0.0f;
+            for (int64_t ib = 0; ib < blocks; ++ib) {
+                const block_fairy2i_act_q16_64 & x_blk = q_x[(size_t) n * (size_t) blocks + (size_t) ib];
+                const block_fairy2i_tile64_v2 &  w_blk = weights[(size_t) row * (size_t) blocks + (size_t) ib];
+
+                int32_t sums[4] = {};
+                fairy2i_accumulate_block_scalar(w_blk, x_blk, sums);
+                fairy2i_apply_branch(w_blk, x_blk, sums, true, real, imag);
+            }
+
+            out[(size_t) n * (size_t) M + (size_t) row] = pack_bf16_pair(real, imag);
+        }
+    }
+    return out;
+}
+
+static bool run_fairy2i_tile64_mul_mat_opencl(std::vector<uint32_t> &                         out,
+                                              ggml_backend_dev_t                              dev,
+                                              int64_t                                         M,
+                                              int64_t                                         N,
+                                              int64_t                                         K,
+                                              const std::vector<block_fairy2i_tile64_v2> &    weights,
+                                              const std::vector<float> &                      x) {
+    scoped_env_var env_fairy("GGML_OPENCL_FAIRY2I");
+    scoped_env_var env_legacy("GGML_OPENCL_IFAIRY64");
+    env_fairy.set("1");
+    env_legacy.unset();
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    if (!backend) {
+        fprintf(stderr, "failed to initialize OpenCL backend\n");
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/4 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "failed to initialize ggml context for Fairy2i OpenCL matmul\n");
+        return false;
+    }
+
+    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, K, M);
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * y = ggml_mul_mat(ctx, w, a);
+    ggml_set_name(y, "fairy2i_opencl_tile64_mul_mat");
+
+    if (!ggml_backend_supports_op(backend, y)) {
+        fprintf(stderr, "%s does not support Fairy2i tile64 MUL_MAT M=%lld N=%lld K=%lld\n",
+                ggml_backend_name(backend), (long long) M, (long long) N, (long long) K);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "failed to allocate OpenCL backend buffer for Fairy2i tile64 MUL_MAT\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(a, x.data(), 0, x.size() * sizeof(float));
+
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "Fairy2i OpenCL tile64 MUL_MAT failed: %s\n", ggml_status_to_string(status));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> out_f32((size_t) M * (size_t) N);
+    ggml_backend_tensor_get(y, out_f32.data(), 0, out_f32.size() * sizeof(float));
+
+    out.resize(out_f32.size());
+    memcpy(out.data(), out_f32.data(), out_f32.size() * sizeof(float));
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+static bool run_fairy2i_opencl_tile64_compare_case(ggml_backend_dev_t dev, int64_t M, int64_t N, int64_t K) {
+    std::vector<block_fairy2i_tile64_v2> weights;
+    fill_fairy2i_weights(weights, M, K, 17);
+    const std::vector<float> x = make_fairy2i_input(N, K);
+
+    const std::vector<uint32_t> ref = fairy2i_tile64_mul_mat_scalar_reference(M, N, K, weights, x);
+
+    std::vector<uint32_t> opencl;
+    if (!run_fairy2i_tile64_mul_mat_opencl(opencl, dev, M, N, K, weights, x)) {
+        return false;
+    }
+
+    char label[128];
+    snprintf(label, sizeof(label), "Fairy2i OpenCL tile64 M=%lld N=%lld K=%lld",
+             (long long) M, (long long) N, (long long) K);
+    return compare_packed_complex(label, opencl, ref, 1e-2f);
+}
+
+static bool test_fairy2i_opencl_tile64_mul_mat() {
+    printf("\n=== Fairy2i OpenCL tile64 MUL_MAT tests ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        printf("OpenCL backend not found; skipping Fairy2i OpenCL tile64 tests.\n");
+        return true;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    int num_failed = 0;
+    auto support = [&](const char *   label,
+                       const char *   fairy_gate_value,
+                       const char *   legacy_gate_value,
+                       enum ggml_type weight_type,
+                       enum ggml_type act_type,
+                       bool           weight_view,
+                       bool           act_view,
+                       int64_t        k,
+                       int64_t        m,
+                       int64_t        n,
+                       bool           expected) {
+        if (!check_fairy2i_opencl_mul_mat_support(dev, label, fairy_gate_value, legacy_gate_value, weight_type, act_type,
+                                                  weight_view, act_view, k, m, n, expected)) {
+            ++num_failed;
+        }
+    };
+
+    support("env-unset",             nullptr, nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
+    support("legacy-env-only",       nullptr, "1",     GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
+    support("env-zero",              "0",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, false);
+    support("contiguous-f32",        "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 256, 7, 1, true);
+    support("k64-staging-rejected",  "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, false, 64,  7, 1, false);
+    support("act-f16",               "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F16, false, false, 256, 7, 1, false);
+    support("weight-view",           "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, true,  false, 256, 7, 1, false);
+    support("activation-view",       "1",     nullptr, GGML_TYPE_FAIRY2I_TILE64_V2, GGML_TYPE_F32, false, true,  256, 7, 1, false);
+    support("legacy-dtype-rejected", "1",     nullptr, GGML_TYPE_IFAIRY64,          GGML_TYPE_F32, false, false, 256, 7, 1, false);
+
+    if (!run_fairy2i_opencl_tile64_compare_case(dev, 7, 1, 256)) {
+        ++num_failed;
+    }
+    if (!run_fairy2i_opencl_tile64_compare_case(dev, 13, 4, 256)) {
+        ++num_failed;
+    }
+
+    if (num_failed == 0) {
+        printf("Fairy2i OpenCL tile64 MUL_MAT tests PASSED!\n");
+    } else {
+        printf("%d Fairy2i OpenCL tile64 MUL_MAT test(s) FAILED\n", num_failed);
+    }
+
+    return num_failed == 0;
+}
+
 static bool test_fairy2i_wide_linear_w2_variants() {
     const int64_t Ms[] = { 7, 23 };
     const int64_t Ks[] = { 64, 128, 256 };
@@ -521,6 +772,10 @@ int main() {
     int num_failed = 0;
     if (!test_fairy2i_wide_linear_w2_variants()) {
         fprintf(stderr, "Fairy2i W2 variant matrix FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_opencl_tile64_mul_mat()) {
+        fprintf(stderr, "Fairy2i OpenCL tile64 MUL_MAT FAILED\n");
         ++num_failed;
     }
 
