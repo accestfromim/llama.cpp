@@ -3456,6 +3456,7 @@ int main(int argc, char ** argv) {
 
         bool         verbose     = false;
         bool         lut_only    = false;
+        bool         fused_only  = false;
         bool         lut_bench   = false;
         bool         opencl_add_only = false;
         bool         opencl_mul_only = false;
@@ -3481,6 +3482,10 @@ int main(int argc, char ** argv) {
             }
             if (strcmp(argv[i], "--ifairy-lut-only") == 0) {
                 lut_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-fused-only") == 0) {
+                fused_only = true;
                 continue;
             }
             if (strcmp(argv[i], "--ifairy-opencl-add-only") == 0) {

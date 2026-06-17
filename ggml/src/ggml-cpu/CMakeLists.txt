@@ -19,8 +19,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         set(GGML_CPU_NAME ggml-cpu)
     endif()
 
-    if (GGML_IFAIRY_FUSE_AVX512 AND NOT GGML_AVX512)
-        message(FATAL_ERROR "GGML_IFAIRY_FUSE_AVX512 requires GGML_AVX512")
+    if (GGML_FAIRY2I_CPU_AVX512 AND NOT GGML_AVX512)
+        message(FATAL_ERROR "GGML_FAIRY2I_CPU_AVX512 requires GGML_AVX512")
     endif()
 
     ggml_add_backend_library(${GGML_CPU_NAME})
@@ -28,11 +28,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
-        ggml-cpu/ifairy-fuse.cpp
-        ggml-cpu/ifairy-fuse.h
-        ggml-cpu/ifairy-fuse-lut.cpp
-        ggml-cpu/ifairy-fuse-lut-qgemm.cpp
-        ggml-cpu/ifairy-fuse-lut-qgemm.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -57,6 +52,19 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
         )
+
+    if (GGML_FAIRY2I_CPU)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/ifairy-fuse.cpp
+            ggml-cpu/ifairy-fuse.h)
+    endif()
+
+    if (GGML_FAIRY2I_CPU_LUT)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/ifairy-fuse-lut.cpp
+            ggml-cpu/ifairy-fuse-lut-qgemm.cpp
+            ggml-cpu/ifairy-fuse-lut-qgemm.h)
+    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
@@ -109,16 +117,24 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
-        set(GGML_IFAIRY_DOTPROD_SOURCE ggml-cpu/arch/arm/quants-ifairy-dotprod.c)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/arm/quants.c
-            ggml-cpu/arch/arm/quants-ifairy.c
-            ${GGML_IFAIRY_DOTPROD_SOURCE}
             ggml-cpu/arch/arm/repack.cpp
             )
 
-        if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
-            set_source_files_properties(${GGML_IFAIRY_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+        if (GGML_FAIRY2I_CPU)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/arch/arm/quants-ifairy.c)
+        endif()
+
+        if (GGML_FAIRY2I_CPU AND GGML_FAIRY2I_CPU_ARM_DOTPROD)
+            set(GGML_IFAIRY_DOTPROD_SOURCE ggml-cpu/arch/arm/quants-ifairy-dotprod.c)
+            list(APPEND GGML_CPU_SOURCES
+                ${GGML_IFAIRY_DOTPROD_SOURCE})
+
+            if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+                set_source_files_properties(${GGML_IFAIRY_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+            endif()
         endif()
 
         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
@@ -624,7 +640,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
-    if (GGML_IFAIRY_FUSE_AVX512)
+    if (GGML_FAIRY2I_CPU)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU)
+    endif()
+
+    if (GGML_FAIRY2I_CPU_LUT)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IFAIRY_LUT_CPU GGML_USE_FAIRY2I_CPU_LUT)
+    endif()
+
+    if (GGML_FAIRY2I_CPU_AVX512)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IFAIRY_FUSE_AVX512)
     endif()
 

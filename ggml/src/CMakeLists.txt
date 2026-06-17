@@ -190,11 +190,14 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
-set(GGML_BASE_IFAIRY_LUT_SOURCES
-    ggml-ifairy-lut.cpp
-    ggml-ifairy-lut-preprocess.cpp
-    ggml-ifairy-lut-qgemm.cpp
-    ggml-ifairy-lut-transform.cpp)
+set(GGML_BASE_IFAIRY_LUT_SOURCES)
+if (GGML_FAIRY2I_CPU_LUT)
+    list(APPEND GGML_BASE_IFAIRY_LUT_SOURCES
+        ggml-ifairy-lut.cpp
+        ggml-ifairy-lut-preprocess.cpp
+        ggml-ifairy-lut-qgemm.cpp
+        ggml-ifairy-lut-transform.cpp)
+endif()
 
 add_library(ggml-base
             ../include/ggml.h
@@ -221,11 +224,15 @@ if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
 
-if (GGML_IFAIRY_LUT_CPU)
-    target_compile_definitions(ggml-base PUBLIC GGML_IFAIRY_LUT_CPU)
+if (GGML_FAIRY2I)
+    target_compile_definitions(ggml-base PUBLIC GGML_USE_FAIRY2I)
 endif()
 
-if (GGML_IFAIRY_LUT_CPU AND GGML_SYSTEM_ARCH STREQUAL "x86")
+if (GGML_FAIRY2I_CPU_LUT)
+    target_compile_definitions(ggml-base PUBLIC GGML_IFAIRY_LUT_CPU GGML_USE_FAIRY2I_CPU_LUT)
+endif()
+
+if (GGML_FAIRY2I_CPU_LUT AND GGML_SYSTEM_ARCH STREQUAL "x86")
     set(GGML_BASE_IFAIRY_LUT_ARCH_FLAGS "")
 
     if (MSVC)

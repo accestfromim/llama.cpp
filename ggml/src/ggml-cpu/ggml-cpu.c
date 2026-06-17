@@ -13,7 +13,9 @@
 #include "binary-ops.h"
 #include "vec.h"
 #include "ops.h"
-#include "ifairy-fuse.h"
+#ifdef GGML_USE_FAIRY2I_CPU
+#    include "ifairy-fuse.h"
+#endif
 #include "ggml.h"
 #ifdef GGML_IFAIRY_LUT_CPU
 #    include "ggml-ifairy-lut-impl.h"
@@ -2412,6 +2414,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             break;
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
+#ifdef GGML_USE_FAIRY2I_CPU
 #ifdef GGML_IFAIRY_LUT_CPU
                 const struct ggml_ifairy_lut_threadpool_config * cfg = &params->threadpool->ifairy_lut_cfg;
                 const bool use_lut = cfg->lut_enabled && cfg->lut_explicit;
@@ -2421,6 +2424,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 }
 #else
                 ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
+#endif
+#else
+                GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 requires GGML_FAIRY2I_CPU");
 #endif
             }
             break;
@@ -3351,13 +3357,21 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {
+#ifdef GGML_USE_FAIRY2I_CPU
                         const struct ggml_tensor * x = node->src[0];
                         GGML_ASSERT(x && x->type == GGML_TYPE_F32);
                         GGML_ASSERT(x->ne[0] % QK_IFAIRY64 == 0);
 
                         const size_t q_row_size = ggml_row_size(GGML_TYPE_IFAIRY64_Q16, x->ne[0]);
                         const size_t q_bytes    = GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_CACHE_LINE);
+#ifdef GGML_IFAIRY_LUT_CPU
                         cur                     = MAX(q_bytes, ggml_ifairy_wide_linear_w2_lut_wsize(node));
+#else
+                        cur                     = q_bytes;
+#endif
+#else
+                        cur = 0;
+#endif
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
