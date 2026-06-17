@@ -9,12 +9,11 @@ Llama or Qwen2. It is not itself the base transformer architecture.
 
 - User-visible GGUF architecture: `general.architecture = "fairy2i"`.
 - Base architecture: `fairy2i.base_arch`, for example `llama` or `qwen2`.
-- Storage format: `GGML_TYPE_IFAIRY64` for tile64_v2 weights.
-- Compatibility: readers may continue accepting older `ifairy` metadata
-  where present, but new converters must write `fairy2i`.
-
-The `ifairy64` name refers to a weight block storage format. The `fairy2i`
-name refers to the model envelope and GGUF metadata namespace.
+- Storage format: `GGML_TYPE_FAIRY2I_TILE64_V2` for tile64_v2 weights.
+- Activation quantization type: `GGML_TYPE_FAIRY2I_ACT_Q16_64`.
+- New Fairy2i files and execution paths must use Fairy2i or generic complex
+  identifiers only. Historical experimental identifiers are legacy-only and
+  are not part of this schema.
 
 ## Required Metadata
 
@@ -24,13 +23,13 @@ New Fairy2i GGUF files should write these keys:
 general.architecture = "fairy2i"
 fairy2i.schema_version = 1
 fairy2i.base_arch = "llama" | "qwen2"
-fairy2i.quant.format = "ifairy64"
+fairy2i.quant.format = "fairy2i_tile64_v2"
 fairy2i.quant.variant = "tile64_v2"
 fairy2i.quant.residual_steps = 2
 fairy2i.quant.codebook = "{+/-1,+/-i}"
 fairy2i.quant.tile_size = 64
 fairy2i.quant.scale_stat = "dominant_mean_abs"
-fairy2i.attn.layout = "llama_real" | "qwen2_real" | "legacy_complex"
+fairy2i.attn.layout = "llama_real" | "qwen2_real"
 fairy2i.tokenizer.profile = "llama_bpe" | "qwen2"
 ```
 
@@ -44,15 +43,14 @@ fairy2i.vocab.padded_size = <uint32>
 fairy2i.vocab.padding_multiple = <uint32>
 ```
 
-For compatibility with current files, readers should tolerate missing
-`fairy2i.schema_version` as version `0`, missing `fairy2i.quant.format` as
-`ifairy64` when `fairy2i.quant.variant = "tile64_v2"`, and missing
-`fairy2i.attn.layout` as `qwen2_real` for tile64_v2 files.
+New Fairy2i readers must require these keys for schema version 1 files.
+Compatibility with previous experimental files belongs in an explicit legacy
+loader or migration tool, not in the normalized Fairy2i schema defaults.
 
 ## tile64_v2 Weight Blocks
 
 The `tile64_v2` variant stores complex phase-aware weights in
-`GGML_TYPE_IFAIRY64` blocks.
+`GGML_TYPE_FAIRY2I_TILE64_V2` blocks.
 
 - Tile size is 64 complex values.
 - Residual stage count is 2.
@@ -103,7 +101,6 @@ conversion:
 - `llama_real`: Llama-style real attention layout. Converters must use this
   for Llama-based checkpoints.
 - `qwen2_real`: Qwen2-style real attention layout.
-- `legacy_complex`: legacy iFairy complex layout for older files.
 
 Converters must not write a base-architecture-specific layout for a different
 base architecture.
@@ -118,14 +115,13 @@ tile-aligned while token ids stay stable. When padding is used:
 - `fairy2i.vocab.original_size` and `fairy2i.vocab.padded_size` must be
   written.
 
-## Compatibility Policy
+## Legacy Policy
 
-The runtime should keep reading current experimental files while new tools
-write the normalized schema above. Compatibility reads should be explicit and
-limited:
+New Fairy2i tools write only the normalized schema above. Legacy compatibility
+must be explicit and isolated:
 
-- `fairy2i.quant.variant = "legacy"` keeps the legacy code path.
-- Missing version and format keys are accepted only through documented
-  defaults.
+- A legacy loader or migration tool may translate previous experimental files.
+- The runtime must not silently treat missing Fairy2i schema keys as the new
+  tile64_v2 format.
 - Unknown quant variants, tile sizes, scale statistics, attention layouts, or
   base architectures must fail with actionable errors.
