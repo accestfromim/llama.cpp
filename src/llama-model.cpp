@@ -12,8 +12,8 @@
 #include "llama-model-loader.h"
 #include "../ggml/src/ggml-quants.h"
 
-#ifdef GGML_IFAIRY_LUT_CPU
-#    include "../ggml/src/ggml-ifairy-lut.h"
+#ifdef GGML_USE_FAIRY2I_CPU_LUT
+#    include "../ggml/src/ggml-fairy2i-lut.h"
 #endif
 
 #include <algorithm>
@@ -28,9 +28,9 @@
 #include <sstream>
 #include <stdexcept>
 
-#ifdef GGML_IFAIRY_LUT_CPU
-static bool llama_ifairy_lut_explicit_enabled() {
-    const char * env = getenv("GGML_IFAIRY_LUT");
+#ifdef GGML_USE_FAIRY2I_CPU_LUT
+static bool llama_fairy2i_lut_explicit_enabled() {
+    const char * env = getenv("GGML_FAIRY2I_LUT");
     return env && strcmp(env, "0") != 0;
 }
 #endif
@@ -4639,7 +4639,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                                     const std::initializer_list<int64_t> & ne, int flags) {
                         const auto stage_tn = bid >= 0 ? tn(tensor, suffix, bid) : tn(tensor, suffix);
                         const auto expected_type = fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2
-                            ? GGML_TYPE_IFAIRY64
+                            ? GGML_TYPE_FAIRY2I_TILE64_V2
                             : GGML_TYPE_IFAIRY;
 
                         const ggml_tensor * t_meta = ml.get_tensor_meta(stage_tn.str().c_str());
@@ -6202,16 +6202,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             const ggml_tensor * src_w0 = output_fairy2i.W[0];
             const ggml_tensor * src_w1 = output_fairy2i.W[1];
 
-            GGML_ASSERT(src_u0->type == GGML_TYPE_IFAIRY64);
-            GGML_ASSERT(src_u1->type == GGML_TYPE_IFAIRY64);
-            GGML_ASSERT(src_w0->type == GGML_TYPE_IFAIRY64);
-            GGML_ASSERT(src_w1->type == GGML_TYPE_IFAIRY64);
+            GGML_ASSERT(src_u0->type == GGML_TYPE_FAIRY2I_TILE64_V2);
+            GGML_ASSERT(src_u1->type == GGML_TYPE_FAIRY2I_TILE64_V2);
+            GGML_ASSERT(src_w0->type == GGML_TYPE_FAIRY2I_TILE64_V2);
+            GGML_ASSERT(src_w1->type == GGML_TYPE_FAIRY2I_TILE64_V2);
             GGML_ASSERT(src_u0->ne[0] == src_u1->ne[0] && src_u0->ne[1] == src_u1->ne[1]);
             GGML_ASSERT(src_w0->ne[0] == src_w1->ne[0] && src_w0->ne[1] == src_w1->ne[1]);
 
             const int64_t in_dim  = src_u0->ne[0];
             const int64_t out_dim = src_u0->ne[1];
-            const size_t  row_size = ggml_row_size(GGML_TYPE_IFAIRY64, in_dim);
+            const size_t  row_size = ggml_row_size(GGML_TYPE_FAIRY2I_TILE64_V2, in_dim);
             const int64_t t_merge_us = ggml_time_us();
 
             ggml_init_params synth_params = {
@@ -6225,8 +6225,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("%s: failed to create merged output ctx", __func__));
             }
 
-            ggml_tensor * merged_u = ggml_new_tensor_2d(synth_ctx.get(), GGML_TYPE_IFAIRY64, in_dim, out_dim);
-            ggml_tensor * merged_w = ggml_new_tensor_2d(synth_ctx.get(), GGML_TYPE_IFAIRY64, in_dim, out_dim);
+            ggml_tensor * merged_u = ggml_new_tensor_2d(synth_ctx.get(), GGML_TYPE_FAIRY2I_TILE64_V2, in_dim, out_dim);
+            ggml_tensor * merged_w = ggml_new_tensor_2d(synth_ctx.get(), GGML_TYPE_FAIRY2I_TILE64_V2, in_dim, out_dim);
             if (!merged_u || !merged_w) {
                 throw std::runtime_error(format("%s: failed to create merged output tensors", __func__));
             }
@@ -6294,14 +6294,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-#ifdef GGML_IFAIRY_LUT_CPU
-    if (llama_ifairy_lut_explicit_enabled()) {
+#ifdef GGML_USE_FAIRY2I_CPU_LUT
+    if (llama_fairy2i_lut_explicit_enabled()) {
         const int64_t t_lut_pack_us = ggml_time_us();
         int           n_lut_tensors = 0;
 
         for (auto & ctx : pimpl->ctxs) {
             for (ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
-                if (cur->type != GGML_TYPE_IFAIRY64) {
+                if (cur->type != GGML_TYPE_FAIRY2I_TILE64_V2) {
                     continue;
                 }
 
@@ -6310,8 +6310,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
 
-                if (!ggml_ifairy_lut_transform_tensor(cur, NULL)) {
-                    throw std::runtime_error(format("%s: failed to prepack IFAIRY64 LUT tensor %s", __func__,
+                if (!ggml_fairy2i_lut_transform_tensor(cur, NULL)) {
+                    throw std::runtime_error(format("%s: failed to prepack Fairy2i tile64 LUT tensor %s", __func__,
                                                     ggml_get_name(cur)));
                 }
                 ++n_lut_tensors;
@@ -6319,7 +6319,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
         if (n_lut_tensors > 0) {
-            LLAMA_LOG_INFO("%s: eagerly prepared %d IFAIRY64 LUT tensors in %.3f sec\n", __func__, n_lut_tensors,
+            LLAMA_LOG_INFO("%s: eagerly prepared %d Fairy2i tile64 LUT tensors in %.3f sec\n", __func__, n_lut_tensors,
                            (ggml_time_us() - t_lut_pack_us) / 1e6);
         }
     }
