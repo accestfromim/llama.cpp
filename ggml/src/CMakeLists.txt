@@ -190,24 +190,6 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
-set(GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES)
-if (GGML_LEGACY_IFAIRY_CPU_LUT)
-    list(APPEND GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES
-        ggml-ifairy-lut.cpp
-        ggml-ifairy-lut-preprocess.cpp
-        ggml-ifairy-lut-qgemm.cpp
-        ggml-ifairy-lut-transform.cpp)
-endif()
-
-set(GGML_BASE_FAIRY2I_LUT_SOURCES)
-if (GGML_FAIRY2I_CPU_LUT)
-    list(APPEND GGML_BASE_FAIRY2I_LUT_SOURCES
-        ggml-fairy2i-lut.cpp
-        ggml-fairy2i-lut-preprocess.cpp
-        ggml-fairy2i-lut-qgemm.cpp
-        ggml-fairy2i-lut-transform.cpp)
-endif()
-
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -224,11 +206,6 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
-            ${GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES}
-            ${GGML_BASE_FAIRY2I_LUT_SOURCES}
-            ggml-fairy2i-lut.h
-            ggml-fairy2i-lut-impl.h
-            ggml-ifairy-lut-impl.h
             gguf.cpp)
 
 target_include_directories(ggml-base PRIVATE .)
@@ -238,83 +215,6 @@ endif()
 
 if (GGML_FAIRY2I)
     target_compile_definitions(ggml-base PUBLIC GGML_USE_FAIRY2I)
-endif()
-
-if (GGML_FAIRY2I_CPU_LUT)
-    target_compile_definitions(ggml-base PUBLIC GGML_USE_FAIRY2I_CPU_LUT)
-endif()
-
-if (GGML_LEGACY_IFAIRY_CPU_LUT)
-    target_compile_definitions(ggml-base PUBLIC GGML_USE_LEGACY_IFAIRY_CPU_LUT)
-endif()
-
-set(GGML_BASE_LUT_SOURCES ${GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES} ${GGML_BASE_FAIRY2I_LUT_SOURCES})
-
-if (GGML_BASE_LUT_SOURCES AND GGML_SYSTEM_ARCH STREQUAL "x86")
-    set(GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS "")
-
-    if (MSVC)
-        if (GGML_AVX512)
-            list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS /arch:AVX512)
-        elseif (GGML_AVX2)
-            list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS /arch:AVX2)
-        elseif (GGML_AVX)
-            list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS /arch:AVX)
-        elseif (GGML_SSE42)
-            list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS /arch:SSE4.2)
-        endif()
-    else()
-        if (GGML_NATIVE)
-            list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -march=native)
-        else()
-            if (GGML_SSE42)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -msse4.2)
-            endif()
-            if (GGML_F16C)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mf16c)
-            endif()
-            if (GGML_FMA)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mfma)
-            endif()
-            if (GGML_BMI2)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mbmi2)
-            endif()
-            if (GGML_AVX)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mavx)
-            endif()
-            if (GGML_AVX2)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mavx2)
-            endif()
-            if (GGML_AVX_VNNI)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mavxvnni)
-            endif()
-            if (GGML_AVX512)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512dq -mavx512bw)
-            endif()
-            if (GGML_AVX512_VBMI)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mavx512vbmi)
-            endif()
-            if (GGML_AVX512_VNNI)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mavx512vnni)
-            endif()
-            if (GGML_AVX512_BF16)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mavx512bf16)
-            endif()
-            if (GGML_AMX_TILE)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mamx-tile)
-            endif()
-            if (GGML_AMX_INT8)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mamx-int8)
-            endif()
-            if (GGML_AMX_BF16)
-                list(APPEND GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS -mamx-bf16)
-            endif()
-        endif()
-    endif()
-
-    if (GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS)
-        set_source_files_properties(${GGML_BASE_LUT_SOURCES} PROPERTIES COMPILE_OPTIONS "${GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS}")
-    endif()
 endif()
 
 add_library(ggml

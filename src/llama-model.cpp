@@ -12,10 +12,6 @@
 #include "llama-model-loader.h"
 #include "../ggml/src/ggml-quants.h"
 
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-#    include "../ggml/src/ggml-fairy2i-lut.h"
-#endif
-
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -27,13 +23,6 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
-
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-static bool llama_fairy2i_lut_explicit_enabled() {
-    const char * env = getenv("GGML_FAIRY2I_LUT");
-    return env && strcmp(env, "0") != 0;
-}
-#endif
 
 static bool llama_fairy2i_merged_output_enabled() {
     const char * env = getenv("LLAMA_FAIRY2I_MERGED_OUTPUT");
@@ -6293,37 +6282,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                            ggml_backend_buffer_get_size(pimpl->bufs.back().get()) / 1024.0 / 1024.0 / 2.0);
         }
     }
-
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-    if (llama_fairy2i_lut_explicit_enabled()) {
-        const int64_t t_lut_pack_us = ggml_time_us();
-        int           n_lut_tensors = 0;
-
-        for (auto & ctx : pimpl->ctxs) {
-            for (ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
-                if (cur->type != GGML_TYPE_FAIRY2I_TILE64_V2) {
-                    continue;
-                }
-
-                const fairy2i_lut_extra * extra = (const fairy2i_lut_extra *) cur->extra;
-                if (extra && extra->packed_w) {
-                    continue;
-                }
-
-                if (!ggml_fairy2i_lut_transform_tensor(cur, NULL)) {
-                    throw std::runtime_error(format("%s: failed to prepack Fairy2i tile64 LUT tensor %s", __func__,
-                                                    ggml_get_name(cur)));
-                }
-                ++n_lut_tensors;
-            }
-        }
-
-        if (n_lut_tensors > 0) {
-            LLAMA_LOG_INFO("%s: eagerly prepared %d Fairy2i tile64 LUT tensors in %.3f sec\n", __func__, n_lut_tensors,
-                           (ggml_time_us() - t_lut_pack_us) / 1e6);
-        }
-    }
-#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
