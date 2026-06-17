@@ -78,6 +78,27 @@ They do not enable Fairy2i features. Legacy iFairy validation must include a
 Fairy2i-off build so old vecdot, W2 fused, and LUT execution cannot silently
 depend on `GGML_FAIRY2I*`.
 
+Recommended validation commands:
+
+```bash
+cmake -B build-ifairy-legacy \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_FAIRY2I=OFF \
+    -DGGML_LEGACY_IFAIRY_CPU=ON \
+    -DGGML_LEGACY_IFAIRY_CPU_LUT=ON
+cmake --build build-ifairy-legacy --target test-legacy-ifairy -j 4
+GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy
+
+cmake -B build-rel-fairy2i \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_FAIRY2I=ON \
+    -DGGML_FAIRY2I_CPU=ON \
+    -DGGML_FAIRY2I_CPU_LUT=ON \
+    -DGGML_LEGACY_IFAIRY_CPU=OFF
+cmake --build build-rel-fairy2i --target test-fairy2i -j 4
+GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+```
+
 ## OpenCL Scope
 
 OpenCL is part of the full decoupling scope. New Fairy2i OpenCL routing uses

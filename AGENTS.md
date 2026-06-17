@@ -49,7 +49,7 @@ When adding a **new model architecture**, most changes should stay in `src/` (se
 - `./build-rel/bin/llama-cli -m <path/to/model.gguf> --gpu-layers 0 -t 4 -p "I believe life is" -n 128 -no-cnv`
 
 ### Targeted rebuild (examples)
-- `cmake --build build-rel --target ggml-base test-ifairy -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)`
+- `cmake --build build-rel --target ggml-base test-legacy-ifairy test-fairy2i -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)`
 
 ## 3) Stage-Gated Workflow (for non-trivial work)
 
@@ -86,9 +86,9 @@ For complex changes (e.g. adding a new architecture, changing hot-path kernels),
 This repo includes an iFairy 3-weight complex LUT path. When touching it:
 
 - Semantic invariant: must match baseline exactly (`w * conj(x)`)
-- Correctness gate: `./build-rel/bin/test-ifairy` and `./build-rel-lut/bin/test-ifairy` must pass
+- Correctness gate: `test-legacy-ifairy` must pass for legacy iFairy changes; `test-fairy2i` must pass for Fairy2i changes.
 - Performance claims must include reproducible commands + raw `eval tok/s` logs
-- Edge-case coverage lives in `tests/test-ifairy.cpp` (alignment, small/large dims, env semantics); keep docs in sync.
+- Edge-case coverage lives in `tests/test-legacy-ifairy.cpp` (alignment, small/large dims, env semantics) and `tests/test-fairy2i.cpp`; keep docs in sync.
 - If adding/changing iFairy LUT env knobs or routing, update the V2 docs (do not modify the legacy `IFAIRY_ARM_3W_LUT_*.md` series):
   - `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_REFACTOR_PLAN.md`
   - `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_LUT_C_INTEGRATION_PLAN.md`

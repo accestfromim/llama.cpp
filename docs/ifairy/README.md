@@ -22,8 +22,22 @@ split into its own model envelope and backend path.
   `GGML_IFAIRY_LUT`, `GGML_IFAIRY_LUT_DEBUG`, and `GGML_IFAIRY_LUT_IMPL`.
 - Fairy2i options and environment variables must not be required to enable old
   iFairy vecdot, W2 fused, or LUT execution.
+- Legacy CPU coverage lives in `tests/test-legacy-ifairy.cpp` and the
+  `test-legacy-ifairy` CTest target.
 - Each independently reviewable compatibility fix is tested and committed
   before the next fix starts.
+
+Current legacy-only validation:
+
+```bash
+cmake -B build-ifairy-legacy \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_FAIRY2I=OFF \
+  -DGGML_LEGACY_IFAIRY_CPU=ON \
+  -DGGML_LEGACY_IFAIRY_CPU_LUT=ON
+cmake --build build-ifairy-legacy --target test-legacy-ifairy -j 4
+GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy
+```
 
 ## 目录结构
 
