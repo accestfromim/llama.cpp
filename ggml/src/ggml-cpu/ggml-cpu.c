@@ -20,10 +20,6 @@
 #    include "legacy-ifairy/legacy-ifairy-cpu.h"
 #endif
 #include "ggml.h"
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-#    include "ggml-fairy2i-lut-impl.h"
-#    include "ggml-fairy2i-lut.h"
-#endif
 #ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
 #    include "ggml-ifairy-lut.h"
 #endif
@@ -513,28 +509,6 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #endif
 
 // Threadpool def
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-enum ggml_fairy2i_lut_impl {
-    GGML_FAIRY2I_LUT_IMPL_AUTO  = 0,
-    GGML_FAIRY2I_LUT_IMPL_LUT16 = 1,
-    GGML_FAIRY2I_LUT_IMPL_LUT_C = 2,
-};
-
-struct ggml_fairy2i_lut_threadpool_config {
-    bool                      dbg;
-    bool                      lut_enabled;
-    bool                      lut_explicit;
-    enum ggml_fairy2i_lut_impl impl;
-};
-
-struct ggml_fairy2i_lut_runtime_shape {
-    int64_t weight_block_k;
-    int64_t act_block_k;
-    int64_t groups_per_weight_block;
-    size_t  packed_wtile_size;
-};
-#endif
-
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -561,10 +535,6 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
-
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-    struct ggml_fairy2i_lut_threadpool_config fairy2i_lut_cfg;
-#endif
 };
 
 // Per-thread state
@@ -664,132 +634,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #endif
 #endif
 }
-
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-static bool ggml_fairy2i_lut_is_weight_branch(const struct ggml_tensor * src0) {
-    if (src0 == NULL || src0->name[0] == '\0') {
-        return false;
-    }
-
-    // Fairy2i GGUF names encode widely-linear branches as "*.U.s{0,1}" / "*.W.s{0,1}".
-    return strstr(src0->name, ".U.s0") != NULL || strstr(src0->name, ".U.s1") != NULL ||
-           strstr(src0->name, ".W.s0") != NULL || strstr(src0->name, ".W.s1") != NULL;
-}
-
-static bool ggml_fairy2i_lut_get_runtime_shape(const struct ggml_tensor *               src0,
-                                               const struct ggml_tensor *               src1,
-                                               const struct ggml_tensor *               dst,
-                                               struct ggml_fairy2i_lut_runtime_shape * out) {
-    if (!src0 || !src1 || !dst || !out) {
-        return false;
-    }
-    if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_FAIRY2I_ACT_Q16_64) || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-
-    switch (src0->type) {
-        case GGML_TYPE_FAIRY2I_TILE64_V2:
-            out->weight_block_k          = QK_FAIRY2I_TILE64;
-            out->act_block_k             = QK_FAIRY2I_ACT_Q16_64;
-            out->groups_per_weight_block = QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
-            out->packed_wtile_size       = sizeof(fairy2i_tile64_lut_wtile_16);
-            break;
-        default:
-            return false;
-    }
-
-    if (src0->ne[0] % out->weight_block_k != 0 || src0->ne[0] % out->act_block_k != 0 || src1->ne[0] != src0->ne[0]) {
-        return false;
-    }
-
-    return true;
-}
-
-static enum ggml_fairy2i_lut_impl ggml_fairy2i_lut_impl_from_env(const char * env_name,
-                                                                  bool         dbg,
-                                                                  const char * log_prefix) {
-    enum ggml_fairy2i_lut_impl impl = GGML_FAIRY2I_LUT_IMPL_AUTO;
-    const char * impl_env           = getenv(env_name);
-    if (impl_env && impl_env[0] != '\0' && strcmp(impl_env, "0") != 0 && strcmp(impl_env, "auto") != 0) {
-        if (strcmp(impl_env, "lut16") == 0) {
-            impl = GGML_FAIRY2I_LUT_IMPL_LUT16;
-        } else if (strcmp(impl_env, "lut_c") == 0) {
-            impl = GGML_FAIRY2I_LUT_IMPL_LUT_C;
-        } else if (dbg) {
-            GGML_LOG_WARN("%s: unknown %s=%s (expected auto|lut16|lut_c)\n", log_prefix, env_name, impl_env);
-        }
-    }
-    return impl;
-}
-
-static void ggml_fairy2i_lut_threadpool_config_update(struct ggml_threadpool * threadpool) {
-    struct ggml_fairy2i_lut_threadpool_config cfg;
-
-    cfg.dbg = ggml_fairy2i_env_enabled("GGML_FAIRY2I_LUT_DEBUG");
-
-    const char * enabled_env = getenv("GGML_FAIRY2I_LUT");
-    cfg.lut_enabled          = !(enabled_env && strcmp(enabled_env, "0") == 0);
-    cfg.lut_explicit         = enabled_env && strcmp(enabled_env, "0") != 0;
-    cfg.impl                 = ggml_fairy2i_lut_impl_from_env("GGML_FAIRY2I_LUT_IMPL", cfg.dbg, "fairy2i_lut");
-
-    threadpool->fairy2i_lut_cfg = cfg;
-}
-
-static const char * ggml_fairy2i_lut_impl_name(enum ggml_fairy2i_lut_impl impl) {
-    switch (impl) {
-        case GGML_FAIRY2I_LUT_IMPL_AUTO:
-            return "auto";
-        case GGML_FAIRY2I_LUT_IMPL_LUT16:
-            return "lut16";
-        case GGML_FAIRY2I_LUT_IMPL_LUT_C:
-            return "lut_c";
-        default:
-            return "unknown";
-    }
-}
-
-static void ggml_fairy2i_lut_debug_profile_log(const char * path,
-                                               enum ggml_fairy2i_lut_impl impl,
-                                               const char * weight_name,
-                                               int64_t      M,
-                                               int64_t      K,
-                                               int64_t      N,
-                                               int          nth,
-                                               int64_t      quant_us,
-                                               int64_t      prep_us,
-                                               int64_t      gemm_us) {
-    fprintf(stderr,
-            "fairy2i_lut: path=%s impl=%s name=%s M=%lld K=%lld N=%lld nth=%d quant=%.3f ms prep=%.3f ms gemm=%.3f ms\n",
-            path, ggml_fairy2i_lut_impl_name(impl), weight_name, (long long) M, (long long) K, (long long) N, nth,
-            quant_us / 1000.0, prep_us / 1000.0, gemm_us / 1000.0);
-    fflush(stderr);
-}
-
-static void ggml_fairy2i_lut_prepare_cgraph_indexes(const struct ggml_cgraph *                           cgraph,
-                                                    const struct ggml_fairy2i_lut_threadpool_config * cfg) {
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        struct ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
-            continue;
-        }
-
-        if (node->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2) {
-            if (!cfg || !cfg->lut_explicit) {
-                continue;
-            }
-            for (int src = 1; src <= 4; ++src) {
-                struct ggml_tensor * weight = node->src[src];
-                const struct fairy2i_lut_extra * extra = weight ? (const struct fairy2i_lut_extra *) weight->extra : NULL;
-                if (weight && (!extra || !extra->packed_w)) {
-                    ggml_fairy2i_lut_transform_tensor(weight, NULL);
-                }
-            }
-            continue;
-        }
-
-    }
-}
-#endif
 
 #ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
 static void ggml_legacy_ifairy_lut_prepare_cgraph_indexes(const struct ggml_cgraph * cgraph) {
@@ -2169,15 +2013,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
             {
 #ifdef GGML_USE_FAIRY2I_CPU
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-                const struct ggml_fairy2i_lut_threadpool_config * cfg = &params->threadpool->fairy2i_lut_cfg;
-                const bool use_lut = cfg->lut_enabled && cfg->lut_explicit;
-                const bool lut_c   = cfg->impl == GGML_FAIRY2I_LUT_IMPL_LUT_C;
-#else
-                const bool use_lut = false;
-                const bool lut_c   = false;
-#endif
-                if (!ggml_fairy2i_cpu_compute_wide_linear_w2(params, tensor, use_lut, lut_c)) {
+                if (!ggml_fairy2i_cpu_compute(params, tensor)) {
                     GGML_ABORT("%s failed", ggml_op_name(tensor->op));
                 }
 #else
@@ -3465,12 +3301,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
 
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-        threadpool->fairy2i_lut_cfg.dbg          = false;
-        threadpool->fairy2i_lut_cfg.lut_enabled  = true;
-        threadpool->fairy2i_lut_cfg.lut_explicit = false;
-        threadpool->fairy2i_lut_cfg.impl         = GGML_FAIRY2I_LUT_IMPL_AUTO;
-#endif
     }
 
     // Allocate and init workers state
@@ -3547,11 +3377,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-    ggml_fairy2i_lut_threadpool_config_update(threadpool);
-
-    const struct ggml_fairy2i_lut_threadpool_config * cfg = &threadpool->fairy2i_lut_cfg;
-    ggml_fairy2i_lut_prepare_cgraph_indexes(cgraph, cfg);
+#ifdef GGML_USE_FAIRY2I_CPU
+    ggml_fairy2i_cpu_prepare_graph(cgraph);
 #endif
 
 #ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
