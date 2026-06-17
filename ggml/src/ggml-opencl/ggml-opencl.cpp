@@ -2915,21 +2915,33 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
     return GGML_STATUS_SUCCESS;
 }
 
+static bool ggml_opencl_is_fairy2i_tile64_type(enum ggml_type type) {
+    return type == GGML_TYPE_IFAIRY64 || type == GGML_TYPE_FAIRY2I_TILE64_V2;
+}
+
 static bool ggml_opencl_is_ifairy_type(enum ggml_type type) {
-    return type == GGML_TYPE_IFAIRY || type == GGML_TYPE_IFAIRY_Q16 || type == GGML_TYPE_IFAIRY64;
+    return type == GGML_TYPE_IFAIRY || type == GGML_TYPE_IFAIRY_Q16 ||
+           type == GGML_TYPE_FAIRY2I_ACT_Q16_64 || ggml_opencl_is_fairy2i_tile64_type(type);
 }
 
 static bool ggml_opencl_is_ifairy_op(const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_IFAIRY_ROPE:
+        case GGML_OP_COMPLEX_ROPE:
         case GGML_OP_IFAIRY_SPLIT:
+        case GGML_OP_COMPLEX_SPLIT:
         case GGML_OP_IFAIRY_MERGE:
+        case GGML_OP_COMPLEX_MERGE:
         case GGML_OP_IFAIRY_ADD:
+        case GGML_OP_COMPLEX_ADD:
         case GGML_OP_IFAIRY_RMSNORM:
+        case GGML_OP_COMPLEX_RMSNORM:
         case GGML_OP_IFAIRY_MUL:
+        case GGML_OP_COMPLEX_MUL:
             return true;
         case GGML_OP_UNARY:
-            return ggml_get_unary_op(op) == GGML_UNARY_OP_IFAIRY_RELU2;
+            return ggml_get_unary_op(op) == GGML_UNARY_OP_IFAIRY_RELU2 ||
+                   ggml_get_unary_op(op) == GGML_UNARY_OP_COMPLEX_RELU2;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             return op->src[0] != nullptr && ggml_opencl_is_ifairy_type(op->src[0]->type);
@@ -2938,7 +2950,12 @@ static bool ggml_opencl_is_ifairy_op(const struct ggml_tensor * op) {
     }
 }
 
-static bool ggml_opencl_ifairy64_enabled(void) {
+static bool ggml_opencl_fairy2i_enabled(void) {
+    const char * env = getenv("GGML_OPENCL_FAIRY2I");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
+static bool ggml_opencl_legacy_ifairy_enabled(void) {
     const char * env = getenv("GGML_OPENCL_IFAIRY64");
     return env != nullptr && strcmp(env, "0") != 0;
 }
@@ -2954,7 +2971,7 @@ static bool ggml_opencl_can_ifairy64_mul_mat(const struct ggml_tensor * op) {
         return false;
     }
 
-    if (src0->type != GGML_TYPE_IFAIRY64 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+    if (!ggml_opencl_is_fairy2i_tile64_type(src0->type) || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
         return false;
     }
 
@@ -3005,15 +3022,17 @@ static bool ggml_opencl_can_ifairy_binary(const struct ggml_tensor * op, enum gg
 }
 
 static bool ggml_opencl_can_ifairy_add(const struct ggml_tensor * op) {
-    return ggml_opencl_can_ifairy_binary(op, GGML_OP_IFAIRY_ADD);
+    return ggml_opencl_can_ifairy_binary(op, GGML_OP_IFAIRY_ADD) ||
+           ggml_opencl_can_ifairy_binary(op, GGML_OP_COMPLEX_ADD);
 }
 
 static bool ggml_opencl_can_ifairy_mul(const struct ggml_tensor * op) {
-    return ggml_opencl_can_ifairy_binary(op, GGML_OP_IFAIRY_MUL);
+    return ggml_opencl_can_ifairy_binary(op, GGML_OP_IFAIRY_MUL) ||
+           ggml_opencl_can_ifairy_binary(op, GGML_OP_COMPLEX_MUL);
 }
 
 static bool ggml_opencl_can_ifairy_rmsnorm(const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_IFAIRY_RMSNORM) {
+    if (op->op != GGML_OP_IFAIRY_RMSNORM && op->op != GGML_OP_COMPLEX_RMSNORM) {
         return false;
     }
 
@@ -3035,7 +3054,7 @@ static bool ggml_opencl_can_ifairy_rmsnorm(const struct ggml_tensor * op) {
 }
 
 static bool ggml_opencl_can_ifairy_split(const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_IFAIRY_SPLIT) {
+    if (op->op != GGML_OP_IFAIRY_SPLIT && op->op != GGML_OP_COMPLEX_SPLIT) {
         return false;
     }
 
@@ -3051,7 +3070,7 @@ static bool ggml_opencl_can_ifairy_split(const struct ggml_tensor * op) {
 }
 
 static bool ggml_opencl_can_ifairy_merge(const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_IFAIRY_MERGE) {
+    if (op->op != GGML_OP_IFAIRY_MERGE && op->op != GGML_OP_COMPLEX_MERGE) {
         return false;
     }
 
@@ -3067,7 +3086,9 @@ static bool ggml_opencl_can_ifairy_merge(const struct ggml_tensor * op) {
 }
 
 static bool ggml_opencl_can_ifairy_relu2(const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_UNARY || ggml_get_unary_op(op) != GGML_UNARY_OP_IFAIRY_RELU2) {
+    if (op->op != GGML_OP_UNARY ||
+        (ggml_get_unary_op(op) != GGML_UNARY_OP_IFAIRY_RELU2 &&
+         ggml_get_unary_op(op) != GGML_UNARY_OP_COMPLEX_RELU2)) {
         return false;
     }
 
@@ -3083,7 +3104,7 @@ static bool ggml_opencl_can_ifairy_relu2(const struct ggml_tensor * op) {
 }
 
 static bool ggml_opencl_can_ifairy_rope(const struct ggml_tensor * op) {
-    if (op->op != GGML_OP_IFAIRY_ROPE) {
+    if (op->op != GGML_OP_IFAIRY_ROPE && op->op != GGML_OP_COMPLEX_ROPE) {
         return false;
     }
 
@@ -3150,7 +3171,7 @@ static bool ggml_opencl_can_neg(const struct ggml_tensor * op) {
 }
 
 static bool ggml_opencl_can_fuse_ifairy_rmsnorm_mul(const struct ggml_cgraph * cgraph, int node_idx) {
-    if (!ggml_opencl_ifairy64_enabled() || !ggml_can_fuse(cgraph, node_idx, { GGML_OP_IFAIRY_RMSNORM, GGML_OP_MUL })) {
+    if (!ggml_opencl_legacy_ifairy_enabled() || !ggml_can_fuse(cgraph, node_idx, { GGML_OP_IFAIRY_RMSNORM, GGML_OP_MUL })) {
         return false;
     }
 
@@ -3194,16 +3215,22 @@ static bool ggml_opencl_ifairy64_kernel_ready(const struct ggml_tensor * op) {
 static bool ggml_opencl_ifairy_complex_kernel_ready(const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_IFAIRY_ADD:
+        case GGML_OP_COMPLEX_ADD:
             return ggml_opencl_can_ifairy_add(op);
         case GGML_OP_IFAIRY_MERGE:
+        case GGML_OP_COMPLEX_MERGE:
             return ggml_opencl_can_ifairy_merge(op);
         case GGML_OP_IFAIRY_MUL:
+        case GGML_OP_COMPLEX_MUL:
             return ggml_opencl_can_ifairy_mul(op);
         case GGML_OP_IFAIRY_RMSNORM:
+        case GGML_OP_COMPLEX_RMSNORM:
             return ggml_opencl_can_ifairy_rmsnorm(op);
         case GGML_OP_IFAIRY_ROPE:
+        case GGML_OP_COMPLEX_ROPE:
             return ggml_opencl_can_ifairy_rope(op);
         case GGML_OP_IFAIRY_SPLIT:
+        case GGML_OP_COMPLEX_SPLIT:
             return ggml_opencl_can_ifairy_split(op);
         case GGML_OP_UNARY:
             return ggml_opencl_can_ifairy_relu2(op);
@@ -3213,17 +3240,33 @@ static bool ggml_opencl_ifairy_complex_kernel_ready(const struct ggml_tensor * o
 }
 
 static bool ggml_opencl_supports_ifairy_op(const struct ggml_tensor * op) {
-    if (!ggml_opencl_ifairy64_enabled()) {
+    const bool fairy2i_op = op->op == GGML_OP_COMPLEX_ADD || op->op == GGML_OP_COMPLEX_MERGE ||
+                            op->op == GGML_OP_COMPLEX_MUL || op->op == GGML_OP_COMPLEX_RMSNORM ||
+                            op->op == GGML_OP_COMPLEX_ROPE || op->op == GGML_OP_COMPLEX_SPLIT ||
+                            (op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_COMPLEX_RELU2) ||
+                            (op->op == GGML_OP_MUL_MAT && op->src[0] != nullptr &&
+                             op->src[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2);
+    if (fairy2i_op) {
+        if (!ggml_opencl_fairy2i_enabled()) {
+            return false;
+        }
+    } else if (!ggml_opencl_legacy_ifairy_enabled()) {
         return false;
     }
 
     switch (op->op) {
         case GGML_OP_IFAIRY_ADD:
+        case GGML_OP_COMPLEX_ADD:
         case GGML_OP_IFAIRY_MERGE:
+        case GGML_OP_COMPLEX_MERGE:
         case GGML_OP_IFAIRY_MUL:
+        case GGML_OP_COMPLEX_MUL:
         case GGML_OP_IFAIRY_RMSNORM:
+        case GGML_OP_COMPLEX_RMSNORM:
         case GGML_OP_IFAIRY_ROPE:
+        case GGML_OP_COMPLEX_ROPE:
         case GGML_OP_IFAIRY_SPLIT:
+        case GGML_OP_COMPLEX_SPLIT:
         case GGML_OP_UNARY:
             return ggml_opencl_ifairy_complex_kernel_ready(op);
         case GGML_OP_MUL_MAT:
@@ -3690,13 +3733,13 @@ static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) 
 }
 
 static size_t ggml_opencl_ifairy64_block_count(const ggml_tensor * tensor) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_IFAIRY64);
-    GGML_ASSERT(ggml_nelements(tensor) % ggml_blck_size(GGML_TYPE_IFAIRY64) == 0);
-    return (size_t) ggml_nelements(tensor) / ggml_blck_size(GGML_TYPE_IFAIRY64);
+    GGML_ASSERT(ggml_opencl_is_fairy2i_tile64_type(tensor->type));
+    GGML_ASSERT(ggml_nelements(tensor) % ggml_blck_size(tensor->type) == 0);
+    return (size_t) ggml_nelements(tensor) / ggml_blck_size(tensor->type);
 }
 
 static size_t ggml_opencl_ifairy64_qs_size(const ggml_tensor * tensor) {
-    return ggml_opencl_ifairy64_block_count(tensor) * ggml_blck_size(GGML_TYPE_IFAIRY64) / 4;
+    return ggml_opencl_ifairy64_block_count(tensor) * ggml_blck_size(tensor->type) / 4;
 }
 
 static size_t ggml_opencl_ifairy64_d_size(const ggml_tensor * tensor) {
@@ -3795,10 +3838,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     cl_context context = backend_ctx->context;
     cl_command_queue queue = backend_ctx->queue;
 
-    if (tensor->type == GGML_TYPE_IFAIRY64) {
+    if (ggml_opencl_is_fairy2i_tile64_type(tensor->type)) {
         GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) &&
-                    "partial OpenCL IFAIRY64 tensor upload is not supported");
-        GGML_ASSERT(tensor->view_offs == 0 && "OpenCL IFAIRY64 tensor views are not supported");
+                    "partial OpenCL tile64 tensor upload is not supported");
+        GGML_ASSERT(tensor->view_offs == 0 && "OpenCL tile64 tensor views are not supported");
 
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *) tensor->extra;
         GGML_ASSERT(extra_orig && "tensors in OpenCL backend should have been allocated and initialized");
@@ -4190,8 +4233,8 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     // Make sure all previously submitted commands in other devices are finished.
     sync_with_other_backends(backend_ctx);
 
-    if (tensor->type == GGML_TYPE_IFAIRY64) {
-        GGML_ASSERT(tensor->view_offs == 0 && "OpenCL IFAIRY64 tensor views are not supported");
+    if (ggml_opencl_is_fairy2i_tile64_type(tensor->type)) {
+        GGML_ASSERT(tensor->view_offs == 0 && "OpenCL tile64 tensor views are not supported");
         ggml_tensor_extra_cl_ifairy64 * extra = (ggml_tensor_extra_cl_ifairy64 *) tensor->extra;
 
         const size_t n_blocks = ggml_opencl_ifairy64_block_count(tensor);
@@ -4348,7 +4391,7 @@ static size_t ggml_backend_opencl_buffer_type_get_max_size(ggml_backend_buffer_t
 }
 
 static size_t ggml_backend_opencl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buffer_type, const ggml_tensor * tensor) {
-    if (tensor->type == GGML_TYPE_IFAIRY64) {
+    if (ggml_opencl_is_fairy2i_tile64_type(tensor->type)) {
         ggml_backend_opencl_context * backend_ctx = ggml_cl2_init(buffer_type->device);
         return ggml_opencl_ifairy64_alloc_size(tensor, backend_ctx->alignment);
     }
@@ -9667,36 +9710,42 @@ static bool ggml_cl_compute_forward_ifairy(ggml_backend_t backend, ggml_tensor *
 
     switch (tensor->op) {
         case GGML_OP_IFAIRY_ADD:
+        case GGML_OP_COMPLEX_ADD:
             if (!ggml_opencl_can_ifairy_add(tensor)) {
                 return false;
             }
             ggml_cl_ifairy_add(backend, src0, src1, tensor);
             return true;
         case GGML_OP_IFAIRY_MERGE:
+        case GGML_OP_COMPLEX_MERGE:
             if (!ggml_opencl_can_ifairy_merge(tensor)) {
                 return false;
             }
             ggml_cl_ifairy_merge(backend, src0, src1, tensor);
             return true;
         case GGML_OP_IFAIRY_MUL:
+        case GGML_OP_COMPLEX_MUL:
             if (!ggml_opencl_can_ifairy_mul(tensor)) {
                 return false;
             }
             ggml_cl_ifairy_mul(backend, src0, src1, tensor);
             return true;
         case GGML_OP_IFAIRY_RMSNORM:
+        case GGML_OP_COMPLEX_RMSNORM:
             if (!ggml_opencl_can_ifairy_rmsnorm(tensor)) {
                 return false;
             }
             ggml_cl_ifairy_rms_norm(backend, src0, src1, tensor);
             return true;
         case GGML_OP_IFAIRY_ROPE:
+        case GGML_OP_COMPLEX_ROPE:
             if (!ggml_opencl_can_ifairy_rope(tensor)) {
                 return false;
             }
             ggml_cl_ifairy_rope(backend, src0, src1, tensor);
             return true;
         case GGML_OP_IFAIRY_SPLIT:
+        case GGML_OP_COMPLEX_SPLIT:
             if (!ggml_opencl_can_ifairy_split(tensor)) {
                 return false;
             }
