@@ -1,6 +1,7 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-backend.h"
 #include "ggml-common.h"
+#include "ggml-fairy2i-lut.h"
 #include "ggml-ifairy-lut-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
@@ -342,6 +343,7 @@ bool ggml_ifairy_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_t
         case GGML_TYPE_IFAIRY:
             return ggml_ifairy_lut_transform_tensor_ifairy(tensor, index_tensor_out);
         case GGML_TYPE_IFAIRY64:
+        case GGML_TYPE_FAIRY2I_TILE64_V2:
             return ggml_ifairy_lut_transform_tensor_ifairy64(tensor, index_tensor_out);
         default:
             if (index_tensor_out) {
@@ -349,4 +351,16 @@ bool ggml_ifairy_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_t
             }
             return false;
     }
+}
+
+void ggml_fairy2i_lut_init(void) {
+    ggml_ifairy_lut_init();
+}
+
+void ggml_fairy2i_lut_free(void) {
+    ggml_ifairy_lut_free();
+}
+
+bool ggml_fairy2i_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_tensor ** index_tensor_out) {
+    return ggml_ifairy_lut_transform_tensor(tensor, index_tensor_out);
 }

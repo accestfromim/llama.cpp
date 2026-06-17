@@ -19,7 +19,7 @@
 #include "ggml.h"
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
 #    include "ggml-ifairy-lut-impl.h"
-#    include "ggml-ifairy-lut.h"
+#    include "ggml-fairy2i-lut.h"
 #endif
 
 // debug helper: last node being computed (for crash diagnostics)
@@ -726,7 +726,7 @@ static enum ggml_fairy2i_lut_impl ggml_fairy2i_lut_impl_from_env(const char * en
 static void ggml_fairy2i_lut_threadpool_config_update(struct ggml_threadpool * threadpool) {
     struct ggml_fairy2i_lut_threadpool_config cfg;
 
-    cfg.dbg = ggml_ifairy_env_enabled("GGML_FAIRY2I_LUT_DEBUG");
+    cfg.dbg = ggml_fairy2i_env_enabled("GGML_FAIRY2I_LUT_DEBUG");
 
     const char * enabled_env = getenv("GGML_FAIRY2I_LUT");
     cfg.lut_enabled          = !(enabled_env && strcmp(enabled_env, "0") == 0);
@@ -782,7 +782,7 @@ static void ggml_fairy2i_lut_prepare_cgraph_indexes(const struct ggml_cgraph *  
                 struct ggml_tensor * weight = node->src[src];
                 const struct ifairy_lut_extra * extra = weight ? (const struct ifairy_lut_extra *) weight->extra : NULL;
                 if (weight && (!extra || !extra->packed_w)) {
-                    ggml_ifairy_lut_transform_tensor(weight, NULL);
+                    ggml_fairy2i_lut_transform_tensor(weight, NULL);
                 }
             }
             continue;
@@ -803,7 +803,7 @@ static void ggml_fairy2i_lut_prepare_cgraph_indexes(const struct ggml_cgraph *  
         if (!ggml_fairy2i_lut_get_runtime_shape(src0, src1, node, &shape)) {
             continue;
         }
-        if (!ggml_ifairy_lut_can_mul_mat(src0, src1, node)) {
+        if (!ggml_fairy2i_lut_can_mul_mat(src0, src1, node)) {
             continue;
         }
 
@@ -812,7 +812,7 @@ static void ggml_fairy2i_lut_prepare_cgraph_indexes(const struct ggml_cgraph *  
             continue;
         }
 
-        ggml_ifairy_lut_transform_tensor(src0, NULL);
+        ggml_fairy2i_lut_transform_tensor(src0, NULL);
     }
 }
 #endif
@@ -1491,13 +1491,13 @@ void ggml_compute_forward_mul_mat(
     struct ggml_fairy2i_lut_runtime_shape lut_shape;
     const bool fairy2i_lut_weight = src0->type == GGML_TYPE_FAIRY2I_TILE64_V2;
     const bool lut_config_enabled = fairy2i_lut_weight ? cfg->lut_enabled : true;
-    if (lut_config_enabled && ggml_ifairy_lut_can_mul_mat(src0, src1, dst) &&
+    if (lut_config_enabled && ggml_fairy2i_lut_can_mul_mat(src0, src1, dst) &&
         ggml_fairy2i_lut_get_runtime_shape(src0, src1, dst, &lut_shape)) {
         enum ggml_fairy2i_lut_impl impl       = fairy2i_lut_weight
                                                     ? cfg->impl
                                                     : ggml_fairy2i_lut_impl_from_env(
                                                           "GGML_IFAIRY_LUT_IMPL",
-                                                          ggml_ifairy_env_enabled("GGML_IFAIRY_LUT_DEBUG"),
+                                                          ggml_fairy2i_env_enabled("GGML_IFAIRY_LUT_DEBUG"),
                                                           "ifairy_lut");
         const bool                 fairy2i_f32 = src1->type == GGML_TYPE_F32 && ggml_fairy2i_lut_is_weight_branch(src0);
         if (impl == GGML_FAIRY2I_LUT_IMPL_AUTO) {
@@ -1560,7 +1560,7 @@ void ggml_compute_forward_mul_mat(
         const size_t shared_bytes = GGML_PAD(lut_bytes + scale_bytes, 64);
         const size_t need         = quant_bytes + shared_bytes;
 
-        GGML_ASSERT(need == ggml_ifairy_lut_get_wsize(src0, src1, dst, nth));
+        GGML_ASSERT(need == ggml_fairy2i_lut_get_wsize(src0, src1, dst, nth));
 
         if (have_index && params->wdata && params->wsize >= need && shared_bytes > 0) {
             void (*preprocess)(int, int, int, const void *, size_t, void *, void *, int, int) = NULL;

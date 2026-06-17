@@ -4,7 +4,7 @@
 #include "ggml-backend.h"
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-#    include "ggml-ifairy-lut.h"
+#    include "ggml-fairy2i-lut.h"
 #endif
 
 namespace ggml::cpu {
@@ -28,8 +28,8 @@ bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct 
 
 bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size_t * size) {
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-    if (op->op == GGML_OP_MUL_MAT && ggml_ifairy_lut_can_mul_mat(op->src[0], op->src[1], op)) {
-        *size = ggml_ifairy_lut_get_wsize(op->src[0], op->src[1], op, n_threads);
+    if (op->op == GGML_OP_MUL_MAT && ggml_fairy2i_lut_can_mul_mat(op->src[0], op->src[1], op)) {
+        *size = ggml_fairy2i_lut_get_wsize(op->src[0], op->src[1], op, n_threads);
         return true;
     }
 #endif

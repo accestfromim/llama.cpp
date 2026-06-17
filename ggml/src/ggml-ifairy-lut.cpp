@@ -1,6 +1,7 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-backend.h"
 #include "ggml-common.h"
+#include "ggml-fairy2i-lut.h"
 #include "ggml-ifairy-lut-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
@@ -150,4 +151,17 @@ size_t ggml_ifairy_lut_get_wsize(const struct ggml_tensor * src0,
     const size_t shared_bytes = GGML_PAD(ggml_ifairy_checked_add_size(lut_bytes, scale_bytes), 64);
 
     return ggml_ifairy_checked_add_size(quant_bytes, shared_bytes);
+}
+
+bool ggml_fairy2i_lut_can_mul_mat(const struct ggml_tensor * src0,
+                                  const struct ggml_tensor * src1,
+                                  const struct ggml_tensor * dst) {
+    return ggml_ifairy_lut_can_mul_mat(src0, src1, dst);
+}
+
+size_t ggml_fairy2i_lut_get_wsize(const struct ggml_tensor * src0,
+                                  const struct ggml_tensor * src1,
+                                  const struct ggml_tensor * dst,
+                                  int                        n_threads) {
+    return ggml_ifairy_lut_get_wsize(src0, src1, dst, n_threads);
 }

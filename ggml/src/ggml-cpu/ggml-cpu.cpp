@@ -7,7 +7,7 @@
 #include "amx/amx.h"
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-#    include "ggml-ifairy-lut.h"
+#    include "ggml-fairy2i-lut.h"
 #endif
 
 #include <cctype>
@@ -112,7 +112,7 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-    ggml_ifairy_lut_free();
+    ggml_fairy2i_lut_free();
 #endif
     delete backend;
 }

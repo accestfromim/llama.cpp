@@ -216,6 +216,7 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             ${GGML_BASE_FAIRY2I_LUT_SOURCES}
+            ggml-fairy2i-lut.h
             ggml-ifairy-lut-impl.h
             gguf.cpp)
 
