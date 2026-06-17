@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-void ggml_ifairy64_lut_qgemm_pair_cpu(int          m,
+void ggml_fairy2i_tile64_lut_qgemm_pair_cpu(int          m,
                                       int          k,
                                       int          n,
                                       const void * packed_wtiles0,
@@ -15,7 +15,7 @@ void ggml_ifairy64_lut_qgemm_pair_cpu(int          m,
                                       size_t       dst_row_stride,
                                       bool         pack_bf16);
 
-bool ggml_ifairy64_lut_qgemm_four_cpu(int          m,
+bool ggml_fairy2i_tile64_lut_qgemm_four_cpu(int          m,
                                       int          k,
                                       int          n,
                                       const void * packed_u0,

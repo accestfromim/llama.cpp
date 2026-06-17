@@ -190,13 +190,22 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
-set(GGML_BASE_FAIRY2I_LUT_SOURCES)
-if (GGML_FAIRY2I_CPU_LUT OR GGML_LEGACY_IFAIRY_CPU_LUT)
-    list(APPEND GGML_BASE_FAIRY2I_LUT_SOURCES
+set(GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES)
+if (GGML_LEGACY_IFAIRY_CPU_LUT)
+    list(APPEND GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES
         ggml-ifairy-lut.cpp
         ggml-ifairy-lut-preprocess.cpp
         ggml-ifairy-lut-qgemm.cpp
         ggml-ifairy-lut-transform.cpp)
+endif()
+
+set(GGML_BASE_FAIRY2I_LUT_SOURCES)
+if (GGML_FAIRY2I_CPU_LUT)
+    list(APPEND GGML_BASE_FAIRY2I_LUT_SOURCES
+        ggml-fairy2i-lut.cpp
+        ggml-fairy2i-lut-preprocess.cpp
+        ggml-fairy2i-lut-qgemm.cpp
+        ggml-fairy2i-lut-transform.cpp)
 endif()
 
 add_library(ggml-base
@@ -215,8 +224,10 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ${GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES}
             ${GGML_BASE_FAIRY2I_LUT_SOURCES}
             ggml-fairy2i-lut.h
+            ggml-fairy2i-lut-impl.h
             ggml-ifairy-lut-impl.h
             gguf.cpp)
 
@@ -237,7 +248,9 @@ if (GGML_LEGACY_IFAIRY_CPU_LUT)
     target_compile_definitions(ggml-base PUBLIC GGML_USE_LEGACY_IFAIRY_CPU_LUT)
 endif()
 
-if ((GGML_FAIRY2I_CPU_LUT OR GGML_LEGACY_IFAIRY_CPU_LUT) AND GGML_SYSTEM_ARCH STREQUAL "x86")
+set(GGML_BASE_LUT_SOURCES ${GGML_BASE_LEGACY_IFAIRY_LUT_SOURCES} ${GGML_BASE_FAIRY2I_LUT_SOURCES})
+
+if (GGML_BASE_LUT_SOURCES AND GGML_SYSTEM_ARCH STREQUAL "x86")
     set(GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS "")
 
     if (MSVC)
@@ -300,7 +313,7 @@ if ((GGML_FAIRY2I_CPU_LUT OR GGML_LEGACY_IFAIRY_CPU_LUT) AND GGML_SYSTEM_ARCH ST
     endif()
 
     if (GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS)
-        set_source_files_properties(${GGML_BASE_FAIRY2I_LUT_SOURCES} PROPERTIES COMPILE_OPTIONS "${GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS}")
+        set_source_files_properties(${GGML_BASE_LUT_SOURCES} PROPERTIES COMPILE_OPTIONS "${GGML_BASE_FAIRY2I_LUT_ARCH_FLAGS}")
     endif()
 endif()
 

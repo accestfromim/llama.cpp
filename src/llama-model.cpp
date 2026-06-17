@@ -6305,7 +6305,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
 
-                const ifairy_lut_extra * extra = (const ifairy_lut_extra *) cur->extra;
+                const fairy2i_lut_extra * extra = (const fairy2i_lut_extra *) cur->extra;
                 if (extra && extra->packed_w) {
                     continue;
                 }

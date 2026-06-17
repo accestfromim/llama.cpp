@@ -1,8 +1,8 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-backend.h"
 #include "ggml-common.h"
-#include "ggml-ifairy-lut.h"
-#include "ggml-ifairy-lut-impl.h"
+#include "ggml-fairy2i-lut.h"
+#include "ggml-fairy2i-lut-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 
@@ -20,26 +20,26 @@
 #include <unordered_map>
 #include <vector>
 
-static_assert(QK_IFAIRY == 256, "lut packing assumes QK_IFAIRY=256");
-static_assert(QK_IFAIRY64 == 64, "lut packing assumes QK_IFAIRY64=64");
+static_assert(QK_FAIRY2I == 64, "lut packing assumes QK_FAIRY2I=64");
+static_assert(QK_FAIRY2I_TILE64 == 64, "lut packing assumes QK_FAIRY2I_TILE64=64");
 
-static std::vector<ifairy_lut_extra *> g_ifairy_lut_extras;
-static std::mutex                      g_ifairy_lut_mutex;
+static std::vector<fairy2i_lut_extra *> g_fairy2i_lut_extras;
+static std::mutex                      g_fairy2i_lut_mutex;
 
-struct ifairy_lut_index_cache_key {
+struct fairy2i_lut_index_cache_key {
     const void * data;
     size_t       nbytes;
     int64_t      k;
     int64_t      rows;
     enum ggml_type type;
 
-    bool operator==(const ifairy_lut_index_cache_key & other) const noexcept {
+    bool operator==(const fairy2i_lut_index_cache_key & other) const noexcept {
         return data == other.data && nbytes == other.nbytes && k == other.k && rows == other.rows && type == other.type;
     }
 };
 
-struct ifairy_lut_index_cache_key_hash {
-    size_t operator()(const ifairy_lut_index_cache_key & key) const noexcept {
+struct fairy2i_lut_index_cache_key_hash {
+    size_t operator()(const fairy2i_lut_index_cache_key & key) const noexcept {
         size_t h = std::hash<uintptr_t>{}((uintptr_t) key.data);
         h ^= std::hash<size_t>{}(key.nbytes) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         h ^= std::hash<int64_t>{}(key.k) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
@@ -49,35 +49,35 @@ struct ifairy_lut_index_cache_key_hash {
     }
 };
 
-struct ifairy_lut_index_cache_entry {
+struct fairy2i_lut_index_cache_entry {
     ggml_backend_buffer_t buffer = nullptr;
     uint8_t *             base   = nullptr;
     size_t                size   = 0;  // total buffer bytes
 };
 
-static std::unordered_map<ifairy_lut_index_cache_key, ifairy_lut_index_cache_entry, ifairy_lut_index_cache_key_hash>
-    g_ifairy_lut_index_cache;
+static std::unordered_map<fairy2i_lut_index_cache_key, fairy2i_lut_index_cache_entry, fairy2i_lut_index_cache_key_hash>
+    g_fairy2i_lut_index_cache;
 
-// iFairy 2-weight LUT implementation (CPU backend).
-// Integrated into ggml mul_mat routing under GGML_IFAIRY_LUT_CPU.
+// Fairy2i tile64_v2 LUT implementation (CPU backend).
+// Integrated into ggml mul_mat routing under GGML_FAIRY2I_CPU_LUT.
 
-void ggml_ifairy_lut_init(void) {
+void ggml_fairy2i_lut_init(void) {
     // No global initialization needed yet.
 }
 
-void ggml_ifairy_lut_free(void) {
+void ggml_fairy2i_lut_free(void) {
     // free any extras allocated by transform_tensor
-    std::lock_guard<std::mutex> lock(g_ifairy_lut_mutex);
-    for (auto & it : g_ifairy_lut_index_cache) {
+    std::lock_guard<std::mutex> lock(g_fairy2i_lut_mutex);
+    for (auto & it : g_fairy2i_lut_index_cache) {
         if (it.second.buffer) {
             ggml_backend_buffer_free(it.second.buffer);
         }
     }
-    g_ifairy_lut_index_cache.clear();
-    for (auto * e : g_ifairy_lut_extras) {
+    g_fairy2i_lut_index_cache.clear();
+    for (auto * e : g_fairy2i_lut_extras) {
         if (e) {
             if ((e->indexes || e->packed_w) && e->index_tensor == NULL && e->index_buffer == NULL) {
-                const size_t index_bytes_aligned = GGML_PAD(e->size, GGML_IFAIRY_LUT_WTILE_ALIGNMENT);
+                const size_t index_bytes_aligned = GGML_PAD(e->size, GGML_FAIRY2I_LUT_WTILE_ALIGNMENT);
                 const size_t total_bytes         = index_bytes_aligned + e->packed_w_size;
                 uint8_t *     base              = e->indexes ? e->indexes : (uint8_t *) e->packed_w;
                 ggml_aligned_free(base, total_bytes);
@@ -93,13 +93,13 @@ void ggml_ifairy_lut_free(void) {
 }
 
 template <typename block_type, typename wtile_type>
-static bool ggml_ifairy_lut_transform_tensor_impl(
+static bool ggml_fairy2i_lut_transform_tensor_impl(
     struct ggml_tensor * tensor,
     struct ggml_tensor ** index_tensor_out,
     int64_t               block_k,
     int64_t               groups_per_block,
-    struct ggml_ifairy_2w_index_info (*get_index_info)(int64_t),
-    size_t (*get_index_buffer_size)(const struct ggml_ifairy_2w_index_info *, int64_t),
+    struct ggml_fairy2i_2w_index_info (*get_index_info)(int64_t),
+    size_t (*get_index_buffer_size)(const struct ggml_fairy2i_2w_index_info *, int64_t),
     bool (*encode)(const block_type * GGML_RESTRICT, int64_t, int64_t, uint8_t * GGML_RESTRICT, size_t)) {
     if (!tensor) {
         if (index_tensor_out) {
@@ -108,10 +108,10 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
         return false;
     }
 
-    const bool dbg = ggml_ifairy_env_enabled("GGML_IFAIRY_LUT_DEBUG");
-    const bool keep_indexes = !std::is_same_v<block_type, block_ifairy64>;
+    const bool dbg = ggml_fairy2i_env_enabled("GGML_FAIRY2I_LUT_DEBUG");
+    const bool keep_indexes = !std::is_same_v<block_type, block_fairy2i_tile64_v2>;
 
-    ifairy_lut_extra * extra = (ifairy_lut_extra *) tensor->extra;
+    fairy2i_lut_extra * extra = (fairy2i_lut_extra *) tensor->extra;
     if (extra && extra->packed_w) {
         if (index_tensor_out) {
             *index_tensor_out = NULL;
@@ -123,23 +123,23 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
     const int64_t rows = tensor->ne[1];
     if (k % block_k != 0 || rows <= 0) {
         if (dbg) {
-            GGML_LOG_WARN("ifairy_lut: transform_tensor: invalid shape type=%s k=%lld rows=%lld block_k=%lld\n",
+            GGML_LOG_WARN("fairy2i_lut: transform_tensor: invalid shape type=%s k=%lld rows=%lld block_k=%lld\n",
                           ggml_type_name(tensor->type), (long long) k, (long long) rows, (long long) block_k);
         }
         return false;
     }
 
-    const struct ggml_ifairy_2w_index_info info        = get_index_info(k);
+    const struct ggml_fairy2i_2w_index_info info        = get_index_info(k);
     const size_t                           index_bytes = get_index_buffer_size(&info, rows);
     if (index_bytes == 0) {
         if (dbg) {
-            GGML_LOG_WARN("ifairy_lut: transform_tensor: index_bytes==0 (k=%lld rows=%lld)\n", (long long) k,
+            GGML_LOG_WARN("fairy2i_lut: transform_tensor: index_bytes==0 (k=%lld rows=%lld)\n", (long long) k,
                           (long long) rows);
         }
         return false;
     }
 
-    const ifairy_lut_index_cache_key key = {
+    const fairy2i_lut_index_cache_key key = {
         /* .data   = */ tensor->data,
         /* .nbytes = */ ggml_nbytes(tensor),
         /* .k      = */ k,
@@ -153,12 +153,12 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
 
     // Layout within a single cached buffer:
     //   [indexes (padded to tile alignment)] [packed_wtiles]
-    const size_t index_bytes_aligned = keep_indexes ? GGML_PAD(index_bytes, GGML_IFAIRY_LUT_WTILE_ALIGNMENT) : 0;
+    const size_t index_bytes_aligned = keep_indexes ? GGML_PAD(index_bytes, GGML_FAIRY2I_LUT_WTILE_ALIGNMENT) : 0;
     const size_t total_bytes         = index_bytes_aligned + packed_bytes;
 
     {
-        std::lock_guard<std::mutex> lock(g_ifairy_lut_mutex);
-        extra = (ifairy_lut_extra *) tensor->extra;
+        std::lock_guard<std::mutex> lock(g_fairy2i_lut_mutex);
+        extra = (fairy2i_lut_extra *) tensor->extra;
         if (extra && extra->packed_w) {
             if (index_tensor_out) {
                 *index_tensor_out = NULL;
@@ -166,12 +166,12 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
             return true;
         }
 
-        const auto it = g_ifairy_lut_index_cache.find(key);
-        if (it != g_ifairy_lut_index_cache.end() && it->second.base && it->second.size == total_bytes) {
+        const auto it = g_fairy2i_lut_index_cache.find(key);
+        if (it != g_fairy2i_lut_index_cache.end() && it->second.base && it->second.size == total_bytes) {
             if (!extra) {
-                extra         = new ifairy_lut_extra;
+                extra         = new fairy2i_lut_extra;
                 tensor->extra = extra;
-                g_ifairy_lut_extras.push_back(extra);
+                g_fairy2i_lut_extras.push_back(extra);
             }
 
             extra->indexes       = keep_indexes ? it->second.base : NULL;
@@ -203,7 +203,7 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
         buf = (uint8_t *) ggml_aligned_malloc(total_bytes);
         if (!buf) {
             if (dbg) {
-                GGML_LOG_WARN("ifairy_lut: transform_tensor: allocation failed (bytes=%zu)\n", total_bytes);
+                GGML_LOG_WARN("fairy2i_lut: transform_tensor: allocation failed (bytes=%zu)\n", total_bytes);
             }
             return false;
         }
@@ -223,7 +223,7 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
     const bool ok = encode((const block_type *) tensor->data, k, rows, indexes, index_bytes);
     if (!ok) {
         if (dbg) {
-            GGML_LOG_WARN("ifairy_lut: transform_tensor: encode failed type=%s (bytes=%zu)\n",
+            GGML_LOG_WARN("fairy2i_lut: transform_tensor: encode failed type=%s (bytes=%zu)\n",
                           ggml_type_name(tensor->type), index_bytes);
         }
         if (index_buffer) {
@@ -247,7 +247,7 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
             wtile_type * t = packed_w + (size_t) tile * (size_t) blocks_per_row + (size_t) blk;
 
             const block_type * wb = w_blocks + (size_t) row * (size_t) blocks_per_row + (size_t) blk;
-            if constexpr (std::is_same_v<wtile_type, ifairy64_lut_wtile_16>) {
+            if constexpr (std::is_same_v<wtile_type, fairy2i_tile64_lut_wtile_16>) {
                 t->d_real[lane] = wb->d_real;
                 t->d_imag[lane] = wb->d_imag;
             } else {
@@ -265,8 +265,8 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
     }
 
     {
-        std::lock_guard<std::mutex> lock(g_ifairy_lut_mutex);
-        extra = (ifairy_lut_extra *) tensor->extra;
+        std::lock_guard<std::mutex> lock(g_fairy2i_lut_mutex);
+        extra = (fairy2i_lut_extra *) tensor->extra;
         if (extra && extra->packed_w) {
             // Another thread finished while we were encoding; discard our buffer.
             if (index_buffer) {
@@ -280,8 +280,8 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
             return true;
         }
 
-        const auto it = g_ifairy_lut_index_cache.find(key);
-        if (it != g_ifairy_lut_index_cache.end() && it->second.base && it->second.size == total_bytes) {
+        const auto it = g_fairy2i_lut_index_cache.find(key);
+        if (it != g_fairy2i_lut_index_cache.end() && it->second.base && it->second.size == total_bytes) {
             // Another thread populated the cache meanwhile; reuse it and free ours.
             if (index_buffer) {
                 ggml_backend_buffer_free(index_buffer);
@@ -291,7 +291,7 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
             index_buffer = it->second.buffer;
             buf          = it->second.base;
         } else if (index_buffer) {
-            g_ifairy_lut_index_cache.emplace(key, ifairy_lut_index_cache_entry{
+            g_fairy2i_lut_index_cache.emplace(key, fairy2i_lut_index_cache_entry{
                                                       /* .buffer = */ index_buffer,
                                                       /* .base   = */ buf,
                                                       /* .size   = */ total_bytes,
@@ -299,9 +299,9 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
         }
 
         if (!extra) {
-            extra         = new ifairy_lut_extra;
+            extra         = new fairy2i_lut_extra;
             tensor->extra = extra;
-            g_ifairy_lut_extras.push_back(extra);
+            g_fairy2i_lut_extras.push_back(extra);
         }
 
         extra->indexes       = keep_indexes ? buf : NULL;
@@ -318,20 +318,15 @@ static bool ggml_ifairy_lut_transform_tensor_impl(
     return true;
 }
 
-static bool ggml_ifairy_lut_transform_tensor_ifairy(struct ggml_tensor * tensor, struct ggml_tensor ** index_tensor_out) {
-    return ggml_ifairy_lut_transform_tensor_impl<block_ifairy, ifairy_lut_wtile_16>(
-        tensor, index_tensor_out, QK_IFAIRY, QK_IFAIRY_GROUPS_PER_BLOCK, ggml_ifairy_2w_get_index_info,
-        ggml_ifairy_2w_index_buffer_size, ggml_ifairy_2w_encode);
+static bool ggml_fairy2i_lut_transform_tensor_fairy2i_tile64(struct ggml_tensor * tensor,
+                                                             struct ggml_tensor ** index_tensor_out) {
+    return ggml_fairy2i_lut_transform_tensor_impl<block_fairy2i_tile64_v2, fairy2i_tile64_lut_wtile_16>(
+        tensor, index_tensor_out, QK_FAIRY2I_TILE64, QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK,
+        ggml_fairy2i_tile64_2w_get_index_info,
+        ggml_fairy2i_tile64_2w_index_buffer_size, ggml_fairy2i_tile64_2w_encode);
 }
 
-static bool ggml_ifairy_lut_transform_tensor_ifairy64(struct ggml_tensor * tensor,
-                                                      struct ggml_tensor ** index_tensor_out) {
-    return ggml_ifairy_lut_transform_tensor_impl<block_ifairy64, ifairy64_lut_wtile_16>(
-        tensor, index_tensor_out, QK_IFAIRY64, QK_IFAIRY64_GROUPS_PER_BLOCK, ggml_ifairy64_2w_get_index_info,
-        ggml_ifairy64_2w_index_buffer_size, ggml_ifairy64_2w_encode);
-}
-
-bool ggml_ifairy_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_tensor ** index_tensor_out) {
+bool ggml_fairy2i_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_tensor ** index_tensor_out) {
     if (!tensor) {
         if (index_tensor_out) {
             *index_tensor_out = NULL;
@@ -340,10 +335,8 @@ bool ggml_ifairy_lut_transform_tensor(struct ggml_tensor * tensor, struct ggml_t
     }
 
     switch (tensor->type) {
-        case GGML_TYPE_IFAIRY:
-            return ggml_ifairy_lut_transform_tensor_ifairy(tensor, index_tensor_out);
-        case GGML_TYPE_IFAIRY64:
-            return ggml_ifairy_lut_transform_tensor_ifairy64(tensor, index_tensor_out);
+        case GGML_TYPE_FAIRY2I_TILE64_V2:
+            return ggml_fairy2i_lut_transform_tensor_fairy2i_tile64(tensor, index_tensor_out);
         default:
             if (index_tensor_out) {
                 *index_tensor_out = NULL;

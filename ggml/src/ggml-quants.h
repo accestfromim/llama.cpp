@@ -131,6 +131,11 @@ struct ggml_ifairy_2w_index_info {
     int64_t groups_per_row;  // 每行双权重组数量
 };
 
+struct ggml_fairy2i_2w_index_info {
+    int64_t k;
+    int64_t groups_per_row;
+};
+
 GGML_API struct ggml_ifairy_2w_index_info ggml_ifairy_2w_get_index_info(int64_t k);
 GGML_API size_t ggml_ifairy_2w_index_buffer_size(const struct ggml_ifairy_2w_index_info * info, int64_t rows);
 GGML_API size_t ggml_ifairy_2w_index_buffer_size_aligned64(const struct ggml_ifairy_2w_index_info * info, int64_t rows);
@@ -146,6 +151,14 @@ GGML_API bool   ggml_ifairy64_2w_encode(const block_ifairy64 * GGML_RESTRICT wei
                                         int64_t                              rows,
                                         uint8_t * GGML_RESTRICT              dst,
                                         size_t                               dst_size);
+GGML_API struct ggml_fairy2i_2w_index_info ggml_fairy2i_tile64_2w_get_index_info(int64_t k);
+GGML_API size_t ggml_fairy2i_tile64_2w_index_buffer_size(const struct ggml_fairy2i_2w_index_info * info,
+                                                         int64_t                                    rows);
+GGML_API bool   ggml_fairy2i_tile64_2w_encode(const block_fairy2i_tile64_v2 * GGML_RESTRICT weights,
+                                              int64_t                                        k,
+                                              int64_t                                        rows,
+                                              uint8_t * GGML_RESTRICT                        dst,
+                                              size_t                                         dst_size);
 
 GGML_API size_t quantize_tq2_1(const float * GGML_RESTRICT src,
                                void * GGML_RESTRICT        dst,

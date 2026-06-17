@@ -2439,6 +2439,84 @@ bool ggml_ifairy64_2w_encode(const block_ifairy64 * GGML_RESTRICT weights,
     return true;
 }
 
+static inline uint8_t ggml_fairy2i_tile64_read_code(const block_fairy2i_tile64_v2 * row_blocks, int64_t idx) {
+    const int64_t block_idx    = idx / QK_FAIRY2I_TILE64;
+    const int64_t idx_in_block = idx - block_idx * QK_FAIRY2I_TILE64;
+    const int     lane         = (int) (idx_in_block & 0x0f);
+    const int     part         = (int) (idx_in_block >> 4);
+    const uint8_t packed       = row_blocks[block_idx].qs[lane];
+    return (packed >> (2 * part)) & 0x3;
+}
+
+struct ggml_fairy2i_2w_index_info ggml_fairy2i_tile64_2w_get_index_info(int64_t k) {
+    GGML_ASSERT(k > 0);
+    GGML_ASSERT(k % QK_FAIRY2I_TILE64 == 0);
+
+    const int64_t blocks           = k / QK_FAIRY2I_TILE64;
+    const int64_t groups_per_block = QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+
+    struct ggml_fairy2i_2w_index_info info = {
+        /*.k              =*/k,
+        /*.groups_per_row =*/blocks * groups_per_block,
+    };
+
+    return info;
+}
+
+size_t ggml_fairy2i_tile64_2w_index_buffer_size(const struct ggml_fairy2i_2w_index_info * info, int64_t rows) {
+    GGML_ASSERT(info != NULL);
+    GGML_ASSERT(rows > 0);
+
+    const size_t groups = (size_t) info->groups_per_row;
+    const size_t n_rows = (size_t) rows;
+
+    GGML_ASSERT(groups <= SIZE_MAX / n_rows);
+
+    return groups * n_rows;
+}
+
+bool ggml_fairy2i_tile64_2w_encode(const block_fairy2i_tile64_v2 * GGML_RESTRICT weights,
+                                   int64_t                                        k,
+                                   int64_t                                        rows,
+                                   uint8_t * GGML_RESTRICT                        dst,
+                                   size_t                                         dst_size) {
+    GGML_ASSERT(weights != NULL);
+    GGML_ASSERT(dst != NULL);
+    GGML_ASSERT(k > 0);
+    GGML_ASSERT(rows > 0);
+    GGML_ASSERT(k % QK_FAIRY2I_TILE64 == 0);
+
+    const struct ggml_fairy2i_2w_index_info info     = ggml_fairy2i_tile64_2w_get_index_info(k);
+    const size_t                            required = ggml_fairy2i_tile64_2w_index_buffer_size(&info, rows);
+    if (dst_size < required) {
+        return false;
+    }
+
+    const int64_t blocks_per_row   = k / QK_FAIRY2I_TILE64;
+    const int64_t groups_per_block = QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    for (int64_t row = 0; row < rows; ++row) {
+        const block_fairy2i_tile64_v2 * row_blocks = weights + row * blocks_per_row;
+        uint8_t *                       row_dst    = dst + row * info.groups_per_row;
+
+        for (int64_t g = 0; g < info.groups_per_row; ++g) {
+            const int64_t blk   = g / groups_per_block;
+            const int64_t intra = g - blk * groups_per_block;
+            const int64_t base  = blk * QK_FAIRY2I_TILE64 + intra * 2;
+
+            const uint8_t c0 = base     < k ? ggml_fairy2i_tile64_read_code(row_blocks, base)     : 0;
+            const uint8_t c1 = base + 1 < k ? ggml_fairy2i_tile64_read_code(row_blocks, base + 1) : 0;
+
+            row_dst[g] = ggml_ifairy_pack_pair_direct(c0, c1);
+        }
+    }
+
+    if (dst_size > required) {
+        memset(dst + required, 0, dst_size - required);
+    }
+
+    return true;
+}
+
 void quantize_row_ifairy_ref(const float * GGML_RESTRICT  x_real,
                              const float * GGML_RESTRICT  x_imag,
                              block_ifairy * GGML_RESTRICT y,

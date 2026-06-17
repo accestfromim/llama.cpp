@@ -81,9 +81,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (GGML_FAIRY2I_CPU_LUT)
         list(APPEND GGML_CPU_SOURCES
-            ggml-cpu/ifairy-fuse-lut.cpp
-            ggml-cpu/ifairy-fuse-lut-qgemm.cpp
-            ggml-cpu/ifairy-fuse-lut-qgemm.h)
+            ggml-cpu/fairy2i/wide-linear-lut.cpp
+            ggml-cpu/fairy2i/lut-qgemm.cpp
+            ggml-cpu/fairy2i/lut-qgemm.h)
     endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
