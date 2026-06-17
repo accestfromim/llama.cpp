@@ -3448,8 +3448,72 @@ static bool ggml_opencl_can_fuse_ifairy_rmsnorm_mul(const struct ggml_cgraph * c
     return ggml_can_repeat(weight, rms_norm);
 }
 
-static bool ggml_opencl_ifairy64_kernel_ready(const struct ggml_tensor * op) {
+enum ggml_opencl_reject_reason {
+    GGML_OPENCL_REJECT_NONE,
+    GGML_OPENCL_REJECT_COMPILE_DISABLED,
+    GGML_OPENCL_REJECT_RUNTIME_DISABLED,
+    GGML_OPENCL_REJECT_UNSUPPORTED_OP,
+    GGML_OPENCL_REJECT_UNSUPPORTED_SHAPE,
+};
+
+static void ggml_opencl_set_reject_reason(enum ggml_opencl_reject_reason * reason, enum ggml_opencl_reject_reason value) {
+    if (reason != nullptr) {
+        *reason = value;
+    }
+}
+
+static bool ggml_opencl_is_fairy2i_op(const struct ggml_tensor * op) {
     switch (op->op) {
+        case GGML_OP_COMPLEX_ADD:
+        case GGML_OP_COMPLEX_MERGE:
+        case GGML_OP_COMPLEX_MUL:
+        case GGML_OP_COMPLEX_RMSNORM:
+        case GGML_OP_COMPLEX_ROPE:
+        case GGML_OP_COMPLEX_SPLIT:
+            return true;
+        case GGML_OP_UNARY:
+            return ggml_get_unary_op(op) == GGML_UNARY_OP_COMPLEX_RELU2;
+        case GGML_OP_MUL_MAT:
+            return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_opencl_is_legacy_ifairy_op(const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_IFAIRY_ADD:
+        case GGML_OP_IFAIRY_MERGE:
+        case GGML_OP_IFAIRY_MUL:
+        case GGML_OP_IFAIRY_RMSNORM:
+        case GGML_OP_IFAIRY_ROPE:
+        case GGML_OP_IFAIRY_SPLIT:
+            return true;
+        case GGML_OP_UNARY:
+            return ggml_get_unary_op(op) == GGML_UNARY_OP_IFAIRY_RELU2;
+        case GGML_OP_MUL_MAT:
+            return op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_IFAIRY64;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_opencl_fairy2i_kernel_ready(const struct ggml_tensor * op) {
+    switch (op->op) {
+        case GGML_OP_COMPLEX_ADD:
+            return ggml_opencl_can_ifairy_add(op);
+        case GGML_OP_COMPLEX_MERGE:
+            return ggml_opencl_can_ifairy_merge(op);
+        case GGML_OP_COMPLEX_MUL:
+            return ggml_opencl_can_ifairy_mul(op);
+        case GGML_OP_COMPLEX_RMSNORM:
+            return ggml_opencl_can_ifairy_rmsnorm(op);
+        case GGML_OP_COMPLEX_ROPE:
+            return ggml_opencl_can_ifairy_rope(op);
+        case GGML_OP_COMPLEX_SPLIT:
+            return ggml_opencl_can_ifairy_split(op);
+        case GGML_OP_UNARY:
+            return ggml_opencl_can_ifairy_relu2(op);
         case GGML_OP_MUL_MAT:
             return ggml_opencl_can_ifairy64_mul_mat(op);
         default:
@@ -3457,71 +3521,85 @@ static bool ggml_opencl_ifairy64_kernel_ready(const struct ggml_tensor * op) {
     }
 }
 
-static bool ggml_opencl_ifairy_complex_kernel_ready(const struct ggml_tensor * op) {
+static bool ggml_opencl_legacy_ifairy_kernel_ready(const struct ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_IFAIRY_ADD:
-        case GGML_OP_COMPLEX_ADD:
             return ggml_opencl_can_ifairy_add(op);
         case GGML_OP_IFAIRY_MERGE:
-        case GGML_OP_COMPLEX_MERGE:
             return ggml_opencl_can_ifairy_merge(op);
         case GGML_OP_IFAIRY_MUL:
-        case GGML_OP_COMPLEX_MUL:
             return ggml_opencl_can_ifairy_mul(op);
         case GGML_OP_IFAIRY_RMSNORM:
-        case GGML_OP_COMPLEX_RMSNORM:
             return ggml_opencl_can_ifairy_rmsnorm(op);
         case GGML_OP_IFAIRY_ROPE:
-        case GGML_OP_COMPLEX_ROPE:
             return ggml_opencl_can_ifairy_rope(op);
         case GGML_OP_IFAIRY_SPLIT:
-        case GGML_OP_COMPLEX_SPLIT:
             return ggml_opencl_can_ifairy_split(op);
         case GGML_OP_UNARY:
             return ggml_opencl_can_ifairy_relu2(op);
+        case GGML_OP_MUL_MAT:
+            return ggml_opencl_can_ifairy64_mul_mat(op);
         default:
             return false;
     }
 }
 
-static bool ggml_opencl_supports_ifairy_op(const struct ggml_tensor * op) {
-    const bool fairy2i_op = op->op == GGML_OP_COMPLEX_ADD || op->op == GGML_OP_COMPLEX_MERGE ||
-                            op->op == GGML_OP_COMPLEX_MUL || op->op == GGML_OP_COMPLEX_RMSNORM ||
-                            op->op == GGML_OP_COMPLEX_ROPE || op->op == GGML_OP_COMPLEX_SPLIT ||
-                            (op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_COMPLEX_RELU2) ||
-                            (op->op == GGML_OP_MUL_MAT && op->src[0] != nullptr &&
-                             op->src[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2);
-    if (fairy2i_op) {
-        if (!ggml_opencl_fairy2i_enabled()) {
-            return false;
-        }
-    } else if (!ggml_opencl_legacy_ifairy_enabled()) {
+static bool ggml_opencl_fairy2i_supports(const struct ggml_tensor * op, enum ggml_opencl_reject_reason * reason) {
+    ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_NONE);
+#ifndef GGML_USE_FAIRY2I_OPENCL
+    GGML_UNUSED(op);
+    ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_COMPILE_DISABLED);
+    return false;
+#else
+    if (!ggml_opencl_fairy2i_enabled()) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_RUNTIME_DISABLED);
         return false;
     }
-
-    switch (op->op) {
-        case GGML_OP_IFAIRY_ADD:
-        case GGML_OP_COMPLEX_ADD:
-        case GGML_OP_IFAIRY_MERGE:
-        case GGML_OP_COMPLEX_MERGE:
-        case GGML_OP_IFAIRY_MUL:
-        case GGML_OP_COMPLEX_MUL:
-        case GGML_OP_IFAIRY_RMSNORM:
-        case GGML_OP_COMPLEX_RMSNORM:
-        case GGML_OP_IFAIRY_ROPE:
-        case GGML_OP_COMPLEX_ROPE:
-        case GGML_OP_IFAIRY_SPLIT:
-        case GGML_OP_COMPLEX_SPLIT:
-        case GGML_OP_UNARY:
-            return ggml_opencl_ifairy_complex_kernel_ready(op);
-        case GGML_OP_MUL_MAT:
-            if (!ggml_opencl_can_ifairy64_mul_mat(op)) {
-                return false;
-            }
-            return ggml_opencl_ifairy64_kernel_ready(op);
-        default:
-            return false;
+    if (!ggml_opencl_is_fairy2i_op(op)) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_UNSUPPORTED_OP);
+        return false;
     }
+    if (!ggml_opencl_fairy2i_kernel_ready(op)) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_UNSUPPORTED_SHAPE);
+        return false;
+    }
+    return true;
+#endif
+}
+
+static bool ggml_opencl_legacy_ifairy_supports(const struct ggml_tensor * op, enum ggml_opencl_reject_reason * reason) {
+    ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_NONE);
+#ifndef GGML_USE_LEGACY_IFAIRY_OPENCL
+    GGML_UNUSED(op);
+    ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_COMPILE_DISABLED);
+    return false;
+#else
+    if (!ggml_opencl_legacy_ifairy_enabled()) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_RUNTIME_DISABLED);
+        return false;
+    }
+    if (!ggml_opencl_is_legacy_ifairy_op(op)) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_UNSUPPORTED_OP);
+        return false;
+    }
+    if (!ggml_opencl_legacy_ifairy_kernel_ready(op)) {
+        ggml_opencl_set_reject_reason(reason, GGML_OPENCL_REJECT_UNSUPPORTED_SHAPE);
+        return false;
+    }
+    return true;
+#endif
+}
+
+static bool ggml_opencl_supports_ifairy_op(const struct ggml_tensor * op) {
+    enum ggml_opencl_reject_reason reason = GGML_OPENCL_REJECT_NONE;
+    if (ggml_opencl_is_fairy2i_op(op)) {
+        return ggml_opencl_fairy2i_supports(op, &reason);
+    }
+    if (ggml_opencl_is_legacy_ifairy_op(op)) {
+        return ggml_opencl_legacy_ifairy_supports(op, &reason);
+    }
+    ggml_opencl_set_reject_reason(&reason, GGML_OPENCL_REJECT_UNSUPPORTED_OP);
+    return false;
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
