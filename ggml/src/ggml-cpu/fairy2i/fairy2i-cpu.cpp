@@ -12,12 +12,22 @@
 
 static constexpr size_t GGML_FAIRY2I_CPU_CACHE_LINE = 64;
 
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
 enum ggml_fairy2i_lut_impl {
     GGML_FAIRY2I_LUT_IMPL_AUTO  = 0,
     GGML_FAIRY2I_LUT_IMPL_LUT16 = 1,
     GGML_FAIRY2I_LUT_IMPL_LUT_C = 2,
 };
+
+struct ggml_fairy2i_cpu_plan {
+    bool                       use_lut;
+    bool                       lut_c;
+    size_t                     q_bytes;
+    size_t                     lut_bytes;
+    size_t                     work_size;
+    enum ggml_fairy2i_lut_impl impl;
+};
+
+#ifdef GGML_USE_FAIRY2I_CPU_LUT
 
 struct ggml_fairy2i_lut_config {
     bool                      dbg;
@@ -57,6 +67,46 @@ static struct ggml_fairy2i_lut_config ggml_fairy2i_lut_config_from_env(void) {
 }
 #endif
 
+static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_tasks, struct ggml_fairy2i_cpu_plan * plan) {
+    GGML_UNUSED(n_tasks);
+
+    if (!plan) {
+        return false;
+    }
+
+    memset(plan, 0, sizeof(*plan));
+    plan->impl = GGML_FAIRY2I_LUT_IMPL_AUTO;
+
+    if (!ggml_fairy2i_cpu_supports_op(dst)) {
+        return false;
+    }
+
+    const struct ggml_tensor * x = dst->src[0];
+    GGML_ASSERT(x && x->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[0] % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2) == 0);
+
+    const size_t q_row_size = ggml_row_size(GGML_TYPE_FAIRY2I_ACT_Q16_64, x->ne[0]);
+    plan->q_bytes           = GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_FAIRY2I_CPU_CACHE_LINE);
+    plan->work_size         = plan->q_bytes;
+
+#ifdef GGML_USE_FAIRY2I_CPU_LUT
+    const struct ggml_fairy2i_lut_config cfg = ggml_fairy2i_lut_config_from_env();
+    plan->use_lut                            = cfg.lut_enabled && cfg.lut_explicit;
+    plan->lut_c                              = cfg.impl == GGML_FAIRY2I_LUT_IMPL_LUT_C;
+    plan->impl                               = cfg.impl;
+    if (plan->use_lut) {
+        plan->lut_bytes = ggml_fairy2i_wide_linear_w2_lut_wsize(dst);
+        if (plan->lut_bytes == 0) {
+            plan->use_lut = false;
+        } else if (plan->work_size < plan->lut_bytes) {
+            plan->work_size = plan->lut_bytes;
+        }
+    }
+#endif
+
+    return true;
+}
+
 bool ggml_fairy2i_cpu_supports_op(const struct ggml_tensor * dst) {
     return dst != nullptr && dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2;
 }
@@ -69,37 +119,20 @@ int ggml_fairy2i_cpu_n_tasks(const struct ggml_tensor * dst, int n_threads) {
 }
 
 size_t ggml_fairy2i_cpu_work_size(const struct ggml_tensor * dst, int n_tasks) {
-    GGML_UNUSED(n_tasks);
-
-    if (!ggml_fairy2i_cpu_supports_op(dst)) {
+    struct ggml_fairy2i_cpu_plan plan;
+    if (!ggml_fairy2i_cpu_build_plan(dst, n_tasks, &plan)) {
         return 0;
     }
 
-    const struct ggml_tensor * x = dst->src[0];
-    GGML_ASSERT(x && x->type == GGML_TYPE_F32);
-    GGML_ASSERT(x->ne[0] % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2) == 0);
-
-    const size_t q_row_size = ggml_row_size(GGML_TYPE_FAIRY2I_ACT_Q16_64, x->ne[0]);
-    const size_t q_bytes    = GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_FAIRY2I_CPU_CACHE_LINE);
-
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-    const size_t lut_bytes = ggml_fairy2i_wide_linear_w2_lut_wsize(dst);
-    return q_bytes > lut_bytes ? q_bytes : lut_bytes;
-#else
-    return q_bytes;
-#endif
+    return plan.work_size;
 }
 
 void ggml_fairy2i_cpu_prepare_graph(const struct ggml_cgraph * cgraph) {
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-    const struct ggml_fairy2i_lut_config cfg = ggml_fairy2i_lut_config_from_env();
-    if (!cfg.lut_explicit) {
-        return;
-    }
-
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
-        if (!node || node->op != GGML_OP_FAIRY2I_WIDE_LINEAR_W2) {
+        struct ggml_fairy2i_cpu_plan plan;
+        if (!ggml_fairy2i_cpu_build_plan(node, 1, &plan) || !plan.use_lut) {
             continue;
         }
 
@@ -123,15 +156,13 @@ void ggml_fairy2i_cpu_free(void) {
 }
 
 static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    if (!ggml_fairy2i_cpu_supports_op(dst)) {
+    struct ggml_fairy2i_cpu_plan plan;
+    if (!ggml_fairy2i_cpu_build_plan(dst, params ? params->nth : 1, &plan)) {
         return false;
     }
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-    const struct ggml_fairy2i_lut_config cfg = ggml_fairy2i_lut_config_from_env();
-    const bool use_lut = cfg.lut_enabled && cfg.lut_explicit;
-    const bool lut_c   = cfg.impl == GGML_FAIRY2I_LUT_IMPL_LUT_C;
-    if (use_lut && ggml_fairy2i_wide_linear_w2_compute_lut(params, dst, lut_c)) {
+    if (plan.use_lut && ggml_fairy2i_wide_linear_w2_compute_lut(params, dst, plan.lut_c)) {
         return true;
     }
 #endif
