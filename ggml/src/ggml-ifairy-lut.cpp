@@ -45,6 +45,7 @@ static bool ggml_ifairy_lut_get_type_info(enum ggml_type type, struct ggml_ifair
             info->groups_per_weight_block = QK_IFAIRY_GROUPS_PER_BLOCK;
             return true;
         case GGML_TYPE_IFAIRY64:
+        case GGML_TYPE_FAIRY2I_TILE64_V2:
             info->weight_block_k         = QK_IFAIRY64;
             info->act_block_k            = QK_IFAIRY;
             info->groups_per_weight_block = QK_IFAIRY64_GROUPS_PER_BLOCK;
@@ -54,14 +55,21 @@ static bool ggml_ifairy_lut_get_type_info(enum ggml_type type, struct ggml_ifair
     }
 }
 
+static bool ggml_ifairy_lut_is_fairy2i_type(enum ggml_type type) {
+    return type == GGML_TYPE_FAIRY2I_TILE64_V2;
+}
+
 bool ggml_ifairy_lut_can_mul_mat(const struct ggml_tensor * src0,
                                  const struct ggml_tensor * src1,
                                  const struct ggml_tensor * dst) {
-    const bool   dbg         = ggml_ifairy_env_enabled("GGML_IFAIRY_LUT_DEBUG");
-    const char * enabled_env = getenv("GGML_IFAIRY_LUT");
+    const bool   fairy2i_type = ggml_ifairy_lut_is_fairy2i_type(src0->type);
+    const char * dbg_name     = fairy2i_type ? "GGML_FAIRY2I_LUT_DEBUG" : "GGML_IFAIRY_LUT_DEBUG";
+    const char * enabled_name = fairy2i_type ? "GGML_FAIRY2I_LUT" : "GGML_IFAIRY_LUT";
+    const bool   dbg          = ggml_ifairy_env_enabled(dbg_name);
+    const char * enabled_env  = getenv(enabled_name);
     if (enabled_env && strcmp(enabled_env, "0") == 0) {
         if (dbg) {
-            GGML_LOG_WARN("ifairy_lut: disabled by env GGML_IFAIRY_LUT=0\n");
+            GGML_LOG_WARN("ifairy_lut: disabled by env %s=0\n", enabled_name);
         }
         return false;
     }
@@ -82,9 +90,9 @@ bool ggml_ifairy_lut_can_mul_mat(const struct ggml_tensor * src0,
         }
         return false;
     }
-    if (src0->type == GGML_TYPE_IFAIRY64 && enabled_env == NULL) {
+    if ((src0->type == GGML_TYPE_IFAIRY64 || fairy2i_type) && enabled_env == NULL) {
         if (dbg) {
-            GGML_LOG_INFO("ifairy_lut: IFAIRY64 LUT is opt-in; default route stays on vecdot\n");
+            GGML_LOG_INFO("ifairy_lut: %s LUT is opt-in; default route stays on vecdot\n", ggml_type_name(src0->type));
         }
         return false;
     }
