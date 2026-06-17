@@ -2001,36 +2001,60 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
             } break;
         case GGML_OP_COMPLEX_RMSNORM:
+            {
+                ggml_compute_forward_complex_rmsnorm(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_RMSNORM:
             {
                 ggml_compute_forward_ifairy_rmsnorm(params, tensor);
             }
             break;
         case GGML_OP_COMPLEX_ROPE:
+            {
+                ggml_compute_forward_complex_rope(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_ROPE:
             {
                 ggml_compute_forward_ifairy_rope(params, tensor);
             }
             break;
         case GGML_OP_COMPLEX_SPLIT:
+            {
+                ggml_compute_forward_complex_split(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_SPLIT:
             {
                 ggml_compute_forward_ifairy_split(params, tensor);
             }
             break;
         case GGML_OP_COMPLEX_MERGE:
+            {
+                ggml_compute_forward_complex_merge(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_MERGE:
             {
                 ggml_compute_forward_ifairy_merge(params, tensor);
             }
             break;
         case GGML_OP_COMPLEX_ADD:
+            {
+                ggml_compute_forward_complex_add(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_ADD:
             {
                 ggml_compute_forward_ifairy_add(params, tensor);
             }
             break;
         case GGML_OP_COMPLEX_MUL:
+            {
+                ggml_compute_forward_complex_mul(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_MUL:
             {
                 ggml_compute_forward_ifairy_mul(params, tensor);

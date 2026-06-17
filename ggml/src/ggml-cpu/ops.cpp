@@ -3590,7 +3590,7 @@ void ggml_compute_forward_rms_norm(
     }
 }
 
-static void ggml_compute_forward_rms_norm_ifairy(const ggml_compute_params * params, ggml_tensor * dst) {
+static void ggml_compute_forward_rms_norm_complex(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
@@ -3640,8 +3640,12 @@ static void ggml_compute_forward_rms_norm_ifairy(const ggml_compute_params * par
     }
 }
 
+void ggml_compute_forward_complex_rmsnorm(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_rms_norm_complex(params, dst);
+}
+
 void ggml_compute_forward_ifairy_rmsnorm(const ggml_compute_params * params, ggml_tensor * dst) {
-    ggml_compute_forward_rms_norm_ifairy(params, dst);
+    ggml_compute_forward_complex_rmsnorm(params, dst);
 }
 
 static void ggml_compute_forward_rms_norm_back_f32(
@@ -5960,7 +5964,7 @@ static void ggml_compute_forward_rope_f16(
     }
 }
 
-inline static void rope_yarn_ifairy(float       theta_extrap,
+inline static void rope_yarn_complex(float       theta_extrap,
                                     float       freq_scale,
                                     const float corr_dims[2],
                                     int64_t     i0,
@@ -5981,7 +5985,7 @@ inline static void rope_yarn_ifairy(float       theta_extrap,
     *sin_theta  = sinf(theta);
 }
 
-static void ggml_rope_cache_init_ifairy(float         theta_base,
+static void ggml_rope_cache_init_complex(float         theta_base,
                                         float         freq_scale,
                                         const float * freq_factors,
                                         const float   corr_dims[2],
@@ -6008,12 +6012,12 @@ static void ggml_rope_cache_init_ifairy(float         theta_base,
         // theta = inv_freq * position_id
         float   theta    = inv_freq * theta_base;
 
-        rope_yarn_ifairy(theta, freq_scale, corr_dims, i0, ext_factor, mscale, &cache[i0 + 0], &cache[i0 + 1]);
+        rope_yarn_complex(theta, freq_scale, corr_dims, i0, ext_factor, mscale, &cache[i0 + 0], &cache[i0 + 1]);
         cache[i0 + 1] *= sin_sign;
     }
 }
 
-static void ggml_compute_forward_rope_ifairy(const ggml_compute_params * params,
+static void ggml_compute_forward_rope_complex(const ggml_compute_params * params,
                                              ggml_tensor *               dst,
                                              const bool                  forward) {
     const ggml_tensor * src0 = dst->src[0];
@@ -6097,7 +6101,7 @@ static void ggml_compute_forward_rope_ifairy(const ggml_compute_params * params,
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
             if (!is_mrope) {
                 const int64_t p = pos[i2];
-                ggml_rope_cache_init_ifairy(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache,
+                ggml_rope_cache_init_complex(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache,
                                             sin_sign, theta_scale);
             } else {
                 const int64_t p_t = pos[i2];
@@ -6147,7 +6151,7 @@ static void ggml_compute_forward_rope_ifairy(const ggml_compute_params * params,
     }
 }
 
-static void ggml_compute_forward_ifairy_split_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+static void ggml_compute_forward_complex_split_impl(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
     GGML_TENSOR_UNARY_OP_LOCALS
@@ -6203,11 +6207,15 @@ static void ggml_compute_forward_ifairy_split_impl(const ggml_compute_params * p
     }
 }
 
-void ggml_compute_forward_ifairy_split(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    ggml_compute_forward_ifairy_split_impl(params, dst);
+void ggml_compute_forward_complex_split(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    ggml_compute_forward_complex_split_impl(params, dst);
 }
 
-static void ggml_compute_forward_ifairy_merge_impl(const ggml_compute_params * params, ggml_tensor * dst) {
+void ggml_compute_forward_ifairy_split(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    ggml_compute_forward_complex_split(params, dst);
+}
+
+static void ggml_compute_forward_complex_merge_impl(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
 
     const int n_dims = src0->ne[0];
@@ -6261,12 +6269,20 @@ static void ggml_compute_forward_ifairy_merge_impl(const ggml_compute_params * p
     }
 }
 
+void ggml_compute_forward_complex_merge(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    ggml_compute_forward_complex_merge_impl(params, dst);
+}
+
 void ggml_compute_forward_ifairy_merge(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    ggml_compute_forward_ifairy_merge_impl(params, dst);
+    ggml_compute_forward_complex_merge(params, dst);
+}
+
+void ggml_compute_forward_complex_rope(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_compute_forward_rope_complex(params, dst, true);
 }
 
 void ggml_compute_forward_ifairy_rope(const ggml_compute_params * params, ggml_tensor * dst) {
-    ggml_compute_forward_rope_ifairy(params, dst, true);
+    ggml_compute_forward_complex_rope(params, dst);
 }
 
 void ggml_compute_forward_rope(
@@ -9346,6 +9362,10 @@ void ggml_compute_forward_unary(
                 ggml_compute_forward_elu(params, dst);
             } break;
         case GGML_UNARY_OP_COMPLEX_RELU2:
+            {
+                ggml_compute_forward_complex_relu2(params, dst);
+            }
+            break;
         case GGML_UNARY_OP_IFAIRY_RELU2:
             {
                 ggml_compute_forward_ifairy_relu2(params, dst);
