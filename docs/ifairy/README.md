@@ -20,8 +20,9 @@ split into its own model envelope and backend path.
   disabled.
 - Legacy runtime configuration uses only the iFairy environment names:
   `GGML_IFAIRY_LUT`, `GGML_IFAIRY_LUT_DEBUG`, and `GGML_IFAIRY_LUT_IMPL`.
-- Legacy OpenCL routing uses `GGML_LEGACY_IFAIRY_OPENCL=ON` at build time and
-  `GGML_OPENCL_IFAIRY64=1` at runtime.
+- Legacy OpenCL routing has been removed. Legacy iFairy is CPU-only; OpenCL
+  reports legacy iFairy ops and storage unsupported so execution can remain on
+  a supported backend.
 - Fairy2i options and environment variables must not be required to enable old
   iFairy vecdot, W2 fused, or LUT execution.
 - Legacy CPU coverage lives in `tests/test-legacy-ifairy.cpp` and the
@@ -32,8 +33,8 @@ split into its own model envelope and backend path.
   by `ggml/src/ggml-cpu/legacy-ifairy/`.
 - Deprecated CMake aliases `GGML_IFAIRY_LUT_CPU` and
   `GGML_IFAIRY_FUSE_AVX512` map only to legacy iFairy CPU options.
-- OpenCL `GGML_OPENCL_IFAIRY64` is legacy-only; Fairy2i OpenCL uses
-  `GGML_OPENCL_FAIRY2I`.
+- Fairy2i OpenCL uses `GGML_OPENCL_FAIRY2I`; legacy iFairy has no OpenCL
+  runtime gate.
 - Each independently reviewable compatibility fix is tested and committed
   before the next fix starts.
 
@@ -55,14 +56,6 @@ cmake -B build-ifairy-legacy \
   -DGGML_LEGACY_IFAIRY_CPU_LUT=ON
 cmake --build build-ifairy-legacy --target test-legacy-ifairy test-legacy-ifairy-direct -j 4
 GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy
-
-cmake -B build-opencl-ifairy \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_OPENCL=ON \
-  -DGGML_OPENCL_EMBED_KERNELS=OFF \
-  -DGGML_FAIRY2I_OPENCL=OFF \
-  -DGGML_LEGACY_IFAIRY_OPENCL=ON
-cmake --build build-opencl-ifairy --target ggml-opencl -j 4
 ```
 
 ## 目录结构

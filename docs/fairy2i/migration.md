@@ -119,7 +119,6 @@ does not eagerly prepack Fairy2i LUT weights.
 | --- | --- |
 | `GGML_IFAIRY_LUT_CPU` | `GGML_LEGACY_IFAIRY_CPU_LUT` |
 | `GGML_IFAIRY_FUSE_AVX512` | `GGML_LEGACY_IFAIRY_CPU_AVX512` |
-| `GGML_OPENCL_IFAIRY64` | legacy iFairy OpenCL runtime only |
 | `GGML_OPENCL_FAIRY2I` | Fairy2i OpenCL runtime only |
 | `GGML_TYPE_IFAIRY64` | legacy iFairy tile64 storage |
 | `GGML_TYPE_FAIRY2I_TILE64_V2` | Fairy2i tile64_v2 storage |
@@ -133,8 +132,8 @@ does not eagerly prepack Fairy2i LUT weights.
 | Fairy2i CPU only | runs `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`; legacy iFairy ops are unsupported |
 | legacy iFairy CPU only | runs legacy vecdot and W2; Fairy2i ops are unsupported |
 | Fairy2i OpenCL only | copies/embeds `complex_*` and `fairy2i_tile64` kernels only |
-| legacy iFairy OpenCL only | copies/embeds `ifairy*` kernels only |
-| clean OpenCL | copies/embeds neither Fairy2i nor legacy iFairy kernels |
+| legacy iFairy with OpenCL enabled | OpenCL reports legacy iFairy unsupported; CPU legacy path remains available |
+| clean OpenCL | copies/embeds no Fairy2i or legacy iFairy kernels |
 
 ## Review Checklist
 
@@ -142,6 +141,7 @@ does not eagerly prepack Fairy2i LUT weights.
 - Legacy iFairy paths keep `ifairy`, `IFAIRY`, and old runtime env names.
 - Old aliases map only to legacy options.
 - Feature-off builds do not compile specialized CPU/OpenCL execution sources.
+- OpenCL is Fairy2i-only; legacy iFairy compatibility belongs to CPU.
 - Search gates and targeted tests are recorded with each commit.
 
 ## OpenCL Scope
@@ -150,6 +150,9 @@ OpenCL is part of the full decoupling scope. Build and runtime migration details
 are tracked in `docs/fairy2i/opencl-migration.md`.
 
 New Fairy2i OpenCL routing uses `GGML_FAIRY2I_OPENCL` at build time and
-`GGML_OPENCL_FAIRY2I` at runtime. Legacy iFairy OpenCL routing uses
-`GGML_LEGACY_IFAIRY_OPENCL` at build time and keeps the older
-`GGML_OPENCL_IFAIRY64` runtime gate.
+`GGML_OPENCL_FAIRY2I` at runtime. Legacy iFairy OpenCL routing has been
+removed; legacy iFairy remains a CPU compatibility path.
+
+Fairy2i OpenCL tile64 matmul stages activations with `fairy2i_act_q16_64`.
+The staging block is 64 complex values, so supported OpenCL shapes require
+`K % 64 == 0`.
