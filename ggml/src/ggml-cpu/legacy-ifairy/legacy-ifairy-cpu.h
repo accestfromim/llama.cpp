@@ -12,6 +12,7 @@ extern "C" {
 bool   ggml_legacy_ifairy_cpu_supports_op(const struct ggml_tensor * dst);
 int    ggml_legacy_ifairy_cpu_n_tasks(const struct ggml_tensor * dst, int n_threads);
 size_t ggml_legacy_ifairy_cpu_work_size(const struct ggml_tensor * dst, int n_tasks);
+void   ggml_legacy_ifairy_cpu_prepare_graph(const struct ggml_cgraph * cgraph);
 bool   ggml_legacy_ifairy_cpu_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 
 bool ggml_legacy_ifairy_cpu_try_quantize_mul_mat_src1(
@@ -23,12 +24,6 @@ bool ggml_legacy_ifairy_cpu_try_quantize_mul_mat_src1(
     size_t                             nbw1,
     size_t                             nbw2,
     size_t                             nbw3);
-
-bool ggml_legacy_ifairy_cpu_compute_wide_linear_w2(
-    const struct ggml_compute_params * params,
-    struct ggml_tensor *                dst,
-    bool                                use_lut,
-    bool                                lut_c);
 
 #ifdef __cplusplus
 }

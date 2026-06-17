@@ -4,10 +4,53 @@
 #include "ggml.h"
 #include "quants.h"
 
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+#    include "ggml-ifairy-lut.h"
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
 static constexpr size_t GGML_LEGACY_IFAIRY_CPU_CACHE_LINE = 64;
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+enum ggml_legacy_ifairy_lut_impl {
+    GGML_LEGACY_IFAIRY_LUT_IMPL_AUTO  = 0,
+    GGML_LEGACY_IFAIRY_LUT_IMPL_LUT16 = 1,
+    GGML_LEGACY_IFAIRY_LUT_IMPL_LUT_C = 2,
+};
+
+struct ggml_legacy_ifairy_lut_config {
+    bool dbg;
+    bool lut_enabled;
+    enum ggml_legacy_ifairy_lut_impl impl;
+};
+
+static enum ggml_legacy_ifairy_lut_impl ggml_legacy_ifairy_lut_impl_from_env(const char * env_name, bool dbg) {
+    enum ggml_legacy_ifairy_lut_impl impl = GGML_LEGACY_IFAIRY_LUT_IMPL_AUTO;
+    const char * impl_env                 = getenv(env_name);
+    if (impl_env && impl_env[0] != '\0' && strcmp(impl_env, "0") != 0 && strcmp(impl_env, "auto") != 0) {
+        if (strcmp(impl_env, "lut16") == 0) {
+            impl = GGML_LEGACY_IFAIRY_LUT_IMPL_LUT16;
+        } else if (strcmp(impl_env, "lut_c") == 0) {
+            impl = GGML_LEGACY_IFAIRY_LUT_IMPL_LUT_C;
+        } else if (dbg) {
+            GGML_LOG_WARN("legacy_ifairy_lut: unknown %s=%s (expected auto|lut16|lut_c)\n", env_name, impl_env);
+        }
+    }
+    return impl;
+}
+
+static struct ggml_legacy_ifairy_lut_config ggml_legacy_ifairy_lut_config_from_env(void) {
+    struct ggml_legacy_ifairy_lut_config cfg;
+
+    cfg.dbg         = ggml_ifairy_env_enabled("GGML_IFAIRY_LUT_DEBUG");
+    cfg.lut_enabled = ggml_ifairy_env_enabled("GGML_IFAIRY_LUT");
+    cfg.impl        = ggml_legacy_ifairy_lut_impl_from_env("GGML_IFAIRY_LUT_IMPL", cfg.dbg);
+
+    return cfg;
+}
+#endif
 
 bool ggml_legacy_ifairy_cpu_supports_op(const struct ggml_tensor * dst) {
     return dst != nullptr && dst->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2;
@@ -39,6 +82,47 @@ size_t ggml_legacy_ifairy_cpu_work_size(const struct ggml_tensor * dst, int n_ta
     return q_bytes > lut_bytes ? q_bytes : lut_bytes;
 #else
     return q_bytes;
+#endif
+}
+
+void ggml_legacy_ifairy_cpu_prepare_graph(const struct ggml_cgraph * cgraph) {
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+    const struct ggml_legacy_ifairy_lut_config cfg = ggml_legacy_ifairy_lut_config_from_env();
+    if (!cfg.lut_enabled) {
+        return;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (!node) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2) {
+            for (int src = 1; src <= 4; ++src) {
+                struct ggml_tensor * weight = node->src[src];
+                const struct ifairy_lut_extra * extra = weight ? (const struct ifairy_lut_extra *) weight->extra : nullptr;
+                if (weight && (!extra || !extra->packed_w)) {
+                    ggml_ifairy_lut_transform_tensor(weight, nullptr);
+                }
+            }
+            continue;
+        }
+
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+
+        struct ggml_tensor * src0 = node->src[0];
+        struct ggml_tensor * src1 = node->src[1];
+        if (!src0 || !src1 || !ggml_ifairy_lut_can_mul_mat(src0, src1, node)) {
+            continue;
+        }
+
+        ggml_ifairy_lut_transform_tensor(src0, nullptr);
+    }
+#else
+    GGML_UNUSED(cgraph);
 #endif
 }
 
@@ -88,7 +172,7 @@ bool ggml_legacy_ifairy_cpu_try_quantize_mul_mat_src1(
     return true;
 }
 
-bool ggml_legacy_ifairy_cpu_compute_wide_linear_w2(
+static bool ggml_legacy_ifairy_cpu_compute_wide_linear_w2(
     const struct ggml_compute_params * params,
     struct ggml_tensor *                dst,
     bool                                use_lut,
@@ -111,5 +195,13 @@ bool ggml_legacy_ifairy_cpu_compute_wide_linear_w2(
 }
 
 bool ggml_legacy_ifairy_cpu_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
-    return ggml_legacy_ifairy_cpu_compute_wide_linear_w2(params, dst, false, false);
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU_LUT
+    const struct ggml_legacy_ifairy_lut_config cfg = ggml_legacy_ifairy_lut_config_from_env();
+    const bool use_lut = cfg.lut_enabled;
+    const bool lut_c   = cfg.impl == GGML_LEGACY_IFAIRY_LUT_IMPL_LUT_C;
+#else
+    const bool use_lut = false;
+    const bool lut_c   = false;
+#endif
+    return ggml_legacy_ifairy_cpu_compute_wide_linear_w2(params, dst, use_lut, lut_c);
 }
