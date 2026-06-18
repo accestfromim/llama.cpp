@@ -4,6 +4,10 @@
 #include "ggml-threading.h"
 #include "quants.h"
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#    include "arm/fairy2i-quants.h"
+#endif
+
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -233,6 +237,10 @@ static inline void ggml_fairy2i_tile64_fuse_accumulate_four(const block_fairy2i_
             ggml_fairy2i_tile64_fuse_accumulate_block_four_avx512(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #elif defined(__AVX2__)
             ggml_fairy2i_tile64_fuse_accumulate_block_four_avx2(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+            if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums)) {
+                ggml_fairy2i_tile64_fuse_accumulate_block_four_scalar(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
+            }
 #else
             ggml_fairy2i_tile64_fuse_accumulate_block_four_scalar(&u0[ib], &u1[ib], &w0[ib], &w1[ib], &x[ib], sums);
 #endif

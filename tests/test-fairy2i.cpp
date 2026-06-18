@@ -7,6 +7,15 @@
 extern "C" {
 #define GGML_COMMON_DECL_CPP
 #include "../ggml/src/ggml-common.h"
+#if defined(__aarch64__) && defined(__ARM_NEON)
+bool ggml_fairy2i_tile64_w2_arm_neon_available(void);
+void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_tile64_v2 *  u0,
+                                                         const block_fairy2i_tile64_v2 *  u1,
+                                                         const block_fairy2i_tile64_v2 *  w0,
+                                                         const block_fairy2i_tile64_v2 *  w1,
+                                                         const block_fairy2i_act_q16_64 * x,
+                                                         int32_t                          sums[4][4]);
+#endif
 }
 
 #ifndef GGML_FP16_TO_FP32
@@ -244,6 +253,147 @@ static void fairy2i_accumulate_block_scalar(
                 break;
         }
     }
+}
+
+static bool compare_fairy2i_sums(const char * label, const int32_t actual[4][4], const int32_t expected[4][4]) {
+    for (int branch = 0; branch < 4; ++branch) {
+        for (int channel = 0; channel < 4; ++channel) {
+            if (actual[branch][channel] != expected[branch][channel]) {
+                fprintf(stderr, "%s mismatch branch=%d channel=%d actual=%d expected=%d\n", label, branch, channel,
+                        actual[branch][channel], expected[branch][channel]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static block_fairy2i_act_q16_64 make_fairy2i_test_act_block(int salt) {
+    block_fairy2i_act_q16_64 x{};
+    x.d_real = GGML_FP32_TO_FP16(0.03125f);
+    x.d_imag = GGML_FP32_TO_FP16(0.046875f);
+    for (int i = 0; i < QK_FAIRY2I_ACT_Q16_64; ++i) {
+        int vr = 0;
+        int vi = 0;
+        switch (i & 7) {
+            case 0:
+                vr = 0;
+                break;
+            case 1:
+                vr = 1;
+                break;
+            case 2:
+                vr = -1;
+                break;
+            case 3:
+                vr = 63;
+                break;
+            case 4:
+                vr = -63;
+                break;
+            case 5:
+                vr = 127;
+                break;
+            case 6:
+                vr = -127;
+                break;
+            default:
+                vr = ((i * 17 + salt) % 255) - 127;
+                break;
+        }
+        switch ((i + salt) & 7) {
+            case 0:
+                vi = 0;
+                break;
+            case 1:
+                vi = -1;
+                break;
+            case 2:
+                vi = 1;
+                break;
+            case 3:
+                vi = -63;
+                break;
+            case 4:
+                vi = 63;
+                break;
+            case 5:
+                vi = -127;
+                break;
+            case 6:
+                vi = 127;
+                break;
+            default:
+                vi = ((i * 29 + 3 * salt) % 255) - 127;
+                break;
+        }
+        x.x_real[i] = (uint8_t) (int8_t) vr;
+        x.x_imag[i] = (uint8_t) (int8_t) vi;
+    }
+    return x;
+}
+
+static block_fairy2i_tile64_v2 make_fairy2i_test_weight_block(int pattern, int salt) {
+    block_fairy2i_tile64_v2 w{};
+    w.d_real = GGML_FP32_TO_FP16(0.019f + 0.002f * (float) (salt & 3));
+    w.d_imag = GGML_FP32_TO_FP16(0.023f + 0.003f * (float) ((salt + 1) & 3));
+    for (int i = 0; i < QK_FAIRY2I_TILE64; ++i) {
+        uint8_t code = 0;
+        if (pattern < 4) {
+            code = (uint8_t) pattern;
+        } else if (pattern == 4) {
+            code = (uint8_t) (i & 3);
+        } else {
+            code = (uint8_t) ((i * 5 + salt * 3 + (i >> 2)) & 3);
+        }
+        set_fairy2i_code(w, i, code);
+    }
+    return w;
+}
+
+static void fairy2i_accumulate_four_scalar(const block_fairy2i_tile64_v2 &  u0,
+                                           const block_fairy2i_tile64_v2 &  u1,
+                                           const block_fairy2i_tile64_v2 &  w0,
+                                           const block_fairy2i_tile64_v2 &  w1,
+                                           const block_fairy2i_act_q16_64 & x,
+                                           int32_t                          sums[4][4]) {
+    fairy2i_accumulate_block_scalar(u0, x, sums[0]);
+    fairy2i_accumulate_block_scalar(u1, x, sums[1]);
+    fairy2i_accumulate_block_scalar(w0, x, sums[2]);
+    fairy2i_accumulate_block_scalar(w1, x, sums[3]);
+}
+
+static bool test_fairy2i_arm_accumulate_neon() {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    if (!ggml_fairy2i_tile64_w2_arm_neon_available()) {
+        printf("  Fairy2i ARM NEON accumulate skipped: runtime lacks NEON\n");
+        return true;
+    }
+
+    bool ok = true;
+    for (int pattern = 0; pattern < 6; ++pattern) {
+        const block_fairy2i_act_q16_64 x  = make_fairy2i_test_act_block(pattern + 11);
+        const block_fairy2i_tile64_v2  u0 = make_fairy2i_test_weight_block(pattern, 1);
+        const block_fairy2i_tile64_v2  u1 = make_fairy2i_test_weight_block((pattern + 1) % 6, 5);
+        const block_fairy2i_tile64_v2  w0 = make_fairy2i_test_weight_block((pattern + 2) % 6, 9);
+        const block_fairy2i_tile64_v2  w1 = make_fairy2i_test_weight_block((pattern + 3) % 6, 13);
+
+        int32_t expected[4][4] = {};
+        int32_t actual[4][4]   = {};
+        fairy2i_accumulate_four_scalar(u0, u1, w0, w1, x, expected);
+        ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(&u0, &u1, &w0, &w1, &x, actual);
+
+        char label[96];
+        snprintf(label, sizeof(label), "Fairy2i ARM NEON accumulate pattern=%d", pattern);
+        ok = compare_fairy2i_sums(label, actual, expected) && ok;
+    }
+
+    printf("  Fairy2i ARM NEON accumulate helper: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+#else
+    printf("  Fairy2i ARM NEON accumulate skipped: non-ARM build\n");
+    return true;
+#endif
 }
 
 static void fairy2i_apply_branch(
@@ -766,6 +916,10 @@ int main() {
     printf("========================================\n");
 
     int num_failed = 0;
+    if (!test_fairy2i_arm_accumulate_neon()) {
+        fprintf(stderr, "Fairy2i ARM NEON accumulate helper FAILED\n");
+        ++num_failed;
+    }
     if (!test_fairy2i_wide_linear_w2_variants()) {
         fprintf(stderr, "Fairy2i W2 variant matrix FAILED\n");
         ++num_failed;
