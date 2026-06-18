@@ -144,6 +144,21 @@ static bool ggml_fairy2i_test_disable_arm_dotprod(void) {
     return env && strcmp(env, "0") != 0;
 }
 
+const char * ggml_fairy2i_tile64_w2_arm_path_name(void) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if (!ggml_fairy2i_test_disable_arm_dotprod() && ggml_fairy2i_tile64_w2_arm_dotprod_available() &&
+        ggml_cpu_has_dotprod()) {
+        return "direct_dotprod";
+    }
+
+    if (ggml_fairy2i_tile64_w2_arm_neon_available()) {
+        return "direct_neon";
+    }
+#endif
+
+    return "direct_scalar";
+}
+
 bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile64_v2 *  u0,
                                                         const block_fairy2i_tile64_v2 *  u1,
                                                         const block_fairy2i_tile64_v2 *  w0,

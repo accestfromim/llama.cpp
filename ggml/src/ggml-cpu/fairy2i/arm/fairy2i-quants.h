@@ -11,6 +11,7 @@ extern "C" {
 
 bool ggml_fairy2i_tile64_w2_arm_neon_available(void);
 bool ggml_fairy2i_tile64_w2_arm_dotprod_available(void);
+const char * ggml_fairy2i_tile64_w2_arm_path_name(void);
 
 void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_tile64_v2 *  u0,
                                                          const block_fairy2i_tile64_v2 *  u1,

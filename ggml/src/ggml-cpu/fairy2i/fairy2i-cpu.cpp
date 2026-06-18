@@ -4,10 +4,15 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#    include "arm/fairy2i-quants.h"
+#endif
+
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
 #    include "ggml-fairy2i-lut.h"
 #endif
 
+#include <stdlib.h>
 #include <string.h>
 
 static constexpr size_t GGML_FAIRY2I_CPU_CACHE_LINE = 64;
@@ -70,6 +75,96 @@ static bool ggml_fairy2i_test_require_lut(void) {
     return ggml_fairy2i_env_enabled("GGML_FAIRY2I_TEST_REQUIRE_LUT");
 }
 #endif
+
+static bool ggml_fairy2i_cpu_debug_enabled(void) {
+    const char * env = getenv("GGML_FAIRY2I_CPU_DEBUG");
+    return env && strcmp(env, "0") != 0;
+}
+
+static bool ggml_fairy2i_test_force_scalar(void) {
+    const char * env = getenv("GGML_FAIRY2I_TEST_FORCE_SCALAR");
+    return env && strcmp(env, "0") != 0;
+}
+
+static const char * ggml_fairy2i_cpu_direct_path_name(void) {
+    if (ggml_fairy2i_test_force_scalar()) {
+        return "direct_scalar";
+    }
+
+#if defined(GGML_USE_FAIRY2I_CPU_AVX512) && defined(__AVX512F__) && defined(__AVX512BW__)
+    return "direct_avx512";
+#elif defined(__AVX2__)
+    return "direct_avx2";
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    return ggml_fairy2i_tile64_w2_arm_path_name();
+#else
+    return "direct_scalar";
+#endif
+}
+
+static bool ggml_fairy2i_cpu_lut_packed_weights_ready(const struct ggml_tensor * dst) {
+#ifdef GGML_USE_FAIRY2I_CPU_LUT
+    if (!dst) {
+        return false;
+    }
+    for (int src = 1; src <= 4; ++src) {
+        const struct ggml_tensor *       weight = dst->src[src];
+        const struct fairy2i_lut_extra * extra  = weight ? (const struct fairy2i_lut_extra *) weight->extra : nullptr;
+        if (!extra || !extra->packed_w) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+static void ggml_fairy2i_cpu_debug_log_w2_once(const struct ggml_compute_params *   params,
+                                               const struct ggml_tensor *           dst,
+                                               const struct ggml_fairy2i_cpu_plan * plan,
+                                               const char *                         path) {
+    if (!ggml_fairy2i_cpu_debug_enabled() || (params && params->ith != 0)) {
+        return;
+    }
+
+    static bool logged_direct_scalar  = false;
+    static bool logged_direct_avx2    = false;
+    static bool logged_direct_avx512  = false;
+    static bool logged_direct_neon    = false;
+    static bool logged_direct_dotprod = false;
+    static bool logged_lut16          = false;
+    static bool logged_lut_c          = false;
+    static bool logged_unknown        = false;
+
+    bool * logged = &logged_unknown;
+    if (path && strcmp(path, "direct_scalar") == 0) {
+        logged = &logged_direct_scalar;
+    } else if (path && strcmp(path, "direct_avx2") == 0) {
+        logged = &logged_direct_avx2;
+    } else if (path && strcmp(path, "direct_avx512") == 0) {
+        logged = &logged_direct_avx512;
+    } else if (path && strcmp(path, "direct_neon") == 0) {
+        logged = &logged_direct_neon;
+    } else if (path && strcmp(path, "direct_dotprod") == 0) {
+        logged = &logged_direct_dotprod;
+    } else if (path && strcmp(path, "lut16") == 0) {
+        logged = &logged_lut16;
+    } else if (path && strcmp(path, "lut_c") == 0) {
+        logged = &logged_lut_c;
+    }
+    if (*logged) {
+        return;
+    }
+    *logged = true;
+
+    const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
+    GGML_LOG_INFO("fairy2i_w2: path=%s M=%lld N=%lld K=%lld nth=%d lut_packed=%d lut_wsize=%zu\n",
+                  path ? path : "unknown", (long long) (dst ? dst->ne[0] : 0), (long long) (x ? ggml_nrows(x) : 0),
+                  (long long) (x ? x->ne[0] : 0), params ? params->nth : 1,
+                  ggml_fairy2i_cpu_lut_packed_weights_ready(dst) ? 1 : 0, plan ? plan->lut_bytes : 0);
+}
 
 static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_tasks, struct ggml_fairy2i_cpu_plan * plan) {
     GGML_UNUSED(n_tasks);
@@ -168,6 +263,7 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
     if (plan.use_lut) {
         if (ggml_fairy2i_wide_linear_w2_compute_lut(params, dst, plan.lut_c)) {
+            ggml_fairy2i_cpu_debug_log_w2_once(params, dst, &plan, plan.lut_c ? "lut_c" : "lut16");
             return true;
         }
         if (ggml_fairy2i_test_require_lut()) {
@@ -177,6 +273,7 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
 #endif
 
     ggml_fairy2i_wide_linear_w2_compute(params, dst);
+    ggml_fairy2i_cpu_debug_log_w2_once(params, dst, &plan, ggml_fairy2i_cpu_direct_path_name());
     return true;
 }
 

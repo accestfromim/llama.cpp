@@ -212,6 +212,26 @@ static inline void ggml_fairy2i_lut_store_tile_arm(int         tile,
         }
     }
 }
+
+static bool ggml_fairy2i_cpu_debug_enabled_for_lut_qgemm(void) {
+    const char * env = getenv("GGML_FAIRY2I_CPU_DEBUG");
+    return env && strcmp(env, "0") != 0;
+}
+
+static void ggml_fairy2i_lut_debug_log_arm_add_vector_once(int m, int64_t blocks, bool pack_bf16) {
+    if (!ggml_fairy2i_cpu_debug_enabled_for_lut_qgemm()) {
+        return;
+    }
+
+    static bool logged = false;
+    if (logged) {
+        return;
+    }
+    logged = true;
+
+    GGML_LOG_INFO("fairy2i_lut: path=arm_lut_add_vector M=%d blocks=%lld pack_bf16=%d\n", m, (long long) blocks,
+                  pack_bf16 ? 1 : 0);
+}
 #endif
 
 #if defined(__AVX2__)
@@ -1495,6 +1515,10 @@ static void ggml_fairy2i_lut_qgemm_lut16_one(int64_t            blocks,
 
 #if defined(__ARM_NEON) && defined(__aarch64__)
     const uint8x16_t mask_4bit = vdupq_n_u8(0x0f);
+
+    if (add) {
+        ggml_fairy2i_lut_debug_log_arm_add_vector_once(m, blocks, pack_bf16);
+    }
 
     if constexpr (std::is_same_v<wtile_type, fairy2i_tile64_lut_wtile_16>) {
         const int tiles_per_pass = 4;
