@@ -31,6 +31,12 @@ bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile
 #endif
 }
 
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
+                                                            block_fairy2i_act_q16_64 * y,
+                                                            bool                       force_scalar);
+#endif
+
 #ifndef GGML_FP16_TO_FP32
 #    define GGML_FP16_TO_FP32 ggml_fp16_to_fp32
 #endif
@@ -196,6 +202,67 @@ static fairy2i_w2_data make_fairy2i_w2_data(const fairy2i_w2_case & tc) {
     fill_fairy2i_weights(data.w_s0, tc.M, tc.K, 9);
     fill_fairy2i_weights(data.w_s1, tc.M, tc.K, 13);
     return data;
+}
+
+static std::vector<float> make_fairy2i_lut_quantize_input(int salt) {
+    static const float values[] = {
+        0.0f,         1.0f,          -1.0f,          0.5f / 63.0f,    -0.5f / 63.0f,
+        1.0f / 63.0f, -1.0f / 63.0f, 62.49f / 63.0f, -62.49f / 63.0f, 0.3125f,
+        -0.6875f,     0.9375f,       -0.9375f,
+    };
+
+    std::vector<float> x(QK_FAIRY2I_TILE64);
+    for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
+        const float real = values[(j + salt) % (int) (sizeof(values) / sizeof(values[0]))];
+        const float imag = values[(3 * j + 5 * salt) % (int) (sizeof(values) / sizeof(values[0]))];
+        x[(size_t) j]    = pack_complex_bf16(real, imag);
+    }
+    return x;
+}
+
+static bool compare_fairy2i_lut_quantize_block(const char *                     label,
+                                               const block_fairy2i_act_q16_64 & fast,
+                                               const block_fairy2i_act_q16_64 & scalar) {
+    if (fast.d_real != scalar.d_real || fast.d_imag != scalar.d_imag) {
+        fprintf(stderr, "%s scale mismatch d_real=%u/%u d_imag=%u/%u\n", label, (unsigned) fast.d_real,
+                (unsigned) scalar.d_real, (unsigned) fast.d_imag, (unsigned) scalar.d_imag);
+        return false;
+    }
+
+    for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
+        if (fast.x_real[j] != scalar.x_real[j] || fast.x_imag[j] != scalar.x_imag[j]) {
+            fprintf(stderr, "%s value mismatch j=%d real=%d/%d imag=%d/%d\n", label, j,
+                    (int) ((const int8_t *) fast.x_real)[j], (int) ((const int8_t *) scalar.x_real)[j],
+                    (int) ((const int8_t *) fast.x_imag)[j], (int) ((const int8_t *) scalar.x_imag)[j]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_fairy2i_lut_quantize_arm_neon() {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT) && defined(__aarch64__) && defined(__ARM_NEON)
+    bool ok = true;
+    for (int salt = 0; salt < 13; ++salt) {
+        const std::vector<float> x = make_fairy2i_lut_quantize_input(salt);
+        block_fairy2i_act_q16_64 fast{};
+        block_fairy2i_act_q16_64 scalar{};
+        ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(x.data(), &scalar, true);
+        ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(x.data(), &fast, false);
+
+        char label[96];
+        snprintf(label, sizeof(label), "Fairy2i LUT ARM quantize salt=%d", salt);
+        ok = compare_fairy2i_lut_quantize_block(label, fast, scalar) && ok;
+    }
+    printf("  Fairy2i LUT ARM quantize: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+#elif !defined(GGML_USE_FAIRY2I_CPU_LUT)
+    printf("  Fairy2i LUT ARM quantize skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+#else
+    printf("  Fairy2i LUT ARM quantize skipped: non-ARM build\n");
+    return true;
+#endif
 }
 
 static int8_t fairy2i_quant_i8(float x) {
@@ -963,6 +1030,10 @@ int main() {
     int num_failed = 0;
     if (!test_fairy2i_arm_accumulate_neon()) {
         fprintf(stderr, "Fairy2i ARM NEON accumulate helper FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_lut_quantize_arm_neon()) {
+        fprintf(stderr, "Fairy2i LUT ARM quantize FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w2_variants()) {

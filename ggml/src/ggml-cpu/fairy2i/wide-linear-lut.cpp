@@ -17,6 +17,9 @@
 #if defined(__AVX2__)
 #    include <immintrin.h>
 #endif
+#    if defined(__ARM_NEON) && defined(__aarch64__)
+#        include <arm_neon.h>
+#    endif
 
 static inline float ggml_fairy2i_wide_linear_lut_bias_at(const struct ggml_tensor * bias,
                                                          int64_t                    i0,
@@ -39,6 +42,78 @@ static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_te
     }
     return true;
 }
+
+void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
+                                                            block_fairy2i_act_q16_64 * y,
+                                                            bool                       force_scalar);
+
+static void ggml_fairy2i_tile64_lut_quantize_block_q16_64_scalar(const float * x, block_fairy2i_act_q16_64 * y) {
+    float max_real = 1e-5f;
+    float max_imag = 1e-5f;
+    for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
+        const ggml_bf16_t * value = (const ggml_bf16_t *) (x + j);
+        max_real                  = std::max(max_real, fabsf(GGML_BF16_TO_FP32(value[0])));
+        max_imag                  = std::max(max_imag, fabsf(GGML_BF16_TO_FP32(value[1])));
+    }
+
+    // A two-value LUT entry remains in int8 when each quantized activation is limited to +/-63.
+    const float iscale_real = 63.0f / max_real;
+    const float iscale_imag = 63.0f / max_imag;
+    y->d_real               = GGML_FP32_TO_FP16(1.0f / iscale_real);
+    y->d_imag               = GGML_FP32_TO_FP16(1.0f / iscale_imag);
+
+    for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
+        const ggml_bf16_t * value = (const ggml_bf16_t *) (x + j);
+        const int           qr    = (int) roundf(iscale_real * GGML_BF16_TO_FP32(value[0]));
+        const int           qi    = (int) roundf(iscale_imag * GGML_BF16_TO_FP32(value[1]));
+        y->x_real[j]              = (uint8_t) std::max(-63, std::min(63, qr));
+        y->x_imag[j]              = (uint8_t) std::max(-63, std::min(63, qi));
+    }
+}
+
+#    if defined(__ARM_NEON) && defined(__aarch64__)
+static inline void ggml_fairy2i_tile64_lut_store_i32x4_as_i8_neon(uint8_t * dst, int32x4_t v) {
+    const int16x4_t v16 = vqmovn_s32(v);
+    const int8x8_t  v8  = vqmovn_s16(vcombine_s16(v16, vdup_n_s16(0)));
+    vst1_lane_s32((int32_t *) (void *) dst, vreinterpret_s32_s8(v8), 0);
+}
+
+static void ggml_fairy2i_tile64_lut_quantize_block_q16_64_neon(const float * x, block_fairy2i_act_q16_64 * y) {
+    const uint32_t * src_words = (const uint32_t *) x;
+    const uint32x4_t imag_mask = vdupq_n_u32(0xffff0000u);
+    float32x4_t      max_real  = vdupq_n_f32(1e-5f);
+    float32x4_t      max_imag  = vdupq_n_f32(1e-5f);
+
+    for (int j = 0; j < QK_FAIRY2I_TILE64; j += 4) {
+        const uint32x4_t  words = vld1q_u32(src_words + j);
+        const float32x4_t real  = vreinterpretq_f32_u32(vshlq_n_u32(words, 16));
+        const float32x4_t imag  = vreinterpretq_f32_u32(vandq_u32(words, imag_mask));
+        max_real                = vmaxq_f32(max_real, vabsq_f32(real));
+        max_imag                = vmaxq_f32(max_imag, vabsq_f32(imag));
+    }
+
+    const float scalar_max_real = vmaxvq_f32(max_real);
+    const float scalar_max_imag = vmaxvq_f32(max_imag);
+    const float iscale_real     = 63.0f / scalar_max_real;
+    const float iscale_imag     = 63.0f / scalar_max_imag;
+    y->d_real                   = GGML_FP32_TO_FP16(1.0f / iscale_real);
+    y->d_imag                   = GGML_FP32_TO_FP16(1.0f / iscale_imag);
+
+    const float32x4_t scale_real = vdupq_n_f32(iscale_real);
+    const float32x4_t scale_imag = vdupq_n_f32(iscale_imag);
+    const int32x4_t   qmin       = vdupq_n_s32(-63);
+    const int32x4_t   qmax       = vdupq_n_s32(63);
+    for (int j = 0; j < QK_FAIRY2I_TILE64; j += 4) {
+        const uint32x4_t  words = vld1q_u32(src_words + j);
+        const float32x4_t real  = vreinterpretq_f32_u32(vshlq_n_u32(words, 16));
+        const float32x4_t imag  = vreinterpretq_f32_u32(vandq_u32(words, imag_mask));
+        const int32x4_t   qr    = vminq_s32(qmax, vmaxq_s32(qmin, vcvtaq_s32_f32(vmulq_f32(real, scale_real))));
+        const int32x4_t   qi    = vminq_s32(qmax, vmaxq_s32(qmin, vcvtaq_s32_f32(vmulq_f32(imag, scale_imag))));
+        ggml_fairy2i_tile64_lut_store_i32x4_as_i8_neon(y->x_real + j, qr);
+        ggml_fairy2i_tile64_lut_store_i32x4_as_i8_neon(y->x_imag + j, qi);
+    }
+}
+#    endif
 
 static void ggml_fairy2i_tile64_lut_quantize_block_q16_64(const float * x, block_fairy2i_act_q16_64 * y, bool use_avx2) {
 #if defined(__AVX2__)
@@ -96,27 +171,22 @@ static void ggml_fairy2i_tile64_lut_quantize_block_q16_64(const float * x, block
     (void) use_avx2;
 #endif
 
-    float max_real = 1e-5f;
-    float max_imag = 1e-5f;
-    for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
-        const ggml_bf16_t * value = (const ggml_bf16_t *) (x + j);
-        max_real                   = std::max(max_real, fabsf(GGML_BF16_TO_FP32(value[0])));
-        max_imag                   = std::max(max_imag, fabsf(GGML_BF16_TO_FP32(value[1])));
-    }
+#    if defined(__ARM_NEON) && defined(__aarch64__)
+    ggml_fairy2i_tile64_lut_quantize_block_q16_64_neon(x, y);
+    return;
+#    endif
 
-    // A two-value LUT entry remains in int8 when each quantized activation is limited to +/-63.
-    const float iscale_real = 63.0f / max_real;
-    const float iscale_imag = 63.0f / max_imag;
-    y->d_real               = GGML_FP32_TO_FP16(1.0f / iscale_real);
-    y->d_imag               = GGML_FP32_TO_FP16(1.0f / iscale_imag);
+    ggml_fairy2i_tile64_lut_quantize_block_q16_64_scalar(x, y);
+}
 
-    for (int j = 0; j < QK_FAIRY2I_TILE64; ++j) {
-        const ggml_bf16_t * value = (const ggml_bf16_t *) (x + j);
-        const int qr = (int) roundf(iscale_real * GGML_BF16_TO_FP32(value[0]));
-        const int qi = (int) roundf(iscale_imag * GGML_BF16_TO_FP32(value[1]));
-        y->x_real[j] = (uint8_t) std::max(-63, std::min(63, qr));
-        y->x_imag[j] = (uint8_t) std::max(-63, std::min(63, qi));
+void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
+                                                            block_fairy2i_act_q16_64 * y,
+                                                            bool                       force_scalar) {
+    if (force_scalar) {
+        ggml_fairy2i_tile64_lut_quantize_block_q16_64_scalar(x, y);
+        return;
     }
+    ggml_fairy2i_tile64_lut_quantize_block_q16_64(x, y, true);
 }
 
 size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
