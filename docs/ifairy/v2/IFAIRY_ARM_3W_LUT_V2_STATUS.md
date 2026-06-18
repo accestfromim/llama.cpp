@@ -60,6 +60,23 @@ Status: Draft (2026-03-13)
   - `GGML_FAIRY2I_TEST_REQUIRE_LUT=1`：当 `GGML_FAIRY2I_LUT=1` 且 W2 LUT 计划已启用时，如果 LUT compute 返回 false，则测试直接失败，避免静默回落到 direct 路径。
   - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1`：在支持 dotprod 的 ARM64 设备上强制 dispatcher 走 NEON fallback，用于覆盖 direct wide-linear-fused 的 NEON 路径。
 - 这两个变量只用于测试/CI 覆盖，不作为生产调优 knob。
+- ARM direct follow-up:
+  - NEON direct helper 从四次串行 one-branch accumulate 改为 pair-blocked accumulate；每个 pair 内 activation 只加载一次，sign decode 与 vector accumulate 在 activation still-live 时完成，末尾统一横向归约。
+  - dotprod helper 从每个 16-lane dot 后立即 `vaddvq_s32` 改为 four-branch persistent `int32x4_t` accumulator；每个 tile64 末尾再按 branch/channel 归约。
+  - dispatcher 语义不变：`force_scalar` 仍强制 scalar；默认仍按 `dotprod -> NEON -> scalar`。
+- LUT activation quantize follow-up:
+  - `wide-linear-lut.cpp` 新增 AArch64/NEON q16 activation quantize fast path，覆盖非 AVX2 ARM 预处理瓶颈。
+  - ARM path 向量化 bf16 pair decode、real/imag abs max、scale、round-away (`vcvtaq_s32_f32`) 和 clamp/store；保留 scalar helper 作为 test reference。
+  - 未新增生产 env knob；新增的 test-only wrapper 只用于 `test-fairy2i` 内部 scalar-vs-NEON quantize byte compare。
+- Correctness/format validation (Apple arm64, `build-rel-fairy2i`):
+  - `cmake --build build-rel-fairy2i --target test-fairy2i -j 8`: PASS
+  - `./build-rel-fairy2i/bin/test-fairy2i`: PASS (`ARM accumulate helpers`, `LUT ARM quantize`, W2 336-case matrix)
+  - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1 ./build-rel-fairy2i/bin/test-fairy2i`: PASS
+  - `GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i`: PASS
+  - scoped `git clang-format --style=file --diff`: PASS
+  - scoped `clang-tidy -p build-rel-fairy2i`: not run (`clang-tidy` not available in PATH)
+- Performance note:
+  - 本次只记录 kernel 形态修正和 correctness gates，未记录真实模型 `eval tok/s` 结论；后续如声称 dotprod/NEON/LUT quantize 性能收益，需补充完整 bench 命令与 raw logs。
 
 ### 2026-03-13 (build `8d73f59a`)
 - 变更摘要：
