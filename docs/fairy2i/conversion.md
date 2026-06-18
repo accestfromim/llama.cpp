@@ -59,6 +59,19 @@ PYTHONPATH=gguf-py .venv/bin/python -m fairy2i.convert \
 
 Supported base architectures in this refactor are `llama` and `qwen2`.
 
+### Unified CLI Arguments
+
+| Argument | Values / default | Description |
+| --- | --- | --- |
+| `model_dir` | required | Hugging Face checkpoint directory. |
+| `output_file` | optional for Llama dry-run, required for writes and Qwen2 | Output GGUF path. |
+| `--base-arch` | `auto` (default), `llama`, `qwen2` | Select the base model adapter. `auto` reads `config.model_type`. |
+| `--quant-variant` | `tile64_v2` | Fairy2i quant/export variant. |
+| `--residual-steps` | `2` | Residual quantization steps. Only `2` is currently supported. |
+| `--dry-run` | off | Validate inputs without writing GGUF. Currently useful for Llama; Qwen2 still requires `output_file`. |
+| `--qk-permute` | off | Apply Llama q/k undo-permute when the checkpoint layout requires it. |
+| `--verbose` | off | Print conversion progress and tensor export stages. |
+
 ## Compatibility Scripts
 
 Existing scripts remain supported:
@@ -78,6 +91,52 @@ PYTHONPATH=gguf-py .venv/bin/python gguf-py/convert_fairy2i_qwen2.py \
 
 Use `--qk-permute` only when the checkpoint's q/k tensors are known to need
 the Llama undo-permute transform.
+
+### Llama Script Arguments
+
+`gguf-py/convert_fairy2i_llama.py` writes Llama-based Fairy2i checkpoints.
+
+| Argument | Values / default | Description |
+| --- | --- | --- |
+| `model_dir` | required | Llama-based Fairy2i checkpoint directory. |
+| `output_file` | optional only with `--dry-run` | Output GGUF path. |
+| `--dry-run` | off | Validate inputs and print the conversion plan without writing GGUF. |
+| `--residual-steps` | `2` | Residual quantization steps. Any value other than `2` errors. |
+| `--qk-permute` | off | Enable Llama q/k undo-permute during conversion. |
+| `--verbose` | off | Print conversion progress. |
+
+Llama output projection is always exported as a dense padded output tensor:
+
+```text
+output
+```
+
+The tensor is written with raw dtype `F16`. The vocabulary is padded by the
+converter, so the dense output row count matches the padded vocab size.
+
+### Qwen2 Script Arguments
+
+`gguf-py/convert_fairy2i_qwen2.py` exposes Qwen2-specific output and bias
+controls that are not forwarded by the unified CLI.
+
+| Argument | Values / default | Description |
+| --- | --- | --- |
+| `model_dir` | required | Qwen2-based Fairy2i checkpoint directory. |
+| `output_file` | required | Output GGUF path. |
+| `--residual-steps` | `2` | Residual quantization steps. Any value other than `2` errors. |
+| `--output-layer` | `wide-linear` (default), `dense`, `both` | Select output projection export format. |
+| `--qk-permute` | off | Enable Llama q/k undo-permute when the source checkpoint requires it. Disabled by default for Fairy2i Qwen2. |
+| `--no-attn-bias` | off | Skip optional attention bias tensors even if present in the checkpoint. |
+| `--quant-variant` | `tile64_v2` | Fairy2i quant/export variant. |
+| `--verbose` | off | Print conversion progress. |
+
+Qwen2 output projection modes:
+
+| Mode | Tensors written | Use case |
+| --- | --- | --- |
+| `wide-linear` | `output.U.s0`, `output.U.s1`, `output.W.s0`, `output.W.s1` | Default Fairy2i W2 output path. |
+| `dense` | `output` as raw dtype `F16` | Dense compatibility path. |
+| `both` | Wide-linear tensors and dense `output` | A/B checks or transitional compatibility. |
 
 ## Metadata Checks
 
@@ -104,3 +163,14 @@ Run the Python Fairy2i converter tests with:
 ```bash
 PYTHONPATH=gguf-py .venv/bin/python -m pytest gguf-py/tests/fairy2i -q
 ```
+
+## Troubleshooting
+
+| Error / symptom | What to check |
+| --- | --- |
+| `could not detect Fairy2i base architecture` | Check `config.json` has a supported `model_type`, or pass `--base-arch llama` / `--base-arch qwen2`. |
+| `output_file is required for qwen2 conversion` | Qwen2 conversion requires an output path. Use the Qwen2 script with `model_dir output_file`. |
+| `only --residual-steps 2 is currently supported` | Remove the flag or pass `--residual-steps 2`. |
+| `tokenizer.json not found` | Use a complete Hugging Face checkpoint directory that includes tokenizer files. |
+| `expected a Llama-style BPE tokenizer with byte_fallback=true` | The checkpoint does not match the Llama Fairy2i tokenizer profile. Use the Qwen2 converter when appropriate, or fix the tokenizer files. |
+| Missing or unexpected attention bias tensors | For Qwen2, omit `--no-attn-bias` to export optional attention bias tensors, or pass it to force skipping them. |
