@@ -889,13 +889,14 @@ static bool test_fairy2i_opencl_tile64_mul_mat() {
 }
 
 static bool test_fairy2i_wide_linear_w2_variants() {
-    const int64_t Ms[] = { 7, 23 };
-    const int64_t Ks[] = { 64, 128, 256 };
-    const int64_t Ns[] = { 1, 4 };
+    const int64_t Ms[] = { 1, 7, 16, 17, 23, 32, 33 };
+    const int64_t Ks[] = { 64, 128, 192, 256, 320, 1024 };
+    const int64_t Ns[] = { 1, 2, 4, 8 };
 
     int  cases_run = 0;
     bool ok        = true;
-    const bool compare_scalar_default = ggml_cpu_has_avx2() != 0;
+    const bool compare_scalar_default =
+        ggml_cpu_has_avx2() != 0 || ggml_cpu_has_neon() != 0 || ggml_cpu_has_dotprod() != 0;
 
     for (int64_t M : Ms) {
         for (int64_t K : Ks) {
@@ -926,7 +927,7 @@ static bool test_fairy2i_wide_linear_w2_variants() {
                     ok = compare_exact(label, direct, ref) && ok;
 
                     if (compare_scalar_default) {
-                        snprintf(label, sizeof(label), "forced scalar vs default AVX2 M=%lld N=%lld K=%lld bias=%d",
+                        snprintf(label, sizeof(label), "forced scalar vs default M=%lld N=%lld K=%lld bias=%d",
                                  (long long) M, (long long) N, (long long) K, (int) with_bias);
                         ok = compare_exact(label, direct_scalar, direct) && ok;
                     }
@@ -943,7 +944,7 @@ static bool test_fairy2i_wide_linear_w2_variants() {
     }
 
     if (!compare_scalar_default) {
-        printf("  Fairy2i W2 scalar/default-AVX2 compare skipped: CPU backend lacks AVX2\n");
+        printf("  Fairy2i W2 scalar/default fast-path compare skipped: CPU backend lacks AVX2/NEON/dotprod\n");
     }
 #if !defined(GGML_USE_FAIRY2I_CPU_LUT)
     printf("  Fairy2i W2 LUT compare skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");

@@ -55,6 +55,12 @@ Status: Draft (2026-03-13)
 
 按日期追加（YYYY-MM-DD）：
 
+### 2026-06-18 (Fairy2i ARM W2 test gates)
+- 新增测试专用环境变量：
+  - `GGML_FAIRY2I_TEST_REQUIRE_LUT=1`：当 `GGML_FAIRY2I_LUT=1` 且 W2 LUT 计划已启用时，如果 LUT compute 返回 false，则测试直接失败，避免静默回落到 direct 路径。
+  - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1`：在支持 dotprod 的 ARM64 设备上强制 dispatcher 走 NEON fallback，用于覆盖 direct wide-linear-fused 的 NEON 路径。
+- 这两个变量只用于测试/CI 覆盖，不作为生产调优 knob。
+
 ### 2026-03-13 (build `8d73f59a`)
 - 变更摘要：
   - 在 `src/llama-quant.cpp` 中补齐 `ifairy` bare `output` 张量的识别逻辑，使 `llama-quantize --output-tensor-type q6_k` 可以直接作用于 `ifairy.gguf` 的输出层，而不要求张量名必须是 `output.weight`。
