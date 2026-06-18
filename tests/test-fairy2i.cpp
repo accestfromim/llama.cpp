@@ -386,12 +386,12 @@ static bool test_fairy2i_arm_accumulate_neon() {
     bool           ok          = true;
     const bool     has_dotprod = ggml_fairy2i_tile64_w2_arm_dotprod_available() && ggml_cpu_has_dotprod();
     scoped_env_var env_disable_dotprod("GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD");
-    for (int pattern = 0; pattern < 6; ++pattern) {
-        const block_fairy2i_act_q16_64 x  = make_fairy2i_test_act_block(pattern + 11);
+    for (int pattern = 0; pattern < 12; ++pattern) {
+        const block_fairy2i_act_q16_64 x  = make_fairy2i_test_act_block(pattern * 13 + 11);
         const block_fairy2i_tile64_v2  u0 = make_fairy2i_test_weight_block(pattern, 1);
-        const block_fairy2i_tile64_v2  u1 = make_fairy2i_test_weight_block((pattern + 1) % 6, 5);
-        const block_fairy2i_tile64_v2  w0 = make_fairy2i_test_weight_block((pattern + 2) % 6, 9);
-        const block_fairy2i_tile64_v2  w1 = make_fairy2i_test_weight_block((pattern + 3) % 6, 13);
+        const block_fairy2i_tile64_v2  u1 = make_fairy2i_test_weight_block(pattern + 1, 5);
+        const block_fairy2i_tile64_v2  w0 = make_fairy2i_test_weight_block(pattern + 2, 9);
+        const block_fairy2i_tile64_v2  w1 = make_fairy2i_test_weight_block(pattern + 3, 13);
 
         int32_t expected[4][4]       = {};
         int32_t actual_neon[4][4]    = {};
