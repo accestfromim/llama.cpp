@@ -9,12 +9,25 @@ extern "C" {
 #include "../ggml/src/ggml-common.h"
 #if defined(__aarch64__) && defined(__ARM_NEON)
 bool ggml_fairy2i_tile64_w2_arm_neon_available(void);
+bool ggml_fairy2i_tile64_w2_arm_dotprod_available(void);
 void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_tile64_v2 *  u0,
                                                          const block_fairy2i_tile64_v2 *  u1,
                                                          const block_fairy2i_tile64_v2 *  w0,
                                                          const block_fairy2i_tile64_v2 *  w1,
                                                          const block_fairy2i_act_q16_64 * x,
                                                          int32_t                          sums[4][4]);
+void ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(const block_fairy2i_tile64_v2 *  u0,
+                                                            const block_fairy2i_tile64_v2 *  u1,
+                                                            const block_fairy2i_tile64_v2 *  w0,
+                                                            const block_fairy2i_tile64_v2 *  w1,
+                                                            const block_fairy2i_act_q16_64 * x,
+                                                            int32_t                          sums[4][4]);
+bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile64_v2 *  u0,
+                                                        const block_fairy2i_tile64_v2 *  u1,
+                                                        const block_fairy2i_tile64_v2 *  w0,
+                                                        const block_fairy2i_tile64_v2 *  w1,
+                                                        const block_fairy2i_act_q16_64 * x,
+                                                        int32_t                          sums[4][4]);
 #endif
 }
 
@@ -370,7 +383,9 @@ static bool test_fairy2i_arm_accumulate_neon() {
         return true;
     }
 
-    bool ok = true;
+    bool           ok          = true;
+    const bool     has_dotprod = ggml_fairy2i_tile64_w2_arm_dotprod_available() && ggml_cpu_has_dotprod();
+    scoped_env_var env_disable_dotprod("GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD");
     for (int pattern = 0; pattern < 6; ++pattern) {
         const block_fairy2i_act_q16_64 x  = make_fairy2i_test_act_block(pattern + 11);
         const block_fairy2i_tile64_v2  u0 = make_fairy2i_test_weight_block(pattern, 1);
@@ -378,17 +393,44 @@ static bool test_fairy2i_arm_accumulate_neon() {
         const block_fairy2i_tile64_v2  w0 = make_fairy2i_test_weight_block((pattern + 2) % 6, 9);
         const block_fairy2i_tile64_v2  w1 = make_fairy2i_test_weight_block((pattern + 3) % 6, 13);
 
-        int32_t expected[4][4] = {};
-        int32_t actual[4][4]   = {};
+        int32_t expected[4][4]       = {};
+        int32_t actual_neon[4][4]    = {};
+        int32_t actual_arm[4][4]     = {};
+        int32_t actual_no_dot[4][4]  = {};
+        int32_t actual_dotprod[4][4] = {};
         fairy2i_accumulate_four_scalar(u0, u1, w0, w1, x, expected);
-        ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(&u0, &u1, &w0, &w1, &x, actual);
+        ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(&u0, &u1, &w0, &w1, &x, actual_neon);
+        if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0, &u1, &w0, &w1, &x, actual_arm)) {
+            fprintf(stderr, "Fairy2i ARM dispatcher unexpectedly declined pattern=%d\n", pattern);
+            ok = false;
+        }
+
+        env_disable_dotprod.set("1");
+        if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0, &u1, &w0, &w1, &x, actual_no_dot)) {
+            fprintf(stderr, "Fairy2i ARM NEON fallback unexpectedly declined pattern=%d\n", pattern);
+            ok = false;
+        }
+        env_disable_dotprod.unset();
+
+        if (has_dotprod) {
+            ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(&u0, &u1, &w0, &w1, &x, actual_dotprod);
+        }
 
         char label[96];
         snprintf(label, sizeof(label), "Fairy2i ARM NEON accumulate pattern=%d", pattern);
-        ok = compare_fairy2i_sums(label, actual, expected) && ok;
+        ok = compare_fairy2i_sums(label, actual_neon, expected) && ok;
+        snprintf(label, sizeof(label), "Fairy2i ARM dispatcher accumulate pattern=%d", pattern);
+        ok = compare_fairy2i_sums(label, actual_arm, expected) && ok;
+        snprintf(label, sizeof(label), "Fairy2i ARM NEON fallback accumulate pattern=%d", pattern);
+        ok = compare_fairy2i_sums(label, actual_no_dot, expected) && ok;
+        if (has_dotprod) {
+            snprintf(label, sizeof(label), "Fairy2i ARM dotprod accumulate pattern=%d", pattern);
+            ok = compare_fairy2i_sums(label, actual_dotprod, expected) && ok;
+        }
     }
 
-    printf("  Fairy2i ARM NEON accumulate helper: %s\n", ok ? "PASS" : "FAIL");
+    printf("  Fairy2i ARM accumulate helpers%s: %s\n", has_dotprod ? " (NEON+dotprod)" : " (NEON)",
+           ok ? "PASS" : "FAIL");
     return ok;
 #else
     printf("  Fairy2i ARM NEON accumulate skipped: non-ARM build\n");

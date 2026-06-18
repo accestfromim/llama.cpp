@@ -701,6 +701,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_AVX512)
     endif()
 
+    if (GGML_FAIRY2I_CPU_ARM_DOTPROD)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_ARM_DOTPROD)
+    endif()
+
     if (GGML_LEGACY_IFAIRY_CPU)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_CPU)
     endif()
