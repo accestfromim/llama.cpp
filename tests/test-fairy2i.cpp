@@ -32,6 +32,7 @@ bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile
 }
 
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
+#    include "../ggml/src/ggml-cpu/fairy2i/lut/ggml-fairy2i-lut.h"
 void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
                                                             block_fairy2i_act_q16_64 * y,
                                                             bool                       force_scalar);
@@ -264,6 +265,185 @@ static bool test_fairy2i_lut_quantize_arm_neon() {
     return true;
 #endif
 }
+
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+static std::vector<fairy2i_tile64_lut_wtile_16> make_fairy2i_lut_wtiles(int64_t M, int64_t K, int salt) {
+    const int64_t                            tiles  = (M + 15) / 16;
+    const int64_t                            blocks = K / QK_FAIRY2I_TILE64;
+    std::vector<fairy2i_tile64_lut_wtile_16> wtiles((size_t) tiles * (size_t) blocks);
+
+    for (int64_t tile = 0; tile < tiles; ++tile) {
+        for (int64_t blk = 0; blk < blocks; ++blk) {
+            fairy2i_tile64_lut_wtile_16 & wt = wtiles[(size_t) tile * (size_t) blocks + (size_t) blk];
+            for (int lane = 0; lane < 16; ++lane) {
+                wt.d_real[lane] = GGML_FP32_TO_FP16(0.013f + 0.001f * (float) ((lane + tile + blk + salt) % 9));
+                wt.d_imag[lane] = GGML_FP32_TO_FP16(0.017f + 0.001f * (float) ((2 * lane + tile + blk + salt) % 7));
+            }
+            for (int byte_idx = 0; byte_idx < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2; ++byte_idx) {
+                for (int lane = 0; lane < 16; ++lane) {
+                    const uint8_t lo      = (uint8_t) ((byte_idx + 3 * lane + 5 * blk + salt) & 0x0f);
+                    const uint8_t hi      = (uint8_t) ((7 * byte_idx + lane + 3 * tile + salt) & 0x0f);
+                    wt.qs[byte_idx][lane] = (uint8_t) (lo | (hi << 4));
+                }
+            }
+        }
+    }
+
+    return wtiles;
+}
+
+static void fill_fairy2i_lut_qgemm_inputs(std::vector<int8_t> & lut,
+                                          std::vector<float> &  scales,
+                                          int64_t               N,
+                                          int64_t               K) {
+    const int64_t blocks = K / QK_FAIRY2I_TILE64;
+    const int64_t groups = blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    lut.assign((size_t) N * (size_t) groups * (size_t) 64, 0);
+    scales.assign((size_t) N * (size_t) blocks * 2u, 0.0f);
+
+    for (int64_t col = 0; col < N; ++col) {
+        for (int64_t blk = 0; blk < blocks; ++blk) {
+            scales[((size_t) col * (size_t) blocks + (size_t) blk) * 2u + 0] =
+                0.03125f + 0.00390625f * (float) ((col + blk) % 5);
+            scales[((size_t) col * (size_t) blocks + (size_t) blk) * 2u + 1] =
+                0.046875f + 0.00390625f * (float) ((2 * col + blk) % 5);
+        }
+
+        int8_t * lut_col = lut.data() + (size_t) col * (size_t) groups * (size_t) 64;
+        for (int64_t group = 0; group < groups; ++group) {
+            int8_t * tbl = lut_col + (size_t) group * 64u;
+            for (int channel = 0; channel < 4; ++channel) {
+                for (int entry = 0; entry < 16; ++entry) {
+                    tbl[channel * 16 + entry] =
+                        (int8_t) (((entry * (channel + 3) + 5 * group + 7 * col + channel) % 17) - 8);
+                }
+            }
+        }
+    }
+}
+
+static void fairy2i_lut_qgemm_lut16_scalar_ref(int64_t                                          M,
+                                               int64_t                                          K,
+                                               int64_t                                          N,
+                                               const std::vector<fairy2i_tile64_lut_wtile_16> & wtiles,
+                                               const std::vector<int8_t> &                      lut,
+                                               const std::vector<float> &                       scales,
+                                               std::vector<float> &                             dst,
+                                               bool                                             negate_imag_scale,
+                                               bool                                             add) {
+    const int64_t blocks = K / QK_FAIRY2I_TILE64;
+    const int64_t groups = blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    if (!add) {
+        std::fill(dst.begin(), dst.end(), 0.0f);
+    }
+
+    for (int64_t col = 0; col < N; ++col) {
+        const int8_t * lut_col = lut.data() + (size_t) col * (size_t) groups * 64u;
+        const float *  sc      = scales.data() + (size_t) col * (size_t) blocks * 2u;
+        for (int64_t row = 0; row < M; ++row) {
+            const int64_t tile = row >> 4;
+            const int     lane = (int) (row & 15);
+            float         real = add ? dst[((size_t) col * (size_t) M + (size_t) row) * 2u + 0] : 0.0f;
+            float         imag = add ? dst[((size_t) col * (size_t) M + (size_t) row) * 2u + 1] : 0.0f;
+
+            for (int64_t blk = 0; blk < blocks; ++blk) {
+                const fairy2i_tile64_lut_wtile_16 & wt = wtiles[(size_t) tile * (size_t) blocks + (size_t) blk];
+                const float                         lr = sc[blk * 2 + 0];
+                const float                         li = negate_imag_scale ? -sc[blk * 2 + 1] : sc[blk * 2 + 1];
+                const float                         wr = GGML_FP16_TO_FP32(wt.d_real[lane]);
+                const float                         wi = GGML_FP16_TO_FP32(wt.d_imag[lane]);
+
+                int sum_ac = 0;
+                int sum_bd = 0;
+                int sum_bc = 0;
+                int sum_ad = 0;
+
+                const int8_t * lut_blk = lut_col + (size_t) blk * (size_t) QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK * 64u;
+                for (int byte_idx = 0; byte_idx < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2; ++byte_idx) {
+                    const uint8_t  packed = wt.qs[byte_idx][lane];
+                    const int8_t * tbl0   = lut_blk + (size_t) (byte_idx * 2) * 64u;
+                    const int8_t * tbl1   = tbl0 + 64u;
+                    const uint8_t  lo     = packed & 0x0fu;
+                    const uint8_t  hi     = (packed >> 4) & 0x0fu;
+
+                    sum_ac += (int) tbl0[0 * 16 + lo] + (int) tbl1[0 * 16 + hi];
+                    sum_bd += (int) tbl0[1 * 16 + lo] + (int) tbl1[1 * 16 + hi];
+                    sum_bc += (int) tbl0[2 * 16 + lo] + (int) tbl1[2 * 16 + hi];
+                    sum_ad += (int) tbl0[3 * 16 + lo] + (int) tbl1[3 * 16 + hi];
+                }
+
+                real += (float) sum_ac * (lr * wr) + (float) sum_bd * (li * wi);
+                imag += (float) sum_bc * (lr * wi) + (float) sum_ad * (li * wr);
+            }
+
+            dst[((size_t) col * (size_t) M + (size_t) row) * 2u + 0] = real;
+            dst[((size_t) col * (size_t) M + (size_t) row) * 2u + 1] = imag;
+        }
+    }
+}
+
+static bool compare_f32_pairs(const char *               label,
+                              const std::vector<float> & actual,
+                              const std::vector<float> & expected) {
+    if (actual.size() != expected.size()) {
+        fprintf(stderr, "%s size mismatch: %zu vs %zu\n", label, actual.size(), expected.size());
+        return false;
+    }
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const float diff = fabsf(actual[i] - expected[i]);
+        if (diff > 1e-5f) {
+            fprintf(stderr, "%s mismatch i=%zu actual=%g expected=%g diff=%g\n", label, i, actual[i], expected[i],
+                    diff);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_fairy2i_lut_qgemm_add() {
+    const int64_t Ms[]      = { 1, 7, 16, 17, 23 };
+    const int64_t Ks[]      = { 64, 128 };
+    const int64_t N         = 2;
+    bool          ok        = true;
+    int           cases_run = 0;
+
+    for (int64_t M : Ms) {
+        for (int64_t K : Ks) {
+            const std::vector<fairy2i_tile64_lut_wtile_16> w0 = make_fairy2i_lut_wtiles(M, K, 3);
+            const std::vector<fairy2i_tile64_lut_wtile_16> w1 = make_fairy2i_lut_wtiles(M, K, 11);
+            std::vector<int8_t>                            lut;
+            std::vector<float>                             scales;
+            fill_fairy2i_lut_qgemm_inputs(lut, scales, N, K);
+
+            std::vector<float> expected((size_t) N * (size_t) M * 2u, 0.0f);
+            fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w0, lut, scales, expected, true, false);
+            fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w1, lut, scales, expected, false, true);
+
+            std::vector<float> actual((size_t) N * (size_t) M * 2u, 0.0f);
+            ggml_fairy2i_tile64_lut_qgemm_lut16((int) M, (int) K, (int) N, w0.data(), lut.data(), scales.data(),
+                                                actual.data(), (size_t) M * 2u * sizeof(float), 2u * sizeof(float),
+                                                false, true, false);
+            ggml_fairy2i_tile64_lut_qgemm_lut16((int) M, (int) K, (int) N, w1.data(), lut.data(), scales.data(),
+                                                actual.data(), (size_t) M * 2u * sizeof(float), 2u * sizeof(float),
+                                                false, false, true);
+
+            char label[128];
+            snprintf(label, sizeof(label), "Fairy2i LUT qgemm add M=%lld K=%lld N=%lld", (long long) M, (long long) K,
+                     (long long) N);
+            ok = compare_f32_pairs(label, actual, expected) && ok;
+            ++cases_run;
+        }
+    }
+
+    printf("  Fairy2i LUT qgemm add: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    return ok;
+}
+#else
+static bool test_fairy2i_lut_qgemm_add() {
+    printf("  Fairy2i LUT qgemm add skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+}
+#endif
 
 static int8_t fairy2i_quant_i8(float x) {
     const int q = (int) nearbyintf(x);
@@ -1034,6 +1214,10 @@ int main() {
     }
     if (!test_fairy2i_lut_quantize_arm_neon()) {
         fprintf(stderr, "Fairy2i LUT ARM quantize FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_lut_qgemm_add()) {
+        fprintf(stderr, "Fairy2i LUT qgemm add FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w2_variants()) {

@@ -168,19 +168,20 @@ static inline void ggml_fairy2i_lut_apply_tile_sums_arm(const wtile_type * wt,
     }
 }
 
-static inline void ggml_fairy2i_lut_store_tile_arm(int           tile,
-                                                  int           m,
-                                                  uint8_t *     dst_col,
-                                                  size_t        dst_row_stride,
-                                                  bool          pack_bf16,
-                                                  float32x4_t   acc_r0,
-                                                  float32x4_t   acc_r1,
-                                                  float32x4_t   acc_r2,
-                                                  float32x4_t   acc_r3,
-                                                  float32x4_t   acc_i0,
-                                                  float32x4_t   acc_i1,
-                                                  float32x4_t   acc_i2,
-                                                  float32x4_t   acc_i3) {
+static inline void ggml_fairy2i_lut_store_tile_arm(int         tile,
+                                                   int         m,
+                                                   uint8_t *   dst_col,
+                                                   size_t      dst_row_stride,
+                                                   bool        pack_bf16,
+                                                   bool        add,
+                                                   float32x4_t acc_r0,
+                                                   float32x4_t acc_r1,
+                                                   float32x4_t acc_r2,
+                                                   float32x4_t acc_r3,
+                                                   float32x4_t acc_i0,
+                                                   float32x4_t acc_i1,
+                                                   float32x4_t acc_i2,
+                                                   float32x4_t acc_i3) {
     const int rows_left = m - (tile << 4);
     if (rows_left <= 0) {
         return;
@@ -201,11 +202,13 @@ static inline void ggml_fairy2i_lut_store_tile_arm(int           tile,
     for (int lane = 0; lane < rows_in_tile; ++lane) {
         uint8_t * out_base = dst_col + ((tile << 4) + lane) * dst_row_stride;
         if (pack_bf16) {
-            ((ggml_bf16_t *) out_base)[0] = GGML_FP32_TO_BF16(out_r[lane]);
-            ((ggml_bf16_t *) out_base)[1] = GGML_FP32_TO_BF16(out_i[lane]);
+            const float prev_r            = add ? GGML_BF16_TO_FP32(((const ggml_bf16_t *) out_base)[0]) : 0.0f;
+            const float prev_i            = add ? GGML_BF16_TO_FP32(((const ggml_bf16_t *) out_base)[1]) : 0.0f;
+            ((ggml_bf16_t *) out_base)[0] = GGML_FP32_TO_BF16(prev_r + out_r[lane]);
+            ((ggml_bf16_t *) out_base)[1] = GGML_FP32_TO_BF16(prev_i + out_i[lane]);
         } else {
-            ((float *) out_base)[0] = out_r[lane];
-            ((float *) out_base)[1] = out_i[lane];
+            ((float *) out_base)[0] = (add ? ((const float *) out_base)[0] : 0.0f) + out_r[lane];
+            ((float *) out_base)[1] = (add ? ((const float *) out_base)[1] : 0.0f) + out_i[lane];
         }
     }
 }
@@ -936,6 +939,7 @@ static void ggml_fairy2i_lut_qgemm_lut16_one(int64_t            blocks,
     (void) groups;
     const int tiles = (m + 15) / 16;
 
+#if !(defined(__ARM_NEON) && defined(__aarch64__))
     if (add) {
         for (int row = 0; row < m; ++row) {
             const int tile = row >> 4;
@@ -1002,6 +1006,7 @@ static void ggml_fairy2i_lut_qgemm_lut16_one(int64_t            blocks,
         }
         return;
     }
+#endif
 
 #if defined(__AVX2__)
     const __m256i one      = _mm256_set1_epi8(1);
@@ -1675,19 +1680,19 @@ static void ggml_fairy2i_lut_qgemm_lut16_one(int64_t            blocks,
                 }
             }
 
-            ggml_fairy2i_lut_store_tile_arm(t0, m, dst_col, dst_row_stride, pack_bf16, acc0_r0, acc0_r1, acc0_r2,
-                                           acc0_r3, acc0_i0, acc0_i1, acc0_i2, acc0_i3);
+            ggml_fairy2i_lut_store_tile_arm(t0, m, dst_col, dst_row_stride, pack_bf16, add, acc0_r0, acc0_r1, acc0_r2,
+                                            acc0_r3, acc0_i0, acc0_i1, acc0_i2, acc0_i3);
             if (has1) {
-                ggml_fairy2i_lut_store_tile_arm(t1, m, dst_col, dst_row_stride, pack_bf16, acc1_r0, acc1_r1, acc1_r2,
-                                               acc1_r3, acc1_i0, acc1_i1, acc1_i2, acc1_i3);
+                ggml_fairy2i_lut_store_tile_arm(t1, m, dst_col, dst_row_stride, pack_bf16, add, acc1_r0, acc1_r1,
+                                                acc1_r2, acc1_r3, acc1_i0, acc1_i1, acc1_i2, acc1_i3);
             }
             if (has2) {
-                ggml_fairy2i_lut_store_tile_arm(t2, m, dst_col, dst_row_stride, pack_bf16, acc2_r0, acc2_r1, acc2_r2,
-                                               acc2_r3, acc2_i0, acc2_i1, acc2_i2, acc2_i3);
+                ggml_fairy2i_lut_store_tile_arm(t2, m, dst_col, dst_row_stride, pack_bf16, add, acc2_r0, acc2_r1,
+                                                acc2_r2, acc2_r3, acc2_i0, acc2_i1, acc2_i2, acc2_i3);
             }
             if (has3) {
-                ggml_fairy2i_lut_store_tile_arm(t3, m, dst_col, dst_row_stride, pack_bf16, acc3_r0, acc3_r1, acc3_r2,
-                                               acc3_r3, acc3_i0, acc3_i1, acc3_i2, acc3_i3);
+                ggml_fairy2i_lut_store_tile_arm(t3, m, dst_col, dst_row_stride, pack_bf16, add, acc3_r0, acc3_r1,
+                                                acc3_r2, acc3_r3, acc3_i0, acc3_i1, acc3_i2, acc3_i3);
             }
         }
         return;
@@ -1774,8 +1779,8 @@ static void ggml_fairy2i_lut_qgemm_lut16_one(int64_t            blocks,
                                                 acc_i1, acc_i2, acc_i3);
         }
 
-        ggml_fairy2i_lut_store_tile_arm(t, m, dst_col, dst_row_stride, pack_bf16, acc_r0, acc_r1, acc_r2, acc_r3,
-                                       acc_i0, acc_i1, acc_i2, acc_i3);
+        ggml_fairy2i_lut_store_tile_arm(t, m, dst_col, dst_row_stride, pack_bf16, add, acc_r0, acc_r1, acc_r2, acc_r3,
+                                        acc_i0, acc_i1, acc_i2, acc_i3);
     }
     return;
 #endif
@@ -2134,6 +2139,14 @@ void ggml_fairy2i_tile64_lut_qgemm_fused_lut_c(int          m,
     ggml_fairy2i_tile64_lut_qgemm_fused_lut16(m, k, n, packed_wtiles, act, act_stride, lut_tmp, lut_scales_tmp, dst,
                                         dst_col_stride, dst_row_stride, pack_bf16, add);
 }
+
+void ggml_fairy2i_lut_mul_mat_scalar(int          m,
+                                     int          k,
+                                     int          n,
+                                     const void * qweights,
+                                     const void * act,
+                                     size_t       act_stride,
+                                     float *      dst);
 
 void ggml_fairy2i_lut_mul_mat_scalar(int          m,
                                     int          k,
