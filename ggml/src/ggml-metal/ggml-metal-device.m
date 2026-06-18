@@ -594,13 +594,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
-    // custom complex ifairy types are CPU-only for now
-    if (op->type == GGML_TYPE_IFAIRY || op->type == GGML_TYPE_IFAIRY_Q16 || op->type == GGML_TYPE_IFAIRY64) {
+    // custom complex types are CPU-only for now
+    if (op->type == GGML_TYPE_IFAIRY || op->type == GGML_TYPE_IFAIRY_Q16 || op->type == GGML_TYPE_IFAIRY64 ||
+        op->type == GGML_TYPE_FAIRY2I_TILE64_V2 || op->type == GGML_TYPE_FAIRY2I_ACT_Q16_64) {
         return false;
     }
     for (size_t i = 0, n = 3; i < n; ++i) {
         if (op->src[i] != NULL &&
-            (op->src[i]->type == GGML_TYPE_IFAIRY || op->src[i]->type == GGML_TYPE_IFAIRY_Q16 || op->src[i]->type == GGML_TYPE_IFAIRY64)) {
+            (op->src[i]->type == GGML_TYPE_IFAIRY || op->src[i]->type == GGML_TYPE_IFAIRY_Q16 ||
+             op->src[i]->type == GGML_TYPE_IFAIRY64 || op->src[i]->type == GGML_TYPE_FAIRY2I_TILE64_V2 ||
+             op->src[i]->type == GGML_TYPE_FAIRY2I_ACT_Q16_64)) {
             return false;
         }
     }

@@ -62,6 +62,8 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_M:    return "IQ3_S mix - 3.66 bpw";
         case LLAMA_FTYPE_MOSTLY_IFAIRY:
             return "IFairy";
+        case LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2:
+            return "Fairy2i tile64_v2";
 
         default: return "unknown, may not work";
     }
@@ -665,6 +667,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IFAIRY:
             case GGML_TYPE_IFAIRY64:
                 ftype = LLAMA_FTYPE_MOSTLY_IFAIRY;
+                break;
+            case GGML_TYPE_FAIRY2I_TILE64_V2:
+                ftype = LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2;
                 break;
             default:
                 {

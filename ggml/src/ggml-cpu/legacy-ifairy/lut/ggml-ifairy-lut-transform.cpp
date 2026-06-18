@@ -1,6 +1,7 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-backend.h"
 #include "ggml-common.h"
+#include "ggml-ifairy-lut.h"
 #include "ggml-ifairy-lut-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"

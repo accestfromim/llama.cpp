@@ -1,10 +1,11 @@
 find_package(OpenCL REQUIRED)
-find_package(Python3 REQUIRED)
 
 set(TARGET_NAME ggml-opencl)
 
 ggml_add_backend_library(${TARGET_NAME}
+                         fairy2i/fairy2i-opencl.cpp
                          ggml-opencl.cpp
+                         fairy2i/fairy2i-opencl.h
                          ../../include/ggml-opencl.h)
 target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
 target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
@@ -22,7 +23,13 @@ if (GGML_OPENCL_USE_ADRENO_KERNELS)
     add_compile_definitions(GGML_OPENCL_USE_ADRENO_KERNELS)
 endif ()
 
+if (GGML_FAIRY2I_OPENCL)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_USE_FAIRY2I_OPENCL)
+endif ()
+
 if (GGML_OPENCL_EMBED_KERNELS)
+    find_package(Python3 REQUIRED)
+
     add_compile_definitions(GGML_OPENCL_EMBED_KERNELS)
 
     set(EMBED_KERNEL_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/kernels/embed_kernel.py")
@@ -90,6 +97,7 @@ set(GGML_OPENCL_KERNELS
     mul_mm_f32_f32_l4_lm
     mul_mm_f16_f32_l4_lm
     mul
+    neg
     norm
     relu
     rms_norm
@@ -118,6 +126,19 @@ set(GGML_OPENCL_KERNELS
     flash_attn_f16
     flash_attn_f32
 )
+
+if (GGML_FAIRY2I_OPENCL)
+    list(APPEND GGML_OPENCL_KERNELS
+        complex_add
+        complex_merge
+        complex_mul
+        complex_relu2
+        complex_rms_norm
+        complex_rope
+        complex_split
+        fairy2i_tile64
+    )
+endif ()
 
 foreach (K ${GGML_OPENCL_KERNELS})
     ggml_opencl_add_kernel(${K})

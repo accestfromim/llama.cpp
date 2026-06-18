@@ -6,8 +6,8 @@
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
-#ifdef GGML_IFAIRY_LUT_CPU
-#    include "ggml-ifairy-lut.h"
+#ifdef GGML_USE_FAIRY2I_CPU
+#    include "fairy2i/fairy2i-cpu.h"
 #endif
 
 #include <cctype>
@@ -111,8 +111,8 @@ static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
-#ifdef GGML_IFAIRY_LUT_CPU
-    ggml_ifairy_lut_free();
+#ifdef GGML_USE_FAIRY2I_CPU
+    ggml_fairy2i_cpu_free();
 #endif
     delete backend;
 }
@@ -434,6 +434,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+        case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
+            return true;
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

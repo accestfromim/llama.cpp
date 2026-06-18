@@ -34,7 +34,7 @@ static inline float op_div(float a, float b) {
  *   Bits 0-15:  real (BF16)
  *   Bits 16-31: imag (BF16)
  */
-static inline float op_ifairy_add(float a, float b) {
+static inline float op_complex_add(float a, float b) {
     float r = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[0]);
     float i = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[1]);
     r       = r + GGML_BF16_TO_FP32(((ggml_bf16_t *) (&b))[0]);
@@ -45,7 +45,7 @@ static inline float op_ifairy_add(float a, float b) {
     return ret;
 }
 
-static inline float op_ifairy_mul(float a, float b) {
+static inline float op_complex_mul(float a, float b) {
     float ra = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[0]);
     float ia = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[1]);
     float rg = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&b))[0]);
@@ -64,7 +64,7 @@ static inline void vec_binary_op_contiguous(const int64_t n, dst_t * z, const sr
     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
     constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
-    const bool     check_nan   = op != op_ifairy_add && op != op_ifairy_mul;
+    const bool     check_nan   = op != op_complex_add && op != op_complex_mul;
 
     for (int i = 0; i < n; i++) {
         const float tmp = op(src0_to_f32(x[i]), src1_to_f32(y[i]));
@@ -199,10 +199,18 @@ void ggml_compute_forward_div(const ggml_compute_params * params, ggml_tensor * 
     binary_op<op_div>(params, dst);
 }
 
+void ggml_compute_forward_complex_add(const ggml_compute_params * params, ggml_tensor * dst) {
+    binary_op<op_complex_add>(params, dst);
+}
+
+void ggml_compute_forward_complex_mul(const ggml_compute_params * params, ggml_tensor * dst) {
+    binary_op<op_complex_mul>(params, dst);
+}
+
 void ggml_compute_forward_ifairy_add(const ggml_compute_params * params, ggml_tensor * dst) {
-    binary_op<op_ifairy_add>(params, dst);
+    ggml_compute_forward_complex_add(params, dst);
 }
 
 void ggml_compute_forward_ifairy_mul(const ggml_compute_params * params, ggml_tensor * dst) {
-    binary_op<op_ifairy_mul>(params, dst);
+    ggml_compute_forward_complex_mul(params, dst);
 }

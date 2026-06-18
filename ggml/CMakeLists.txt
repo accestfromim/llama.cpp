@@ -85,7 +85,57 @@ option(GGML_CCACHE "ggml: use ccache if available"                   ON)
 option(GGML_ALL_WARNINGS           "ggml: enable all compiler warnings"                   ON)
 option(GGML_ALL_WARNINGS_3RD_PARTY "ggml: enable all compiler warnings in 3rd party libs" OFF)
 option(GGML_GPROF                  "ggml: enable gprof"                                   OFF)
-option(GGML_IFAIRY_LUT_CPU         "ggml: enable iFairy 3-weight LUT (CPU-only route)"     ON)
+option(GGML_FAIRY2I                "ggml: enable Fairy2i model support"                   OFF)
+option(GGML_FAIRY2I_CPU            "ggml: enable Fairy2i CPU kernels"                     ${GGML_FAIRY2I})
+option(GGML_FAIRY2I_CPU_LUT        "ggml: enable Fairy2i CPU LUT kernels"                 OFF)
+option(GGML_FAIRY2I_CPU_AVX512     "ggml: enable AVX512 Fairy2i fused wide-linear kernel"  OFF)
+option(GGML_FAIRY2I_CPU_ARM_DOTPROD "ggml: enable Fairy2i ARM dotprod kernels"            ON)
+option(GGML_LEGACY_IFAIRY_CPU      "ggml: enable legacy iFairy CPU kernels"                OFF)
+option(GGML_LEGACY_IFAIRY_CPU_LUT  "ggml: enable legacy iFairy CPU LUT kernels"            OFF)
+option(GGML_LEGACY_IFAIRY_CPU_AVX512 "ggml: enable legacy iFairy AVX512 fuse kernels"      OFF)
+option(GGML_LEGACY_IFAIRY_CPU_ARM_DOTPROD "ggml: enable legacy iFairy ARM dotprod kernels" ON)
+option(GGML_LEGACY_IFAIRY_LUT_CPU  "ggml: deprecated alias for GGML_LEGACY_IFAIRY_CPU_LUT"  OFF)
+option(GGML_LEGACY_IFAIRY_AVX512   "ggml: deprecated alias for GGML_LEGACY_IFAIRY_CPU_AVX512" OFF)
+option(GGML_IFAIRY_LUT_CPU         "ggml: deprecated alias for GGML_LEGACY_IFAIRY_CPU_LUT"  OFF)
+option(GGML_IFAIRY_FUSE_AVX512     "ggml: deprecated alias for GGML_LEGACY_IFAIRY_CPU_AVX512" OFF)
+
+if (GGML_LEGACY_IFAIRY_LUT_CPU)
+    message(WARNING "GGML_LEGACY_IFAIRY_LUT_CPU is deprecated; use GGML_LEGACY_IFAIRY_CPU_LUT")
+    set(GGML_LEGACY_IFAIRY_CPU_LUT ON CACHE BOOL "" FORCE)
+endif()
+
+if (GGML_LEGACY_IFAIRY_AVX512)
+    message(WARNING "GGML_LEGACY_IFAIRY_AVX512 is deprecated; use GGML_LEGACY_IFAIRY_CPU_AVX512")
+    set(GGML_LEGACY_IFAIRY_CPU_AVX512 ON CACHE BOOL "" FORCE)
+endif()
+
+if (GGML_IFAIRY_LUT_CPU)
+    message(WARNING "GGML_IFAIRY_LUT_CPU is deprecated; use GGML_LEGACY_IFAIRY_CPU_LUT for legacy iFairy or GGML_FAIRY2I_CPU_LUT for Fairy2i")
+    set(GGML_LEGACY_IFAIRY_CPU_LUT ON CACHE BOOL "" FORCE)
+endif()
+
+if (GGML_IFAIRY_FUSE_AVX512)
+    message(WARNING "GGML_IFAIRY_FUSE_AVX512 is deprecated; use GGML_LEGACY_IFAIRY_CPU_AVX512 for legacy iFairy or GGML_FAIRY2I_CPU_AVX512 for Fairy2i")
+    set(GGML_LEGACY_IFAIRY_CPU_AVX512 ON CACHE BOOL "" FORCE)
+endif()
+
+if (GGML_FAIRY2I_CPU_LUT)
+    set(GGML_FAIRY2I ON)
+    set(GGML_FAIRY2I_CPU ON)
+endif()
+
+if (GGML_FAIRY2I_CPU_AVX512)
+    set(GGML_FAIRY2I ON)
+    set(GGML_FAIRY2I_CPU ON)
+endif()
+
+if (GGML_LEGACY_IFAIRY_CPU_LUT)
+    set(GGML_LEGACY_IFAIRY_CPU ON CACHE BOOL "" FORCE)
+endif()
+
+if (GGML_LEGACY_IFAIRY_CPU_AVX512)
+    set(GGML_LEGACY_IFAIRY_CPU ON CACHE BOOL "" FORCE)
+endif()
 
 # build
 option(GGML_FATAL_WARNINGS    "ggml: enable -Werror flag"    OFF)
@@ -212,23 +262,32 @@ option(GGML_OPENCL                          "ggml: use OpenCL"                  
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
 option(GGML_OPENCL_EMBED_KERNELS            "ggml: embed kernels"                             ON)
 option(GGML_OPENCL_USE_ADRENO_KERNELS       "ggml: use optimized kernels for Adreno"          ON)
+option(GGML_FAIRY2I_OPENCL                  "ggml: enable Fairy2i OpenCL kernels"             ${GGML_FAIRY2I})
 set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "gmml: OpenCL API version to target")
 
-if (GGML_IFAIRY_LUT_CPU)
-    message(STATUS "GGML_IFAIRY_LUT_CPU=ON: enforcing CPU-only build (disabling accelerator backends)")
+if (GGML_FAIRY2I_CPU_LUT OR GGML_LEGACY_IFAIRY_CPU_LUT)
+    set(_GGML_CPU_LUT_FORCE_REASONS)
+    if (GGML_FAIRY2I_CPU_LUT)
+        list(APPEND _GGML_CPU_LUT_FORCE_REASONS "GGML_FAIRY2I_CPU_LUT")
+    endif()
+    if (GGML_LEGACY_IFAIRY_CPU_LUT)
+        list(APPEND _GGML_CPU_LUT_FORCE_REASONS "GGML_LEGACY_IFAIRY_CPU_LUT")
+    endif()
+    string(JOIN " or " _GGML_CPU_LUT_FORCE_REASON ${_GGML_CPU_LUT_FORCE_REASONS})
+    message(STATUS "${_GGML_CPU_LUT_FORCE_REASON}=ON: enforcing CPU-only build (disabling accelerator backends)")
 
-    function(_ggml_ifairy_force_backend_off opt)
+    function(_ggml_cpu_lut_force_backend_off opt)
         if (NOT DEFINED ${opt})
             return()
         endif()
         if (NOT "${${opt}}" STREQUAL "OFF")
-            message(WARNING "GGML_IFAIRY_LUT_CPU=ON: forcing ${opt}=OFF for the CPU-only iFairy LUT path")
+            message(WARNING "${_GGML_CPU_LUT_FORCE_REASON}=ON: forcing ${opt}=OFF for the CPU-only LUT path")
         endif()
         set(${opt} OFF CACHE BOOL "" FORCE)
     endfunction()
 
-    set(_GGML_IFAIRY_FORCED_BACKENDS
+    set(_GGML_CPU_LUT_FORCED_BACKENDS
         GGML_METAL
         GGML_METAL_EMBED_LIBRARY
         GGML_METAL_NDEBUG
@@ -269,10 +328,11 @@ if (GGML_IFAIRY_LUT_CPU)
         GGML_OPENCL_PROFILING
         GGML_OPENCL_EMBED_KERNELS
         GGML_OPENCL_USE_ADRENO_KERNELS
+        GGML_FAIRY2I_OPENCL
     )
 
-    foreach(opt IN LISTS _GGML_IFAIRY_FORCED_BACKENDS)
-        _ggml_ifairy_force_backend_off(${opt})
+    foreach(opt IN LISTS _GGML_CPU_LUT_FORCED_BACKENDS)
+        _ggml_cpu_lut_force_backend_off(${opt})
     endforeach()
 endif()
 

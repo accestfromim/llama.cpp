@@ -253,6 +253,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                 new_type = GGML_TYPE_Q4_K;
             } else if (ftype == LLAMA_FTYPE_MOSTLY_IFAIRY) {
                 new_type = GGML_TYPE_IFAIRY;
+            } else if (ftype == LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2) {
+                new_type = GGML_TYPE_FAIRY2I_TILE64_V2;
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS ||
@@ -566,6 +568,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_TQ2_0:   default_type = GGML_TYPE_TQ2_0;   break;
         case LLAMA_FTYPE_MOSTLY_IFAIRY:
             default_type = GGML_TYPE_IFAIRY;
+            break;
+        case LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2:
+            default_type = GGML_TYPE_FAIRY2I_TILE64_V2;
             break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: default_type = GGML_TYPE_IQ2_XXS; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  default_type = GGML_TYPE_IQ2_XS;  break;

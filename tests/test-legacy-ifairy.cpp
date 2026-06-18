@@ -9,7 +9,7 @@
 // Include internal quantization headers for ifairy types
 extern "C" {
 #include "../ggml/src/ggml-common.h"
-#include "../ggml/src/ggml-ifairy-lut.h"
+#include "../ggml/src/ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut.h"
 #include "../ggml/src/ggml-quants.h"
 
 void quantize_row_ifairy_q16_tensor(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -64,9 +64,11 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
 #include <assert.h>
 
 #include <cerrno>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -81,7 +83,7 @@ void ggml_vec_dot_ifairy64_q16_K_generic(int                        n,
 #    pragma warning(disable : 4244 4267)  // possible loss of data
 #endif
 
-#if defined(GGML_IFAIRY_LUT_CPU) && \
+#if defined(GGML_USE_LEGACY_IFAIRY_CPU_LUT) && \
     ((defined(__aarch64__) && defined(__ARM_NEON)) || defined(__x86_64__) || defined(_M_X64))
 #    define GGML_IFAIRY_LUT_TEST_BACKEND_ENABLED 1
 #else
@@ -383,6 +385,10 @@ static float pack_bf16_pair(float real, float imag) {
     float out;
     memcpy(&out, pair, sizeof(out));
     return out;
+}
+
+static float make_bf16_aligned_f32(float x) {
+    return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x));
 }
 
 static bool parse_cli_i64(const char * name, const char * arg, int64_t * value) {
@@ -1193,7 +1199,6 @@ static bool test_ifairy64_vecdot_compare() {
 
     const int k    = 1024;
     const int nb64 = k / QK_IFAIRY64;
-    const int nbq  = k / QK_IFAIRY;
     const int rows = 3;
 
     std::mt19937                          rng(4049u);
@@ -1214,14 +1219,14 @@ static bool test_ifairy64_vecdot_compare() {
         }
     }
 
-    std::vector<block_ifairy_q16> x((size_t) nbq);
-    for (int ib = 0; ib < nbq; ++ib) {
+    std::vector<block_ifairy64_q16> x((size_t) nb64);
+    for (int ib = 0; ib < nb64; ++ib) {
         x[ib].d_real = GGML_FP32_TO_FP16(scale_dist(rng));
         x[ib].d_imag = GGML_FP32_TO_FP16(scale_dist(rng));
 
         int8_t * xr = (int8_t *) x[ib].x_real;
         int8_t * xi = (int8_t *) x[ib].x_imag;
-        for (int j = 0; j < QK_IFAIRY; ++j) {
+        for (int j = 0; j < QK_IFAIRY64; ++j) {
             xr[j] = (int8_t) act_dist(rng);
             xi[j] = (int8_t) act_dist(rng);
         }
@@ -1648,6 +1653,79 @@ static bool run_ifairy64_backend_mul_mat_shape(std::vector<uint32_t> & packed_ou
                                                          act_bytes, lut_env);
 }
 
+static bool run_ifairy64_mul_mat_shape_on_backend(std::vector<uint32_t> &              packed_out,
+                                                  ggml_backend_t                       backend,
+                                                  int64_t                              M,
+                                                  int64_t                              N,
+                                                  int64_t                              K,
+                                                  const std::vector<block_ifairy64> &  weights,
+                                                  const std::vector<float> &           act_f32,
+                                                  bool                                 require_supported) {
+    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY) != 0) {
+        fprintf(stderr, "Invalid ifairy64 OpenCL test shape: M=%lld N=%lld K=%lld\n",
+                (long long) M, (long long) N, (long long) K);
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for IFAIRY64 MUL_MAT backend run\n");
+        return false;
+    }
+
+    struct ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    struct ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    struct ggml_tensor * out = ggml_mul_mat(ctx, w, a);
+    ggml_set_name(w, "ifairy64_w");
+    ggml_set_name(a, "ifairy64_a");
+    ggml_set_name(out, "ifairy64_out");
+
+    if (require_supported && !ggml_backend_supports_op(backend, out)) {
+        fprintf(stderr, "%s does not support IFAIRY64 MUL_MAT positive case M=%lld N=%lld K=%lld\n",
+                ggml_backend_name(backend), (long long) M, (long long) N, (long long) K);
+        ggml_free(ctx);
+        return false;
+    }
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate backend buffer for IFAIRY64 MUL_MAT on %s\n", ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(a, act_f32.data(), 0, act_f32.size() * sizeof(float));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "IFAIRY64 MUL_MAT graph compute failed on %s\n", ggml_backend_name(backend));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> out_f32((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_f32.data(), 0, ggml_nbytes(out));
+
+    packed_out.resize(out_f32.size());
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+        memcpy(&packed_out[i], &out_f32[i], sizeof(uint32_t));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
 static void fill_ifairy_backend_act_f32(std::vector<float> & act_f32, int64_t N, int64_t K) {
     act_f32.assign((size_t) N * (size_t) K, 0.0f);
     for (int64_t c = 0; c < N; ++c) {
@@ -1659,6 +1737,171 @@ static void fill_ifairy_backend_act_f32(std::vector<float> & act_f32, int64_t N,
     }
 }
 
+static bool run_ifairy64_wide_linear_w2_backend(std::vector<uint32_t> &             packed_out,
+                                                int64_t                             M,
+                                                int64_t                             N,
+                                                int64_t                             K,
+                                                const std::vector<block_ifairy64> & u_s0_data,
+                                                const std::vector<block_ifairy64> & u_s1_data,
+                                                const std::vector<block_ifairy64> & w_s0_data,
+                                                const std::vector<block_ifairy64> & w_s1_data,
+                                                const std::vector<float> &          x_data,
+                                                const std::vector<float> &          x_conj_data,
+                                                const std::vector<float> *          bias_data,
+                                                bool                                fused) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, 4);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * x_conj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * u_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * u_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * bias   = bias_data ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * M) : nullptr;
+
+    ggml_tensor * out = nullptr;
+    if (fused) {
+        out = ggml_ifairy_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
+    } else {
+        ggml_tensor * u = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, u_s0, x_conj), ggml_mul_mat(ctx, u_s1, x_conj));
+        ggml_tensor * w = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, w_s0, x), ggml_mul_mat(ctx, w_s1, x));
+        out             = ggml_ifairy_add(ctx, u, w);
+        if (bias) {
+            out = ggml_ifairy_merge(ctx, ggml_add(ctx, ggml_ifairy_split(ctx, out), bias));
+        }
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
+    ggml_backend_tensor_set(x_conj, x_conj_data.data(), 0, x_conj_data.size() * sizeof(float));
+    ggml_backend_tensor_set(u_s0, u_s0_data.data(), 0, u_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(u_s1, u_s1_data.data(), 0, u_s1_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s0, w_s0_data.data(), 0, w_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s1, w_s1_data.data(), 0, w_s1_data.size() * sizeof(block_ifairy64));
+    if (bias) {
+        ggml_backend_tensor_set(bias, bias_data->data(), 0, bias_data->size() * sizeof(float));
+    }
+
+    const bool ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        std::vector<float> out_data((size_t) M * (size_t) N);
+        ggml_backend_tensor_get(out, out_data.data(), 0, out_data.size() * sizeof(float));
+        packed_out.resize(out_data.size());
+        memcpy(packed_out.data(), out_data.data(), out_data.size() * sizeof(float));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return ok;
+}
+
+static bool test_ifairy64_wide_linear_w2_fused() {
+    printf("\n=== Test 5.5: iFairy64 fused wide linear W2 ===\n");
+
+    const int64_t M = 7;
+    const int64_t K = 2 * QK_IFAIRY64;
+
+    std::vector<block_ifairy64> u_s0;
+    std::vector<block_ifairy64> u_s1;
+    std::vector<block_ifairy64> w_s0;
+    std::vector<block_ifairy64> w_s1;
+    fill_ifairy64_backend_weights(u_s0, M, K);
+    fill_ifairy64_backend_weights(u_s1, M, K);
+    fill_ifairy64_backend_weights(w_s0, M, K);
+    fill_ifairy64_backend_weights(w_s1, M, K);
+
+    for (size_t i = 0; i < u_s0.size(); ++i) {
+        u_s0[i].d_real = GGML_FP32_TO_FP16(0.050f + 0.001f * (float) (i % 5));
+        u_s0[i].d_imag = GGML_FP32_TO_FP16(0.040f + 0.001f * (float) (i % 3));
+        u_s1[i].d_real = GGML_FP32_TO_FP16(0.035f + 0.001f * (float) (i % 7));
+        u_s1[i].d_imag = GGML_FP32_TO_FP16(0.030f + 0.001f * (float) (i % 2));
+        w_s0[i].d_real = GGML_FP32_TO_FP16(0.045f + 0.001f * (float) (i % 4));
+        w_s0[i].d_imag = GGML_FP32_TO_FP16(0.025f + 0.001f * (float) (i % 6));
+        w_s1[i].d_real = GGML_FP32_TO_FP16(0.055f + 0.001f * (float) (i % 3));
+        w_s1[i].d_imag = GGML_FP32_TO_FP16(0.020f + 0.001f * (float) (i % 5));
+    }
+
+    std::vector<float> bias((size_t) 2 * (size_t) M);
+    for (int64_t i = 0; i < 2 * M; ++i) {
+        bias[(size_t) i] = (float) (i - M) / 32.0f;
+    }
+
+    const int64_t              n_cases[]    = { 1, 3 };
+    const std::vector<float> * bias_cases[] = { nullptr, &bias };
+    const struct {
+        const char * enabled;
+        const char * impl;
+    } lut_cases[] = {
+        { "0", "lut16" },
+        { "1", "lut16" },
+        { "1", "auto" },
+    };
+    for (const auto & lut_case : lut_cases) {
+        scoped_env_var env_lut("GGML_IFAIRY_LUT");
+        scoped_env_var env_impl("GGML_IFAIRY_LUT_IMPL");
+        env_lut.set(lut_case.enabled);
+        env_impl.set(lut_case.impl);
+
+        for (int64_t N : n_cases) {
+            std::vector<float> x;
+            fill_ifairy_backend_act_f32(x, N, K);
+
+            std::vector<float> x_conj(x.size());
+            for (size_t i = 0; i < x.size(); ++i) {
+                const ggml_bf16_t * in = (const ggml_bf16_t *) &x[i];
+                ggml_bf16_t *       out = (ggml_bf16_t *) &x_conj[i];
+                out[0]                  = in[0];
+                out[1]                  = GGML_FP32_TO_BF16(-GGML_BF16_TO_FP32(in[1]));
+            }
+
+            for (const std::vector<float> * bias_case : bias_cases) {
+                std::vector<uint32_t> out_fused;
+                std::vector<uint32_t> out_reference;
+                if (!run_ifairy64_wide_linear_w2_backend(out_fused, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
+                                                          bias_case, true) ||
+                    !run_ifairy64_wide_linear_w2_backend(out_reference, M, N, K, u_s0, u_s1, w_s0, w_s1, x, x_conj,
+                                                          bias_case, false)) {
+                    return false;
+                }
+
+                if (!compare_packed_complex_outputs(out_fused.data(), out_reference.data(), out_reference.size(),
+                                                    1e-2f)) {
+                    fprintf(stderr, "Fused wide linear W2 mismatch (LUT=%s/%s, N=%lld, %s bias)\n", lut_case.enabled,
+                            lut_case.impl, (long long) N, bias_case ? "with" : "without");
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
 static void quantize_ifairy_backend_act_q16(std::vector<block_ifairy_q16> & act_q16,
                                             const std::vector<float> &      act_f32,
                                             int64_t                         N,
@@ -1668,6 +1911,18 @@ static void quantize_ifairy_backend_act_q16(std::vector<block_ifairy_q16> & act_
     for (int64_t c = 0; c < N; ++c) {
         quantize_row_ifairy_q16_tensor(act_f32.data() + (size_t) c * (size_t) K,
                                        act_q16.data() + (size_t) c * (size_t) blocks, K);
+    }
+}
+
+static void quantize_ifairy64_backend_act_q16(std::vector<block_ifairy64_q16> & act_q16,
+                                              const std::vector<float> &        act_f32,
+                                              int64_t                           N,
+                                              int64_t                           K) {
+    const int64_t blocks = K / QK_IFAIRY64;
+    act_q16.assign((size_t) N * (size_t) blocks, block_ifairy64_q16{});
+    for (int64_t c = 0; c < N; ++c) {
+        quantize_row_ifairy64_q16_ref(act_f32.data() + (size_t) c * (size_t) K,
+                                      act_q16.data() + (size_t) c * (size_t) blocks, K);
     }
 }
 
@@ -1804,7 +2059,7 @@ static bool test_ifairy_lut_backend_f32_vs_q16() {
         fprintf(stderr, "Size mismatch (F32 vs Q16): %zu vs %zu\n", out_f32.size(), out_q16.size());
         return false;
     }
-    return compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size());
+    return compare_packed_complex_outputs(out_q16.data(), out_f32.data(), out_f32.size(), 1e-2f);
 #endif
 }
 
@@ -1843,7 +2098,7 @@ static bool test_ifairy_lut_backend_lut_c_f32_vs_q16() {
         fprintf(stderr, "Size mismatch (lut_c F32 vs Q16): %zu vs %zu\n", out_f32.size(), out_q16.size());
         return false;
     }
-    return compare_u32_arrays(out_q16.data(), out_f32.data(), out_f32.size());
+    return compare_packed_complex_outputs(out_q16.data(), out_f32.data(), out_f32.size(), 1e-2f);
 #endif
 }
 
@@ -1858,20 +2113,18 @@ static bool test_ifairy64_lut_backend_compare() {
     const int64_t N = 2;
     const int64_t K = 2 * QK_IFAIRY;
 
-    std::vector<float>            act_f32;
-    std::vector<block_ifairy_q16> act_q16;
+    std::vector<float> act_f32;
     fill_ifairy_backend_act_f32(act_f32, N, K);
-    quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
 
     std::vector<uint32_t> out_off;
     std::vector<uint32_t> out_on;
-    if (!run_ifairy64_backend_mul_mat_shape(out_off, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
+    if (!run_ifairy64_backend_mul_mat_shape(out_off, M, N, K, GGML_TYPE_F32, act_f32.data(),
+                                            act_f32.size() * sizeof(float),
                                             /*lut_env*/ "0")) {
         return false;
     }
-    if (!run_ifairy64_backend_mul_mat_shape(out_on, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
+    if (!run_ifairy64_backend_mul_mat_shape(out_on, M, N, K, GGML_TYPE_F32, act_f32.data(),
+                                            act_f32.size() * sizeof(float),
                                             /*lut_env*/ "1")) {
         return false;
     }
@@ -1885,30 +2138,30 @@ static bool test_ifairy64_lut_backend_compare() {
 
 static bool test_ifairy64_lut_backend_f32_vs_q16() {
 #if !GGML_IFAIRY_LUT_TEST_BACKEND_ENABLED
-    printf("\n=== Test 5.4: iFairy64 LUT backend F32 vs Q16 (SKIP: backend not enabled on this platform) ===\n");
+    printf("\n=== Test 5.4: iFairy64 backend F32 vs Q16 (SKIP: backend not enabled on this platform) ===\n");
     return true;
 #else
-    printf("\n=== Test 5.4: iFairy64 LUT backend F32 vs Q16 ===\n");
+    printf("\n=== Test 5.4: iFairy64 backend F32 vs Q16 ===\n");
 
     const int64_t M = 8;
     const int64_t N = 2;
     const int64_t K = 2 * QK_IFAIRY;
 
-    std::vector<float>            act_f32;
-    std::vector<block_ifairy_q16> act_q16;
+    std::vector<float>              act_f32;
+    std::vector<block_ifairy64_q16> act_q16;
     fill_ifairy_backend_act_f32(act_f32, N, K);
-    quantize_ifairy_backend_act_q16(act_q16, act_f32, N, K);
+    quantize_ifairy64_backend_act_q16(act_q16, act_f32, N, K);
 
     std::vector<uint32_t> out_f32;
     std::vector<uint32_t> out_q16;
     if (!run_ifairy64_backend_mul_mat_shape(out_f32, M, N, K, GGML_TYPE_F32, act_f32.data(),
                                             act_f32.size() * sizeof(float),
-                                            /*lut_env*/ "1")) {
+                                            /*lut_env*/ "0")) {
         return false;
     }
-    if (!run_ifairy64_backend_mul_mat_shape(out_q16, M, N, K, GGML_TYPE_IFAIRY_Q16, act_q16.data(),
-                                            act_q16.size() * sizeof(block_ifairy_q16),
-                                            /*lut_env*/ "1")) {
+    if (!run_ifairy64_backend_mul_mat_shape(out_q16, M, N, K, GGML_TYPE_IFAIRY64_Q16, act_q16.data(),
+                                            act_q16.size() * sizeof(block_ifairy64_q16),
+                                            /*lut_env*/ "0")) {
         return false;
     }
     if (out_f32.size() != out_q16.size()) {
@@ -2151,9 +2404,990 @@ static int run_ifairy_lut_only_tests(void) {
     return num_failed > 0 ? 1 : 0;
 }
 
+static ggml_backend_dev_t find_opencl_test_device(void) {
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const char *       name = ggml_backend_dev_name(dev);
+        ggml_backend_reg_t reg  = ggml_backend_dev_backend_reg(dev);
+        const char *       reg_name = ggml_backend_reg_name(reg);
+
+        if ((name && strcmp(name, "GPUOpenCL") == 0) || (reg_name && strcmp(reg_name, "OpenCL") == 0)) {
+            return dev;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool check_ifairy_opencl_binary_support(ggml_backend_dev_t dev,
+                                               const char *       op_name,
+                                               ggml_tensor *    (*op)(ggml_context *, ggml_tensor *, ggml_tensor *),
+                                               const char *       label,
+                                               const char *       gate_value,
+                                               enum ggml_type     type,
+                                               bool               src0_view,
+                                               bool               src1_view,
+                                               int64_t            ne0,
+                                               int64_t            ne1,
+                                               int64_t            src1_ne0,
+                                               bool               expected) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    if (gate_value) {
+        env_gate.set(gate_value);
+    } else {
+        env_gate.unset();
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for %s %s\n", op_name, label);
+        return false;
+    }
+
+    struct ggml_tensor * a_base = ggml_new_tensor_2d(ctx, type, src0_view ? ne0 * 2 : ne0, ne1);
+    struct ggml_tensor * b_base = ggml_new_tensor_2d(ctx, type, src1_view ? src1_ne0 * 2 : src1_ne0, ne1);
+    struct ggml_tensor * a = src0_view ? ggml_view_2d(ctx, a_base, ne0, ne1, a_base->nb[1], 0) : a_base;
+    struct ggml_tensor * b = src1_view ? ggml_view_2d(ctx, b_base, src1_ne0, ne1, b_base->nb[1], 0) : b_base;
+    struct ggml_tensor * out = op(ctx, a, b);
+
+    const bool supported = ggml_backend_dev_supports_op(dev, out);
+    ggml_free(ctx);
+
+    if (supported != expected) {
+        fprintf(stderr, "%s OpenCL support case '%s' expected %s, got %s\n",
+                op_name, label, expected ? "supported" : "unsupported", supported ? "supported" : "unsupported");
+        return false;
+    }
+
+    printf("  %-28s : %s\n", label, supported ? "supported" : "unsupported");
+    return true;
+}
+
+static bool check_ifairy64_opencl_mul_mat_support(ggml_backend_dev_t dev,
+                                                  const char *       label,
+                                                  const char *       gate_value,
+                                                  enum ggml_type     weight_type,
+                                                  enum ggml_type     act_type,
+                                                  bool               weight_view,
+                                                  bool               act_view,
+                                                  int64_t            k,
+                                                  int64_t            m,
+                                                  int64_t            n,
+                                                  bool               expected) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    if (gate_value) {
+        env_gate.set(gate_value);
+    } else {
+        env_gate.unset();
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for IFAIRY64 MUL_MAT %s\n", label);
+        return false;
+    }
+
+    struct ggml_tensor * w_base = ggml_new_tensor_2d(ctx, weight_type, weight_view ? k * 2 : k, m);
+    struct ggml_tensor * x_base = ggml_new_tensor_2d(ctx, act_type, act_view ? k * 2 : k, n);
+    struct ggml_tensor * w      = weight_view ? ggml_view_2d(ctx, w_base, k, m, w_base->nb[1], 0) : w_base;
+    struct ggml_tensor * x      = act_view ? ggml_view_2d(ctx, x_base, k, n, x_base->nb[1], 0) : x_base;
+    struct ggml_tensor * out    = ggml_mul_mat(ctx, w, x);
+
+    const bool supported = ggml_backend_dev_supports_op(dev, out);
+    ggml_free(ctx);
+
+    if (supported != expected) {
+        fprintf(stderr, "IFAIRY64 MUL_MAT OpenCL support case '%s' expected %s, got %s\n",
+                label, expected ? "supported" : "unsupported", supported ? "supported" : "unsupported");
+        return false;
+    }
+
+    printf("  %-28s : %s\n", label, supported ? "supported" : "unsupported");
+    return true;
+}
+
+static int run_ifairy_opencl_binary_tests(const char * op_name,
+                                          ggml_tensor * (*op)(ggml_context *, ggml_tensor *, ggml_tensor *)) {
+    printf("\n=== iFairy OpenCL %s support gate tests ===\n", op_name);
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        printf("OpenCL backend not found; skipping iFairy OpenCL %s support tests.\n", op_name);
+        return 0;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    int num_failed = 0;
+    auto run = [&](const char *   label,
+                   const char *   gate_value,
+                   enum ggml_type type,
+                   bool           src0_view,
+                   bool           src1_view,
+                   int64_t        ne0,
+                   int64_t        ne1,
+                   int64_t        src1_ne0,
+                   bool           expected) {
+        if (!check_ifairy_opencl_binary_support(dev, op_name, op, label, gate_value, type, src0_view, src1_view, ne0, ne1, src1_ne0, expected)) {
+            num_failed++;
+        }
+    };
+
+    run("env-unset",       nullptr, GGML_TYPE_F32, false, false, 4, 4, 4, false);
+    run("env-zero",        "0",     GGML_TYPE_F32, false, false, 4, 4, 4, false);
+    run("same-shape-f32",  "1",     GGML_TYPE_F32, false, false, 4, 4, 4, true);
+    run("broadcast-ne0",   "1",     GGML_TYPE_F32, false, false, 8, 4, 4, true);
+    run("f16-rejected",    "1",     GGML_TYPE_F16, false, false, 4, 4, 4, false);
+    run("src0-view",       "1",     GGML_TYPE_F32, true,  false, 4, 4, 4, false);
+    run("src1-view",       "1",     GGML_TYPE_F32, false, true,  4, 4, 4, false);
+    if (num_failed == 0) {
+        printf("iFairy OpenCL %s support gate tests PASSED!\n", op_name);
+    } else {
+        printf("%d iFairy OpenCL %s support gate test(s) FAILED\n", num_failed, op_name);
+    }
+
+    return num_failed > 0 ? 1 : 0;
+}
+
+static int run_ifairy_opencl_add_tests(void) {
+    return run_ifairy_opencl_binary_tests("IFAIRY_ADD", ggml_ifairy_add);
+}
+
+static int run_ifairy_opencl_mul_tests(void) {
+    return run_ifairy_opencl_binary_tests("IFAIRY_MUL", ggml_ifairy_mul);
+}
+
+static bool run_ifairy64_opencl_mul_mat_compare_case(ggml_backend_dev_t dev,
+                                                     int64_t            m,
+                                                     int64_t            n,
+                                                     int64_t            k) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    env_gate.set("1");
+
+    std::vector<block_ifairy64> weights;
+    std::vector<float>          act_f32;
+    fill_ifairy64_backend_weights(weights, m, k);
+    fill_ifairy_backend_act_f32(act_f32, n, k);
+
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    if (!cpu_backend) {
+        fprintf(stderr, "Failed to init CPU backend for IFAIRY64 MUL_MAT compare\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(cpu_backend, 4);
+
+    ggml_backend_t opencl_backend = ggml_backend_dev_init(dev, NULL);
+    if (!opencl_backend) {
+        fprintf(stderr, "Failed to init OpenCL backend for IFAIRY64 MUL_MAT compare\n");
+        ggml_backend_free(cpu_backend);
+        return false;
+    }
+
+    std::vector<uint32_t> cpu_out;
+    std::vector<uint32_t> opencl_out;
+    const bool cpu_ok = run_ifairy64_mul_mat_shape_on_backend(cpu_out, cpu_backend, m, n, k, weights, act_f32,
+                                                              /*require_supported*/ false);
+    const bool opencl_ok = run_ifairy64_mul_mat_shape_on_backend(opencl_out, opencl_backend, m, n, k, weights, act_f32,
+                                                                 /*require_supported*/ true);
+
+    ggml_backend_free(opencl_backend);
+    ggml_backend_free(cpu_backend);
+
+    if (!cpu_ok || !opencl_ok) {
+        return false;
+    }
+    if (cpu_out.size() != opencl_out.size()) {
+        fprintf(stderr, "IFAIRY64 MUL_MAT output size mismatch: CPU=%zu OpenCL=%zu\n", cpu_out.size(), opencl_out.size());
+        return false;
+    }
+
+    printf("  compare IFAIRY64_MUL_MAT M=%lld N=%lld K=%lld\n",
+           (long long) m, (long long) n, (long long) k);
+    return compare_packed_complex_outputs(opencl_out.data(), cpu_out.data(), cpu_out.size(), 1e-2f);
+}
+
+static int run_ifairy64_opencl_mul_mat_tests(void) {
+    printf("\n=== iFairy64 OpenCL MUL_MAT support and correctness tests ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        fprintf(stderr, "OpenCL backend not found; IFAIRY64 MUL_MAT requires real OpenCL execution.\n");
+        return 1;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    int num_failed = 0;
+    auto support = [&](const char *   label,
+                       const char *   gate_value,
+                       enum ggml_type weight_type,
+                       enum ggml_type act_type,
+                       bool           weight_view,
+                       bool           act_view,
+                       int64_t        k,
+                       int64_t        m,
+                       int64_t        n,
+                       bool           expected) {
+        if (!check_ifairy64_opencl_mul_mat_support(dev, label, gate_value, weight_type, act_type,
+                                                   weight_view, act_view, k, m, n, expected)) {
+            num_failed++;
+        }
+    };
+
+    support("env-unset",        nullptr, GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY,   4, 1, false);
+    support("env-zero",         "0",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY,   4, 1, false);
+    support("contiguous-f32",   "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY,   4, 1, true);
+    support("k64-rejected",     "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY64, 4, 1, false);
+    support("act-f16",          "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F16, false, false, QK_IFAIRY,   4, 1, false);
+    support("weight-view",      "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, true,  false, QK_IFAIRY,   4, 1, false);
+    support("activation-view",  "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, true,  QK_IFAIRY,   4, 1, false);
+
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 7, 1, QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 9, 1, 2 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 256, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 512, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 1024, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 2048, 1, 4 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 13, 4, 2 * QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 8, 8, 2 * QK_IFAIRY)) {
+        num_failed++;
+    }
+
+    if (num_failed == 0) {
+        printf("iFairy64 OpenCL MUL_MAT support and correctness tests PASSED!\n");
+    } else {
+        printf("%d iFairy64 OpenCL MUL_MAT test(s) FAILED\n", num_failed);
+    }
+
+    return num_failed > 0 ? 1 : 0;
+}
+
+static bool check_ifairy_opencl_rmsnorm_support(ggml_backend_dev_t dev,
+                                                const char *       label,
+                                                const char *       gate_value,
+                                                enum ggml_type     type,
+                                                bool               src0_view,
+                                                int64_t            ne0,
+                                                int64_t            ne1,
+                                                bool               expected) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    if (gate_value) {
+        env_gate.set(gate_value);
+    } else {
+        env_gate.unset();
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for IFAIRY_RMS_NORM %s\n", label);
+        return false;
+    }
+
+    struct ggml_tensor * a_base = ggml_new_tensor_2d(ctx, type, src0_view ? ne0 * 2 : ne0, ne1);
+    struct ggml_tensor * a      = src0_view ? ggml_view_2d(ctx, a_base, ne0, ne1, a_base->nb[1], 0) : a_base;
+    struct ggml_tensor * out    = ggml_ifairy_rms_norm(ctx, a, 1e-6f);
+
+    const bool supported = ggml_backend_dev_supports_op(dev, out);
+    ggml_free(ctx);
+
+    if (supported != expected) {
+        fprintf(stderr, "IFAIRY_RMS_NORM OpenCL support case '%s' expected %s, got %s\n",
+                label, expected ? "supported" : "unsupported", supported ? "supported" : "unsupported");
+        return false;
+    }
+
+    printf("  %-28s : %s\n", label, supported ? "supported" : "unsupported");
+    return true;
+}
+
+static bool run_ifairy_rmsnorm_backend(std::vector<float> &            out_data,
+                                       ggml_backend_t                 backend,
+                                       const std::array<int64_t, 4> & ne,
+                                       float                          eps,
+                                       bool                           fused_mul,
+                                       bool                           broadcast_weight,
+                                       const std::vector<float> &      input_data,
+                                       const std::vector<float> &      weight_data) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/4 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for IFAIRY_RMS_NORM backend run\n");
+        return false;
+    }
+
+    struct ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+    ggml_set_name(a, "a");
+
+    struct ggml_tensor * out = ggml_ifairy_rms_norm(ctx, a, eps);
+    struct ggml_tensor * w   = nullptr;
+    if (fused_mul) {
+        const std::array<int64_t, 4> w_ne = broadcast_weight ? std::array<int64_t, 4>{ne[0], 1, 1, 1} : ne;
+        w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, w_ne.data());
+        ggml_set_name(w, "w");
+        out = ggml_mul(ctx, out, w);
+    }
+    ggml_set_name(out, "out");
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    if (!ggml_backend_supports_op(backend, out)) {
+        fprintf(stderr, "%s does not support final graph output %s (%s)\n",
+                ggml_backend_name(backend), ggml_op_name(out->op), out->name);
+        ggml_free(ctx);
+        return false;
+    }
+    if (fused_mul && !ggml_backend_supports_op(backend, out->src[0])) {
+        fprintf(stderr, "%s does not support IFAIRY_RMS_NORM before fused MUL\n", ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate backend buffer for IFAIRY_RMS_NORM on %s\n", ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(a, input_data.data(), 0, ggml_nbytes(a));
+    if (fused_mul) {
+        ggml_backend_tensor_set(w, weight_data.data(), 0, ggml_nbytes(w));
+    }
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "IFAIRY_RMS_NORM graph compute failed on %s\n", ggml_backend_name(backend));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return false;
+    }
+
+    out_data.resize((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
+static bool run_ifairy_opencl_rmsnorm_compare_case(ggml_backend_dev_t             dev,
+                                                   const std::array<int64_t, 4> & ne,
+                                                   float                          eps,
+                                                   bool                           fused_mul,
+                                                   bool                           broadcast_weight,
+                                                   bool                           near_zero) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    env_gate.set("1");
+
+    const size_t nels = (size_t) ne[0] * (size_t) ne[1] * (size_t) ne[2] * (size_t) ne[3];
+    std::vector<float> input_data(nels);
+    for (size_t i = 0; i < nels; ++i) {
+        const float base = near_zero
+            ? 1e-4f * (float) ((int) (i % 13) - 6)
+            : 0.125f + 0.03125f * (float) ((int) (i % 29) - 14);
+        input_data[i] = make_bf16_aligned_f32(base);
+    }
+
+    const std::array<int64_t, 4> w_ne = broadcast_weight ? std::array<int64_t, 4>{ne[0], 1, 1, 1} : ne;
+    const size_t weight_nels = (size_t) w_ne[0] * (size_t) w_ne[1] * (size_t) w_ne[2] * (size_t) w_ne[3];
+    std::vector<float> weight_data(weight_nels);
+    for (size_t i = 0; i < weight_nels; ++i) {
+        weight_data[i] = 0.75f + 0.0625f * (float) (int) (i % 9);
+    }
+
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    if (!cpu_backend) {
+        fprintf(stderr, "Failed to init CPU backend for IFAIRY_RMS_NORM compare\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(cpu_backend, 4);
+
+    ggml_backend_t opencl_backend = ggml_backend_dev_init(dev, NULL);
+    if (!opencl_backend) {
+        fprintf(stderr, "Failed to init OpenCL backend for IFAIRY_RMS_NORM compare\n");
+        ggml_backend_free(cpu_backend);
+        return false;
+    }
+
+    std::vector<float> cpu_out;
+    std::vector<float> opencl_out;
+    const bool cpu_ok = run_ifairy_rmsnorm_backend(cpu_out, cpu_backend, ne, eps, fused_mul, broadcast_weight,
+                                                   input_data, weight_data);
+    const bool opencl_ok = run_ifairy_rmsnorm_backend(opencl_out, opencl_backend, ne, eps, fused_mul, broadcast_weight,
+                                                      input_data, weight_data);
+
+    ggml_backend_free(opencl_backend);
+    ggml_backend_free(cpu_backend);
+
+    if (!cpu_ok || !opencl_ok) {
+        return false;
+    }
+    if (cpu_out.size() != opencl_out.size()) {
+        fprintf(stderr, "IFAIRY_RMS_NORM output size mismatch: CPU=%zu OpenCL=%zu\n", cpu_out.size(), opencl_out.size());
+        return false;
+    }
+
+    printf("  compare %s ne=[%lld,%lld,%lld,%lld] eps=%.1e broadcast=%d near_zero=%d\n",
+           fused_mul ? "rmsnorm+mul" : "rmsnorm",
+           (long long) ne[0], (long long) ne[1], (long long) ne[2], (long long) ne[3],
+           (double) eps, broadcast_weight ? 1 : 0, near_zero ? 1 : 0);
+    return compare_arrays(opencl_out.data(), cpu_out.data(), cpu_out.size(), fused_mul ? 1e-4f : 1e-3f);
+}
+
+static int run_ifairy_opencl_rmsnorm_tests(void) {
+    printf("\n=== iFairy OpenCL IFAIRY_RMS_NORM support and correctness tests ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        printf("OpenCL backend not found; skipping iFairy OpenCL RMSNorm tests.\n");
+        return 0;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    int num_failed = 0;
+    auto support = [&](const char *   label,
+                       const char *   gate_value,
+                       enum ggml_type type,
+                       bool           src0_view,
+                       int64_t        ne0,
+                       int64_t        ne1,
+                       bool           expected) {
+        if (!check_ifairy_opencl_rmsnorm_support(dev, label, gate_value, type, src0_view, ne0, ne1, expected)) {
+            num_failed++;
+        }
+    };
+
+    support("env-unset",      nullptr, GGML_TYPE_F32, false, 4, 4, false);
+    support("env-zero",       "0",     GGML_TYPE_F32, false, 4, 4, false);
+    support("contiguous-f32", "1",     GGML_TYPE_F32, false, 4, 4, true);
+    support("f16-rejected",   "1",     GGML_TYPE_F16, false, 4, 4, false);
+    support("src0-view",      "1",     GGML_TYPE_F32, true,  4, 4, false);
+
+    if (!run_ifairy_opencl_rmsnorm_compare_case(dev, {1, 1, 1, 1}, 1e-6f, false, true, false)) {
+        num_failed++;
+    }
+    if (!run_ifairy_opencl_rmsnorm_compare_case(dev, {33, 2, 1, 1}, 1e-6f, false, true, false)) {
+        num_failed++;
+    }
+    if (!run_ifairy_opencl_rmsnorm_compare_case(dev, {64, 5, 4, 3}, 1e-4f, false, true, true)) {
+        num_failed++;
+    }
+    if (!run_ifairy_opencl_rmsnorm_compare_case(dev, {1, 1, 1, 1}, 1e-6f, true, true, false)) {
+        num_failed++;
+    }
+    if (!run_ifairy_opencl_rmsnorm_compare_case(dev, {33, 2, 1, 1}, 1e-6f, true, true, false)) {
+        num_failed++;
+    }
+    if (!run_ifairy_opencl_rmsnorm_compare_case(dev, {64, 5, 4, 3}, 1e-4f, true, false, true)) {
+        num_failed++;
+    }
+
+    if (num_failed == 0) {
+        printf("iFairy OpenCL IFAIRY_RMS_NORM support and correctness tests PASSED!\n");
+    } else {
+        printf("%d iFairy OpenCL IFAIRY_RMS_NORM test(s) FAILED\n", num_failed);
+    }
+
+    return num_failed > 0 ? 1 : 0;
+}
+
+struct ifairy_rmsnorm_bench_result {
+    double   us_per_run = 0.0;
+    int      runs       = 0;
+    uint64_t hash       = 0;
+};
+
+static uint64_t hash_f32_bits(const std::vector<float> & values) {
+    uint64_t h = 1469598103934665603ULL;
+    for (float v : values) {
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        h ^= (uint64_t) bits;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t hash_u32_bits(const std::vector<uint32_t> & values) {
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t v : values) {
+        h ^= (uint64_t) v;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static bool run_ifairy_rmsnorm_mul_bench_case(ifairy_rmsnorm_bench_result & result,
+                                              ggml_backend_t                backend,
+                                              const std::array<int64_t, 4> & ne,
+                                              float                         eps,
+                                              bool                          broadcast_weight) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/4 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for IFAIRY_RMS_NORM_MUL bench\n");
+        return false;
+    }
+
+    struct ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+    ggml_set_name(a, "a");
+
+    const std::array<int64_t, 4> w_ne = broadcast_weight ? std::array<int64_t, 4>{ne[0], 1, 1, 1} : ne;
+    struct ggml_tensor * w = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, w_ne.data());
+    ggml_set_name(w, "w");
+
+    struct ggml_tensor * rms = ggml_ifairy_rms_norm(ctx, a, eps);
+    ggml_set_name(rms, "rms");
+    struct ggml_tensor * out = ggml_mul(ctx, rms, w);
+    ggml_set_name(out, "out");
+
+    if (!ggml_backend_supports_op(backend, rms) || !ggml_backend_supports_op(backend, out)) {
+        fprintf(stderr, "%s does not support IFAIRY_RMS_NORM_MUL bench graph\n", ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate backend buffer for IFAIRY_RMS_NORM_MUL bench on %s\n",
+                ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
+
+    const size_t nels = (size_t) ne[0] * (size_t) ne[1] * (size_t) ne[2] * (size_t) ne[3];
+    std::vector<float> input_data(nels);
+    for (size_t i = 0; i < nels; ++i) {
+        const float base = 0.125f + 0.03125f * (float) ((int) (i % 29) - 14);
+        input_data[i] = make_bf16_aligned_f32(base);
+    }
+
+    const size_t weight_nels = (size_t) w_ne[0] * (size_t) w_ne[1] * (size_t) w_ne[2] * (size_t) w_ne[3];
+    std::vector<float> weight_data(weight_nels);
+    for (size_t i = 0; i < weight_nels; ++i) {
+        weight_data[i] = 0.75f + 0.0625f * (float) (int) (i % 9);
+    }
+
+    ggml_backend_tensor_set(a, input_data.data(), 0, ggml_nbytes(a));
+    ggml_backend_tensor_set(w, weight_data.data(), 0, ggml_nbytes(w));
+
+    for (int i = 0; i < 10; ++i) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "IFAIRY_RMS_NORM_MUL bench warmup failed on %s\n", ggml_backend_name(backend));
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+    }
+    ggml_backend_synchronize(backend);
+
+    int64_t total_us = 0;
+    int     runs     = 0;
+    do {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "IFAIRY_RMS_NORM_MUL bench run failed on %s\n", ggml_backend_name(backend));
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+        const auto t1 = std::chrono::steady_clock::now();
+
+        total_us += (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        runs++;
+    } while (total_us < 1000 * 1000 || runs < 50);
+
+    std::vector<float> out_data((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_data.data(), 0, ggml_nbytes(out));
+
+    result.us_per_run = (double) total_us / (double) runs;
+    result.runs       = runs;
+    result.hash       = hash_f32_bits(out_data);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
+static int run_ifairy_opencl_rmsnorm_bench(void) {
+    printf("\n=== iFairy OpenCL IFAIRY_RMS_NORM_MUL microbench ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        printf("OpenCL backend not found; skipping iFairy OpenCL RMSNorm bench.\n");
+        return 0;
+    }
+
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    env_gate.set("1");
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    if (!backend) {
+        fprintf(stderr, "Failed to init OpenCL backend for IFAIRY_RMS_NORM_MUL bench\n");
+        return 1;
+    }
+
+    const bool fusion_disabled = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+    printf("fusion=%s\n", fusion_disabled ? "disabled" : "enabled");
+
+    int num_failed = 0;
+    auto bench = [&](const std::array<int64_t, 4> & ne, float eps, bool broadcast_weight) {
+        ifairy_rmsnorm_bench_result result;
+        if (!run_ifairy_rmsnorm_mul_bench_case(result, backend, ne, eps, broadcast_weight)) {
+            num_failed++;
+            return;
+        }
+        printf("  IFAIRY_RMS_NORM_MUL ne=[%lld,%lld,%lld,%lld] eps=%.1e broadcast_weight=%d runs=%d us/run=%.2f hash=0x%016llx\n",
+               (long long) ne[0], (long long) ne[1], (long long) ne[2], (long long) ne[3],
+               (double) eps, broadcast_weight ? 1 : 0, result.runs, result.us_per_run,
+               (unsigned long long) result.hash);
+    };
+
+    bench({1024, 1024, 1, 1}, 1e-6f, true);
+    bench({4096, 1024, 1, 1}, 1e-6f, true);
+    bench({4096, 1024, 1, 1}, 1e-6f, false);
+
+    ggml_backend_free(backend);
+    return num_failed > 0 ? 1 : 0;
+}
+
 // ============================================================================
 // 测试 5: 复数矩阵乘法
 // ============================================================================
+
+struct ifairy64_mulmat_bench_result {
+    double   us_per_run = 0.0;
+    int      runs       = 0;
+    uint64_t hash       = 0;
+};
+
+static bool run_ifairy64_opencl_mul_mat_bench_once(ifairy64_mulmat_bench_result & result,
+                                                   std::vector<uint32_t> &       packed_out,
+                                                   ggml_backend_dev_t            dev,
+                                                   int64_t                       m,
+                                                   int64_t                       n,
+                                                   int64_t                       k,
+                                                   const char *                  impl) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    scoped_env_var env_impl("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
+    env_gate.set("1");
+    env_impl.set(impl);
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    if (!backend) {
+        fprintf(stderr, "Failed to init OpenCL backend for IFAIRY64 MUL_MAT bench\n");
+        return false;
+    }
+
+    std::vector<block_ifairy64> weights;
+    std::vector<float>          act_f32;
+    fill_ifairy64_backend_weights(weights, m, k);
+    fill_ifairy_backend_act_f32(act_f32, n, k);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "Failed to init ggml context for IFAIRY64 MUL_MAT bench\n");
+        return false;
+    }
+
+    struct ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, m);
+    struct ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    struct ggml_tensor * out = ggml_mul_mat(ctx, w, a);
+
+    if (!ggml_backend_supports_op(backend, out)) {
+        fprintf(stderr, "%s does not support IFAIRY64 MUL_MAT bench M=%lld N=%lld K=%lld\n",
+                ggml_backend_name(backend), (long long) m, (long long) n, (long long) k);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate backend buffer for IFAIRY64 MUL_MAT bench\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(a, act_f32.data(), 0, act_f32.size() * sizeof(float));
+
+    for (int i = 0; i < 8; ++i) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "IFAIRY64 MUL_MAT bench warmup failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+    }
+    ggml_backend_synchronize(backend);
+
+    int64_t total_us = 0;
+    int     runs     = 0;
+    do {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "IFAIRY64 MUL_MAT bench run failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+        const auto t1 = std::chrono::steady_clock::now();
+
+        total_us += (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        runs++;
+    } while (total_us < 500 * 1000 || runs < 30);
+
+    std::vector<float> out_f32((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_f32.data(), 0, ggml_nbytes(out));
+
+    packed_out.resize(out_f32.size());
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+        memcpy(&packed_out[i], &out_f32[i], sizeof(uint32_t));
+    }
+
+    result.us_per_run = (double) total_us / (double) runs;
+    result.runs       = runs;
+    result.hash       = hash_u32_bits(packed_out);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+static bool run_ifairy64_cpu_mul_mat_bench_once(ifairy64_mulmat_bench_result & result,
+                                                std::vector<uint32_t> &       packed_out,
+                                                int64_t                       m,
+                                                int64_t                       n,
+                                                int64_t                       k,
+                                                int                           n_threads) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        fprintf(stderr, "Failed to init CPU backend for IFAIRY64 MUL_MAT bench\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+
+    std::vector<block_ifairy64> weights;
+    std::vector<float>          act_f32;
+    fill_ifairy64_backend_weights(weights, m, k);
+    fill_ifairy_backend_act_f32(act_f32, n, k);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/128 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "Failed to init ggml context for CPU IFAIRY64 MUL_MAT bench\n");
+        return false;
+    }
+
+    struct ggml_tensor * w   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, m);
+    struct ggml_tensor * a   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    struct ggml_tensor * out = ggml_mul_mat(ctx, w, a);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate CPU backend buffer for IFAIRY64 MUL_MAT bench\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(w, weights.data(), 0, weights.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(a, act_f32.data(), 0, act_f32.size() * sizeof(float));
+
+    for (int i = 0; i < 8; ++i) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "CPU IFAIRY64 MUL_MAT bench warmup failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+    }
+    ggml_backend_synchronize(backend);
+
+    int64_t total_us = 0;
+    int     runs     = 0;
+    do {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "CPU IFAIRY64 MUL_MAT bench run failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+        const auto t1 = std::chrono::steady_clock::now();
+
+        total_us += (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        runs++;
+    } while (total_us < 500 * 1000 || runs < 30);
+
+    std::vector<float> out_f32((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_f32.data(), 0, ggml_nbytes(out));
+
+    packed_out.resize(out_f32.size());
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+        memcpy(&packed_out[i], &out_f32[i], sizeof(uint32_t));
+    }
+
+    result.us_per_run = (double) total_us / (double) runs;
+    result.runs       = runs;
+    result.hash       = hash_u32_bits(packed_out);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+static int run_ifairy64_opencl_mul_mat_bench(void) {
+    printf("\n=== iFairy64 OpenCL MUL_MAT microbench ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        fprintf(stderr, "OpenCL backend not found; IFAIRY64 MUL_MAT bench requires real OpenCL execution.\n");
+        return 1;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    int num_failed = 0;
+    auto bench = [&](int64_t m, int64_t n, int64_t k) {
+        ifairy64_mulmat_bench_result gemv2;
+        ifairy64_mulmat_bench_result gemv4;
+        ifairy64_mulmat_bench_result gemm;
+        ifairy64_mulmat_bench_result direct;
+        ifairy64_mulmat_bench_result cpu4t;
+        std::vector<uint32_t>        out_gemv2;
+        std::vector<uint32_t>        out_gemv4;
+        std::vector<uint32_t>        out_gemm;
+        std::vector<uint32_t>        out_direct;
+        std::vector<uint32_t>        out_cpu4t;
+
+        if (!run_ifairy64_opencl_mul_mat_bench_once(gemv2, out_gemv2, dev, m, n, k, "gemv2") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(gemv4, out_gemv4, dev, m, n, k, "gemv4") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(gemm, out_gemm, dev, m, n, k, "gemm") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(direct, out_direct, dev, m, n, k, "direct") ||
+            !run_ifairy64_cpu_mul_mat_bench_once(cpu4t, out_cpu4t, m, n, k, 4)) {
+            num_failed++;
+            return;
+        }
+
+        if (!compare_packed_complex_outputs(out_gemv2.data(), out_gemm.data(), out_gemm.size()) ||
+            !compare_packed_complex_outputs(out_gemv4.data(), out_gemm.data(), out_gemm.size()) ||
+            !compare_packed_complex_outputs(out_gemm.data(), out_cpu4t.data(), out_cpu4t.size())) {
+            fprintf(stderr, "IFAIRY64 MUL_MAT bench output mismatch M=%lld N=%lld K=%lld\n",
+                    (long long) m, (long long) n, (long long) k);
+            num_failed++;
+            return;
+        }
+
+        const double speedup_gemv2 = gemm.us_per_run / gemv2.us_per_run;
+        const double speedup_gemv4 = gemm.us_per_run / gemv4.us_per_run;
+        const char * best = "gemm";
+        double best_us = gemm.us_per_run;
+        if (gemv2.us_per_run < best_us) {
+            best = "gemv2";
+            best_us = gemv2.us_per_run;
+        }
+        if (gemv4.us_per_run < best_us) {
+            best = "gemv4";
+        }
+
+        printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemm_us=%.2f direct_us=%.2f cpu4t_us=%.2f "
+               "gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx direct_over_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
+               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx runs=%d/%d/%d/%d/%d\n",
+               (long long) m, (long long) n, (long long) k,
+               gemv2.us_per_run, gemv4.us_per_run, gemm.us_per_run, direct.us_per_run, cpu4t.us_per_run,
+               speedup_gemv2, speedup_gemv4, direct.us_per_run / gemm.us_per_run, cpu4t.us_per_run / gemm.us_per_run, best,
+               (unsigned long long) gemv2.hash, (unsigned long long) gemv4.hash,
+               (unsigned long long) gemm.hash, (unsigned long long) direct.hash,
+               (unsigned long long) cpu4t.hash,
+               gemv2.runs, gemv4.runs, gemm.runs, direct.runs, cpu4t.runs);
+    };
+
+    bench(128, 1, 2 * QK_IFAIRY);
+    bench(256, 1, 2 * QK_IFAIRY);
+    bench(512, 1, 2 * QK_IFAIRY);
+    bench(1024, 1, 2 * QK_IFAIRY);
+    bench(2048, 1, 2 * QK_IFAIRY);
+    bench(128, 1, 4 * QK_IFAIRY);
+    bench(256, 1, 4 * QK_IFAIRY);
+    bench(512, 1, 4 * QK_IFAIRY);
+    bench(1024, 1, 4 * QK_IFAIRY);
+    bench(2048, 1, 4 * QK_IFAIRY);
+
+    return num_failed > 0 ? 1 : 0;
+}
 
 static bool test_complex_matmul() {
     printf("\n=== Test 6: Complex Matrix Multiplication ===\n");
@@ -2222,7 +3456,14 @@ int main(int argc, char ** argv) {
 
         bool         verbose     = false;
         bool         lut_only    = false;
+        bool         fused_only  = false;
         bool         lut_bench   = false;
+        bool         opencl_add_only = false;
+        bool         opencl_mul_only = false;
+        bool         opencl_rmsnorm_only = false;
+        bool         opencl_rmsnorm_bench = false;
+        bool         opencl_ifairy64_mulmat_only = false;
+        bool         opencl_ifairy64_mulmat_bench = false;
         const char * vecdot_mode = NULL;
         int64_t      bench_M     = 4096;
         int64_t      bench_N     = 1;
@@ -2241,6 +3482,34 @@ int main(int argc, char ** argv) {
             }
             if (strcmp(argv[i], "--ifairy-lut-only") == 0) {
                 lut_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-fused-only") == 0) {
+                fused_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-add-only") == 0) {
+                opencl_add_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-mul-only") == 0) {
+                opencl_mul_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-rmsnorm-only") == 0) {
+                opencl_rmsnorm_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-rmsnorm-bench") == 0) {
+                opencl_rmsnorm_bench = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-ifairy64-mulmat-only") == 0) {
+                opencl_ifairy64_mulmat_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-ifairy64-mulmat-bench") == 0) {
+                opencl_ifairy64_mulmat_bench = true;
                 continue;
             }
             if (strcmp(argv[i], "--ifairy-lut-backend-bench") == 0) {
@@ -2284,6 +3553,34 @@ int main(int argc, char ** argv) {
 
         if (lut_only) {
             return run_ifairy_lut_only_tests();
+        }
+
+        if (opencl_add_only) {
+            return run_ifairy_opencl_add_tests();
+        }
+
+        if (opencl_mul_only) {
+            return run_ifairy_opencl_mul_tests();
+        }
+
+        if (opencl_rmsnorm_only) {
+            return run_ifairy_opencl_rmsnorm_tests();
+        }
+
+        if (opencl_rmsnorm_bench) {
+            return run_ifairy_opencl_rmsnorm_bench();
+        }
+
+        if (opencl_ifairy64_mulmat_only) {
+            return run_ifairy64_opencl_mul_mat_tests();
+        }
+
+        if (opencl_ifairy64_mulmat_bench) {
+            return run_ifairy64_opencl_mul_mat_bench();
+        }
+
+        if (fused_only) {
+            return test_ifairy64_wide_linear_w2_fused() ? 0 : 1;
         }
 
         if (lut_bench) {
@@ -2390,6 +3687,11 @@ int main(int argc, char ** argv) {
 
         if (!test_ifairy64_lut_backend_f32_vs_q16()) {
             fprintf(stderr, "Test 5.4 FAILED\n");
+            num_failed++;
+        }
+
+        if (!test_ifairy64_wide_linear_w2_fused()) {
+            fprintf(stderr, "Test 5.5 FAILED\n");
             num_failed++;
         }
 

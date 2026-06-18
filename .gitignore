@@ -157,3 +157,6 @@ poetry.toml
 # Local tooling (not versioned)
 /.claude/
 /test.tracetemplate
+
+# memory profiling
+/memory_profile_data

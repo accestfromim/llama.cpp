@@ -24,7 +24,7 @@ static inline float op_elu(float x) {
     return (x > 0.f) ? x : expm1f(x);
 }
 
-static inline float op_ifairy_relu2(float x) {
+static inline float op_complex_relu2(float x) {
     if ((((ggml_fp16_t *) (&x))[0] & ((ggml_fp16_t *) (&x))[1]) >> 15) {
         // both real and imag are negative
         return 0.f;
@@ -161,8 +161,12 @@ void ggml_compute_forward_elu(const ggml_compute_params * params, ggml_tensor * 
     unary_op<op_elu>(params, dst);
 }
 
+void ggml_compute_forward_complex_relu2(const ggml_compute_params * params, ggml_tensor * dst) {
+    unary_op<op_complex_relu2>(params, dst);
+}
+
 void ggml_compute_forward_ifairy_relu2(const ggml_compute_params * params, ggml_tensor * dst) {
-    unary_op<op_ifairy_relu2>(params, dst);
+    ggml_compute_forward_complex_relu2(params, dst);
 }
 
 void ggml_compute_forward_relu(const ggml_compute_params * params, ggml_tensor * dst) {

@@ -1,6 +1,7 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-backend.h"
 #include "ggml-common.h"
+#include "ggml-ifairy-lut.h"
 #include "ggml-ifairy-lut-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
@@ -84,7 +85,7 @@ bool ggml_ifairy_lut_can_mul_mat(const struct ggml_tensor * src0,
     }
     if (src0->type == GGML_TYPE_IFAIRY64 && enabled_env == NULL) {
         if (dbg) {
-            GGML_LOG_INFO("ifairy_lut: IFAIRY64 LUT is opt-in; default route stays on vecdot\n");
+            GGML_LOG_INFO("ifairy_lut: %s LUT is opt-in; default route stays on vecdot\n", ggml_type_name(src0->type));
         }
         return false;
     }

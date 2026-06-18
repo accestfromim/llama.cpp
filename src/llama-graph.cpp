@@ -1521,12 +1521,14 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
-ggml_tensor * llm_graph_context::ifairy_build_attn(llm_graph_input_attn_kv * inp,
-                                                   ggml_tensor * q_cur,  // [n_embd_head_q * 2, n_head_q, n_tokens]
-                                                   ggml_tensor * k_cur,  // [n_embd_head_k * 2, n_head_k, n_tokens]
-                                                   ggml_tensor * v_cur,  // [n_embd_head_v * 2, n_head_v, n_tokens]);
-                                                   float         kq_scale,
-                                                   int           il) const {
+ggml_tensor * llm_graph_context::complex_build_attn_impl(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q_cur,  // [n_embd_head_q * 2, n_head_q, n_tokens]
+        ggml_tensor * k_cur,  // [n_embd_head_k * 2, n_head_k, n_tokens]
+        ggml_tensor * v_cur,  // [n_embd_head_v * 2, n_head_v, n_tokens]
+        float         kq_scale,
+        int           il,
+        bool          legacy_ops) const {
     ggml_build_forward_expand(gf, q_cur);
     ggml_build_forward_expand(gf, k_cur);
     ggml_build_forward_expand(gf, v_cur);
@@ -1559,12 +1561,30 @@ ggml_tensor * llm_graph_context::ifairy_build_attn(llm_graph_input_attn_kv * inp
     cur = ggml_reshape_3d(ctx0, cur, cur->ne[0] / n_head_kv, n_head_kv, n_tokens);
     //LLAMA_LOG("cur shape after mha: %ld x %ld x %ld\n", cur->ne[0], cur->ne[1], cur->ne[2]);
 
-    cur = ggml_ifairy_merge(ctx0, cur);
+    cur = legacy_ops ? ggml_ifairy_merge(ctx0, cur) : ggml_complex_merge(ctx0, cur);
 
     cur = ggml_reshape_2d(ctx0, cur, cur->ne[0] * cur->ne[1], cur->ne[2]);
     cb(cur, "kqv_out", il);
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::complex_build_attn(llm_graph_input_attn_kv * inp,
+                                                    ggml_tensor * q_cur,  // [n_embd_head_q * 2, n_head_q, n_tokens]
+                                                    ggml_tensor * k_cur,  // [n_embd_head_k * 2, n_head_k, n_tokens]
+                                                    ggml_tensor * v_cur,  // [n_embd_head_v * 2, n_head_v, n_tokens]
+                                                    float         kq_scale,
+                                                    int           il) const {
+    return complex_build_attn_impl(inp, q_cur, k_cur, v_cur, kq_scale, il, false);
+}
+
+ggml_tensor * llm_graph_context::ifairy_build_attn(llm_graph_input_attn_kv * inp,
+                                                   ggml_tensor * q_cur,  // [n_embd_head_q * 2, n_head_q, n_tokens]
+                                                   ggml_tensor * k_cur,  // [n_embd_head_k * 2, n_head_k, n_tokens]
+                                                   ggml_tensor * v_cur,  // [n_embd_head_v * 2, n_head_v, n_tokens]
+                                                   float         kq_scale,
+                                                   int           il) const {
+    return complex_build_attn_impl(inp, q_cur, k_cur, v_cur, kq_scale, il, true);
 }
 
 ggml_tensor * llm_graph_context::build_attn(

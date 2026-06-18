@@ -4,10 +4,10 @@
 Convert a Llama-based Fairy2i Hugging Face checkpoint to GGUF.
 
 This converter is for checkpoints whose dense BF16 Linear weights are trained
-with the QATLinearComplexPhaseV2 tile64 quantization kernel. It reuses the
-Fairy2i tile64_v2 packer from convert_fairy2i_qwen2.py, but exports a Llama
-BPE tokenizer and pads the vocabulary so the optional Fairy2i output tensor
-shape checks stay 64-aligned while token ids remain stable.
+with the QATLinearComplexPhaseV2 tile64 quantization kernel. It uses the shared
+Fairy2i tile64_v2 packer, exports a Llama BPE tokenizer, and pads the
+vocabulary so the optional Fairy2i output tensor shape checks stay 64-aligned
+while token ids remain stable.
 """
 
 import argparse
@@ -21,21 +21,23 @@ import gguf
 import numpy as np
 import torch
 
-from convert_fairy2i_qwen2 import (
-    QK_IFAIRY,
+from fairy2i.io.tensor_reader import TensorReader, add_optional_vector_tensor, load_weight_map
+from fairy2i.quant.tile64_v2 import (
+    FAIRY2I_TILE64,
     TILE64,
-    TensorReader,
-    add_optional_vector_tensor,
-    load_weight_map,
-    quantize_linear_to_ifairy64_stages,
+    quantize_linear_to_fairy2i_tile64_v2_stages,
     round_up,
-    undo_llama_permute,
 )
+from fairy2i.quant.widely_linear import undo_llama_permute
+from fairy2i.spec import Fairy2IMetadata, write_metadata
+from fairy2i.tokenizer.chat_template import load_fairy2i_chat_template
+
+
+FAIRY2I_VOCAB_PADDING_MULTIPLE = 2 * TILE64
 
 
 def round_up_even_tile_vocab(vocab_size: int) -> int:
-    complex_tile = 2 * TILE64
-    return round_up(vocab_size, complex_tile)
+    return round_up(vocab_size, FAIRY2I_VOCAB_PADDING_MULTIPLE)
 
 
 def token_looks_special(token: str | bytes) -> bool:
@@ -56,6 +58,81 @@ def llama_token_type(token_id: int, token_text: str, special_ids: set[int]) -> g
     if re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", token_text):
         return gguf.TokenType.BYTE
     return gguf.TokenType.CONTROL if token_id in special_ids else gguf.TokenType.NORMAL
+
+
+def token_config_text(tokenizer_config: dict, token_name: str) -> str | None:
+    token = tokenizer_config.get(f"{token_name}_token")
+    if isinstance(token, str):
+        return token
+    if isinstance(token, dict):
+        content = token.get("content")
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def token_id_for_text(reverse_vocab: dict[int, str], token_text: str) -> int | None:
+    for token_id, vocab_text in reverse_vocab.items():
+        if vocab_text == token_text:
+            return token_id
+    return None
+
+
+def resolve_special_token_id(
+    token_name: str,
+    config: dict,
+    tokenizer_config: dict,
+    reverse_vocab: dict[int, str],
+    padded_vocab_size: int,
+) -> int:
+    config_token_id = config.get(f"{token_name}_token_id")
+    token_text = token_config_text(tokenizer_config, token_name)
+
+    token_id = None
+    if isinstance(config_token_id, int) and config_token_id >= 0:
+        if token_text is None or reverse_vocab.get(config_token_id) == token_text:
+            token_id = config_token_id
+
+    if token_id is None and token_text is not None:
+        token_id = token_id_for_text(reverse_vocab, token_text)
+
+    if token_id is None and isinstance(config_token_id, int) and config_token_id >= 0:
+        token_id = config_token_id
+
+    if token_id is None:
+        raise ValueError(f"could not resolve {token_name}_token_id")
+    if token_id >= padded_vocab_size:
+        raise ValueError(f"{token_name}_token_id={token_id} is outside padded vocab {padded_vocab_size}")
+    return token_id
+
+
+def add_fairy2i_llama_tokenizer_metadata(
+    model_dir: Path,
+    config: dict,
+    tokenizer_config: dict,
+    writer: gguf.GGUFWriter,
+    reverse_vocab: dict[int, str],
+    padded_vocab_size: int,
+) -> None:
+    writer.add_bos_token_id(
+        resolve_special_token_id("bos", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+    writer.add_eos_token_id(
+        resolve_special_token_id("eos", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+    writer.add_unk_token_id(
+        resolve_special_token_id("unk", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+    writer.add_pad_token_id(
+        resolve_special_token_id("pad", config, tokenizer_config, reverse_vocab, padded_vocab_size)
+    )
+
+    writer.add_add_bos_token(False)
+    writer.add_add_sep_token(False)
+
+    chat_template = load_fairy2i_chat_template(model_dir, tokenizer_config)
+    if chat_template is not None:
+        writer.add_chat_template(chat_template)
 
 
 def set_vocab_llama_bpe_padded(
@@ -142,9 +219,14 @@ def set_vocab_llama_bpe_padded(
     writer.add_token_list(tokens)
     writer.add_token_scores(scores)
     writer.add_token_types(toktypes)
-
-    special_vocab = gguf.SpecialVocab(model_dir, n_vocab=padded_vocab_size)
-    special_vocab.add_to_gguf(writer)
+    add_fairy2i_llama_tokenizer_metadata(
+        model_dir,
+        config,
+        tokenizer_config,
+        writer,
+        reverse_vocab,
+        padded_vocab_size,
+    )
 
     if "add_prefix_space" in tokenizer_config:
         writer.add_add_space_prefix(tokenizer_config["add_prefix_space"])
@@ -234,7 +316,7 @@ def validate_checkpoint(config: dict, weight_map: dict[str, str]) -> None:
         raise KeyError(f"missing {len(missing)} required tensors: {preview}")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Convert Llama-based Fairy2i HF weights to GGUF")
     parser.add_argument("model_dir", type=Path, help="Path to the Llama-based Fairy2i model directory")
     parser.add_argument("output_file", type=Path, nargs="?", help="Output GGUF file path")
@@ -251,7 +333,7 @@ def main() -> None:
     )
     parser.add_argument("--qk-permute", action="store_true", help="Enable Llama q/k undo-permute during conversion")
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.residual_steps != 2:
         raise ValueError("only --residual-steps 2 is currently supported")
@@ -278,7 +360,7 @@ def main() -> None:
     if ff_real % 2 != 0:
         raise ValueError(f"intermediate_size must be even, got {ff_real}")
     ff_complex = ff_real // 2
-    ff_complex_padded = round_up(ff_complex, QK_IFAIRY)
+    ff_complex_padded = round_up(ff_complex, FAIRY2I_TILE64)
 
     print(
         "Fairy2i Llama conversion: "
@@ -304,16 +386,22 @@ def main() -> None:
     writer.add_head_count_kv(n_head_kv)
     writer.add_layer_norm_rms_eps(float(config["rms_norm_eps"]))
     add_rope_metadata(config, writer)
-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_IFAIRY)
+    writer.add_file_type(gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2)
     writer.add_vocab_size(vocab_padded)
-    writer.add_uint32("fairy2i.quant.residual_steps", args.residual_steps)
-    writer.add_string("fairy2i.quant.codebook", "{+/-1,+/-i}")
-    writer.add_string("fairy2i.quant.variant", "tile64_v2")
-    writer.add_uint32("fairy2i.quant.tile_size", TILE64)
-    writer.add_string("fairy2i.quant.scale_stat", "dominant_mean_abs")
-    writer.add_string("fairy2i.attn.layout", "qwen2_real")
-    writer.add_uint32("fairy2i.vocab.original_size", vocab_original)
-    writer.add_uint32("fairy2i.vocab.padded_size", vocab_padded)
+    write_metadata(
+        writer,
+        Fairy2IMetadata(
+            base_arch="llama",
+            base_model_type=config.get("model_type"),
+            base_architecture=(config.get("architectures") or [None])[0],
+            attn_layout="llama_real",
+            tokenizer_profile="llama_bpe",
+            residual_steps=args.residual_steps,
+            vocab_original_size=vocab_original,
+            vocab_padded_size=vocab_padded,
+            vocab_padding_multiple=FAIRY2I_VOCAB_PADDING_MULTIPLE,
+        ),
+    )
 
     if args.verbose:
         print("adding token embedding")
@@ -389,12 +477,12 @@ def main() -> None:
             out_target = ff_complex_padded if out_c == ff_complex else out_c
             in_target = ff_complex_padded if in_c == ff_complex else in_c
 
-            packed = quantize_linear_to_ifairy64_stages(w, out_target, in_target)
+            packed = quantize_linear_to_fairy2i_tile64_v2_stages(w, out_target, in_target)
             for stage_name, stage_data in packed.items():
                 writer.add_tensor(
                     f"blk.{il}.{gguf_base}.{stage_name}",
                     stage_data,
-                    raw_dtype=gguf.GGMLQuantizationType.IFAIRY64,
+                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
                 )
 
             del w, packed

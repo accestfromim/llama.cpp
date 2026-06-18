@@ -97,6 +97,11 @@ typedef sycl::half2 ggml_half2;
 #        define QK_IFAIRY64_QS_BYTES       (QK_IFAIRY64 / 4)
 static_assert(QK_IFAIRY == 256, "ifairy packing currently assumes QK_IFAIRY=256");
 
+#        define QK_FAIRY2I_TILE64          64
+#        define QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK (QK_FAIRY2I_TILE64 / 2)
+#        define QK_FAIRY2I_TILE64_QS_BYTES (QK_FAIRY2I_TILE64 / 4)
+#        define QK_FAIRY2I_ACT_Q16_64      64
+
 #        if defined(GGML_COMMON_DECL_CUDA) || defined(GGML_COMMON_DECL_HIP) || defined(GGML_COMMON_DECL_SYCL)
 // QR = QK / number of values before dequantization
 // QI = number of 32 bit integers before dequantization
@@ -281,6 +286,14 @@ typedef struct {
 
 static_assert(sizeof(block_ifairy64) == 2 * sizeof(ggml_half) + QK_IFAIRY64_QS_BYTES, "wrong ifairy64 block size/padding");
 
+typedef struct {
+    uint8_t   qs[QK_FAIRY2I_TILE64_QS_BYTES];  // 2 bits per element
+    ggml_half d_real, d_imag;
+} block_fairy2i_tile64_v2;
+
+static_assert(sizeof(block_fairy2i_tile64_v2) == 2 * sizeof(ggml_half) + QK_FAIRY2I_TILE64_QS_BYTES,
+              "wrong fairy2i_tile64_v2 block size/padding");
+
 // 总大小: 64 + 2 + 2 = 68 字节
 // 存储 QK_IFAIRY 个复数 = 2*QK_IFAIRY 个 fp32 值
 // 压缩率: 2048/68 ~ 30.1x
@@ -291,6 +304,22 @@ typedef struct {
 } block_ifairy_q16;
 
 static_assert(sizeof(block_ifairy_q16) == 2 * sizeof(ggml_half) + QK_IFAIRY * 2, "wrong ifairy_q16 block size/padding");
+
+typedef struct {
+    uint8_t   x_real[QK_IFAIRY64], x_imag[QK_IFAIRY64];
+    ggml_half d_real, d_imag;
+} block_ifairy64_q16;
+
+static_assert(sizeof(block_ifairy64_q16) == 2 * sizeof(ggml_half) + QK_IFAIRY64 * 2,
+              "wrong ifairy64_q16 block size/padding");
+
+typedef struct {
+    uint8_t   x_real[QK_FAIRY2I_ACT_Q16_64], x_imag[QK_FAIRY2I_ACT_Q16_64];
+    ggml_half d_real, d_imag;
+} block_fairy2i_act_q16_64;
+
+static_assert(sizeof(block_fairy2i_act_q16_64) == 2 * sizeof(ggml_half) + QK_FAIRY2I_ACT_Q16_64 * 2,
+              "wrong fairy2i_act_q16_64 block size/padding");
 
 //
 // Super-block quantization structures

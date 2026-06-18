@@ -521,6 +521,26 @@ static void quantize_row_ifairy64_from_float_ref(const float * GGML_RESTRICT x, 
     free(tmp);
 }
 
+static void quantize_row_fairy2i_tile64_v2_from_float_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    float * tmp = (float *) malloc(2 * (size_t) k * sizeof(float));
+    if (tmp == NULL) {
+        GGML_ABORT("out of memory");
+    }
+
+    float * real = tmp;
+    float * imag = tmp + k;
+
+    for (int64_t i = 0; i < k; ++i) {
+        ggml_bf16_t pair[2];
+        memcpy(pair, x + i, sizeof(pair));
+        real[i] = GGML_BF16_TO_FP32(pair[0]);
+        imag[i] = GGML_BF16_TO_FP32(pair[1]);
+    }
+
+    quantize_row_fairy2i_tile64_v2_ref(real, imag, (block_fairy2i_tile64_v2 *) vy, k);
+    free(tmp);
+}
+
 bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
     return memcmp(guid_a, guid_b, sizeof(ggml_guid)) == 0;
 }
@@ -949,6 +969,26 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = NULL,
         .from_float_ref           = quantize_row_ifairy64_from_float_ref,
     },
+    [GGML_TYPE_IFAIRY64_Q16] = {
+        .type_name                = "ifairy64_q16",
+        .blck_size                = QK_IFAIRY64,
+        .type_size                = sizeof(block_ifairy64_q16),
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_FAIRY2I_TILE64_V2] = {
+        .type_name                = "fairy2i_tile64_v2",
+        .blck_size                = QK_FAIRY2I_TILE64,
+        .type_size                = sizeof(block_fairy2i_tile64_v2),
+        .is_quantized             = true,
+        .to_float                 = NULL,
+        .from_float_ref           = quantize_row_fairy2i_tile64_v2_from_float_ref,
+    },
+    [GGML_TYPE_FAIRY2I_ACT_Q16_64] = {
+        .type_name                = "fairy2i_act_q16_64",
+        .blck_size                = QK_FAIRY2I_ACT_Q16_64,
+        .type_size                = sizeof(block_fairy2i_act_q16_64),
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1091,14 +1131,23 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CROSS_ENTROPY_LOSS_BACK",
     "OPT_STEP_ADAMW",
     "OPT_STEP_SGD",
+    "GLU",
+
     "IFAIRY_ROPE",
     "IFAIRY_SPLIT",
     "IFAIRY_MERGE",
     "IFAIRY_ADD",
     "IFAIRY_RMS_NORM",
     "IFAIRY_MUL",
+    "IFAIRY_WIDE_LINEAR_W2",
 
-    "GLU",
+    "COMPLEX_ROPE",
+    "COMPLEX_SPLIT",
+    "COMPLEX_MERGE",
+    "COMPLEX_ADD",
+    "COMPLEX_RMS_NORM",
+    "COMPLEX_MUL",
+    "FAIRY2I_WIDE_LINEAR_W2",
 };
 
 // static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
@@ -1209,6 +1258,15 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "ifairy_add(x, y)",
     "ifairy_rms_norm(x)",
     "ifairy_mul(x,y)",
+    "ifairy_wide_linear_w2(x)",
+
+    "complex_rope(x)",
+    "complex_split(x)",
+    "complex_merge(x)",
+    "complex_add(x, y)",
+    "complex_rms_norm(x)",
+    "complex_mul(x,y)",
+    "fairy2i_wide_linear_w2(x)",
 };
 
 // static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
@@ -1218,9 +1276,10 @@ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "ABS",     "SGN",  "NEG",        "STEP", "TANH",      "ELU",         "RELU", "IFAIRY_RELU2",
     "SIGMOID", "GELU", "GELU_QUICK", "SILU", "HARDSWISH", "HARDSIGMOID", "EXP",  "GELU_ERF",
+    "COMPLEX_RELU2",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 16, "GGML_UNARY_OP_COUNT != 16");
+static_assert(GGML_UNARY_OP_COUNT == 17, "GGML_UNARY_OP_COUNT != 17");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -2626,6 +2685,10 @@ struct ggml_tensor * ggml_elu_inplace(
 }
 
 // ggml_relu
+struct ggml_tensor * ggml_complex_relu2(struct ggml_context * ctx, struct ggml_tensor * a) {
+    return ggml_unary(ctx, a, GGML_UNARY_OP_COMPLEX_RELU2);
+}
+
 struct ggml_tensor * ggml_ifairy_relu2(struct ggml_context * ctx, struct ggml_tensor * a) {
     return ggml_unary(ctx, a, GGML_UNARY_OP_IFAIRY_RELU2);
 }
@@ -4018,73 +4081,76 @@ static struct ggml_tensor * ggml_rope_impl(
     return result;
 }
 
-static struct ggml_tensor * ggml_ifairy_split_impl(struct ggml_context * ctx, struct ggml_tensor * a) {
+static struct ggml_tensor * ggml_complex_split_impl(struct ggml_context * ctx, struct ggml_tensor * a, enum ggml_op op) {
     a->ne[0]                    = a->ne[0] * 2;
     struct ggml_tensor * result = false ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
     a->ne[0]                    = a->ne[0] / 2;
 
-    result->op     = GGML_OP_IFAIRY_SPLIT;
+    result->op     = op;
     result->src[0] = a;
 
     return result;
 }
 
-static struct ggml_tensor * ggml_ifairy_add_impl(struct ggml_context * ctx,
-                                                 struct ggml_tensor *  a,
-                                                 struct ggml_tensor *  b,
-                                                 bool                  inplace) {
+static struct ggml_tensor * ggml_complex_add_impl(struct ggml_context * ctx,
+                                                  struct ggml_tensor *  a,
+                                                  struct ggml_tensor *  b,
+                                                  bool                  inplace,
+                                                  enum ggml_op          op) {
     GGML_ASSERT(ggml_can_repeat(b, a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    result->op     = GGML_OP_IFAIRY_ADD;
+    result->op     = op;
     result->src[0] = a;
     result->src[1] = b;
 
     return result;
 }
 
-static struct ggml_tensor * ggml_ifairy_mul_impl(struct ggml_context * ctx,
-                                                 struct ggml_tensor *  a,
-                                                 struct ggml_tensor *  b,
-                                                 bool                  inplace) {
+static struct ggml_tensor * ggml_complex_mul_impl(struct ggml_context * ctx,
+                                                  struct ggml_tensor *  a,
+                                                  struct ggml_tensor *  b,
+                                                  bool                  inplace,
+                                                  enum ggml_op          op) {
     GGML_ASSERT(ggml_can_repeat(b, a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    result->op     = GGML_OP_IFAIRY_MUL;
+    result->op     = op;
     result->src[0] = a;
     result->src[1] = b;
 
     return result;
 }
 
-static struct ggml_tensor * ggml_ifairy_merge_impl(struct ggml_context * ctx, struct ggml_tensor * a) {
+static struct ggml_tensor * ggml_complex_merge_impl(struct ggml_context * ctx, struct ggml_tensor * a, enum ggml_op op) {
     GGML_ASSERT(a->ne[0] % 2 == 0);
 
     a->ne[0]                    = a->ne[0] / 2;
     struct ggml_tensor * result = false ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
     a->ne[0]                    = a->ne[0] * 2;
 
-    result->op     = GGML_OP_IFAIRY_MERGE;
+    result->op     = op;
     result->src[0] = a;
 
     return result;
 }
 
-static struct ggml_tensor * ggml_ifairy_rope_impl(struct ggml_context * ctx,
-                                                  struct ggml_tensor *  a,
-                                                  struct ggml_tensor *  b,
-                                                  int                   n_dims,
-                                                  int                   sections[GGML_MROPE_SECTIONS],
-                                                  int                   mode,
-                                                  int                   n_ctx_orig,
-                                                  float                 freq_base,
-                                                  float                 freq_scale,
-                                                  float                 ext_factor,
-                                                  float                 attn_factor,
-                                                  float                 beta_fast,
-                                                  float                 beta_slow) {
+static struct ggml_tensor * ggml_complex_rope_impl(struct ggml_context * ctx,
+                                                   struct ggml_tensor *  a,
+                                                   struct ggml_tensor *  b,
+                                                   int                   n_dims,
+                                                   int                   sections[GGML_MROPE_SECTIONS],
+                                                   int                   mode,
+                                                   int                   n_ctx_orig,
+                                                   float                 freq_base,
+                                                   float                 freq_scale,
+                                                   float                 ext_factor,
+                                                   float                 attn_factor,
+                                                   float                 beta_fast,
+                                                   float                 beta_slow,
+                                                   enum ggml_op          op) {
     GGML_ASSERT((mode & 1) == 0 && "mode & 1 == 1 is no longer supported");
 
     GGML_ASSERT(ggml_is_vector(b));
@@ -4113,11 +4179,20 @@ static struct ggml_tensor * ggml_ifairy_rope_impl(struct ggml_context * ctx,
     }
     ggml_set_op_params(result, params, sizeof(params));
 
-    result->op     = GGML_OP_IFAIRY_ROPE;
+    result->op     = op;
     result->src[0] = a;
     result->src[1] = b;
 
     return result;
+}
+
+struct ggml_tensor * ggml_complex_rope(struct ggml_context * ctx,
+                                       struct ggml_tensor *  a,
+                                       struct ggml_tensor *  b,
+                                       int                   n_dims,
+                                       int                   mode) {
+    return ggml_complex_rope_impl(ctx, a, b, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                                  GGML_OP_COMPLEX_ROPE);
 }
 
 struct ggml_tensor * ggml_ifairy_rope(struct ggml_context * ctx,
@@ -4125,41 +4200,139 @@ struct ggml_tensor * ggml_ifairy_rope(struct ggml_context * ctx,
                                       struct ggml_tensor *  b,
                                       int                   n_dims,
                                       int                   mode) {
-    return ggml_ifairy_rope_impl(ctx, a, b, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    return ggml_complex_rope_impl(ctx, a, b, n_dims, NULL, mode, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+                                  GGML_OP_IFAIRY_ROPE);
+}
+
+struct ggml_tensor * ggml_complex_add(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
+    return ggml_complex_add_impl(ctx, a, b, false, GGML_OP_COMPLEX_ADD);
 }
 
 struct ggml_tensor * ggml_ifairy_add(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
-    return ggml_ifairy_add_impl(ctx, a, b, false);
+    return ggml_complex_add_impl(ctx, a, b, false, GGML_OP_IFAIRY_ADD);
+}
+
+struct ggml_tensor * ggml_complex_mul(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
+    return ggml_complex_mul_impl(ctx, a, b, false, GGML_OP_COMPLEX_MUL);
 }
 
 struct ggml_tensor * ggml_ifairy_mul(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
-    return ggml_ifairy_mul_impl(ctx, a, b, false);
+    return ggml_complex_mul_impl(ctx, a, b, false, GGML_OP_IFAIRY_MUL);
+}
+
+static struct ggml_tensor * ggml_wide_linear_w2_impl(struct ggml_context * ctx,
+                                                     struct ggml_tensor *  x,
+                                                     struct ggml_tensor *  u_s0,
+                                                     struct ggml_tensor *  u_s1,
+                                                     struct ggml_tensor *  w_s0,
+                                                     struct ggml_tensor *  w_s1,
+                                                     struct ggml_tensor *  bias,
+                                                     enum ggml_type        weight_type,
+                                                     enum ggml_op          op) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(u_s0);
+    GGML_ASSERT(u_s1);
+    GGML_ASSERT(w_s0);
+    GGML_ASSERT(w_s1);
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(u_s0->type == weight_type);
+    GGML_ASSERT(u_s1->type == weight_type);
+    GGML_ASSERT(w_s0->type == weight_type);
+    GGML_ASSERT(w_s1->type == weight_type);
+
+    GGML_ASSERT(ggml_can_mul_mat(u_s0, x));
+    GGML_ASSERT(ggml_can_mul_mat(u_s1, x));
+    GGML_ASSERT(ggml_can_mul_mat(w_s0, x));
+    GGML_ASSERT(ggml_can_mul_mat(w_s1, x));
+
+    GGML_ASSERT(u_s0->ne[1] == u_s1->ne[1]);
+    GGML_ASSERT(u_s0->ne[1] == w_s0->ne[1]);
+    GGML_ASSERT(u_s0->ne[1] == w_s1->ne[1]);
+
+    const int64_t ne[4] = { u_s0->ne[1], x->ne[1], x->ne[2], x->ne[3] };
+
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT((2 * ne[0]) % bias->ne[0] == 0);
+        GGML_ASSERT(ne[1] % bias->ne[1] == 0);
+        GGML_ASSERT(ne[2] % bias->ne[2] == 0);
+        GGML_ASSERT(ne[3] % bias->ne[3] == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = op;
+    result->src[0] = x;
+    result->src[1] = u_s0;
+    result->src[2] = u_s1;
+    result->src[3] = w_s0;
+    result->src[4] = w_s1;
+    result->src[5] = bias;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_fairy2i_wide_linear_w2(struct ggml_context * ctx,
+                                                 struct ggml_tensor *  x,
+                                                 struct ggml_tensor *  u_s0,
+                                                 struct ggml_tensor *  u_s1,
+                                                 struct ggml_tensor *  w_s0,
+                                                 struct ggml_tensor *  w_s1,
+                                                 struct ggml_tensor *  bias) {
+    return ggml_wide_linear_w2_impl(ctx, x, u_s0, u_s1, w_s0, w_s1, bias, GGML_TYPE_FAIRY2I_TILE64_V2,
+                                    GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+}
+
+struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
+                                                struct ggml_tensor *  x,
+                                                struct ggml_tensor *  u_s0,
+                                                struct ggml_tensor *  u_s1,
+                                                struct ggml_tensor *  w_s0,
+                                                struct ggml_tensor *  w_s1,
+                                                struct ggml_tensor *  bias) {
+    return ggml_wide_linear_w2_impl(ctx, x, u_s0, u_s1, w_s0, w_s1, bias, GGML_TYPE_IFAIRY64,
+                                    GGML_OP_IFAIRY_WIDE_LINEAR_W2);
+}
+
+struct ggml_tensor * ggml_complex_split(struct ggml_context * ctx, struct ggml_tensor * a) {
+    return ggml_complex_split_impl(ctx, a, GGML_OP_COMPLEX_SPLIT);
 }
 
 struct ggml_tensor * ggml_ifairy_split(struct ggml_context * ctx, struct ggml_tensor * a) {
-    return ggml_ifairy_split_impl(ctx, a);
+    return ggml_complex_split_impl(ctx, a, GGML_OP_IFAIRY_SPLIT);
+}
+
+struct ggml_tensor * ggml_complex_merge(struct ggml_context * ctx, struct ggml_tensor * a) {
+    return ggml_complex_merge_impl(ctx, a, GGML_OP_COMPLEX_MERGE);
 }
 
 struct ggml_tensor * ggml_ifairy_merge(struct ggml_context * ctx, struct ggml_tensor * a) {
-    return ggml_ifairy_merge_impl(ctx, a);
+    return ggml_complex_merge_impl(ctx, a, GGML_OP_IFAIRY_MERGE);
 }
 
-static struct ggml_tensor * ggml_ifairy_rms_norm_impl(struct ggml_context * ctx,
-                                                      struct ggml_tensor *  a,
-                                                      float                 eps,
-                                                      bool                  inplace) {
+static struct ggml_tensor * ggml_complex_rms_norm_impl(struct ggml_context * ctx,
+                                                       struct ggml_tensor *  a,
+                                                       float                 eps,
+                                                       bool                  inplace,
+                                                       enum ggml_op          op) {
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
     ggml_set_op_params(result, &eps, sizeof(eps));
 
-    result->op     = GGML_OP_IFAIRY_RMSNORM;
+    result->op     = op;
     result->src[0] = a;
 
     return result;
 }
 
+struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps) {
+    return ggml_complex_rms_norm_impl(ctx, a, eps, false, GGML_OP_COMPLEX_RMSNORM);
+}
+
 struct ggml_tensor * ggml_ifairy_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps) {
-    return ggml_ifairy_rms_norm_impl(ctx, a, eps, false);
+    return ggml_complex_rms_norm_impl(ctx, a, eps, false, GGML_OP_IFAIRY_RMSNORM);
 }
 
 struct ggml_tensor * ggml_rope(
