@@ -65,6 +65,10 @@ static struct ggml_fairy2i_lut_config ggml_fairy2i_lut_config_from_env(void) {
 
     return cfg;
 }
+
+static bool ggml_fairy2i_test_require_lut(void) {
+    return ggml_fairy2i_env_enabled("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+}
 #endif
 
 static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_tasks, struct ggml_fairy2i_cpu_plan * plan) {
@@ -162,8 +166,13 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
     }
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-    if (plan.use_lut && ggml_fairy2i_wide_linear_w2_compute_lut(params, dst, plan.lut_c)) {
-        return true;
+    if (plan.use_lut) {
+        if (ggml_fairy2i_wide_linear_w2_compute_lut(params, dst, plan.lut_c)) {
+            return true;
+        }
+        if (ggml_fairy2i_test_require_lut()) {
+            return false;
+        }
     }
 #endif
 

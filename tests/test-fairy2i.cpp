@@ -501,8 +501,10 @@ static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
     scoped_env_var env_lut("GGML_FAIRY2I_LUT");
     scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
     scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
+    scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
     env_lut.set(lut_enabled ? "1" : "0");
     env_impl.set("lut16");
+    env_require_lut.set(lut_enabled ? "1" : "0");
     if (force_scalar) {
         env_force_scalar.set("1");
     } else {

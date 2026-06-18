@@ -251,8 +251,9 @@ void ggml_fairy2i_tile64_lut_qgemm_pair_cpu(int          m,
     ggml_fairy2i_tile64_lut_qgemm_pair_avx2(m, k, n, packed_wtiles0, packed_wtiles1, lut, lut_scales, dst, dst_col_stride,
                                       dst_row_stride, pack_bf16, /*negate_imag_scale*/ false, /*add*/ false);
 #else
-    ggml_fairy2i_tile64_lut_qgemm_pair_lut16(m, k, n, packed_wtiles0, packed_wtiles1, lut, lut_scales, dst, dst_col_stride,
-                                       dst_row_stride, pack_bf16);
+    ggml_fairy2i_tile64_lut_qgemm_pair_lut16(m, k, n, packed_wtiles0, packed_wtiles1, lut, lut_scales, dst,
+                                             dst_col_stride, dst_row_stride, pack_bf16,
+                                             /*negate_imag_scale=*/false, /*add=*/false);
 #endif
 }
 
@@ -285,19 +286,19 @@ bool ggml_fairy2i_tile64_lut_qgemm_four_cpu(int          m,
                                       dst_row_stride, pack_bf16, /*negate_imag_scale*/ false, /*add*/ true);
     return true;
 #else
-    GGML_UNUSED(m);
-    GGML_UNUSED(k);
-    GGML_UNUSED(n);
-    GGML_UNUSED(packed_u0);
-    GGML_UNUSED(packed_u1);
-    GGML_UNUSED(packed_w0);
-    GGML_UNUSED(packed_w1);
-    GGML_UNUSED(lut);
-    GGML_UNUSED(lut_scales);
-    GGML_UNUSED(dst);
-    GGML_UNUSED(dst_col_stride);
-    GGML_UNUSED(dst_row_stride);
-    GGML_UNUSED(pack_bf16);
-    return false;
+    if (m == 0) {
+        return true;
+    }
+    if (!packed_u0 || !packed_u1 || !packed_w0 || !packed_w1 || !dst || !lut || !lut_scales || m < 0 || k <= 0 ||
+        n <= 0) {
+        return false;
+    }
+
+    // LUT preprocessing folds in conjugation. Negating the imaginary scale recovers U * x.
+    ggml_fairy2i_tile64_lut_qgemm_pair_lut16(m, k, n, packed_u0, packed_u1, lut, lut_scales, dst, dst_col_stride,
+                                             dst_row_stride, pack_bf16, /*negate_imag_scale=*/true, /*add=*/false);
+    ggml_fairy2i_tile64_lut_qgemm_pair_lut16(m, k, n, packed_w0, packed_w1, lut, lut_scales, dst, dst_col_stride,
+                                             dst_row_stride, pack_bf16, /*negate_imag_scale=*/false, /*add=*/true);
+    return true;
 #endif
 }
