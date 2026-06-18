@@ -60,10 +60,22 @@ Status: Draft (2026-03-13)
   - `GGML_FAIRY2I_TEST_REQUIRE_LUT=1`：当 `GGML_FAIRY2I_LUT=1` 且 W2 LUT 计划已启用时，如果 LUT compute 返回 false，则测试直接失败，避免静默回落到 direct 路径。
   - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1`：在支持 dotprod 的 ARM64 设备上强制 dispatcher 走 NEON fallback，用于覆盖 direct wide-linear-fused 的 NEON 路径。
 - 这两个变量只用于测试/CI 覆盖，不作为生产调优 knob。
+- 新增 debug-only 环境变量：
+  - `GGML_FAIRY2I_CPU_DEBUG=1`：默认关闭；W2 compute 每种 CPU path 首次命中时打印 `path=direct_scalar|direct_neon|direct_dotprod|lut16|lut_c`、`M/N/K/nth` 和 packed-weight 状态。
+  - ARM LUT qgemm 的 `add=true` vector path 首次命中时打印 `path=arm_lut_add_vector`，用于确认 fused four 的追加分支没有回到 scalar add row loop。
+  - 该变量只用于 debug/测试观测，不作为生产调优 knob。
+- ARM LUT add follow-up:
+  - `ggml_fairy2i_lut_store_tile_arm()` 支持 `add=true`，覆盖 `pack_bf16=true/false` 和 partial tile；`add=false` 仍保持覆盖写。
+  - ARM NEON 编译下 `ggml_fairy2i_lut_qgemm_lut16_one()` 不再因为 `add=true` 提前进入 scalar row loop，而是继续走现有 ARM tile qgemm，由 ARM store 处理累加。
+  - 非 ARM/非 AVX2 的 scalar add fallback 保持不变；本轮未引入 pair-combined qgemm。
 - ARM direct follow-up:
   - NEON direct helper 从四次串行 one-branch accumulate 改为 pair-blocked accumulate；每个 pair 内 activation 只加载一次，sign decode 与 vector accumulate 在 activation still-live 时完成，末尾统一横向归约。
   - dotprod helper 从每个 16-lane dot 后立即 `vaddvq_s32` 改为 four-branch persistent `int32x4_t` accumulator；每个 tile64 末尾再按 branch/channel 归约。
   - dispatcher 语义不变：`force_scalar` 仍强制 scalar；默认仍按 `dotprod -> NEON -> scalar`。
+- Dotprod build semantics:
+  - `GGML_FAIRY2I_CPU_ARM_DOTPROD=ON` 只允许编译 Fairy2i ARM dotprod translation unit。
+  - 实际 direct dotprod path 仍同时依赖编译期 `__ARM_FEATURE_DOTPROD` 和运行时 `ggml_cpu_has_dotprod()`；测试可用 `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1` 覆盖到 NEON fallback。
+  - 非 Android cross build 若目标编译参数没有启用 dotprod，需要显式配置 `-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod` 或等价 target flags；否则 dotprod TU 可能存在，但 runtime path 不会命中。
 - LUT activation quantize follow-up:
   - `wide-linear-lut.cpp` 新增 AArch64/NEON q16 activation quantize fast path，覆盖非 AVX2 ARM 预处理瓶颈。
   - ARM path 向量化 bf16 pair decode、real/imag abs max、scale、round-away (`vcvtaq_s32_f32`) 和 clamp/store；保留 scalar helper 作为 test reference。
@@ -75,8 +87,34 @@ Status: Draft (2026-03-13)
   - `GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i`: PASS
   - scoped `git clang-format --style=file --diff`: PASS
   - scoped `clang-tidy -p build-rel-fairy2i`: not run (`clang-tidy` not available in PATH)
+- Debug validation:
+  - `GGML_FAIRY2I_CPU_DEBUG=1 GGML_FAIRY2I_LUT=1 ./build-rel-fairy2i/bin/test-fairy2i`: PASS; observed `path=direct_dotprod`, `path=direct_scalar`, `path=lut16`, `lut_packed=1`, and `path=arm_lut_add_vector`.
+  - `GGML_FAIRY2I_CPU_DEBUG=1 GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1 ./build-rel-fairy2i/bin/test-fairy2i`: PASS; observed `path=direct_neon`, `path=direct_scalar`, `path=lut16`, and `path=arm_lut_add_vector`.
+- Real model smoke/bench (Apple arm64, build `bae7743d` / `6954`):
+  - Model: `/Users/a1806/.cache/huggingface/hub/models--PKU-DS-LAB--Fairy-plus-minus-i-700M/snapshots/c274e9bb0b9a82fbe0bc20eeedbf4b8a3fcd358b/ifairy.gguf`.
+  - CLI smoke:
+    - `GGML_FAIRY2I_CPU_DEBUG=1 GGML_FAIRY2I_LUT=0 ./build-rel-fairy2i/bin/llama-cli ... -n 16 -no-cnv`: PASS; raw `tmp/fairy2i-arm-lut-add/cli-direct-smoke.txt`.
+    - `GGML_FAIRY2I_CPU_DEBUG=1 GGML_FAIRY2I_LUT=1 GGML_FAIRY2I_LUT_IMPL=lut16 ./build-rel-fairy2i/bin/llama-cli ... -n 16 -no-cnv`: PASS; raw `tmp/fairy2i-arm-lut-add/cli-lut16-smoke.txt`.
+  - Observation: this GGUF reports `general.architecture=ifairy` and `type ifairy: 168 tensors`; neither smoke log contains `fairy2i_w2`/`path=lut16` debug markers. Treat the following bench as an env smoke on the provided legacy iFairy model, not as evidence that Fairy2i W2 LUT/direct paths were hit by a full model.
+  - Bench command template:
+    - `GGML_FAIRY2I_LUT={0,1} [GGML_FAIRY2I_LUT_IMPL=lut16] ./build-rel-fairy2i/bin/llama-bench -m <model> --threads {1,2,4} --n-prompt 128 --n-gen 256 --repetitions 3 --device none -ngl 0 -o jsonl`
+  - Result (`tok/s`, raw logs under `tmp/fairy2i-arm-lut-add/`):
+
+    | threads | direct pp128 | direct tg256 | LUT-env pp128 | LUT-env tg256 |
+    |---|---:|---:|---:|---:|
+    | 1 | 47.26 | 37.95 | 45.21 | 36.96 |
+    | 2 | 88.61 | 61.19 | 87.24 | 60.61 |
+    | 4 | 162.14 | 89.60 | 161.57 | 89.50 |
+
+  - Raw bench logs:
+    - `tmp/fairy2i-arm-lut-add/direct-t1.jsonl`
+    - `tmp/fairy2i-arm-lut-add/direct-t2.jsonl`
+    - `tmp/fairy2i-arm-lut-add/direct-t4.jsonl`
+    - `tmp/fairy2i-arm-lut-add/lut16-t1.jsonl`
+    - `tmp/fairy2i-arm-lut-add/lut16-t2.jsonl`
+    - `tmp/fairy2i-arm-lut-add/lut16-t4.jsonl`
 - Performance note:
-  - 本次只记录 kernel 形态修正和 correctness gates，未记录真实模型 `eval tok/s` 结论；后续如声称 dotprod/NEON/LUT quantize 性能收益，需补充完整 bench 命令与 raw logs。
+  - Fairy2i W2 path 的真实性能结论仍以 Fairy2i GGUF 或专门触发 `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` 的模型为准；当前 full-model bench 使用的是 legacy iFairy GGUF，不能支持 Fairy2i W2 LUT/direct 性能声明。
 
 ### 2026-03-13 (build `8d73f59a`)
 - 变更摘要：
