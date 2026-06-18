@@ -6231,10 +6231,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
             ggml_backend_buffer_set_usage(synth_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
-            const int64_t blocks_per_row = in_dim / QK_IFAIRY64;
-            std::vector<block_ifairy64> row_a((size_t) blocks_per_row);
-            std::vector<block_ifairy64> row_b((size_t) blocks_per_row);
-            std::vector<block_ifairy64> row_out((size_t) blocks_per_row);
+            const int64_t blocks_per_row = in_dim / QK_FAIRY2I_TILE64;
+            std::vector<block_fairy2i_tile64_v2> row_a((size_t) blocks_per_row);
+            std::vector<block_fairy2i_tile64_v2> row_b((size_t) blocks_per_row);
+            std::vector<block_fairy2i_tile64_v2> row_out((size_t) blocks_per_row);
             std::vector<float> tmp_a_real((size_t) in_dim);
             std::vector<float> tmp_a_imag((size_t) in_dim);
             std::vector<float> tmp_b_real((size_t) in_dim);
@@ -6249,15 +6249,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     ggml_backend_tensor_get(stage0, row_a.data(), row_off, row_size);
                     ggml_backend_tensor_get(stage1, row_b.data(), row_off, row_size);
 
-                    dequantize_row_ifairy64(row_a.data(), tmp_a_real.data(), tmp_a_imag.data(), in_dim);
-                    dequantize_row_ifairy64(row_b.data(), tmp_b_real.data(), tmp_b_imag.data(), in_dim);
+                    dequantize_row_fairy2i_tile64_v2(row_a.data(), tmp_a_real.data(), tmp_a_imag.data(), in_dim);
+                    dequantize_row_fairy2i_tile64_v2(row_b.data(), tmp_b_real.data(), tmp_b_imag.data(), in_dim);
 
                     for (int64_t i = 0; i < in_dim; ++i) {
                         tmp_sum_real[(size_t) i] = tmp_a_real[(size_t) i] + tmp_b_real[(size_t) i];
                         tmp_sum_imag[(size_t) i] = tmp_a_imag[(size_t) i] + tmp_b_imag[(size_t) i];
                     }
 
-                    quantize_row_ifairy64_ref(tmp_sum_real.data(), tmp_sum_imag.data(), row_out.data(), in_dim);
+                    quantize_row_fairy2i_tile64_v2_ref(tmp_sum_real.data(), tmp_sum_imag.data(), row_out.data(), in_dim);
                     ggml_backend_tensor_set(dst, row_out.data(), (size_t) row * dst->nb[1], row_size);
                 }
             };

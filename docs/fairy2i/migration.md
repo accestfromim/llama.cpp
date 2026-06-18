@@ -164,3 +164,16 @@ removed; legacy iFairy remains a CPU compatibility path.
 Fairy2i OpenCL tile64 matmul stages activations with `fairy2i_act_q16_64`.
 The staging block is 64 complex values, so supported OpenCL shapes require
 `K % 64 == 0`.
+
+## Merged Output
+
+`LLAMA_FAIRY2I_MERGED_OUTPUT=1` merges split Fairy2i output stages through
+Fairy2i tile64_v2 helpers:
+
+```text
+block_fairy2i_tile64_v2
+quantize_row_fairy2i_tile64_v2_ref()
+dequantize_row_fairy2i_tile64_v2()
+```
+
+Legacy `ifairy64` helpers remain reserved for legacy iFairy paths.
