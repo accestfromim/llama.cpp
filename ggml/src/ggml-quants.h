@@ -48,6 +48,10 @@ GGML_API void quantize_row_ifairy64_ref(const float * GGML_RESTRICT    x_real,
                                         const float * GGML_RESTRICT    x_imag,
                                         block_ifairy64 * GGML_RESTRICT y,
                                         int64_t                        k);
+GGML_API void quantize_row_fairy2i_tile64_v2_ref(const float * GGML_RESTRICT                x_real,
+                                                 const float * GGML_RESTRICT                x_imag,
+                                                 block_fairy2i_tile64_v2 * GGML_RESTRICT y,
+                                                 int64_t                                    k);
 
 GGML_API void quantize_row_iq3_xxs_ref(const float * GGML_RESTRICT x, block_iq3_xxs * GGML_RESTRICT y, int64_t k);
 GGML_API void quantize_row_iq4_nl_ref (const float * GGML_RESTRICT x, block_iq4_nl  * GGML_RESTRICT y, int64_t k);
@@ -87,6 +91,10 @@ GGML_API void dequantize_row_ifairy64(const block_ifairy64 * GGML_RESTRICT x,
                                       float * GGML_RESTRICT                y_real,
                                       float * GGML_RESTRICT                y_imag,
                                       int64_t                              k);
+GGML_API void dequantize_row_fairy2i_tile64_v2(const block_fairy2i_tile64_v2 * GGML_RESTRICT x,
+                                               float * GGML_RESTRICT                          y_real,
+                                               float * GGML_RESTRICT                          y_imag,
+                                               int64_t                                        k);
 
 GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);

@@ -522,7 +522,23 @@ static void quantize_row_ifairy64_from_float_ref(const float * GGML_RESTRICT x, 
 }
 
 static void quantize_row_fairy2i_tile64_v2_from_float_ref(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
-    quantize_row_ifairy64_from_float_ref(x, vy, k);
+    float * tmp = (float *) malloc(2 * (size_t) k * sizeof(float));
+    if (tmp == NULL) {
+        GGML_ABORT("out of memory");
+    }
+
+    float * real = tmp;
+    float * imag = tmp + k;
+
+    for (int64_t i = 0; i < k; ++i) {
+        ggml_bf16_t pair[2];
+        memcpy(pair, x + i, sizeof(pair));
+        real[i] = GGML_BF16_TO_FP32(pair[0]);
+        imag[i] = GGML_BF16_TO_FP32(pair[1]);
+    }
+
+    quantize_row_fairy2i_tile64_v2_ref(real, imag, (block_fairy2i_tile64_v2 *) vy, k);
+    free(tmp);
 }
 
 bool ggml_guid_matches(ggml_guid_t guid_a, ggml_guid_t guid_b) {
