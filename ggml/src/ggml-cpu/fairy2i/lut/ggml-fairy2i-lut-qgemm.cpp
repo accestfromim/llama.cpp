@@ -528,6 +528,15 @@ static inline int ggml_fairy2i_u8_to_s8_int(uint8_t v) {
     return v < 128 ? (int) v : (int) v - 256;
 }
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+static inline int8x16_t ggml_fairy2i_lut_select_sign_arm(int8x16_t value, uint8x16_t neg_mask, uint8x16_t pos_mask) {
+    const int8x16_t zero = vdupq_n_s8(0);
+    const int8x16_t neg  = vnegq_s8(value);
+
+    return vbslq_s8(pos_mask, value, vbslq_s8(neg_mask, neg, zero));
+}
+#endif
+
 static inline void ggml_fairy2i_lut_fill_group_lut16(int xr0, int xi0, int xr1, int xi1, int8_t * tbl) {
 #if defined(__AVX2__)
     const __m256i c0_ac_bc = _mm256_setr_epi8(-1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0,  // lower = c0_r
@@ -564,29 +573,41 @@ static inline void ggml_fairy2i_lut_fill_group_lut16(int xr0, int xi0, int xr1, 
     _mm_storeu_si128((__m128i *) (tbl + 32), _mm256_extracti128_si256(tbl_ac_bc, 1));
     _mm_storeu_si128((__m128i *) (tbl + 48), _mm256_extracti128_si256(tbl_bd_ad, 1));
 #elif defined(__ARM_NEON) && defined(__aarch64__)
-    const int8x16_t c0_ac = {
-        -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0,
+    const uint8x16_t c0_ac_neg = {
+        0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0,
     };
-    const int8x16_t c1_ac = {
-        -1, -1, -1, -1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    const uint8x16_t c0_ac_pos = {
+        0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0,
     };
-    const int8x16_t c0_bd = {
-        0, 0, 1, -1, 0, 0, 1, -1, 0, 0, 1, -1, 0, 0, 1, -1,
+    const uint8x16_t c1_ac_neg = {
+        0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     };
-    const int8x16_t c1_bd = {
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, -1, -1, -1, -1,
+    const uint8x16_t c1_ac_pos = {
+        0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
     };
-    const int8x16_t c0_bc = {
-        0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1,
+    const uint8x16_t c0_bd_neg = {
+        0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff,
     };
-    const int8x16_t c1_bc = {
-        0, 0, 0, 0, 0, 0, 0, 0, -1, -1, -1, -1, 1, 1, 1, 1,
+    const uint8x16_t c0_bd_pos = {
+        0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0,
     };
-    const int8x16_t c0_ad = {
-        -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0, -1, 1, 0, 0,
+    const uint8x16_t c1_bd_neg = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff,
     };
-    const int8x16_t c1_ad = {
-        -1, -1, -1, -1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+    const uint8x16_t c1_bd_pos = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0,
+    };
+    const uint8x16_t c0_bc_neg = {
+        0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0,
+    };
+    const uint8x16_t c0_bc_pos = {
+        0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff,
+    };
+    const uint8x16_t c1_bc_neg = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0,
+    };
+    const uint8x16_t c1_bc_pos = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff,
     };
 
     const int8x16_t v_r0 = vdupq_n_s8((int8_t) r0);
@@ -594,10 +615,14 @@ static inline void ggml_fairy2i_lut_fill_group_lut16(int xr0, int xi0, int xr1, 
     const int8x16_t v_i0 = vdupq_n_s8((int8_t) i0);
     const int8x16_t v_i1 = vdupq_n_s8((int8_t) i1);
 
-    const int8x16_t ac_tbl = vaddq_s8(vmulq_s8(v_r0, c0_ac), vmulq_s8(v_r1, c1_ac));
-    const int8x16_t bd_tbl = vaddq_s8(vmulq_s8(v_i0, c0_bd), vmulq_s8(v_i1, c1_bd));
-    const int8x16_t bc_tbl = vaddq_s8(vmulq_s8(v_r0, c0_bc), vmulq_s8(v_r1, c1_bc));
-    const int8x16_t ad_tbl = vaddq_s8(vmulq_s8(v_i0, c0_ad), vmulq_s8(v_i1, c1_ad));
+    const int8x16_t ac_tbl = vaddq_s8(ggml_fairy2i_lut_select_sign_arm(v_r0, c0_ac_neg, c0_ac_pos),
+                                      ggml_fairy2i_lut_select_sign_arm(v_r1, c1_ac_neg, c1_ac_pos));
+    const int8x16_t bd_tbl = vaddq_s8(ggml_fairy2i_lut_select_sign_arm(v_i0, c0_bd_neg, c0_bd_pos),
+                                      ggml_fairy2i_lut_select_sign_arm(v_i1, c1_bd_neg, c1_bd_pos));
+    const int8x16_t bc_tbl = vaddq_s8(ggml_fairy2i_lut_select_sign_arm(v_r0, c0_bc_neg, c0_bc_pos),
+                                      ggml_fairy2i_lut_select_sign_arm(v_r1, c1_bc_neg, c1_bc_pos));
+    const int8x16_t ad_tbl = vaddq_s8(ggml_fairy2i_lut_select_sign_arm(v_i0, c0_ac_neg, c0_ac_pos),
+                                      ggml_fairy2i_lut_select_sign_arm(v_i1, c1_ac_neg, c1_ac_pos));
 
     vst1q_s8(tbl + 0, ac_tbl);
     vst1q_s8(tbl + 16, bd_tbl);
