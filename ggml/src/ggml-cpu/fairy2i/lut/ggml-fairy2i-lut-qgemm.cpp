@@ -594,10 +594,10 @@ static inline void ggml_fairy2i_lut_fill_group_lut16(int xr0, int xi0, int xr1, 
     const int8x16_t v_i0 = vdupq_n_s8((int8_t) i0);
     const int8x16_t v_i1 = vdupq_n_s8((int8_t) i1);
 
-    const int8x16_t ac_tbl = vqaddq_s8(vmulq_s8(v_r0, c0_ac), vmulq_s8(v_r1, c1_ac));
-    const int8x16_t bd_tbl = vqaddq_s8(vmulq_s8(v_i0, c0_bd), vmulq_s8(v_i1, c1_bd));
-    const int8x16_t bc_tbl = vqaddq_s8(vmulq_s8(v_r0, c0_bc), vmulq_s8(v_r1, c1_bc));
-    const int8x16_t ad_tbl = vqaddq_s8(vmulq_s8(v_i0, c0_ad), vmulq_s8(v_i1, c1_ad));
+    const int8x16_t ac_tbl = vaddq_s8(vmulq_s8(v_r0, c0_ac), vmulq_s8(v_r1, c1_ac));
+    const int8x16_t bd_tbl = vaddq_s8(vmulq_s8(v_i0, c0_bd), vmulq_s8(v_i1, c1_bd));
+    const int8x16_t bc_tbl = vaddq_s8(vmulq_s8(v_r0, c0_bc), vmulq_s8(v_r1, c1_bc));
+    const int8x16_t ad_tbl = vaddq_s8(vmulq_s8(v_i0, c0_ad), vmulq_s8(v_i1, c1_ad));
 
     vst1q_s8(tbl + 0, ac_tbl);
     vst1q_s8(tbl + 16, bd_tbl);
