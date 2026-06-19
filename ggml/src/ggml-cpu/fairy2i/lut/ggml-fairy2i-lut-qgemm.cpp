@@ -771,6 +771,50 @@ static void ggml_fairy2i_tile64_lut_preprocess_lut16_one(const block_fairy2i_q16
     }
 }
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+static inline void ggml_fairy2i_tile64_lut_fill_q16_64_groups4_arm(const block_fairy2i_act_q16_64 & act_blk,
+                                                                   int64_t                          local_group,
+                                                                   int8_t *                         lut_out) {
+    const int      base_off = (int) local_group * 2;
+    const int8x8_t xr       = vreinterpret_s8_u8(vld1_u8(act_blk.x_real + base_off));
+    const int8x8_t xi       = vreinterpret_s8_u8(vld1_u8(act_blk.x_imag + base_off));
+
+    ggml_fairy2i_lut_fill_group_lut16(vget_lane_s8(xr, 0), vget_lane_s8(xi, 0), vget_lane_s8(xr, 1),
+                                      vget_lane_s8(xi, 1), lut_out + 0 * k_fairy2i_lut_group_bytes);
+    ggml_fairy2i_lut_fill_group_lut16(vget_lane_s8(xr, 2), vget_lane_s8(xi, 2), vget_lane_s8(xr, 3),
+                                      vget_lane_s8(xi, 3), lut_out + 1 * k_fairy2i_lut_group_bytes);
+    ggml_fairy2i_lut_fill_group_lut16(vget_lane_s8(xr, 4), vget_lane_s8(xi, 4), vget_lane_s8(xr, 5),
+                                      vget_lane_s8(xi, 5), lut_out + 2 * k_fairy2i_lut_group_bytes);
+    ggml_fairy2i_lut_fill_group_lut16(vget_lane_s8(xr, 6), vget_lane_s8(xi, 6), vget_lane_s8(xr, 7),
+                                      vget_lane_s8(xi, 7), lut_out + 3 * k_fairy2i_lut_group_bytes);
+}
+
+static inline void ggml_fairy2i_tile64_lut_preprocess_q16_64_groups_arm(const block_fairy2i_act_q16_64 * act_blocks,
+                                                                        int64_t                          blocks,
+                                                                        int8_t *                         lut_out) {
+    for (int64_t blk = 0; blk < blocks; ++blk) {
+        const block_fairy2i_act_q16_64 & act_blk = act_blocks[blk];
+        int8_t * lut_blk = lut_out + (size_t) blk * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK * k_fairy2i_lut_group_bytes;
+
+        int64_t local_group = 0;
+        for (; local_group + 4 <= QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK; local_group += 4) {
+            ggml_fairy2i_tile64_lut_fill_q16_64_groups4_arm(act_blk, local_group,
+                                                            lut_blk + (size_t) local_group * k_fairy2i_lut_group_bytes);
+        }
+        for (; local_group < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK; ++local_group) {
+            const int64_t base_off = local_group * 2;
+            const int     xr0      = ggml_fairy2i_u8_to_s8_int(act_blk.x_real[base_off + 0]);
+            const int     xi0      = ggml_fairy2i_u8_to_s8_int(act_blk.x_imag[base_off + 0]);
+            const int     xr1      = ggml_fairy2i_u8_to_s8_int(act_blk.x_real[base_off + 1]);
+            const int     xi1      = ggml_fairy2i_u8_to_s8_int(act_blk.x_imag[base_off + 1]);
+
+            ggml_fairy2i_lut_fill_group_lut16(xr0, xi0, xr1, xi1,
+                                              lut_blk + (size_t) local_group * k_fairy2i_lut_group_bytes);
+        }
+    }
+}
+#endif
+
 static void ggml_fairy2i_tile64_lut_preprocess_q16_64_lut16_one(const block_fairy2i_act_q16_64 * act_blocks,
                                                           int64_t                    blocks,
                                                           float *                    scales_out,
@@ -781,6 +825,13 @@ static void ggml_fairy2i_tile64_lut_preprocess_q16_64_lut16_one(const block_fair
         scales_out[blk * 2 + 0] = GGML_FP16_TO_FP32(act_blocks[blk].d_real);
         scales_out[blk * 2 + 1] = GGML_FP16_TO_FP32(act_blocks[blk].d_imag);
     }
+
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if (g0 == 0 && gstep == 1) {
+        ggml_fairy2i_tile64_lut_preprocess_q16_64_groups_arm(act_blocks, blocks, lut_out);
+        return;
+    }
+#endif
 
     const int64_t groups = blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
     for (int64_t g = g0; g < groups; g += gstep) {
