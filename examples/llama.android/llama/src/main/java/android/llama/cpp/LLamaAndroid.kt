@@ -107,6 +107,38 @@ class LLamaAndroid {
         Companion.configureNativeLibraryDir(path)
     }
 
+    fun configureOpenCLWideLinearW2ImplEarly(impl: String?) {
+        val normalized = impl
+            ?.trim()
+            ?.lowercase(Locale.US)
+            ?.takeIf { it.isNotEmpty() && it != "default" && it != "q16" }
+
+        runCatching {
+            when (normalized) {
+                null -> {
+                    Os.unsetenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL")
+                    Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL unset (q16)")
+                }
+                "q16dot8",
+                "dot8",
+                "lutlocal",
+                "lut",
+                "lutglobal",
+                "lutglobal16",
+                "lutglobal32",
+                "lutglobal64" -> {
+                    Os.setenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL", normalized, true)
+                    Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL=$normalized")
+                }
+                else -> {
+                    Log.e(LOG_TAG, "Ignoring unsupported early GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL=$impl")
+                }
+            }
+        }.onFailure { throwable ->
+            Log.w(LOG_TAG, "Early OpenCL W2 impl configuration failed", throwable)
+        }
+    }
+
     @Volatile
     private var stopRequested: Boolean = false
 
@@ -140,6 +172,8 @@ class LLamaAndroid {
         openclSupportsDebug: Int,
         forceCpu: Int,
     )
+    private external fun configure_opencl_mul_mat_impl(impl: String?)
+    private external fun configure_opencl_wide_linear_w2_impl(impl: String?)
     private external fun bench_model(
         context: Long,
         model: Long,
@@ -211,6 +245,18 @@ class LLamaAndroid {
                 openclSupportsDebug,
                 forceCpu,
             )
+        }
+    }
+
+    suspend fun configureOpenCLMulMatImpl(impl: String?) {
+        withContext(runLoop) {
+            configure_opencl_mul_mat_impl(impl)
+        }
+    }
+
+    suspend fun configureOpenCLWideLinearW2Impl(impl: String?) {
+        withContext(runLoop) {
+            configure_opencl_wide_linear_w2_impl(impl)
         }
     }
 

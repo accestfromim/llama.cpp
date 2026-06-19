@@ -71,6 +71,7 @@ set(GGML_OPENCL_KERNELS
     ifairy_add
     ifairy_merge
     ifairy64
+    ifairy64_dot8
     ifairy_mul
     ifairy_relu2
     ifairy_rms_norm

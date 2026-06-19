@@ -166,6 +166,8 @@ private data class RuntimeBenchConfig(
     val schedDebug: Int = -1,
     val openclSupportsDebug: Int = -1,
     val forceCpu: Int = -1,
+    val openclMulMatImpl: String? = null,
+    val openclWideLinearW2Impl: String? = null,
 )
 
 class MainViewModel(
@@ -356,6 +358,14 @@ class MainViewModel(
         val schedDebug = extras.getIntOrSentinel("codex_sched_debug")
         val openclSupportsDebug = extras.getIntOrSentinel("codex_opencl_supports_debug")
         val forceCpu = extras.getIntOrSentinel("codex_force_cpu")
+        val openclMulMatImpl = extras.getString("codex_opencl_mul_mat_impl")
+            ?.trim()
+            ?.lowercase(Locale.US)
+            ?.takeIf { it.isNotEmpty() }
+        val openclWideLinearW2Impl = extras.getString("codex_opencl_wide_linear_w2_impl")
+            ?.trim()
+            ?.lowercase(Locale.US)
+            ?.takeIf { it.isNotEmpty() }
         val benchCooldownMs = extras.getIntOrSentinel("codex_bench_cooldown_ms")
         val benchRepetitions = extras.getIntOrSentinel("codex_bench_repetitions")
         val benchPromptTokens = extras.getIntOrSentinel("codex_bench_pp")
@@ -396,6 +406,8 @@ class MainViewModel(
             schedDebug = if (schedDebug >= 0) schedDebug else runtimeBenchConfig.schedDebug,
             openclSupportsDebug = if (openclSupportsDebug >= 0) openclSupportsDebug else runtimeBenchConfig.openclSupportsDebug,
             forceCpu = if (forceCpu >= 0) forceCpu else runtimeBenchConfig.forceCpu,
+            openclMulMatImpl = openclMulMatImpl ?: runtimeBenchConfig.openclMulMatImpl,
+            openclWideLinearW2Impl = openclWideLinearW2Impl ?: runtimeBenchConfig.openclWideLinearW2Impl,
         )
 
         if (
@@ -427,7 +439,9 @@ class MainViewModel(
             generatePrompt == null &&
             generateMaxTokens < 0 &&
             generateFormatChat < 0 &&
-            generateOutputPrefix == null
+            generateOutputPrefix == null &&
+            openclMulMatImpl == null &&
+            openclWideLinearW2Impl == null
         ) {
             return
         }
@@ -489,6 +503,7 @@ class MainViewModel(
             log("Automation generate output prefix override: $automationGenerateOutputPrefix")
         }
         runtimeBenchConfig = nextRuntimeBenchConfig
+        llamaAndroid.configureOpenCLWideLinearW2ImplEarly(nextRuntimeBenchConfig.openclWideLinearW2Impl)
 
         viewModelScope.launch {
             runCatching {
@@ -507,6 +522,8 @@ class MainViewModel(
                     openclSupportsDebug = openclSupportsDebug,
                     forceCpu = forceCpu,
                 )
+                llamaAndroid.configureOpenCLMulMatImpl(nextRuntimeBenchConfig.openclMulMatImpl)
+                llamaAndroid.configureOpenCLWideLinearW2Impl(nextRuntimeBenchConfig.openclWideLinearW2Impl)
             }.onSuccess {
                 log(
                     "Runtime overrides: n_ctx=${formatOverride(nCtx)}, n_batch=${formatOverride(nBatch)}, " +
@@ -523,6 +540,8 @@ class MainViewModel(
                         "battery_capacity_mah=${configuredBatteryCapacityMah?.let(::formatCsvDecimal) ?: "default"}, " +
                         "model_filter=${modelFilter?.joinToString(",") ?: "default"}, " +
                         "preset_filter=${presetFilter?.joinToString(",") ?: "default"}, " +
+                        "opencl_mul_mat_impl=${nextRuntimeBenchConfig.openclMulMatImpl ?: "default"}, " +
+                        "opencl_wide_linear_w2_impl=${nextRuntimeBenchConfig.openclWideLinearW2Impl ?: "default"}, " +
                         "generation_priority=${formatOverride(generationPriority, -99)}, " +
                         "batch_priority=${formatOverride(batchPriority, -99)}"
                 )
@@ -614,6 +633,7 @@ class MainViewModel(
 
         viewModelScope.launch {
             runCatching {
+                applyCurrentRuntimeBenchConfig()
                 loadModelInternal(model)
             }.onSuccess {
                 maybeStartPendingAutomation()
@@ -849,6 +869,8 @@ class MainViewModel(
             openclSupportsDebug = config.openclSupportsDebug,
             forceCpu = config.forceCpu,
         )
+        llamaAndroid.configureOpenCLMulMatImpl(config.openclMulMatImpl)
+        llamaAndroid.configureOpenCLWideLinearW2Impl(config.openclWideLinearW2Impl)
         log(
             "Applied runtime config before benchmark load: " +
                 "n_ctx=${formatOverride(config.nCtx)}, n_batch=${formatOverride(config.nBatch)}, " +
@@ -859,7 +881,9 @@ class MainViewModel(
                 "generation_priority=${formatOverride(config.generationPriority, -99)}, " +
                 "batch_priority=${formatOverride(config.batchPriority, -99)}, " +
                 "sched_debug=${formatOverride(config.schedDebug)}, opencl_supports_debug=${formatOverride(config.openclSupportsDebug)}, " +
-                "force_cpu=${formatOverride(config.forceCpu)}"
+                "force_cpu=${formatOverride(config.forceCpu)}, " +
+                "opencl_mul_mat_impl=${config.openclMulMatImpl ?: "default"}, " +
+                "opencl_wide_linear_w2_impl=${config.openclWideLinearW2Impl ?: "default"}"
         )
     }
 

@@ -378,6 +378,24 @@ struct scoped_env_var {
     }
 };
 
+static bool opencl_ifairy64_wide_linear_w2_lut_requested() {
+    const char * env = getenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL");
+    return env && (strcmp(env, "lutlocal") == 0 || strcmp(env, "lut") == 0 ||
+                   strcmp(env, "lutglobal") == 0 || strcmp(env, "lutglobal16") == 0 ||
+                   strcmp(env, "lutglobal32") == 0 || strcmp(env, "lutglobal64") == 0);
+}
+
+static bool opencl_ifairy64_wide_linear_w2_lutlocal_requested() {
+    const char * env = getenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL");
+    return env && (strcmp(env, "lutlocal") == 0 || strcmp(env, "lut") == 0);
+}
+
+static bool opencl_ifairy64_wide_linear_w2_lutglobal_requested() {
+    const char * env = getenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL");
+    return env && (strcmp(env, "lutglobal") == 0 || strcmp(env, "lutglobal16") == 0 ||
+                   strcmp(env, "lutglobal32") == 0 || strcmp(env, "lutglobal64") == 0);
+}
+
 static float pack_bf16_pair(float real, float imag) {
     ggml_bf16_t pair[2];
     pair[0] = GGML_FP32_TO_BF16(real);
@@ -1510,7 +1528,8 @@ static bool run_ifairy_backend_mul_mat_shape_with_weights(std::vector<uint32_t> 
         env_lut.unset();
     }
 
-    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY) != 0) {
+    const int64_t weight_block_k = weight_type == GGML_TYPE_IFAIRY64 ? QK_IFAIRY64 : QK_IFAIRY;
+    if (M <= 0 || N <= 0 || K <= 0 || (K % weight_block_k) != 0) {
         fprintf(stderr, "Invalid backend test shape: M=%lld N=%lld K=%lld\n", (long long) M, (long long) N,
                 (long long) K);
         return false;
@@ -1661,7 +1680,7 @@ static bool run_ifairy64_mul_mat_shape_on_backend(std::vector<uint32_t> &       
                                                   const std::vector<block_ifairy64> &  weights,
                                                   const std::vector<float> &           act_f32,
                                                   bool                                 require_supported) {
-    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY) != 0) {
+    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY64) != 0) {
         fprintf(stderr, "Invalid ifairy64 OpenCL test shape: M=%lld N=%lld K=%lld\n",
                 (long long) M, (long long) N, (long long) K);
         return false;
@@ -1818,6 +1837,294 @@ static bool run_ifairy64_wide_linear_w2_backend(std::vector<uint32_t> &         
     ggml_free(ctx);
     ggml_backend_free(backend);
     return ok;
+}
+
+static bool ifairy_graph_all_supported(ggml_backend_t backend, const ggml_cgraph * gf, const char * label) {
+    ggml_cgraph * graph = const_cast<ggml_cgraph *>(gf);
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor * node = ggml_graph_node(graph, i);
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (!ggml_backend_supports_op(backend, node)) {
+            fprintf(stderr, "%s does not support node %d: %s (%s)\n",
+                    ggml_backend_name(backend), i, node->name, ggml_op_name(node->op));
+            if (label) {
+                fprintf(stderr, "  graph label: %s\n", label);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool run_ifairy64_wide_linear_w2_backend_generic(std::vector<uint32_t> &             packed_out,
+                                                        ggml_backend_t                      backend,
+                                                        int64_t                             M,
+                                                        int64_t                             N,
+                                                        int64_t                             K,
+                                                        const std::vector<block_ifairy64> & u_s0_data,
+                                                        const std::vector<block_ifairy64> & u_s1_data,
+                                                        const std::vector<block_ifairy64> & w_s0_data,
+                                                        const std::vector<block_ifairy64> & w_s1_data,
+                                                        const std::vector<float> &          x_data,
+                                                        const std::vector<float> *          bias_data,
+                                                        bool                                fused,
+                                                        bool                                require_supported) {
+    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY64) != 0) {
+        fprintf(stderr, "Invalid ifairy64 wide-linear shape: M=%lld N=%lld K=%lld\n",
+                (long long) M, (long long) N, (long long) K);
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for wide-linear W2 backend run\n");
+        return false;
+    }
+
+    ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * x_conj = fused ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * u_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * u_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * bias   = bias_data ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * M) : nullptr;
+    ggml_set_name(x, "wide_x");
+    if (x_conj) {
+        ggml_set_name(x_conj, "wide_x_conj");
+    }
+    ggml_set_name(u_s0, "wide_u_s0");
+    ggml_set_name(u_s1, "wide_u_s1");
+    ggml_set_name(w_s0, "wide_w_s0");
+    ggml_set_name(w_s1, "wide_w_s1");
+    if (bias) {
+        ggml_set_name(bias, "wide_bias");
+    }
+
+    ggml_tensor * out = nullptr;
+    if (fused) {
+        out = ggml_ifairy_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
+    } else {
+        ggml_tensor * u = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, u_s0, x_conj), ggml_mul_mat(ctx, u_s1, x_conj));
+        ggml_tensor * w = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, w_s0, x), ggml_mul_mat(ctx, w_s1, x));
+        out             = ggml_ifairy_add(ctx, u, w);
+        if (bias) {
+            out = ggml_ifairy_merge(ctx, ggml_add(ctx, ggml_ifairy_split(ctx, out), bias));
+        }
+    }
+    ggml_set_name(out, fused ? "wide_out_fused" : "wide_out_unfused");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    if (require_supported && !ifairy_graph_all_supported(backend, gf, fused ? "wide-fused" : "wide-unfused")) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate backend buffer for wide-linear W2 on %s\n", ggml_backend_name(backend));
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
+    if (x_conj) {
+        std::vector<float> x_conj_data(x_data.size());
+        for (size_t i = 0; i < x_data.size(); ++i) {
+            const ggml_bf16_t * in = (const ggml_bf16_t *) &x_data[i];
+            ggml_bf16_t *       out_pair = (ggml_bf16_t *) &x_conj_data[i];
+            out_pair[0]                  = in[0];
+            out_pair[1]                  = GGML_FP32_TO_BF16(-GGML_BF16_TO_FP32(in[1]));
+        }
+        ggml_backend_tensor_set(x_conj, x_conj_data.data(), 0, x_conj_data.size() * sizeof(float));
+    }
+    ggml_backend_tensor_set(u_s0, u_s0_data.data(), 0, u_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(u_s1, u_s1_data.data(), 0, u_s1_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s0, w_s0_data.data(), 0, w_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s1, w_s1_data.data(), 0, w_s1_data.size() * sizeof(block_ifairy64));
+    if (bias) {
+        ggml_backend_tensor_set(bias, bias_data->data(), 0, bias_data->size() * sizeof(float));
+    }
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "wide-linear W2 graph compute failed on %s (%s)\n",
+                ggml_backend_name(backend), fused ? "fused" : "unfused");
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> out_data((size_t) M * (size_t) N);
+    ggml_backend_tensor_get(out, out_data.data(), 0, out_data.size() * sizeof(float));
+    packed_out.resize(out_data.size());
+    memcpy(packed_out.data(), out_data.data(), out_data.size() * sizeof(float));
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
+static bool run_ifairy64_wide_linear_w2_lut_reference(std::vector<uint32_t> &             packed_out,
+                                                       int64_t                             M,
+                                                       int64_t                             N,
+                                                       int64_t                             K,
+                                                       const std::vector<block_ifairy64> & u_s0_data,
+                                                       const std::vector<block_ifairy64> & u_s1_data,
+                                                       const std::vector<block_ifairy64> & w_s0_data,
+                                                       const std::vector<block_ifairy64> & w_s1_data,
+                                                       const std::vector<float> &          x_data,
+                                                       const std::vector<float> *          bias_data) {
+    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY64) != 0) {
+        return false;
+    }
+
+    const int64_t blocks = K / QK_IFAIRY64;
+    packed_out.assign((size_t) M * (size_t) N, 0);
+
+    std::vector<int>   q_real((size_t) K);
+    std::vector<int>   q_imag((size_t) K);
+    std::vector<float> s_real((size_t) blocks);
+    std::vector<float> s_imag((size_t) blocks);
+
+    auto unpack_pair = [](float packed, float & real, float & imag) {
+        uint32_t bits = 0;
+        memcpy(&bits, &packed, sizeof(bits));
+        ggml_bf16_t r;
+        ggml_bf16_t i;
+        r.bits = (uint16_t) (bits & 0xffffu);
+        i.bits = (uint16_t) (bits >> 16);
+        real = GGML_BF16_TO_FP32(r);
+        imag = GGML_BF16_TO_FP32(i);
+    };
+
+    auto decode_code = [](uint8_t code, int & wr, int & wi) {
+        if (code == 0) {
+            wr = -1;
+            wi = 0;
+        } else if (code == 1) {
+            wr = 1;
+            wi = 0;
+        } else if (code == 2) {
+            wr = 0;
+            wi = -1;
+        } else {
+            wr = 0;
+            wi = 1;
+        }
+    };
+
+    auto accumulate_weight_lane = [&](const std::vector<block_ifairy64> & weights,
+                                      int64_t row,
+                                      int64_t block,
+                                      int     pair_lane,
+                                      bool    conj,
+                                      float & acc_real,
+                                      float & acc_imag) {
+        const block_ifairy64 * row_blocks = weights.data() + (size_t) row * (size_t) blocks;
+        const block_ifairy64 & blk = row_blocks[block];
+        const float d_real = GGML_FP16_TO_FP32(blk.d_real);
+        const float d_imag = GGML_FP16_TO_FP32(blk.d_imag);
+
+        int sum_ac = 0;
+        int sum_bd = 0;
+        int sum_bc = 0;
+        int sum_ad = 0;
+        for (int part = 0; part < 4; ++part) {
+            const int j = pair_lane * 4 + part;
+            int wr = 0;
+            int wi = 0;
+            decode_code(get_ifairy64_code(row_blocks, (int) (block * QK_IFAIRY64 + j)), wr, wi);
+
+            const int64_t k_idx = block * QK_IFAIRY64 + j;
+            const int xr = q_real[(size_t) k_idx];
+            const int xi = q_imag[(size_t) k_idx];
+            sum_ac += xr * wr;
+            sum_bd += xi * wi;
+            sum_bc += xr * wi;
+            sum_ad -= xi * wr;
+        }
+
+        const float x_real = s_real[(size_t) block];
+        const float x_imag = s_imag[(size_t) block];
+        if (conj) {
+            acc_real += d_real * x_real * (float) sum_ac + d_imag * x_imag * (float) sum_bd;
+            acc_imag += d_imag * x_real * (float) sum_bc + d_real * x_imag * (float) sum_ad;
+        } else {
+            acc_real += d_real * x_real * (float) sum_ac - d_imag * x_imag * (float) sum_bd;
+            acc_imag += d_imag * x_real * (float) sum_bc - d_real * x_imag * (float) sum_ad;
+        }
+    };
+
+    for (int64_t col = 0; col < N; ++col) {
+        const float * x_col = x_data.data() + (size_t) col * (size_t) K;
+        for (int64_t block = 0; block < blocks; ++block) {
+            float max_real = 1.0e-5f;
+            float max_imag = 1.0e-5f;
+            for (int j = 0; j < QK_IFAIRY64; ++j) {
+                float xr = 0.0f;
+                float xi = 0.0f;
+                unpack_pair(x_col[block * QK_IFAIRY64 + j], xr, xi);
+                max_real = fmaxf(max_real, fabsf(xr));
+                max_imag = fmaxf(max_imag, fabsf(xi));
+            }
+
+            s_real[(size_t) block] = max_real / 63.0f;
+            s_imag[(size_t) block] = max_imag / 63.0f;
+            const float inv_real = 1.0f / s_real[(size_t) block];
+            const float inv_imag = 1.0f / s_imag[(size_t) block];
+
+            for (int j = 0; j < QK_IFAIRY64; ++j) {
+                float xr = 0.0f;
+                float xi = 0.0f;
+                unpack_pair(x_col[block * QK_IFAIRY64 + j], xr, xi);
+                const int64_t k_idx = block * QK_IFAIRY64 + j;
+                q_real[(size_t) k_idx] = std::max(-63, std::min(63, (int) lrintf(xr * inv_real)));
+                q_imag[(size_t) k_idx] = std::max(-63, std::min(63, (int) lrintf(xi * inv_imag)));
+            }
+        }
+
+        for (int64_t row = 0; row < M; ++row) {
+            float lane_real[16] = {};
+            float lane_imag[16] = {};
+            for (int64_t block = 0; block < blocks; ++block) {
+                for (int pair_lane = 0; pair_lane < 16; ++pair_lane) {
+                    accumulate_weight_lane(u_s0_data, row, block, pair_lane, /*conj*/ false,
+                                           lane_real[pair_lane], lane_imag[pair_lane]);
+                    accumulate_weight_lane(u_s1_data, row, block, pair_lane, /*conj*/ false,
+                                           lane_real[pair_lane], lane_imag[pair_lane]);
+                    accumulate_weight_lane(w_s0_data, row, block, pair_lane, /*conj*/ true,
+                                           lane_real[pair_lane], lane_imag[pair_lane]);
+                    accumulate_weight_lane(w_s1_data, row, block, pair_lane, /*conj*/ true,
+                                           lane_real[pair_lane], lane_imag[pair_lane]);
+                }
+            }
+
+            float out_real = 0.0f;
+            float out_imag = 0.0f;
+            for (int pair_lane = 0; pair_lane < 16; ++pair_lane) {
+                out_real += lane_real[pair_lane];
+                out_imag += lane_imag[pair_lane];
+            }
+            if (bias_data) {
+                out_real += (*bias_data)[(size_t) row];
+                out_imag += (*bias_data)[(size_t) row + (size_t) M];
+            }
+            const float packed = pack_bf16_pair(out_real, out_imag);
+            memcpy(&packed_out[(size_t) col * (size_t) M + (size_t) row], &packed, sizeof(uint32_t));
+        }
+    }
+
+    return true;
 }
 
 static bool test_ifairy64_wide_linear_w2_fused() {
@@ -2572,9 +2879,16 @@ static int run_ifairy_opencl_mul_tests(void) {
 static bool run_ifairy64_opencl_mul_mat_compare_case(ggml_backend_dev_t dev,
                                                      int64_t            m,
                                                      int64_t            n,
-                                                     int64_t            k) {
+                                                     int64_t            k,
+                                                     const char *       impl = nullptr) {
     scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    scoped_env_var env_impl("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
     env_gate.set("1");
+    if (impl) {
+        env_impl.set(impl);
+    } else {
+        env_impl.unset();
+    }
 
     std::vector<block_ifairy64> weights;
     std::vector<float>          act_f32;
@@ -2613,8 +2927,8 @@ static bool run_ifairy64_opencl_mul_mat_compare_case(ggml_backend_dev_t dev,
         return false;
     }
 
-    printf("  compare IFAIRY64_MUL_MAT M=%lld N=%lld K=%lld\n",
-           (long long) m, (long long) n, (long long) k);
+    printf("  compare IFAIRY64_MUL_MAT%s%s M=%lld N=%lld K=%lld\n",
+           impl ? " " : "", impl ? impl : "", (long long) m, (long long) n, (long long) k);
     return compare_packed_complex_outputs(opencl_out.data(), cpu_out.data(), cpu_out.size(), 1e-2f);
 }
 
@@ -2649,21 +2963,21 @@ static int run_ifairy64_opencl_mul_mat_tests(void) {
     support("env-unset",        nullptr, GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY,   4, 1, false);
     support("env-zero",         "0",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY,   4, 1, false);
     support("contiguous-f32",   "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY,   4, 1, true);
-    support("k64-rejected",     "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY64, 4, 1, false);
+    support("k64-contiguous",   "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, false, QK_IFAIRY64, 4, 1, true);
     support("act-f16",          "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F16, false, false, QK_IFAIRY,   4, 1, false);
     support("weight-view",      "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, true,  false, QK_IFAIRY,   4, 1, false);
     support("activation-view",  "1",     GGML_TYPE_IFAIRY64, GGML_TYPE_F32, false, true,  QK_IFAIRY,   4, 1, false);
 
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 7, 1, QK_IFAIRY)) {
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 7, 1, QK_IFAIRY64)) {
         num_failed++;
     }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 9, 1, 2 * QK_IFAIRY)) {
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 9, 1, 2 * QK_IFAIRY64)) {
         num_failed++;
     }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 256, 1, 4 * QK_IFAIRY)) {
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 256, 1, QK_IFAIRY)) {
         num_failed++;
     }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 512, 1, 4 * QK_IFAIRY)) {
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 512, 1, 2 * QK_IFAIRY)) {
         num_failed++;
     }
     if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 1024, 1, 4 * QK_IFAIRY)) {
@@ -2672,10 +2986,19 @@ static int run_ifairy64_opencl_mul_mat_tests(void) {
     if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 2048, 1, 4 * QK_IFAIRY)) {
         num_failed++;
     }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 13, 4, 2 * QK_IFAIRY)) {
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 13, 4, 2 * QK_IFAIRY64)) {
         num_failed++;
     }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 8, 8, 2 * QK_IFAIRY)) {
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 8, 8, QK_IFAIRY)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 256, 1, QK_IFAIRY, "lut16")) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 512, 1, 2 * QK_IFAIRY, "lut32")) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 1024, 1, 4 * QK_IFAIRY, "lut64")) {
         num_failed++;
     }
 
@@ -2683,6 +3006,198 @@ static int run_ifairy64_opencl_mul_mat_tests(void) {
         printf("iFairy64 OpenCL MUL_MAT support and correctness tests PASSED!\n");
     } else {
         printf("%d iFairy64 OpenCL MUL_MAT test(s) FAILED\n", num_failed);
+    }
+
+    return num_failed > 0 ? 1 : 0;
+}
+
+static bool check_ifairy64_opencl_wide_linear_support(ggml_backend_dev_t dev,
+                                                      const char *       label,
+                                                      const char *       gate_value,
+                                                      bool               x_view,
+                                                      bool               weight_view,
+                                                      bool               with_bias,
+                                                      int64_t            k,
+                                                      int64_t            m,
+                                                      int64_t            n,
+                                                      bool               expected) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    if (gate_value) {
+        env_gate.set(gate_value);
+    } else {
+        env_gate.unset();
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Failed to init ggml context for IFAIRY_WIDE_LINEAR_W2 %s\n", label);
+        return false;
+    }
+
+    ggml_tensor * x_base  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x_view ? k * 2 : k, n);
+    ggml_tensor * x       = x_view ? ggml_view_2d(ctx, x_base, k, n, x_base->nb[1], 0) : x_base;
+    ggml_tensor * w0_base = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, weight_view ? k * 2 : k, m);
+    ggml_tensor * w0      = weight_view ? ggml_view_2d(ctx, w0_base, k, m, w0_base->nb[1], 0) : w0_base;
+    ggml_tensor * w1      = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, m);
+    ggml_tensor * u0      = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, m);
+    ggml_tensor * u1      = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, k, m);
+    ggml_tensor * bias    = with_bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * m) : nullptr;
+    ggml_tensor * out     = ggml_ifairy_wide_linear_w2(ctx, x, u0, u1, w0, w1, bias);
+
+    const bool supported = ggml_backend_dev_supports_op(dev, out);
+    ggml_free(ctx);
+
+    if (supported != expected) {
+        fprintf(stderr, "IFAIRY_WIDE_LINEAR_W2 OpenCL support case '%s' expected %s, got %s\n",
+                label, expected ? "supported" : "unsupported", supported ? "supported" : "unsupported");
+        return false;
+    }
+
+    printf("  %-28s : %s\n", label, supported ? "supported" : "unsupported");
+    return true;
+}
+
+static bool run_ifairy64_opencl_wide_linear_compare_case(ggml_backend_dev_t dev,
+                                                         int64_t            m,
+                                                         int64_t            n,
+                                                         int64_t            k,
+                                                         bool               with_bias) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    env_gate.set("1");
+
+    std::vector<block_ifairy64> u_s0;
+    std::vector<block_ifairy64> u_s1;
+    std::vector<block_ifairy64> w_s0;
+    std::vector<block_ifairy64> w_s1;
+    fill_ifairy64_backend_weights(u_s0, m, k);
+    fill_ifairy64_backend_weights(u_s1, m, k);
+    fill_ifairy64_backend_weights(w_s0, m, k);
+    fill_ifairy64_backend_weights(w_s1, m, k);
+    for (size_t i = 0; i < u_s0.size(); ++i) {
+        u_s0[i].d_real = GGML_FP32_TO_FP16(0.050f + 0.001f * (float) (i % 5));
+        u_s0[i].d_imag = GGML_FP32_TO_FP16(0.040f + 0.001f * (float) (i % 3));
+        u_s1[i].d_real = GGML_FP32_TO_FP16(0.035f + 0.001f * (float) (i % 7));
+        u_s1[i].d_imag = GGML_FP32_TO_FP16(0.030f + 0.001f * (float) (i % 2));
+        w_s0[i].d_real = GGML_FP32_TO_FP16(0.045f + 0.001f * (float) (i % 4));
+        w_s0[i].d_imag = GGML_FP32_TO_FP16(0.025f + 0.001f * (float) (i % 6));
+        w_s1[i].d_real = GGML_FP32_TO_FP16(0.055f + 0.001f * (float) (i % 3));
+        w_s1[i].d_imag = GGML_FP32_TO_FP16(0.020f + 0.001f * (float) (i % 5));
+    }
+
+    std::vector<float> x;
+    fill_ifairy_backend_act_f32(x, n, k);
+
+    std::vector<float> bias;
+    if (with_bias) {
+        bias.resize((size_t) 2 * (size_t) m);
+        for (int64_t i = 0; i < 2 * m; ++i) {
+            bias[(size_t) i] = (float) (i - m) / 32.0f;
+        }
+    }
+
+    ggml_backend_t opencl_backend = ggml_backend_dev_init(dev, NULL);
+    if (!opencl_backend) {
+        fprintf(stderr, "Failed to init OpenCL backend for IFAIRY_WIDE_LINEAR_W2 compare\n");
+        return false;
+    }
+
+    std::vector<uint32_t> cpu_out;
+    std::vector<uint32_t> opencl_out;
+    const bool use_lut_reference = opencl_ifairy64_wide_linear_w2_lut_requested();
+
+    bool cpu_ok = false;
+    if (use_lut_reference) {
+        cpu_ok = run_ifairy64_wide_linear_w2_lut_reference(cpu_out, m, n, k,
+                                                           u_s0, u_s1, w_s0, w_s1, x,
+                                                           with_bias ? &bias : nullptr);
+    } else {
+        ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+        if (!cpu_backend) {
+            fprintf(stderr, "Failed to init CPU backend for IFAIRY_WIDE_LINEAR_W2 compare\n");
+            ggml_backend_free(opencl_backend);
+            return false;
+        }
+        ggml_backend_cpu_set_n_threads(cpu_backend, 4);
+        cpu_ok = run_ifairy64_wide_linear_w2_backend_generic(cpu_out, cpu_backend, m, n, k,
+                                                             u_s0, u_s1, w_s0, w_s1, x,
+                                                             with_bias ? &bias : nullptr,
+                                                             /*fused*/ true,
+                                                             /*require_supported*/ false);
+        ggml_backend_free(cpu_backend);
+    }
+
+    const bool opencl_ok = run_ifairy64_wide_linear_w2_backend_generic(opencl_out, opencl_backend, m, n, k,
+                                                                       u_s0, u_s1, w_s0, w_s1, x,
+                                                                       with_bias ? &bias : nullptr,
+                                                                       /*fused*/ true,
+                                                                       /*require_supported*/ true);
+
+    ggml_backend_free(opencl_backend);
+
+    if (!cpu_ok || !opencl_ok) {
+        return false;
+    }
+    if (cpu_out.size() != opencl_out.size()) {
+        fprintf(stderr, "IFAIRY_WIDE_LINEAR_W2 output size mismatch: CPU=%zu OpenCL=%zu\n",
+                cpu_out.size(), opencl_out.size());
+        return false;
+    }
+
+    printf("  compare IFAIRY_WIDE_LINEAR_W2 M=%lld N=%lld K=%lld bias=%d\n",
+           (long long) m, (long long) n, (long long) k, with_bias ? 1 : 0);
+    const float max_error = use_lut_reference ? 5e-2f : 1e-2f;
+    return compare_packed_complex_outputs(opencl_out.data(), cpu_out.data(), cpu_out.size(), max_error);
+}
+
+static int run_ifairy64_opencl_wide_linear_tests(void) {
+    printf("\n=== iFairy64 OpenCL WIDE_LINEAR_W2 support and correctness tests ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        fprintf(stderr, "OpenCL backend not found; IFAIRY_WIDE_LINEAR_W2 requires real OpenCL execution.\n");
+        return 1;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    int num_failed = 0;
+    auto support = [&](const char * label, const char * gate, bool x_view, bool weight_view, bool with_bias,
+                       int64_t k, int64_t m, int64_t n, bool expected) {
+        if (!check_ifairy64_opencl_wide_linear_support(dev, label, gate, x_view, weight_view, with_bias,
+                                                       k, m, n, expected)) {
+            num_failed++;
+        }
+    };
+
+    support("env-unset",      nullptr, false, false, false, QK_IFAIRY64, 4, 1, false);
+    support("env-zero",       "0",     false, false, false, QK_IFAIRY64, 4, 1, false);
+    support("contiguous",     "1",     false, false, false, QK_IFAIRY64, 4, 1, true);
+    support("contiguous-bias","1",     false, false, true,  QK_IFAIRY64, 4, 1, true);
+    support("x-view",         "1",     true,  false, false, QK_IFAIRY64, 4, 1, false);
+    support("weight-view",    "1",     false, true,  false, QK_IFAIRY64, 4, 1, false);
+
+    if (!run_ifairy64_opencl_wide_linear_compare_case(dev, 7, 1, QK_IFAIRY64, false)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_wide_linear_compare_case(dev, 9, 3, 2 * QK_IFAIRY64, true)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_wide_linear_compare_case(dev, 256, 1, QK_IFAIRY, false)) {
+        num_failed++;
+    }
+    if (!run_ifairy64_opencl_wide_linear_compare_case(dev, 128, 4, QK_IFAIRY, true)) {
+        num_failed++;
+    }
+
+    if (num_failed == 0) {
+        printf("iFairy64 OpenCL WIDE_LINEAR_W2 support and correctness tests PASSED!\n");
+    } else {
+        printf("%d iFairy64 OpenCL WIDE_LINEAR_W2 test(s) FAILED\n", num_failed);
     }
 
     return num_failed > 0 ? 1 : 0;
@@ -2951,6 +3466,219 @@ static uint64_t hash_u32_bits(const std::vector<uint32_t> & values) {
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+struct ifairy64_wide_bench_result {
+    double   us_per_run = 0.0;
+    int      runs       = 0;
+    uint64_t hash       = 0;
+};
+
+static bool run_ifairy64_opencl_wide_linear_bench_once(ifairy64_wide_bench_result &          result,
+                                                       std::vector<uint32_t> &              packed_out,
+                                                       ggml_backend_dev_t                   dev,
+                                                       int64_t                              M,
+                                                       int64_t                              N,
+                                                       int64_t                              K,
+                                                       const std::vector<block_ifairy64> &  u_s0_data,
+                                                       const std::vector<block_ifairy64> &  u_s1_data,
+                                                       const std::vector<block_ifairy64> &  w_s0_data,
+                                                       const std::vector<block_ifairy64> &  w_s1_data,
+                                                       const std::vector<float> &           x_data,
+                                                       bool                                 fused) {
+    scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
+    env_gate.set("1");
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    if (!backend) {
+        fprintf(stderr, "Failed to init OpenCL backend for IFAIRY_WIDE_LINEAR_W2 bench\n");
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "Failed to init ggml context for IFAIRY_WIDE_LINEAR_W2 bench\n");
+        return false;
+    }
+
+    ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * x_conj = fused ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+    ggml_tensor * u_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * u_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s0   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_tensor * w_s1   = ggml_new_tensor_2d(ctx, GGML_TYPE_IFAIRY64, K, M);
+    ggml_set_name(x, "bench_wide_x");
+    if (x_conj) {
+        ggml_set_name(x_conj, "bench_wide_x_conj");
+    }
+    ggml_set_name(u_s0, "bench_wide_u_s0");
+    ggml_set_name(u_s1, "bench_wide_u_s1");
+    ggml_set_name(w_s0, "bench_wide_w_s0");
+    ggml_set_name(w_s1, "bench_wide_w_s1");
+
+    ggml_tensor * out = nullptr;
+    if (fused) {
+        out = ggml_ifairy_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, nullptr);
+    } else {
+        ggml_tensor * u = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, u_s0, x_conj), ggml_mul_mat(ctx, u_s1, x_conj));
+        ggml_tensor * w = ggml_ifairy_add(ctx, ggml_mul_mat(ctx, w_s0, x), ggml_mul_mat(ctx, w_s1, x));
+        out             = ggml_ifairy_add(ctx, u, w);
+    }
+    ggml_set_name(out, fused ? "bench_wide_out_fused" : "bench_wide_out_unfused");
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    if (!ifairy_graph_all_supported(backend, gf, fused ? "wide-bench-fused" : "wide-bench-unfused")) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Failed to allocate backend buffer for IFAIRY_WIDE_LINEAR_W2 bench\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
+    if (x_conj) {
+        std::vector<float> x_conj_data(x_data.size());
+        for (size_t i = 0; i < x_data.size(); ++i) {
+            const ggml_bf16_t * in = (const ggml_bf16_t *) &x_data[i];
+            ggml_bf16_t *       out_pair = (ggml_bf16_t *) &x_conj_data[i];
+            out_pair[0]                  = in[0];
+            out_pair[1]                  = GGML_FP32_TO_BF16(-GGML_BF16_TO_FP32(in[1]));
+        }
+        ggml_backend_tensor_set(x_conj, x_conj_data.data(), 0, x_conj_data.size() * sizeof(float));
+    }
+    ggml_backend_tensor_set(u_s0, u_s0_data.data(), 0, u_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(u_s1, u_s1_data.data(), 0, u_s1_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s0, w_s0_data.data(), 0, w_s0_data.size() * sizeof(block_ifairy64));
+    ggml_backend_tensor_set(w_s1, w_s1_data.data(), 0, w_s1_data.size() * sizeof(block_ifairy64));
+
+    for (int i = 0; i < 8; ++i) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "IFAIRY_WIDE_LINEAR_W2 bench warmup failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+    }
+    ggml_backend_synchronize(backend);
+
+    int64_t total_us = 0;
+    int     runs     = 0;
+    do {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "IFAIRY_WIDE_LINEAR_W2 bench run failed\n");
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+        const auto t1 = std::chrono::steady_clock::now();
+
+        total_us += (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        runs++;
+    } while (total_us < 500 * 1000 || runs < 30);
+
+    std::vector<float> out_f32((size_t) ggml_nelements(out));
+    ggml_backend_tensor_get(out, out_f32.data(), 0, ggml_nbytes(out));
+
+    packed_out.resize(out_f32.size());
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+        memcpy(&packed_out[i], &out_f32[i], sizeof(uint32_t));
+    }
+
+    result.us_per_run = (double) total_us / (double) runs;
+    result.runs       = runs;
+    result.hash       = hash_u32_bits(packed_out);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+static int run_ifairy64_opencl_wide_linear_bench(void) {
+    printf("\n=== iFairy64 OpenCL WIDE_LINEAR_W2 microbench ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        fprintf(stderr, "OpenCL backend not found; IFAIRY_WIDE_LINEAR_W2 bench requires real OpenCL execution.\n");
+        return 1;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    scoped_env_var env_mul_mat_impl("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
+    if (opencl_ifairy64_wide_linear_w2_lutlocal_requested()) {
+        env_mul_mat_impl.set("lut64");
+        printf("  W2 LUTLOCAL reference: unfused MUL_MAT lut64\n");
+    } else if (opencl_ifairy64_wide_linear_w2_lutglobal_requested()) {
+        env_mul_mat_impl.set("lutglobal64");
+        printf("  W2 LUTGLOBAL reference: unfused MUL_MAT lutglobal64\n");
+    }
+
+    int num_failed = 0;
+    auto bench = [&](int64_t m, int64_t n, int64_t k) {
+        std::vector<block_ifairy64> u_s0;
+        std::vector<block_ifairy64> u_s1;
+        std::vector<block_ifairy64> w_s0;
+        std::vector<block_ifairy64> w_s1;
+        std::vector<float>          x;
+        fill_ifairy64_backend_weights(u_s0, m, k);
+        fill_ifairy64_backend_weights(u_s1, m, k);
+        fill_ifairy64_backend_weights(w_s0, m, k);
+        fill_ifairy64_backend_weights(w_s1, m, k);
+        fill_ifairy_backend_act_f32(x, n, k);
+
+        ifairy64_wide_bench_result fused;
+        ifairy64_wide_bench_result unfused;
+        std::vector<uint32_t> out_fused;
+        std::vector<uint32_t> out_unfused;
+        if (!run_ifairy64_opencl_wide_linear_bench_once(fused, out_fused, dev, m, n, k,
+                                                        u_s0, u_s1, w_s0, w_s1, x, true) ||
+            !run_ifairy64_opencl_wide_linear_bench_once(unfused, out_unfused, dev, m, n, k,
+                                                        u_s0, u_s1, w_s0, w_s1, x, false)) {
+            num_failed++;
+            return;
+        }
+
+        const float max_error = opencl_ifairy64_wide_linear_w2_lut_requested() ? 5e-2f : 1e-2f;
+        if (!compare_packed_complex_outputs(out_fused.data(), out_unfused.data(), out_unfused.size(), max_error)) {
+            fprintf(stderr, "IFAIRY_WIDE_LINEAR_W2 bench output mismatch M=%lld N=%lld K=%lld\n",
+                    (long long) m, (long long) n, (long long) k);
+            num_failed++;
+            return;
+        }
+
+        printf("  M=%lld N=%lld K=%lld fused_us=%.2f unfused_us=%.2f speedup=%.3fx "
+               "hashes=0x%016llx/0x%016llx runs=%d/%d\n",
+               (long long) m, (long long) n, (long long) k,
+               fused.us_per_run, unfused.us_per_run, unfused.us_per_run / fused.us_per_run,
+               (unsigned long long) fused.hash, (unsigned long long) unfused.hash,
+               fused.runs, unfused.runs);
+    };
+
+    bench(512, 1, 512);
+    bench(1024, 1, 1024);
+    bench(2048, 1, 1024);
+    bench(512, 4, 1024);
+    bench(1024, 8, 1024);
+
+    return num_failed > 0 ? 1 : 0;
 }
 
 static bool run_ifairy_rmsnorm_mul_bench_case(ifairy_rmsnorm_bench_result & result,
@@ -3325,17 +4053,26 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
         ifairy64_mulmat_bench_result gemv2;
         ifairy64_mulmat_bench_result gemv4;
         ifairy64_mulmat_bench_result gemm;
+        ifairy64_mulmat_bench_result lut16;
+        ifairy64_mulmat_bench_result lut32;
+        ifairy64_mulmat_bench_result lut64;
         ifairy64_mulmat_bench_result direct;
         ifairy64_mulmat_bench_result cpu4t;
         std::vector<uint32_t>        out_gemv2;
         std::vector<uint32_t>        out_gemv4;
         std::vector<uint32_t>        out_gemm;
+        std::vector<uint32_t>        out_lut16;
+        std::vector<uint32_t>        out_lut32;
+        std::vector<uint32_t>        out_lut64;
         std::vector<uint32_t>        out_direct;
         std::vector<uint32_t>        out_cpu4t;
 
         if (!run_ifairy64_opencl_mul_mat_bench_once(gemv2, out_gemv2, dev, m, n, k, "gemv2") ||
             !run_ifairy64_opencl_mul_mat_bench_once(gemv4, out_gemv4, dev, m, n, k, "gemv4") ||
             !run_ifairy64_opencl_mul_mat_bench_once(gemm, out_gemm, dev, m, n, k, "gemm") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(lut16, out_lut16, dev, m, n, k, "lut16") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(lut32, out_lut32, dev, m, n, k, "lut32") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(lut64, out_lut64, dev, m, n, k, "lut64") ||
             !run_ifairy64_opencl_mul_mat_bench_once(direct, out_direct, dev, m, n, k, "direct") ||
             !run_ifairy64_cpu_mul_mat_bench_once(cpu4t, out_cpu4t, m, n, k, 4)) {
             num_failed++;
@@ -3344,6 +4081,9 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
 
         if (!compare_packed_complex_outputs(out_gemv2.data(), out_gemm.data(), out_gemm.size()) ||
             !compare_packed_complex_outputs(out_gemv4.data(), out_gemm.data(), out_gemm.size()) ||
+            !compare_packed_complex_outputs(out_lut16.data(), out_gemm.data(), out_gemm.size()) ||
+            !compare_packed_complex_outputs(out_lut32.data(), out_gemm.data(), out_gemm.size()) ||
+            !compare_packed_complex_outputs(out_lut64.data(), out_gemm.data(), out_gemm.size()) ||
             !compare_packed_complex_outputs(out_gemm.data(), out_cpu4t.data(), out_cpu4t.size())) {
             fprintf(stderr, "IFAIRY64 MUL_MAT bench output mismatch M=%lld N=%lld K=%lld\n",
                     (long long) m, (long long) n, (long long) k);
@@ -3361,30 +4101,127 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
         }
         if (gemv4.us_per_run < best_us) {
             best = "gemv4";
+            best_us = gemv4.us_per_run;
+        }
+        if (lut16.us_per_run < best_us) {
+            best = "lut16";
+            best_us = lut16.us_per_run;
+        }
+        if (lut32.us_per_run < best_us) {
+            best = "lut32";
+            best_us = lut32.us_per_run;
+        }
+        if (lut64.us_per_run < best_us) {
+            best = "lut64";
         }
 
-        printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemm_us=%.2f direct_us=%.2f cpu4t_us=%.2f "
-               "gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx direct_over_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
-               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx runs=%d/%d/%d/%d/%d\n",
+        printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemm_us=%.2f "
+               "lut16_us=%.2f lut32_us=%.2f lut64_us=%.2f direct_us=%.2f cpu4t_us=%.2f "
+               "gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx lut16_vs_gemm=%.3fx lut32_vs_gemm=%.3fx "
+               "lut64_vs_gemm=%.3fx direct_over_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
+               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx "
+               "runs=%d/%d/%d/%d/%d/%d/%d/%d\n",
                (long long) m, (long long) n, (long long) k,
-               gemv2.us_per_run, gemv4.us_per_run, gemm.us_per_run, direct.us_per_run, cpu4t.us_per_run,
-               speedup_gemv2, speedup_gemv4, direct.us_per_run / gemm.us_per_run, cpu4t.us_per_run / gemm.us_per_run, best,
+               gemv2.us_per_run, gemv4.us_per_run, gemm.us_per_run,
+               lut16.us_per_run, lut32.us_per_run, lut64.us_per_run, direct.us_per_run, cpu4t.us_per_run,
+               speedup_gemv2, speedup_gemv4, gemm.us_per_run / lut16.us_per_run, gemm.us_per_run / lut32.us_per_run,
+               gemm.us_per_run / lut64.us_per_run, direct.us_per_run / gemm.us_per_run,
+               cpu4t.us_per_run / gemm.us_per_run, best,
                (unsigned long long) gemv2.hash, (unsigned long long) gemv4.hash,
-               (unsigned long long) gemm.hash, (unsigned long long) direct.hash,
+               (unsigned long long) gemm.hash, (unsigned long long) lut16.hash,
+               (unsigned long long) lut32.hash, (unsigned long long) lut64.hash,
+               (unsigned long long) direct.hash,
                (unsigned long long) cpu4t.hash,
-               gemv2.runs, gemv4.runs, gemm.runs, direct.runs, cpu4t.runs);
+               gemv2.runs, gemv4.runs, gemm.runs, lut16.runs, lut32.runs, lut64.runs, direct.runs, cpu4t.runs);
     };
 
-    bench(128, 1, 2 * QK_IFAIRY);
-    bench(256, 1, 2 * QK_IFAIRY);
-    bench(512, 1, 2 * QK_IFAIRY);
-    bench(1024, 1, 2 * QK_IFAIRY);
+    bench(128, 1, QK_IFAIRY64);
+    bench(256, 1, QK_IFAIRY64);
+    bench(512, 1, 2 * QK_IFAIRY64);
+    bench(1024, 1, QK_IFAIRY);
     bench(2048, 1, 2 * QK_IFAIRY);
     bench(128, 1, 4 * QK_IFAIRY);
     bench(256, 1, 4 * QK_IFAIRY);
     bench(512, 1, 4 * QK_IFAIRY);
     bench(1024, 1, 4 * QK_IFAIRY);
     bench(2048, 1, 4 * QK_IFAIRY);
+
+    return num_failed > 0 ? 1 : 0;
+}
+
+static int run_ifairy64_opencl_gemv_tile_bench(void) {
+    printf("\n=== iFairy64 OpenCL GEMV tile microbench (q16 no-LUT) ===\n");
+
+    ggml_backend_dev_t dev = find_opencl_test_device();
+    if (!dev) {
+        fprintf(stderr, "OpenCL backend not found; GEMV tile bench requires real OpenCL execution.\n");
+        return 1;
+    }
+
+    printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    int num_failed = 0;
+    auto bench = [&](int64_t m, int64_t n, int64_t k) {
+        ifairy64_mulmat_bench_result gemv2;
+        ifairy64_mulmat_bench_result gemv4;
+        ifairy64_mulmat_bench_result gemv8;
+        ifairy64_mulmat_bench_result gemv16;
+        std::vector<uint32_t>        out_gemv2;
+        std::vector<uint32_t>        out_gemv4;
+        std::vector<uint32_t>        out_gemv8;
+        std::vector<uint32_t>        out_gemv16;
+
+        if (!run_ifairy64_opencl_mul_mat_bench_once(gemv2, out_gemv2, dev, m, n, k, "gemv2") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(gemv4, out_gemv4, dev, m, n, k, "gemv4") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(gemv8, out_gemv8, dev, m, n, k, "gemv8") ||
+            !run_ifairy64_opencl_mul_mat_bench_once(gemv16, out_gemv16, dev, m, n, k, "gemv16")) {
+            num_failed++;
+            return;
+        }
+
+        if (!compare_packed_complex_outputs(out_gemv2.data(), out_gemv4.data(), out_gemv4.size()) ||
+            !compare_packed_complex_outputs(out_gemv8.data(), out_gemv4.data(), out_gemv4.size()) ||
+            !compare_packed_complex_outputs(out_gemv16.data(), out_gemv4.data(), out_gemv4.size())) {
+            fprintf(stderr, "IFAIRY64 GEMV tile bench output mismatch M=%lld N=%lld K=%lld\n",
+                    (long long) m, (long long) n, (long long) k);
+            num_failed++;
+            return;
+        }
+
+        const char * best    = "gemv2";
+        double       best_us = gemv2.us_per_run;
+        if (gemv4.us_per_run < best_us) {
+            best    = "gemv4";
+            best_us = gemv4.us_per_run;
+        }
+        if (gemv8.us_per_run < best_us) {
+            best    = "gemv8";
+            best_us = gemv8.us_per_run;
+        }
+        if (gemv16.us_per_run < best_us) {
+            best = "gemv16";
+        }
+
+        printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemv8_us=%.2f gemv16_us=%.2f "
+               "gemv4_vs_gemv2=%.3fx gemv8_vs_gemv2=%.3fx gemv16_vs_gemv2=%.3fx best=%s "
+               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx runs=%d/%d/%d/%d\n",
+               (long long) m, (long long) n, (long long) k,
+               gemv2.us_per_run, gemv4.us_per_run, gemv8.us_per_run, gemv16.us_per_run,
+               gemv2.us_per_run / gemv4.us_per_run, gemv2.us_per_run / gemv8.us_per_run,
+               gemv2.us_per_run / gemv16.us_per_run, best,
+               (unsigned long long) gemv2.hash, (unsigned long long) gemv4.hash,
+               (unsigned long long) gemv8.hash, (unsigned long long) gemv16.hash,
+               gemv2.runs, gemv4.runs, gemv8.runs, gemv16.runs);
+    };
+
+    bench(2048, 1, 2048);
+    bench(4096, 1, 2048);
+    bench(8192, 1, 2048);
+    bench(11008, 1, 2048);
+    bench(2048, 1, 4096);
+    bench(4096, 1, 4096);
+    bench(8192, 1, 4096);
+    bench(11008, 1, 4096);
 
     return num_failed > 0 ? 1 : 0;
 }
@@ -3463,6 +4300,10 @@ int main(int argc, char ** argv) {
         bool         opencl_rmsnorm_bench = false;
         bool         opencl_ifairy64_mulmat_only = false;
         bool         opencl_ifairy64_mulmat_bench = false;
+        bool         opencl_ifairy64_gemv_tile_bench = false;
+        bool         opencl_ifairy64_wide_linear_only = false;
+        bool         opencl_ifairy64_wide_linear_bench = false;
+        bool         fused_only = false;
         const char * vecdot_mode = NULL;
         int64_t      bench_M     = 4096;
         int64_t      bench_N     = 1;
@@ -3505,6 +4346,22 @@ int main(int argc, char ** argv) {
             }
             if (strcmp(argv[i], "--ifairy-opencl-ifairy64-mulmat-bench") == 0) {
                 opencl_ifairy64_mulmat_bench = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-ifairy64-gemv-tile-bench") == 0) {
+                opencl_ifairy64_gemv_tile_bench = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-wide-linear-only") == 0) {
+                opencl_ifairy64_wide_linear_only = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-opencl-wide-linear-bench") == 0) {
+                opencl_ifairy64_wide_linear_bench = true;
+                continue;
+            }
+            if (strcmp(argv[i], "--ifairy-wide-linear-w2-fused-only") == 0) {
+                fused_only = true;
                 continue;
             }
             if (strcmp(argv[i], "--ifairy-lut-backend-bench") == 0) {
@@ -3572,6 +4429,18 @@ int main(int argc, char ** argv) {
 
         if (opencl_ifairy64_mulmat_bench) {
             return run_ifairy64_opencl_mul_mat_bench();
+        }
+
+        if (opencl_ifairy64_gemv_tile_bench) {
+            return run_ifairy64_opencl_gemv_tile_bench();
+        }
+
+        if (opencl_ifairy64_wide_linear_only) {
+            return run_ifairy64_opencl_wide_linear_tests();
+        }
+
+        if (opencl_ifairy64_wide_linear_bench) {
+            return run_ifairy64_opencl_wide_linear_bench();
         }
 
         if (fused_only) {

@@ -89,6 +89,68 @@ static void enable_android_opencl_ifairy64_gate() {
 #ifdef GGML_USE_OPENCL
     setenv("GGML_OPENCL_IFAIRY64", "1", 1);
     LOGi("Runtime toggle: GGML_OPENCL_IFAIRY64=1 for OpenCL build");
+    setenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2", "1", 1);
+    LOGi("Runtime toggle: LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1 for OpenCL build");
+#endif
+}
+
+static void configure_opencl_ifairy64_mul_mat_impl(const char * impl) {
+#ifdef GGML_USE_OPENCL
+    if (impl == nullptr || impl[0] == '\0' || strcmp(impl, "default") == 0) {
+        unsetenv("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
+        LOGi("Runtime toggle: GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL unset");
+        return;
+    }
+
+    if (
+            strcmp(impl, "gemm") == 0 ||
+            strcmp(impl, "gemv2") == 0 ||
+            strcmp(impl, "gemv4") == 0 ||
+            strcmp(impl, "gemv8") == 0 ||
+            strcmp(impl, "gemv16") == 0 ||
+            strcmp(impl, "direct") == 0 ||
+            strcmp(impl, "lut16") == 0 ||
+            strcmp(impl, "lut32") == 0 ||
+            strcmp(impl, "lut64") == 0 ||
+            strcmp(impl, "lutglobal16") == 0 ||
+            strcmp(impl, "lutglobal32") == 0 ||
+            strcmp(impl, "lutglobal64") == 0) {
+        setenv("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL", impl, 1);
+        LOGi("Runtime toggle: GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL=%s", impl);
+        return;
+    }
+
+    LOGe("Ignoring unsupported GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL=%s", impl);
+#else
+    (void) impl;
+#endif
+}
+
+static void configure_opencl_ifairy64_wide_linear_w2_impl(const char * impl) {
+#ifdef GGML_USE_OPENCL
+    if (impl == nullptr || impl[0] == '\0' || strcmp(impl, "default") == 0 || strcmp(impl, "q16") == 0) {
+        unsetenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL");
+        LOGi("Runtime toggle: GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL unset (q16)");
+        return;
+    }
+
+    if (
+            strcmp(impl, "q16dot8") == 0 ||
+            strcmp(impl, "dot8") == 0 ||
+            strcmp(impl, "lutlocal") == 0 ||
+            strcmp(impl, "lut") == 0 ||
+            strcmp(impl, "lutglobal") == 0 ||
+            strcmp(impl, "lutglobal16") == 0 ||
+            strcmp(impl, "lutglobal32") == 0 ||
+            strcmp(impl, "lutglobal64") == 0) {
+        setenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL", impl, 1);
+        LOGi("Runtime toggle: GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL=%s", impl);
+        return;
+    }
+
+    LOGe("Ignoring unsupported GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL=%s", impl);
+#else
+    (void) impl;
 #endif
 }
 
@@ -926,6 +988,40 @@ Java_android_llama_cpp_LLamaAndroid_configure_1runtime(
             g_runtime_overrides.sched_debug,
             g_runtime_overrides.opencl_supports_debug,
             g_runtime_overrides.force_cpu);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_android_llama_cpp_LLamaAndroid_configure_1opencl_1mul_1mat_1impl(
+        JNIEnv * env,
+        jobject,
+        jstring jimpl
+) {
+    if (jimpl == nullptr) {
+        configure_opencl_ifairy64_mul_mat_impl(nullptr);
+        return;
+    }
+
+    const char * impl = env->GetStringUTFChars(jimpl, nullptr);
+    configure_opencl_ifairy64_mul_mat_impl(impl);
+    env->ReleaseStringUTFChars(jimpl, impl);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_android_llama_cpp_LLamaAndroid_configure_1opencl_1wide_1linear_1w2_1impl(
+        JNIEnv * env,
+        jobject,
+        jstring jimpl
+) {
+    if (jimpl == nullptr) {
+        configure_opencl_ifairy64_wide_linear_w2_impl(nullptr);
+        return;
+    }
+
+    const char * impl = env->GetStringUTFChars(jimpl, nullptr);
+    configure_opencl_ifairy64_wide_linear_w2_impl(impl);
+    env->ReleaseStringUTFChars(jimpl, impl);
 }
 
 extern "C"
