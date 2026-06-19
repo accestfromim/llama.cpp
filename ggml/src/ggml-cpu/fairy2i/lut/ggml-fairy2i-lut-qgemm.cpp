@@ -232,6 +232,221 @@ static void ggml_fairy2i_lut_debug_log_arm_add_vector_once(int m, int64_t blocks
     GGML_LOG_INFO("fairy2i_lut: path=arm_lut_add_vector M=%d blocks=%lld pack_bf16=%d\n", m, (long long) blocks,
                   pack_bf16 ? 1 : 0);
 }
+
+static void ggml_fairy2i_lut_debug_log_arm_pair_neon_once(int m, int64_t blocks, bool pack_bf16) {
+    if (!ggml_fairy2i_cpu_debug_enabled_for_lut_qgemm()) {
+        return;
+    }
+
+    static bool logged = false;
+    if (logged) {
+        return;
+    }
+    logged = true;
+
+    GGML_LOG_INFO("fairy2i_lut: path=arm_neon_pair2tile M=%d blocks=%lld pack_bf16=%d\n", m, (long long) blocks,
+                  pack_bf16 ? 1 : 0);
+}
+
+static inline void ggml_fairy2i_lut_accumulate_wtile_arm(const fairy2i_tile64_lut_wtile_16 * wt,
+                                                         int                                 byte_idx,
+                                                         const int8x16x4_t &                 ilut_0,
+                                                         const int8x16x4_t &                 ilut_1,
+                                                         const uint8x16_t                    mask_4bit,
+                                                         int16x8_t &                         sum_ac_0,
+                                                         int16x8_t &                         sum_ac_1,
+                                                         int16x8_t &                         sum_bc_0,
+                                                         int16x8_t &                         sum_bc_1,
+                                                         int16x8_t &                         sum_ad_0,
+                                                         int16x8_t &                         sum_ad_1,
+                                                         int16x8_t &                         sum_bd_0,
+                                                         int16x8_t &                         sum_bd_1) {
+    const uint8x16_t packed = vld1q_u8(wt->qs[byte_idx]);
+    const uint8x16_t idx_lo = vandq_u8(packed, mask_4bit);
+    const uint8x16_t idx_hi = vandq_u8(vshrq_n_u8(packed, 4), mask_4bit);
+
+    const int8x16_t v_ac_0 = vqtbl1q_s8(ilut_0.val[0], idx_lo);
+    const int8x16_t v_bd_0 = vqtbl1q_s8(ilut_0.val[1], idx_lo);
+    const int8x16_t v_bc_0 = vqtbl1q_s8(ilut_0.val[2], idx_lo);
+    const int8x16_t v_ad_0 = vqtbl1q_s8(ilut_0.val[3], idx_lo);
+
+    const int8x16_t v_ac_1 = vqtbl1q_s8(ilut_1.val[0], idx_hi);
+    const int8x16_t v_bd_1 = vqtbl1q_s8(ilut_1.val[1], idx_hi);
+    const int8x16_t v_bc_1 = vqtbl1q_s8(ilut_1.val[2], idx_hi);
+    const int8x16_t v_ad_1 = vqtbl1q_s8(ilut_1.val[3], idx_hi);
+
+    sum_ac_0 = vaddw_s8(sum_ac_0, vget_low_s8(v_ac_0));
+    sum_ac_1 = vaddw_s8(sum_ac_1, vget_high_s8(v_ac_0));
+    sum_ac_0 = vaddw_s8(sum_ac_0, vget_low_s8(v_ac_1));
+    sum_ac_1 = vaddw_s8(sum_ac_1, vget_high_s8(v_ac_1));
+
+    sum_bc_0 = vaddw_s8(sum_bc_0, vget_low_s8(v_bc_0));
+    sum_bc_1 = vaddw_s8(sum_bc_1, vget_high_s8(v_bc_0));
+    sum_bc_0 = vaddw_s8(sum_bc_0, vget_low_s8(v_bc_1));
+    sum_bc_1 = vaddw_s8(sum_bc_1, vget_high_s8(v_bc_1));
+
+    sum_ad_0 = vaddw_s8(sum_ad_0, vget_low_s8(v_ad_0));
+    sum_ad_1 = vaddw_s8(sum_ad_1, vget_high_s8(v_ad_0));
+    sum_ad_0 = vaddw_s8(sum_ad_0, vget_low_s8(v_ad_1));
+    sum_ad_1 = vaddw_s8(sum_ad_1, vget_high_s8(v_ad_1));
+
+    sum_bd_0 = vaddw_s8(sum_bd_0, vget_low_s8(v_bd_0));
+    sum_bd_1 = vaddw_s8(sum_bd_1, vget_high_s8(v_bd_0));
+    sum_bd_0 = vaddw_s8(sum_bd_0, vget_low_s8(v_bd_1));
+    sum_bd_1 = vaddw_s8(sum_bd_1, vget_high_s8(v_bd_1));
+}
+
+static void ggml_fairy2i_tile64_lut_qgemm_pair_neon(int          m,
+                                                    int          k,
+                                                    int          n,
+                                                    const void * packed_wtiles0,
+                                                    const void * packed_wtiles1,
+                                                    const void * lut,
+                                                    const void * lut_scales,
+                                                    float *      dst,
+                                                    size_t       dst_col_stride,
+                                                    size_t       dst_row_stride,
+                                                    bool         pack_bf16,
+                                                    bool         negate_imag_scale,
+                                                    bool         add) {
+    const int64_t    blocks           = k / QK_FAIRY2I_TILE64;
+    const int64_t    groups_per_block = QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    const int64_t    groups           = blocks * groups_per_block;
+    const int        tiles            = (m + 15) / 16;
+    const int        tiles_per_pass   = 2;
+    const auto *     wtiles0          = (const fairy2i_tile64_lut_wtile_16 *) packed_wtiles0;
+    const auto *     wtiles1          = (const fairy2i_tile64_lut_wtile_16 *) packed_wtiles1;
+    const uint8x16_t mask_4bit        = vdupq_n_u8(0x0f);
+
+    ggml_fairy2i_lut_debug_log_arm_pair_neon_once(m, blocks, pack_bf16);
+
+    for (int col = 0; col < n; ++col) {
+        const int8_t * lut_col = (const int8_t *) lut + (size_t) col * (size_t) groups * k_fairy2i_lut_group_bytes;
+        const float *  scales  = (const float *) lut_scales + (size_t) col * (size_t) blocks * 2u;
+        uint8_t *      dst_col = (uint8_t *) dst + (size_t) col * dst_col_stride;
+
+        for (int t0 = 0; t0 < tiles; t0 += tiles_per_pass) {
+            const int  t1   = t0 + 1;
+            const bool has1 = t1 < tiles;
+
+            float32x4_t acc0_r0 = vdupq_n_f32(0.0f);
+            float32x4_t acc0_r1 = vdupq_n_f32(0.0f);
+            float32x4_t acc0_r2 = vdupq_n_f32(0.0f);
+            float32x4_t acc0_r3 = vdupq_n_f32(0.0f);
+            float32x4_t acc0_i0 = vdupq_n_f32(0.0f);
+            float32x4_t acc0_i1 = vdupq_n_f32(0.0f);
+            float32x4_t acc0_i2 = vdupq_n_f32(0.0f);
+            float32x4_t acc0_i3 = vdupq_n_f32(0.0f);
+
+            float32x4_t acc1_r0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1_r1 = vdupq_n_f32(0.0f);
+            float32x4_t acc1_r2 = vdupq_n_f32(0.0f);
+            float32x4_t acc1_r3 = vdupq_n_f32(0.0f);
+            float32x4_t acc1_i0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1_i1 = vdupq_n_f32(0.0f);
+            float32x4_t acc1_i2 = vdupq_n_f32(0.0f);
+            float32x4_t acc1_i3 = vdupq_n_f32(0.0f);
+
+            for (int64_t blk = 0; blk < blocks; ++blk) {
+                const fairy2i_tile64_lut_wtile_16 * wt00 = wtiles0 + (size_t) t0 * (size_t) blocks + (size_t) blk;
+                const fairy2i_tile64_lut_wtile_16 * wt01 = wtiles1 + (size_t) t0 * (size_t) blocks + (size_t) blk;
+                const fairy2i_tile64_lut_wtile_16 * wt10 =
+                    has1 ? wtiles0 + (size_t) t1 * (size_t) blocks + (size_t) blk : nullptr;
+                const fairy2i_tile64_lut_wtile_16 * wt11 =
+                    has1 ? wtiles1 + (size_t) t1 * (size_t) blocks + (size_t) blk : nullptr;
+
+                int16x8_t sum00_ac_0 = vdupq_n_s16(0);
+                int16x8_t sum00_ac_1 = vdupq_n_s16(0);
+                int16x8_t sum00_bc_0 = vdupq_n_s16(0);
+                int16x8_t sum00_bc_1 = vdupq_n_s16(0);
+                int16x8_t sum00_ad_0 = vdupq_n_s16(0);
+                int16x8_t sum00_ad_1 = vdupq_n_s16(0);
+                int16x8_t sum00_bd_0 = vdupq_n_s16(0);
+                int16x8_t sum00_bd_1 = vdupq_n_s16(0);
+
+                int16x8_t sum01_ac_0 = vdupq_n_s16(0);
+                int16x8_t sum01_ac_1 = vdupq_n_s16(0);
+                int16x8_t sum01_bc_0 = vdupq_n_s16(0);
+                int16x8_t sum01_bc_1 = vdupq_n_s16(0);
+                int16x8_t sum01_ad_0 = vdupq_n_s16(0);
+                int16x8_t sum01_ad_1 = vdupq_n_s16(0);
+                int16x8_t sum01_bd_0 = vdupq_n_s16(0);
+                int16x8_t sum01_bd_1 = vdupq_n_s16(0);
+
+                int16x8_t sum10_ac_0 = vdupq_n_s16(0);
+                int16x8_t sum10_ac_1 = vdupq_n_s16(0);
+                int16x8_t sum10_bc_0 = vdupq_n_s16(0);
+                int16x8_t sum10_bc_1 = vdupq_n_s16(0);
+                int16x8_t sum10_ad_0 = vdupq_n_s16(0);
+                int16x8_t sum10_ad_1 = vdupq_n_s16(0);
+                int16x8_t sum10_bd_0 = vdupq_n_s16(0);
+                int16x8_t sum10_bd_1 = vdupq_n_s16(0);
+
+                int16x8_t sum11_ac_0 = vdupq_n_s16(0);
+                int16x8_t sum11_ac_1 = vdupq_n_s16(0);
+                int16x8_t sum11_bc_0 = vdupq_n_s16(0);
+                int16x8_t sum11_bc_1 = vdupq_n_s16(0);
+                int16x8_t sum11_ad_0 = vdupq_n_s16(0);
+                int16x8_t sum11_ad_1 = vdupq_n_s16(0);
+                int16x8_t sum11_bd_0 = vdupq_n_s16(0);
+                int16x8_t sum11_bd_1 = vdupq_n_s16(0);
+
+                const int8_t * lut_ptr = lut_col + (size_t) blk * (size_t) groups_per_block * k_fairy2i_lut_group_bytes;
+
+#    if defined(__GNUC__) || defined(__clang__)
+#        pragma GCC unroll 2
+#    endif
+                for (int byte_idx = 0; byte_idx < groups_per_block / 2; ++byte_idx) {
+                    const int8x16x4_t ilut_0 = vld1q_s8_x4(lut_ptr + 0);
+                    const int8x16x4_t ilut_1 = vld1q_s8_x4(lut_ptr + 64);
+                    lut_ptr += 128;
+
+                    ggml_fairy2i_lut_accumulate_wtile_arm(wt00, byte_idx, ilut_0, ilut_1, mask_4bit, sum00_ac_0,
+                                                          sum00_ac_1, sum00_bc_0, sum00_bc_1, sum00_ad_0, sum00_ad_1,
+                                                          sum00_bd_0, sum00_bd_1);
+                    ggml_fairy2i_lut_accumulate_wtile_arm(wt01, byte_idx, ilut_0, ilut_1, mask_4bit, sum01_ac_0,
+                                                          sum01_ac_1, sum01_bc_0, sum01_bc_1, sum01_ad_0, sum01_ad_1,
+                                                          sum01_bd_0, sum01_bd_1);
+                    if (has1) {
+                        ggml_fairy2i_lut_accumulate_wtile_arm(wt10, byte_idx, ilut_0, ilut_1, mask_4bit, sum10_ac_0,
+                                                              sum10_ac_1, sum10_bc_0, sum10_bc_1, sum10_ad_0,
+                                                              sum10_ad_1, sum10_bd_0, sum10_bd_1);
+                        ggml_fairy2i_lut_accumulate_wtile_arm(wt11, byte_idx, ilut_0, ilut_1, mask_4bit, sum11_ac_0,
+                                                              sum11_ac_1, sum11_bc_0, sum11_bc_1, sum11_ad_0,
+                                                              sum11_ad_1, sum11_bd_0, sum11_bd_1);
+                    }
+                }
+
+                const float       lr   = scales[blk * 2 + 0];
+                const float       li   = negate_imag_scale ? -scales[blk * 2 + 1] : scales[blk * 2 + 1];
+                const float32x4_t v_lr = vdupq_n_f32(lr);
+                const float32x4_t v_li = vdupq_n_f32(li);
+
+                ggml_fairy2i_lut_apply_tile_sums_arm(wt00, v_lr, v_li, sum00_ac_0, sum00_ac_1, sum00_bc_0, sum00_bc_1,
+                                                     sum00_ad_0, sum00_ad_1, sum00_bd_0, sum00_bd_1, acc0_r0, acc0_r1,
+                                                     acc0_r2, acc0_r3, acc0_i0, acc0_i1, acc0_i2, acc0_i3);
+                ggml_fairy2i_lut_apply_tile_sums_arm(wt01, v_lr, v_li, sum01_ac_0, sum01_ac_1, sum01_bc_0, sum01_bc_1,
+                                                     sum01_ad_0, sum01_ad_1, sum01_bd_0, sum01_bd_1, acc0_r0, acc0_r1,
+                                                     acc0_r2, acc0_r3, acc0_i0, acc0_i1, acc0_i2, acc0_i3);
+                if (has1) {
+                    ggml_fairy2i_lut_apply_tile_sums_arm(
+                        wt10, v_lr, v_li, sum10_ac_0, sum10_ac_1, sum10_bc_0, sum10_bc_1, sum10_ad_0, sum10_ad_1,
+                        sum10_bd_0, sum10_bd_1, acc1_r0, acc1_r1, acc1_r2, acc1_r3, acc1_i0, acc1_i1, acc1_i2, acc1_i3);
+                    ggml_fairy2i_lut_apply_tile_sums_arm(
+                        wt11, v_lr, v_li, sum11_ac_0, sum11_ac_1, sum11_bc_0, sum11_bc_1, sum11_ad_0, sum11_ad_1,
+                        sum11_bd_0, sum11_bd_1, acc1_r0, acc1_r1, acc1_r2, acc1_r3, acc1_i0, acc1_i1, acc1_i2, acc1_i3);
+                }
+            }
+
+            ggml_fairy2i_lut_store_tile_arm(t0, m, dst_col, dst_row_stride, pack_bf16, add, acc0_r0, acc0_r1, acc0_r2,
+                                            acc0_r3, acc0_i0, acc0_i1, acc0_i2, acc0_i3);
+            if (has1) {
+                ggml_fairy2i_lut_store_tile_arm(t1, m, dst_col, dst_row_stride, pack_bf16, add, acc1_r0, acc1_r1,
+                                                acc1_r2, acc1_r3, acc1_i0, acc1_i1, acc1_i2, acc1_i3);
+            }
+        }
+    }
+}
 #endif
 
 #if defined(__AVX2__)
@@ -2072,6 +2287,9 @@ void ggml_fairy2i_tile64_lut_qgemm_pair_lut16(int          m,
                                             _mm256_add_ps(acc0_i_hi, acc1_i_hi));
         }
     }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    ggml_fairy2i_tile64_lut_qgemm_pair_neon(m, k, n, packed_wtiles0, packed_wtiles1, lut, lut_scales, dst,
+                                            dst_col_stride, dst_row_stride, pack_bf16, negate_imag_scale, add);
 #else
     ggml_fairy2i_tile64_lut_qgemm_lut16(m, k, n, packed_wtiles0, lut, lut_scales, dst, dst_col_stride, dst_row_stride,
                                         pack_bf16, negate_imag_scale, add);
