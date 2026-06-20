@@ -639,6 +639,19 @@ void ggml_vec_dot_ifairy_q16_K_generic(int                        n,
     ((ggml_bf16_t *) s)[1] = GGML_FP32_TO_BF16(sum_imag_total);
 }
 
+#if !defined(__x86_64__) && !defined(__i386__) && !defined(GGML_USE_LEGACY_IFAIRY_CPU)
+void ggml_vec_dot_ifairy_q16_K(int                        n,
+                               float * GGML_RESTRICT      s,
+                               size_t                     bs,
+                               const void * GGML_RESTRICT vx,
+                               size_t                     bx,
+                               const void * GGML_RESTRICT vy,
+                               size_t                     by,
+                               int                        nrc) {
+    ggml_vec_dot_ifairy_q16_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+}
+#endif
+
 void ggml_vec_dot_ifairy64_q16_K(int                        n,
                                  float * GGML_RESTRICT      s,
                                  size_t                     bs,

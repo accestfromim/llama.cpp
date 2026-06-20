@@ -5,6 +5,7 @@ description = "Read and write ML models in GGUF for GGML"
 authors = ["GGML <ggml@ggml.ai>"]
 packages = [
     {include = "gguf"},
+    {include = "fairy2i"},
     {include = "gguf/py.typed"},
 ]
 readme = "README.md"

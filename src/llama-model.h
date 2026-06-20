@@ -187,6 +187,7 @@ enum llama_fairy2i_quant_variant {
 
 enum llama_fairy2i_attn_layout {
     LLAMA_FAIRY2I_ATTN_LAYOUT_LEGACY_COMPLEX = 0,
+    LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL,
     LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL,
 };
 

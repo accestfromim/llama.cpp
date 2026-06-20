@@ -116,22 +116,16 @@ class LLamaAndroid {
         runCatching {
             when (normalized) {
                 null -> {
-                    Os.unsetenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL")
-                    Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL unset (q16)")
+                    Os.unsetenv("GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL")
+                    Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL unset (q16)")
                 }
                 "q16dot8",
-                "dot8",
-                "lutlocal",
-                "lut",
-                "lutglobal",
-                "lutglobal16",
-                "lutglobal32",
-                "lutglobal64" -> {
-                    Os.setenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL", normalized, true)
-                    Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL=$normalized")
+                "dot8" -> {
+                    Os.setenv("GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL", normalized, true)
+                    Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL=$normalized")
                 }
                 else -> {
-                    Log.e(LOG_TAG, "Ignoring unsupported early GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL=$impl")
+                    Log.e(LOG_TAG, "Ignoring unsupported early GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL=$impl")
                 }
             }
         }.onFailure { throwable ->

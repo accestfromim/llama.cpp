@@ -25,7 +25,7 @@
 - `rope_test.json`: ROPE 算子测试数据
 - `matmul_test.json`: 复数矩阵乘法测试数据
 
-### 3. C++ 单元测试 (`test-ifairy.cpp`)
+### 3. C++ 单元测试 (`test-legacy-ifairy.cpp`)
 包含以下测试用例：
 - **Test 1**: 量化/反量化正确性验证
 - **Test 2**: ROPE 算子功能验证
@@ -61,19 +61,19 @@ Test data generation complete!
 # 配置 CMake（如果还没有构建目录）
 cmake -B build
 
-# 编译 test-ifairy
-cmake --build build --target test-ifairy -j $(nproc)
+# 编译 legacy iFairy 测试
+cmake --build build --target test-legacy-ifairy -j $(nproc)
 ```
 
 ### 步骤 3: 运行测试
 
 ```bash
 # 运行单个测试
-./build/bin/test-ifairy
+./build/bin/test-legacy-ifairy
 
 # 或使用 CTest
 cd build
-ctest -R test-ifairy --output-on-failure
+GGML_IFAIRY_LUT=1 ctest -R legacy-ifairy --output-on-failure
 ```
 
 **期望输出**:
@@ -158,7 +158,8 @@ C_imag = A_real @ B_imag + A_imag @ B_real
 ```
 tests/
 ├── test-ifairy-ref.py          # Python 参考实现和测试数据生成器
-├── test-ifairy.cpp              # C++ 单元测试
+├── test-legacy-ifairy.cpp       # legacy iFairy C++ 单元测试
+├── test-fairy2i.cpp             # Fairy2i CPU smoke 测试
 ├── ifairy-test-data/            # 测试数据目录
 │   ├── quant_test.json         # 量化测试数据
 │   ├── rope_test.json          # ROPE 测试数据
@@ -186,7 +187,7 @@ def generate_test_data(output_dir: Path):
 
 ### 2. 在 C++ 中添加测试函数
 
-编辑 `tests/test-ifairy.cpp`，添加新的测试函数：
+编辑 `tests/test-legacy-ifairy.cpp`，添加新的 legacy iFairy 测试函数：
 
 ```cpp
 bool test_new_feature() {

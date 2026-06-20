@@ -13,12 +13,13 @@
 #include "binary-ops.h"
 #include "vec.h"
 #include "ops.h"
-#include "ifairy-fuse.h"
-#include "ggml.h"
-#ifdef GGML_IFAIRY_LUT_CPU
-#    include "ggml-ifairy-lut-impl.h"
-#    include "ggml-ifairy-lut.h"
+#ifdef GGML_USE_FAIRY2I_CPU
+#    include "fairy2i/fairy2i-cpu.h"
 #endif
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+#    include "legacy-ifairy/legacy-ifairy-cpu.h"
+#endif
+#include "ggml.h"
 
 // debug helper: last node being computed (for crash diagnostics)
 extern struct ggml_tensor * ggml_debug_last_node;
@@ -398,6 +399,9 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_IFAIRY64_Q16] = {
         .from_float               = quantize_row_ifairy64_q16,
     },
+    [GGML_TYPE_FAIRY2I_ACT_Q16_64] = {
+        .from_float               = quantize_row_ifairy64_q16,
+    },
     [GGML_TYPE_BF16] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_bf16,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_bf16,
@@ -429,6 +433,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_ifairy64,
         .vec_dot                  = ggml_vec_dot_ifairy64_q16_K,
         .vec_dot_type             = GGML_TYPE_IFAIRY64_Q16,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_FAIRY2I_TILE64_V2] = {
+        .from_float               = quantize_row_ifairy64,
+        .vec_dot                  = ggml_vec_dot_ifairy64_q16_K,
+        .vec_dot_type             = GGML_TYPE_FAIRY2I_ACT_Q16_64,
         .nrows                    = 1,
     },
 };
@@ -496,28 +506,6 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #endif
 
 // Threadpool def
-#ifdef GGML_IFAIRY_LUT_CPU
-enum ggml_ifairy_lut_impl {
-    GGML_IFAIRY_LUT_IMPL_AUTO  = 0,
-    GGML_IFAIRY_LUT_IMPL_LUT16 = 1,
-    GGML_IFAIRY_LUT_IMPL_LUT_C = 2,
-};
-
-struct ggml_ifairy_lut_threadpool_config {
-    bool                      dbg;
-    bool                      lut_enabled;
-    bool                      lut_explicit;
-    enum ggml_ifairy_lut_impl impl;
-};
-
-struct ggml_ifairy_lut_runtime_shape {
-    int64_t weight_block_k;
-    int64_t act_block_k;
-    int64_t groups_per_weight_block;
-    size_t  packed_wtile_size;
-};
-#endif
-
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -544,10 +532,6 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
-
-#ifdef GGML_IFAIRY_LUT_CPU
-    struct ggml_ifairy_lut_threadpool_config ifairy_lut_cfg;
-#endif
 };
 
 // Per-thread state
@@ -647,157 +631,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     #endif
 #endif
 }
-
-#ifdef GGML_IFAIRY_LUT_CPU
-static bool ggml_ifairy_lut_is_fairy2i_weight(const struct ggml_tensor * src0) {
-    if (src0 == NULL || src0->name[0] == '\0') {
-        return false;
-    }
-
-    // Fairy2i GGUF names encode widely-linear branches as "*.U.s{0,1}" / "*.W.s{0,1}".
-    return strstr(src0->name, ".U.s0") != NULL || strstr(src0->name, ".U.s1") != NULL ||
-           strstr(src0->name, ".W.s0") != NULL || strstr(src0->name, ".W.s1") != NULL;
-}
-
-static bool ggml_ifairy_lut_get_runtime_shape(const struct ggml_tensor *              src0,
-                                              const struct ggml_tensor *              src1,
-                                              const struct ggml_tensor *              dst,
-                                              struct ggml_ifairy_lut_runtime_shape * out) {
-    if (!src0 || !src1 || !dst || !out) {
-        return false;
-    }
-    if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_IFAIRY_Q16) || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-
-    switch (src0->type) {
-        case GGML_TYPE_IFAIRY:
-            out->weight_block_k          = QK_IFAIRY;
-            out->act_block_k             = QK_IFAIRY;
-            out->groups_per_weight_block = QK_IFAIRY_GROUPS_PER_BLOCK;
-            out->packed_wtile_size       = sizeof(struct ifairy_lut_wtile_16);
-            break;
-        case GGML_TYPE_IFAIRY64:
-            out->weight_block_k          = QK_IFAIRY64;
-            out->act_block_k             = QK_IFAIRY;
-            out->groups_per_weight_block = QK_IFAIRY64_GROUPS_PER_BLOCK;
-            out->packed_wtile_size       = sizeof(struct ifairy64_lut_wtile_16);
-            break;
-        default:
-            return false;
-    }
-
-    if (src0->ne[0] % out->weight_block_k != 0 || src0->ne[0] % out->act_block_k != 0 || src1->ne[0] != src0->ne[0]) {
-        return false;
-    }
-
-    return true;
-}
-
-static void ggml_ifairy_lut_threadpool_config_update(struct ggml_threadpool * threadpool) {
-    struct ggml_ifairy_lut_threadpool_config cfg;
-
-    cfg.dbg = ggml_ifairy_env_enabled("GGML_IFAIRY_LUT_DEBUG");
-
-    const char * enabled_env = getenv("GGML_IFAIRY_LUT");
-    cfg.lut_enabled          = !(enabled_env && strcmp(enabled_env, "0") == 0);
-    cfg.lut_explicit         = enabled_env && strcmp(enabled_env, "0") != 0;
-
-    cfg.impl              = GGML_IFAIRY_LUT_IMPL_AUTO;
-    const char * impl_env = getenv("GGML_IFAIRY_LUT_IMPL");
-    if (impl_env && impl_env[0] != '\0' && strcmp(impl_env, "0") != 0 && strcmp(impl_env, "auto") != 0) {
-        if (strcmp(impl_env, "lut16") == 0) {
-            cfg.impl = GGML_IFAIRY_LUT_IMPL_LUT16;
-        } else if (strcmp(impl_env, "lut_c") == 0) {
-            cfg.impl = GGML_IFAIRY_LUT_IMPL_LUT_C;
-        } else if (cfg.dbg) {
-            GGML_LOG_WARN("ifairy_lut: unknown GGML_IFAIRY_LUT_IMPL=%s (expected auto|lut16|lut_c)\n", impl_env);
-        }
-    }
-
-    threadpool->ifairy_lut_cfg = cfg;
-}
-
-static const char * ggml_ifairy_lut_impl_name(enum ggml_ifairy_lut_impl impl) {
-    switch (impl) {
-        case GGML_IFAIRY_LUT_IMPL_AUTO:
-            return "auto";
-        case GGML_IFAIRY_LUT_IMPL_LUT16:
-            return "lut16";
-        case GGML_IFAIRY_LUT_IMPL_LUT_C:
-            return "lut_c";
-        default:
-            return "unknown";
-    }
-}
-
-static void ggml_ifairy_lut_debug_profile_log(const char * path,
-                                              enum ggml_ifairy_lut_impl impl,
-                                              const char * weight_name,
-                                              int64_t      M,
-                                              int64_t      K,
-                                              int64_t      N,
-                                              int          nth,
-                                              int64_t      quant_us,
-                                              int64_t      prep_us,
-                                              int64_t      gemm_us) {
-    fprintf(stderr,
-            "ifairy_lut: path=%s impl=%s name=%s M=%lld K=%lld N=%lld nth=%d quant=%.3f ms prep=%.3f ms gemm=%.3f ms\n",
-            path, ggml_ifairy_lut_impl_name(impl), weight_name, (long long) M, (long long) K, (long long) N, nth,
-            quant_us / 1000.0, prep_us / 1000.0, gemm_us / 1000.0);
-    fflush(stderr);
-}
-
-static void ggml_ifairy_lut_prepare_cgraph_indexes(const struct ggml_cgraph *                          cgraph,
-                                                   const struct ggml_ifairy_lut_threadpool_config * cfg) {
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        struct ggml_tensor * node = cgraph->nodes[i];
-        if (!node) {
-            continue;
-        }
-
-        if (node->op == GGML_OP_IFAIRY_WIDE_LINEAR_W2) {
-            if (!cfg || !cfg->lut_explicit) {
-                continue;
-            }
-            for (int src = 1; src <= 4; ++src) {
-                struct ggml_tensor * weight = node->src[src];
-                const struct ifairy_lut_extra * extra = weight ? (const struct ifairy_lut_extra *) weight->extra : NULL;
-                if (weight && (!extra || !extra->packed_w)) {
-                    ggml_ifairy_lut_transform_tensor(weight, NULL);
-                }
-            }
-            continue;
-        }
-
-        if (node->op != GGML_OP_MUL_MAT) {
-            continue;
-        }
-
-        struct ggml_tensor *       src0 = node->src[0];
-        const struct ggml_tensor * src1 = node->src[1];
-
-        if (!src0 || !src1) {
-            continue;
-        }
-
-        struct ggml_ifairy_lut_runtime_shape shape;
-        if (!ggml_ifairy_lut_get_runtime_shape(src0, src1, node, &shape)) {
-            continue;
-        }
-        if (src0->type == GGML_TYPE_IFAIRY64 && (!cfg || !cfg->lut_explicit)) {
-            continue;
-        }
-
-        const struct ifairy_lut_extra * extra = (const struct ifairy_lut_extra *) src0->extra;
-        if (extra && extra->packed_w) {
-            continue;
-        }
-
-        ggml_ifairy_lut_transform_tensor(src0, NULL);
-    }
-}
-#endif
 
 void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
     atomic_store_explicit(&tp->current_chunk, value, memory_order_relaxed);
@@ -1468,286 +1301,6 @@ void ggml_compute_forward_mul_mat(
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
 
-#if defined(GGML_IFAIRY_LUT_CPU)
-    const struct ggml_ifairy_lut_threadpool_config * cfg = &params->threadpool->ifairy_lut_cfg;
-    struct ggml_ifairy_lut_runtime_shape lut_shape;
-    if (cfg->lut_enabled && ggml_ifairy_lut_get_runtime_shape(src0, src1, dst, &lut_shape) &&
-        !(src0->type == GGML_TYPE_IFAIRY64 && !cfg->lut_explicit)) {
-        enum ggml_ifairy_lut_impl impl        = cfg->impl;
-        const bool                fairy2i_f32 = src1->type == GGML_TYPE_F32 && ggml_ifairy_lut_is_fairy2i_weight(src0);
-        if (impl == GGML_IFAIRY_LUT_IMPL_AUTO) {
-            // Keep auto mode conservative for Fairy2i decode quality while still allowing explicit lut16 selection.
-            impl = fairy2i_f32 ? GGML_IFAIRY_LUT_IMPL_LUT_C : GGML_IFAIRY_LUT_IMPL_LUT16;
-        }
-        if (impl == GGML_IFAIRY_LUT_IMPL_LUT_C && src1->type != GGML_TYPE_F32) {
-            if (cfg->dbg) {
-                GGML_LOG_WARN("ifairy_lut: lut_c requires src1=F32, falling back to lut16\n");
-            }
-            impl = GGML_IFAIRY_LUT_IMPL_LUT16;
-        }
-
-        // NOTE: packed weights are prepared up-front in ggml_graph_compute(); this is a cheap cache check.
-        const bool have_index = src0->extra && ((struct ifairy_lut_extra *) src0->extra)->packed_w;
-
-        const int64_t M             = ne01;
-        const int64_t K             = ne00;
-        const int64_t N             = ne11;
-        const int64_t weight_blocks = K / lut_shape.weight_block_k;
-        const int64_t act_blocks    = K / lut_shape.act_block_k;
-        const int64_t groups        = weight_blocks * lut_shape.groups_per_weight_block;
-
-        GGML_ASSERT(M >= 0);
-        GGML_ASSERT(K >= 0);
-        GGML_ASSERT(N >= 0);
-        GGML_ASSERT(weight_blocks >= 0);
-        GGML_ASSERT(act_blocks >= 0);
-
-        const bool dbg_ifairy64 = cfg->dbg && src0->type == GGML_TYPE_IFAIRY64;
-        int64_t    quant_us     = 0;
-        int64_t    prep_us      = 0;
-        int64_t    gemm_us      = 0;
-        const char * dbg_path   = NULL;
-
-        size_t quant_bytes = 0;
-        if (src1->type == GGML_TYPE_F32) {
-            const size_t act_blocks_sz = (size_t) act_blocks;
-            GGML_ASSERT(act_blocks_sz == 0 || (size_t) N <= SIZE_MAX / act_blocks_sz);
-            const size_t q_elems = (size_t) N * act_blocks_sz;
-            GGML_ASSERT(q_elems == 0 || sizeof(block_ifairy_q16) <= SIZE_MAX / q_elems);
-            quant_bytes = GGML_PAD(q_elems * sizeof(block_ifairy_q16), 64);
-        }
-
-        const size_t groups_sz = (size_t) groups;
-        GGML_ASSERT(groups_sz == 0 || (size_t) N <= SIZE_MAX / groups_sz);
-        const size_t lut_groups = (size_t) N * groups_sz;
-        GGML_ASSERT(lut_groups == 0 || (size_t) k_ifairy_lut_group_bytes <= SIZE_MAX / lut_groups);
-        const size_t lut_bytes = lut_groups * (size_t) k_ifairy_lut_group_bytes;
-
-        // activation scales are duplicated per weight block for IFAIRY64; legacy IFAIRY remains 1:1.
-        const size_t weight_blocks_sz = (size_t) weight_blocks;
-        GGML_ASSERT(weight_blocks_sz == 0 || (size_t) N <= SIZE_MAX / weight_blocks_sz);
-        const size_t scale_elems0 = (size_t) N * weight_blocks_sz;
-        GGML_ASSERT(scale_elems0 == 0 || 2u <= SIZE_MAX / scale_elems0);
-        const size_t scale_elems = scale_elems0 * 2u;
-        GGML_ASSERT(scale_elems == 0 || sizeof(float) <= SIZE_MAX / scale_elems);
-        const size_t scale_bytes = scale_elems * sizeof(float);
-        GGML_ASSERT(lut_bytes <= SIZE_MAX - scale_bytes);
-        const size_t shared_bytes = GGML_PAD(lut_bytes + scale_bytes, 64);
-        const size_t need         = quant_bytes + shared_bytes;
-
-        GGML_ASSERT(need == ggml_ifairy_lut_get_wsize(src0, src1, dst, nth));
-
-        if (have_index && params->wdata && params->wsize >= need && shared_bytes > 0) {
-            void (*preprocess)(int, int, int, const void *, size_t, void *, void *, int, int) = NULL;
-            void (*qgemm)(int, int, int, const void *, const void *, const void *, float *, size_t, size_t, bool, bool) = NULL;
-            void (*qgemm_fused)(int,
-                                int,
-                                int,
-                                const void *,
-                                const void *,
-                                size_t,
-                                void *,
-                                void *,
-                                float *,
-                                size_t,
-                                size_t,
-                                bool,
-                                bool) = NULL;
-
-            if (src0->type == GGML_TYPE_IFAIRY64) {
-                preprocess = impl == GGML_IFAIRY_LUT_IMPL_LUT_C ? ggml_ifairy64_lut_preprocess_ex_lut_c
-                                                                : ggml_ifairy64_lut_preprocess_ex_lut16;
-                qgemm      = impl == GGML_IFAIRY_LUT_IMPL_LUT_C ? ggml_ifairy64_lut_qgemm_lut_c
-                                                                : ggml_ifairy64_lut_qgemm_lut16;
-                qgemm_fused = impl == GGML_IFAIRY_LUT_IMPL_LUT_C ? ggml_ifairy64_lut_qgemm_fused_lut_c
-                                                                 : ggml_ifairy64_lut_qgemm_fused_lut16;
-            } else {
-                preprocess = impl == GGML_IFAIRY_LUT_IMPL_LUT_C ? ggml_ifairy_lut_preprocess_ex_lut_c
-                                                                : ggml_ifairy_lut_preprocess_ex_lut16;
-                qgemm      = impl == GGML_IFAIRY_LUT_IMPL_LUT_C ? ggml_ifairy_lut_qgemm_lut_c
-                                                                : ggml_ifairy_lut_qgemm_lut16;
-                qgemm_fused = impl == GGML_IFAIRY_LUT_IMPL_LUT_C ? ggml_ifairy_lut_qgemm_fused_lut_c
-                                                                 : ggml_ifairy_lut_qgemm_fused_lut16;
-            }
-
-            const struct ifairy_lut_extra * extra          = (const struct ifairy_lut_extra *) src0->extra;
-            const void *                    packed_w        = extra->packed_w;
-            const uint8_t *                 packed_w_bytes  = (const uint8_t *) extra->packed_w;
-            const size_t packed_w_tile_bytes = (size_t) weight_blocks * lut_shape.packed_wtile_size;
-
-            uint8_t *          work  = (uint8_t *) params->wdata;
-            block_ifairy_q16 * act_q = src1->type == GGML_TYPE_F32 ? (block_ifairy_q16 *) work : NULL;
-
-            uint8_t *    shared = work + quant_bytes;
-            void *       lut    = (void *) shared;
-            float *      scales = (float *) (shared + lut_bytes);
-            const size_t act_stride =
-                src1->type == GGML_TYPE_F32 ? (size_t) act_blocks * sizeof(block_ifairy_q16) : nb11;
-
-            // quantize activations once if needed (parallelize across columns to reduce thread idle)
-            if (src1->type == GGML_TYPE_F32) {
-                const float * act_f32            = (const float *) src1->data;
-                const int64_t act_f32_col_stride = (int64_t) (nb11 / sizeof(float));
-
-                const bool lut_c_impl = impl == GGML_IFAIRY_LUT_IMPL_LUT_C;
-                void (*quantize_act)(const float * GGML_RESTRICT, void * GGML_RESTRICT, int64_t) =
-                    lut_c_impl ? quantize_row_ifairy_q16_lut_c : quantize_row_ifairy_q16_tensor;
-
-                int64_t quant_t0 = 0;
-                if (dbg_ifairy64) {
-                    ggml_barrier(params->threadpool);
-                    if (ith == 0) {
-                        quant_t0 = ggml_time_us();
-                    }
-                    ggml_barrier(params->threadpool);
-                }
-
-                if (N >= nth || !lut_c_impl) {
-                    // Shard by columns. For tensor-scale quantization, avoid partial K ranges.
-                    for (int64_t c = ith; c < N; c += nth) {
-                        quantize_act(act_f32 + c * act_f32_col_stride, act_q + c * act_blocks, K);
-                    }
-                } else {
-                    // Decode-like: N is small (often 1). Shard each column by K-block ranges to keep all threads busy.
-                    const int64_t ib0 = (act_blocks * ith) / nth;
-                    const int64_t ib1 = (act_blocks * (ith + 1)) / nth;
-                    if (ib1 > ib0) {
-                        const int64_t k_part = (ib1 - ib0) * QK_IFAIRY;
-                        for (int64_t c = 0; c < N; ++c) {
-                            const float * x = act_f32 + c * act_f32_col_stride + ib0 * QK_IFAIRY;
-                            void *        y = act_q + c * act_blocks + ib0;
-                            quantize_act(x, y, k_part);
-                        }
-                    }
-                }
-                ggml_barrier(params->threadpool);
-                if (dbg_ifairy64 && ith == 0) {
-                    quant_us = ggml_time_us() - quant_t0;
-                }
-            }
-
-            const void * act_src = (src1->type == GGML_TYPE_F32) ? (const void *) act_q : src1->data;
-
-            uint8_t * dst_base = (uint8_t *) dst->data;
-            if (N >= nth) {
-                dbg_path = "col-fused";
-                const int64_t col0  = (N * ith) / nth;
-                const int64_t col1  = (N * (ith + 1)) / nth;
-                const int64_t ncols = col1 - col0;
-
-                int64_t gemm_t0 = 0;
-                if (dbg_ifairy64) {
-                    ggml_barrier(params->threadpool);
-                    if (ith == 0) {
-                        gemm_t0 = ggml_time_us();
-                    }
-                    ggml_barrier(params->threadpool);
-                }
-
-                if (ncols > 0) {
-                    const size_t lut_col_bytes = (size_t) weight_blocks * (size_t) lut_shape.groups_per_weight_block *
-                                                 (size_t) k_ifairy_lut_group_bytes;
-                    const void * act_src_col   = (const uint8_t *) act_src + (size_t) col0 * act_stride;
-                    void *       lut_col       = (uint8_t *) lut + (size_t) col0 * lut_col_bytes;
-                    float *      scales_col    = scales + (size_t) col0 * (size_t) weight_blocks * 2u;
-                    float *      dst_col       = (float *) (dst_base + (size_t) col0 * nb1);
-
-                    qgemm_fused((int) M, (int) K, (int) ncols, packed_w, act_src_col, act_stride, lut_col, scales_col,
-                                dst_col, nb1, nb0, /*pack_bf16*/ true, /*add*/ false);
-                }
-                if (dbg_ifairy64) {
-                    ggml_barrier(params->threadpool);
-                    if (ith == 0) {
-                        gemm_us = ggml_time_us() - gemm_t0;
-                        ggml_ifairy_lut_debug_profile_log(dbg_path, impl, src0->name, M, K, N, nth, quant_us, prep_us,
-                                                          gemm_us);
-                    }
-                }
-            } else {
-                const int64_t tiles_total = (M + 15) / 16;
-                const int64_t tile0       = (tiles_total * ith) / nth;
-                const int64_t tile1       = (tiles_total * (ith + 1)) / nth;
-
-                const int64_t row0  = tile0 * 16;
-                const int64_t row1  = tile1 * 16 > M ? M : tile1 * 16;
-                const int64_t nrows = row1 - row0;
-
-                // Decode-like N==1 path: use per-thread fused preprocess+qgemm to keep the tiny LUT hot in
-                // thread-local cache and avoid the shared-LUT/barrier overhead that regressed 2w on Apple Silicon.
-                if (N == 1) {
-                    dbg_path = "decode-fused";
-                    int64_t gemm_t0 = 0;
-                    if (dbg_ifairy64) {
-                        ggml_barrier(params->threadpool);
-                        if (ith == 0) {
-                            gemm_t0 = ggml_time_us();
-                        }
-                        ggml_barrier(params->threadpool);
-                    }
-                    if (nrows > 0) {
-                        const void * w_tile = packed_w_bytes + (size_t) tile0 * packed_w_tile_bytes;
-                        float *      dst_f  = (float *) (dst_base + (size_t) row0 * nb0);
-
-                        qgemm_fused((int) nrows, (int) K, 1, w_tile, act_src, act_stride, NULL, NULL, dst_f, nb1, nb0,
-                                    /*pack_bf16*/ true, /*add*/ false);
-                    }
-                    if (dbg_ifairy64) {
-                        ggml_barrier(params->threadpool);
-                        if (ith == 0) {
-                            gemm_us = ggml_time_us() - gemm_t0;
-                            ggml_ifairy_lut_debug_profile_log(dbg_path, impl, src0->name, M, K, N, nth, quant_us,
-                                                              prep_us, gemm_us);
-                        }
-                    }
-                    return;
-                }
-
-                // Small-N decode-like path: keep the shared-LUT build for N>1 to avoid duplicated preprocess work.
-                dbg_path = "decode-shared";
-                int64_t prep_t0 = 0;
-                if (dbg_ifairy64) {
-                    ggml_barrier(params->threadpool);
-                    if (ith == 0) {
-                        prep_t0 = ggml_time_us();
-                    }
-                    ggml_barrier(params->threadpool);
-                }
-                preprocess((int) M, (int) K, (int) N, act_src, act_stride, scales, lut, ith, nth);
-                ggml_barrier(params->threadpool);
-                if (dbg_ifairy64 && ith == 0) {
-                    prep_us = ggml_time_us() - prep_t0;
-                }
-
-                int64_t gemm_t0 = 0;
-                if (dbg_ifairy64) {
-                    ggml_barrier(params->threadpool);
-                    if (ith == 0) {
-                        gemm_t0 = ggml_time_us();
-                    }
-                    ggml_barrier(params->threadpool);
-                }
-
-                if (nrows > 0) {
-                    const void * w_tile = packed_w_bytes + (size_t) tile0 * packed_w_tile_bytes;
-                    float *      dst_f  = (float *) (dst_base + (size_t) row0 * nb0);
-
-                    qgemm((int) nrows, (int) K, (int) N, w_tile, lut, scales, dst_f, nb1, nb0,
-                          /*pack_bf16*/ true, /*add*/ false);
-                }
-                if (dbg_ifairy64) {
-                    ggml_barrier(params->threadpool);
-                    if (ith == 0) {
-                        gemm_us = ggml_time_us() - gemm_t0;
-                        ggml_ifairy_lut_debug_profile_log(dbg_path, impl, src0->name, M, K, N, nth, quant_us, prep_us,
-                                                          gemm_us);
-                    }
-                }
-            }
-            return;
-        }
-    }
-#endif
-
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
     // broadcast factors
@@ -1787,9 +1340,12 @@ UseGgmlGemm1:;
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-        const char * ifairy_act_tensor_env = getenv("GGML_IFAIRY_VEC_DOT_ACT_TENSOR");
-        const bool   ifairy_act_tensor = (src0->type == GGML_TYPE_IFAIRY) && (vec_dot_type == GGML_TYPE_IFAIRY_Q16) &&
-                                         (ifairy_act_tensor_env != NULL) && (strcmp(ifairy_act_tensor_env, "0") != 0);
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+        const bool src1_quantized_by_backend = ggml_legacy_ifairy_cpu_try_quantize_mul_mat_src1(
+            params, src0, src1, vec_dot_type, wdata, nbw1, nbw2, nbw3);
+#else
+        const bool src1_quantized_by_backend = false;
+#endif
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1802,16 +1358,10 @@ UseGgmlGemm1:;
             }
         }
 #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    if (ifairy_act_tensor) {
-                        if (ith == 0) {
-                            quantize_row_ifairy_q16_tensor(
-                                (float *) ((char *) src1->data + i13 * nb13 + i12 * nb12 + i11 * nb11),
-                                (void *) (wdata + i13 * nbw3 + i12 * nbw2 + i11 * nbw1), ne10);
-                        }
-                    } else {
+        if (!src1_quantized_by_backend) {
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
                         size_t  bs               = ggml_blck_size(vec_dot_type);
                         int64_t ne10_block_start = (ith * ne10 / bs) / nth;
                         int64_t ne10_block_end   = ((ith + 1) * ne10 / bs) / nth;
@@ -2183,6 +1733,72 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+static bool ggml_cpu_extension_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+#ifdef GGML_USE_FAIRY2I_CPU
+    if (ggml_fairy2i_cpu_supports_op(tensor)) {
+        if (!ggml_fairy2i_cpu_compute(params, tensor)) {
+            GGML_ABORT("%s failed", ggml_op_name(tensor->op));
+        }
+        return true;
+    }
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+    if (ggml_legacy_ifairy_cpu_supports_op(tensor)) {
+        if (!ggml_legacy_ifairy_cpu_compute(params, tensor)) {
+            GGML_ABORT("%s failed", ggml_op_name(tensor->op));
+        }
+        return true;
+    }
+#endif
+
+    GGML_UNUSED(params);
+    GGML_UNUSED(tensor);
+    return false;
+}
+
+static bool ggml_cpu_extension_n_tasks(struct ggml_tensor * node, int n_threads, int * n_tasks) {
+#ifdef GGML_USE_FAIRY2I_CPU
+    if (ggml_fairy2i_cpu_supports_op(node)) {
+        *n_tasks = ggml_fairy2i_cpu_n_tasks(node, n_threads);
+        return true;
+    }
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+    if (ggml_legacy_ifairy_cpu_supports_op(node)) {
+        *n_tasks = ggml_legacy_ifairy_cpu_n_tasks(node, n_threads);
+        return true;
+    }
+#endif
+
+    GGML_UNUSED(node);
+    GGML_UNUSED(n_threads);
+    GGML_UNUSED(n_tasks);
+    return false;
+}
+
+static bool ggml_cpu_extension_work_size(struct ggml_tensor * node, int n_tasks, size_t * work_size) {
+#ifdef GGML_USE_FAIRY2I_CPU
+    if (ggml_fairy2i_cpu_supports_op(node)) {
+        *work_size = ggml_fairy2i_cpu_work_size(node, n_tasks);
+        return true;
+    }
+#endif
+
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+    if (ggml_legacy_ifairy_cpu_supports_op(node)) {
+        *work_size = ggml_legacy_ifairy_cpu_work_size(node, n_tasks);
+        return true;
+    }
+#endif
+
+    GGML_UNUSED(node);
+    GGML_UNUSED(n_tasks);
+    GGML_UNUSED(work_size);
+    return false;
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2192,6 +1808,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
     // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
+        return;
+    }
+
+    if (ggml_cpu_extension_compute_forward(params, tensor)) {
         return;
     }
 
@@ -2380,9 +2000,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_soft_max_ext_back(params, tensor);
             } break;
+        case GGML_OP_COMPLEX_RMSNORM:
+            {
+                ggml_compute_forward_complex_rmsnorm(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_RMSNORM:
             {
                 ggml_compute_forward_ifairy_rmsnorm(params, tensor);
+            }
+            break;
+        case GGML_OP_COMPLEX_ROPE:
+            {
+                ggml_compute_forward_complex_rope(params, tensor);
             }
             break;
         case GGML_OP_IFAIRY_ROPE:
@@ -2390,9 +2020,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ifairy_rope(params, tensor);
             }
             break;
+        case GGML_OP_COMPLEX_SPLIT:
+            {
+                ggml_compute_forward_complex_split(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_SPLIT:
             {
                 ggml_compute_forward_ifairy_split(params, tensor);
+            }
+            break;
+        case GGML_OP_COMPLEX_MERGE:
+            {
+                ggml_compute_forward_complex_merge(params, tensor);
             }
             break;
         case GGML_OP_IFAIRY_MERGE:
@@ -2400,9 +2040,19 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ifairy_merge(params, tensor);
             }
             break;
+        case GGML_OP_COMPLEX_ADD:
+            {
+                ggml_compute_forward_complex_add(params, tensor);
+            }
+            break;
         case GGML_OP_IFAIRY_ADD:
             {
                 ggml_compute_forward_ifairy_add(params, tensor);
+            }
+            break;
+        case GGML_OP_COMPLEX_MUL:
+            {
+                ggml_compute_forward_complex_mul(params, tensor);
             }
             break;
         case GGML_OP_IFAIRY_MUL:
@@ -2410,18 +2060,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ifairy_mul(params, tensor);
             }
             break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
+            {
+                GGML_ABORT("%s requires GGML_FAIRY2I_CPU", ggml_op_name(tensor->op));
+            }
+            break;
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
-#ifdef GGML_IFAIRY_LUT_CPU
-                const struct ggml_ifairy_lut_threadpool_config * cfg = &params->threadpool->ifairy_lut_cfg;
-                const bool use_lut = cfg->lut_enabled && cfg->lut_explicit;
-                const bool lut_c   = cfg->impl == GGML_IFAIRY_LUT_IMPL_LUT_C;
-                if (!use_lut || !ggml_compute_forward_ifairy_wide_linear_w2_lut(params, tensor, lut_c)) {
-                    ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
-                }
-#else
-                ggml_compute_forward_ifairy_wide_linear_w2(params, tensor);
-#endif
+                GGML_ABORT("%s requires GGML_LEGACY_IFAIRY_CPU", ggml_op_name(tensor->op));
             }
             break;
         case GGML_OP_ROPE:
@@ -2701,6 +2347,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         return n_tasks;
     }
 
+    if (ggml_cpu_extension_n_tasks(node, n_threads, &n_tasks)) {
+        return n_tasks;
+    }
+
     switch (node->op) {
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -2744,6 +2394,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_TANH:
                 case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_COMPLEX_RELU2:
                 case GGML_UNARY_OP_IFAIRY_RELU2:
                 case GGML_UNARY_OP_SIGMOID:
                 case GGML_UNARY_OP_HARDSWISH:
@@ -2784,6 +2435,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DIV:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
+        case GGML_OP_COMPLEX_RMSNORM:
         case GGML_OP_IFAIRY_RMSNORM:
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_L2_NORM:
@@ -2817,6 +2469,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DIAG_MASK_ZERO:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SOFT_MAX_BACK:
+        case GGML_OP_COMPLEX_ADD:
+        case GGML_OP_COMPLEX_MUL:
+        case GGML_OP_COMPLEX_SPLIT:
+        case GGML_OP_COMPLEX_ROPE:
+        case GGML_OP_COMPLEX_MERGE:
         case GGML_OP_IFAIRY_ADD:
         case GGML_OP_IFAIRY_MUL:
         case GGML_OP_IFAIRY_SPLIT:
@@ -2828,6 +2485,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = n_threads;
             } break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
                 n_tasks = n_threads;
@@ -3271,7 +2929,8 @@ struct ggml_cplan ggml_graph_plan(
 
         size_t cur = 0;
 
-        if (!ggml_cpu_extra_work_size(n_threads, node, &cur)) {
+        if (!ggml_cpu_extra_work_size(n_threads, node, &cur) &&
+            !ggml_cpu_extension_work_size(node, n_tasks, &cur)) {
             switch (node->op) {
                 case GGML_OP_CPY:
                 case GGML_OP_DUP:
@@ -3340,6 +2999,12 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
+                case GGML_OP_COMPLEX_SPLIT:
+                case GGML_OP_COMPLEX_ADD:
+                case GGML_OP_COMPLEX_MUL:
+                case GGML_OP_COMPLEX_MERGE:
+                case GGML_OP_COMPLEX_ROPE:
+                case GGML_OP_COMPLEX_RMSNORM:
                 case GGML_OP_IFAIRY_SPLIT:
                 case GGML_OP_IFAIRY_ADD:
                 case GGML_OP_IFAIRY_MUL:
@@ -3349,15 +3014,10 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;
+                case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {
-                        const struct ggml_tensor * x = node->src[0];
-                        GGML_ASSERT(x && x->type == GGML_TYPE_F32);
-                        GGML_ASSERT(x->ne[0] % QK_IFAIRY64 == 0);
-
-                        const size_t q_row_size = ggml_row_size(GGML_TYPE_IFAIRY64_Q16, x->ne[0]);
-                        const size_t q_bytes    = GGML_PAD((size_t) ggml_nrows(x) * q_row_size, GGML_CACHE_LINE);
-                        cur                     = MAX(q_bytes, ggml_ifairy_wide_linear_w2_lut_wsize(node));
+                        cur = 0;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
@@ -3665,12 +3325,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
 
-#ifdef GGML_IFAIRY_LUT_CPU
-        threadpool->ifairy_lut_cfg.dbg         = false;
-        threadpool->ifairy_lut_cfg.lut_enabled = true;
-        threadpool->ifairy_lut_cfg.lut_explicit = false;
-        threadpool->ifairy_lut_cfg.impl        = GGML_IFAIRY_LUT_IMPL_AUTO;
-#endif
     }
 
     // Allocate and init workers state
@@ -3747,13 +3401,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
-#ifdef GGML_IFAIRY_LUT_CPU
-    ggml_ifairy_lut_threadpool_config_update(threadpool);
+#ifdef GGML_USE_FAIRY2I_CPU
+    ggml_fairy2i_cpu_prepare_graph(cgraph);
+#endif
 
-    const struct ggml_ifairy_lut_threadpool_config * cfg = &threadpool->ifairy_lut_cfg;
-    if (cfg->lut_enabled) {
-        ggml_ifairy_lut_prepare_cgraph_indexes(cgraph, cfg);
-    }
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
+    ggml_legacy_ifairy_cpu_prepare_graph(cgraph);
 #endif
 
 #ifdef GGML_USE_OPENMP

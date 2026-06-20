@@ -72,13 +72,19 @@ android {
 
                 when (llamaAndroidBackend) {
                     "cpu" -> {
-                        arguments += "-DGGML_IFAIRY_LUT_CPU=ON"
+                        arguments += "-DGGML_FAIRY2I=ON"
+                        arguments += "-DGGML_FAIRY2I_CPU=ON"
+                        arguments += "-DGGML_FAIRY2I_CPU_LUT=ON"
+                        arguments += "-DGGML_FAIRY2I_OPENCL=OFF"
                         arguments += "-DGGML_OPENCL=OFF"
                     }
                     "opencl" -> {
                         val includeDir = requireOpenClIncludeDir(openclIncludeDir)
                         val library = requireOpenClLibrary(openclLibrary)
-                        arguments += "-DGGML_IFAIRY_LUT_CPU=OFF"
+                        arguments += "-DGGML_FAIRY2I=ON"
+                        arguments += "-DGGML_FAIRY2I_CPU=OFF"
+                        arguments += "-DGGML_FAIRY2I_CPU_LUT=OFF"
+                        arguments += "-DGGML_FAIRY2I_OPENCL=ON"
                         arguments += "-DGGML_OPENCL=ON"
                         arguments += "-DGGML_OPENCL_USE_ADRENO_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_ADRENO", true)) "ON" else "OFF"}"
                         arguments += "-DGGML_OPENCL_EMBED_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_EMBED_KERNELS", true)) "ON" else "OFF"}"

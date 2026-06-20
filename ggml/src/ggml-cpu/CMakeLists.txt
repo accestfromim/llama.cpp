@@ -19,8 +19,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         set(GGML_CPU_NAME ggml-cpu)
     endif()
 
-    if (GGML_IFAIRY_FUSE_AVX512 AND NOT GGML_AVX512)
-        message(FATAL_ERROR "GGML_IFAIRY_FUSE_AVX512 requires GGML_AVX512")
+    if (GGML_FAIRY2I_CPU_AVX512 AND NOT GGML_AVX512)
+        message(FATAL_ERROR "GGML_FAIRY2I_CPU_AVX512 requires GGML_AVX512")
+    endif()
+    if (GGML_LEGACY_IFAIRY_CPU_AVX512 AND NOT GGML_AVX512)
+        message(FATAL_ERROR "GGML_LEGACY_IFAIRY_CPU_AVX512 requires GGML_AVX512")
     endif()
 
     ggml_add_backend_library(${GGML_CPU_NAME})
@@ -28,11 +31,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
-        ggml-cpu/ifairy-fuse.cpp
-        ggml-cpu/ifairy-fuse.h
-        ggml-cpu/ifairy-fuse-lut.cpp
-        ggml-cpu/ifairy-fuse-lut-qgemm.cpp
-        ggml-cpu/ifairy-fuse-lut-qgemm.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -58,8 +56,52 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.cpp
         )
 
+    if (GGML_FAIRY2I_CPU)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/fairy2i/fairy2i-cpu.cpp
+            ggml-cpu/fairy2i/fairy2i-cpu.h
+            ggml-cpu/fairy2i/wide-linear.cpp
+            ggml-cpu/fairy2i/wide-linear.h)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/legacy-ifairy/legacy-ifairy-cpu.cpp
+            ggml-cpu/legacy-ifairy/legacy-ifairy-cpu.h
+            ggml-cpu/legacy-ifairy/wide-linear.cpp
+            ggml-cpu/legacy-ifairy/wide-linear.h)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU_LUT)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut.cpp
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut-preprocess.cpp
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut-qgemm.cpp
+            ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut-transform.cpp
+            ggml-cpu/legacy-ifairy/wide-linear-lut.cpp
+            ggml-cpu/legacy-ifairy/lut-qgemm.cpp
+            ggml-cpu/legacy-ifairy/lut-qgemm.h)
+    endif()
+
+    if (GGML_FAIRY2I_CPU_LUT)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut.cpp
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut-preprocess.cpp
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut-qgemm.cpp
+            ggml-cpu/fairy2i/lut/ggml-fairy2i-lut-transform.cpp
+            ggml-cpu/fairy2i/wide-linear-lut.cpp
+            ggml-cpu/fairy2i/lut-qgemm.cpp
+            ggml-cpu/fairy2i/lut-qgemm.h)
+    endif()
+
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+    if (GGML_LEGACY_IFAIRY_CPU_LUT)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/legacy-ifairy/lut)
+    endif()
+    if (GGML_FAIRY2I_CPU_LUT)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/fairy2i/lut)
+    endif()
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
@@ -109,16 +151,39 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
-        set(GGML_IFAIRY_DOTPROD_SOURCE ggml-cpu/arch/arm/quants-ifairy-dotprod.c)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/arm/quants.c
-            ggml-cpu/arch/arm/quants-ifairy.c
-            ${GGML_IFAIRY_DOTPROD_SOURCE}
             ggml-cpu/arch/arm/repack.cpp
             )
 
-        if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
-            set_source_files_properties(${GGML_IFAIRY_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+        if (GGML_FAIRY2I_CPU)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/fairy2i/arm/fairy2i-quants.c)
+        endif()
+
+        if (GGML_FAIRY2I_CPU AND GGML_FAIRY2I_CPU_ARM_DOTPROD)
+            set(GGML_FAIRY2I_DOTPROD_SOURCE ggml-cpu/fairy2i/arm/fairy2i-dotprod.c)
+            list(APPEND GGML_CPU_SOURCES
+                ${GGML_FAIRY2I_DOTPROD_SOURCE})
+
+            if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+                set_source_files_properties(${GGML_FAIRY2I_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+            endif()
+        endif()
+
+        if (GGML_LEGACY_IFAIRY_CPU)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/legacy-ifairy/arm/ifairy-quants.c)
+        endif()
+
+        if (GGML_LEGACY_IFAIRY_CPU AND GGML_LEGACY_IFAIRY_CPU_ARM_DOTPROD)
+            set(GGML_LEGACY_IFAIRY_DOTPROD_SOURCE ggml-cpu/legacy-ifairy/arm/ifairy-dotprod.c)
+            list(APPEND GGML_CPU_SOURCES
+                ${GGML_LEGACY_IFAIRY_DOTPROD_SOURCE})
+
+            if (ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+                set_source_files_properties(${GGML_LEGACY_IFAIRY_DOTPROD_SOURCE} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+dotprod")
+            endif()
         endif()
 
         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
@@ -624,8 +689,32 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_sources(${GGML_CPU_NAME} PRIVATE ${GGML_CPU_SOURCES})
     target_compile_options(${GGML_CPU_NAME} PRIVATE ${ARCH_FLAGS})
     target_compile_definitions(${GGML_CPU_NAME} PRIVATE ${ARCH_DEFINITIONS})
-    if (GGML_IFAIRY_FUSE_AVX512)
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_IFAIRY_FUSE_AVX512)
+    if (GGML_FAIRY2I_CPU)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU)
+    endif()
+
+    if (GGML_FAIRY2I_CPU_LUT)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_LUT)
+    endif()
+
+    if (GGML_FAIRY2I_CPU_AVX512)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_AVX512)
+    endif()
+
+    if (GGML_FAIRY2I_CPU_ARM_DOTPROD)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_FAIRY2I_CPU_ARM_DOTPROD)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_CPU)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU_LUT)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_CPU_LUT)
+    endif()
+
+    if (GGML_LEGACY_IFAIRY_CPU_AVX512)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_LEGACY_IFAIRY_CPU_AVX512)
     endif()
 
     if (EMSCRIPTEN)

@@ -59,10 +59,13 @@ static float make_ifairy_split_value(float x) {
 }
 
 static bool is_ifairy_packed_pair_output(const ggml_tensor * t) {
-    if (t->op == GGML_OP_IFAIRY_ADD || t->op == GGML_OP_IFAIRY_MUL || t->op == GGML_OP_IFAIRY_MERGE) {
+    if (t->op == GGML_OP_COMPLEX_ADD || t->op == GGML_OP_COMPLEX_MUL || t->op == GGML_OP_COMPLEX_MERGE ||
+        t->op == GGML_OP_IFAIRY_ADD || t->op == GGML_OP_IFAIRY_MUL || t->op == GGML_OP_IFAIRY_MERGE) {
         return true;
     }
-    return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_IFAIRY_RELU2;
+    return t->op == GGML_OP_UNARY &&
+           (ggml_get_unary_op(t) == GGML_UNARY_OP_COMPLEX_RELU2 ||
+            ggml_get_unary_op(t) == GGML_UNARY_OP_IFAIRY_RELU2);
 }
 
 static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
@@ -6008,7 +6011,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_UNARY_OP_COUNT; op++) {
-                if (op == GGML_UNARY_OP_IFAIRY_RELU2) {
+                if (op == GGML_UNARY_OP_COMPLEX_RELU2 || op == GGML_UNARY_OP_IFAIRY_RELU2) {
                     continue;
                 }
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 128, 2, 2, 2 }, v));

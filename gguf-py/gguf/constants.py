@@ -401,7 +401,8 @@ class MODEL_ARCH(IntEnum):
     LLADA            = auto()
     LLADA_MOE        = auto()
     SEED_OSS         = auto()
-    IFAIRY           = auto() # newly added for ifairy
+    IFAIRY           = auto() # legacy iFairy architecture alias
+    FAIRY2I          = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -773,7 +774,8 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LLADA:            "llada",
     MODEL_ARCH.LLADA_MOE:        "llada-moe",
     MODEL_ARCH.SEED_OSS:         "seed_oss",
-    MODEL_ARCH.IFAIRY:           "ifairy", # newly added for ifairy
+    MODEL_ARCH.IFAIRY:           "ifairy", # legacy iFairy architecture alias
+    MODEL_ARCH.FAIRY2I:          "fairy2i",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -1035,8 +1037,24 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
-    # newly added for ifairy
+    # legacy iFairy architecture alias
     MODEL_ARCH.IFAIRY: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_SUB_NORM,
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.POST_NORM,
+        MODEL_TENSOR.PRE_NORM,
+        MODEL_TENSOR.ATTN_LAYERNORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.OUTPUT,
+    ],
+    MODEL_ARCH.FAIRY2I: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.FFN_DOWN,
@@ -2838,7 +2856,11 @@ MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.BAILINGMOE: [
         MODEL_TENSOR.ROPE_FREQS,
     ],
-    MODEL_ARCH.IFAIRY: [ # newly added for ifairy, 但我觉得没啥用，貌似本来也没有这两个层
+    MODEL_ARCH.IFAIRY: [ # legacy iFairy architecture alias
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.ATTN_ROT_EMBD,
+    ],
+    MODEL_ARCH.FAIRY2I: [
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.ATTN_ROT_EMBD,
     ],
@@ -2910,6 +2932,9 @@ class GGMLQuantizationType(IntEnum):
     F16_I2  = 40 # newly added for ifairy，2-bit codes + fp16 scales
     IFAIRY  = 41 # newly added for ifairy
     IFAIRY64 = 42 # tile64 Fairy2i weight format
+    IFAIRY64_Q16 = 43
+    FAIRY2I_TILE64_V2 = 44
+    FAIRY2I_ACT_Q16_64 = 45
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -2962,6 +2987,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ1_0         = 36  # except 1d tensors
     MOSTLY_TQ2_0         = 37  # except 1d tensors
     MOSTLY_IFAIRY        = 40
+    MOSTLY_FAIRY2I_TILE64_V2 = 41
 
 
     GUESSED              = 1024  # not specified in the model file
@@ -3024,6 +3050,8 @@ class VisionProjectorType:
 QK_K = 256
 QK_IFAIRY = 256
 QK_IFAIRY64 = 64
+QK_FAIRY2I_TILE64 = 64
+QK_FAIRY2I_ACT_Q16_64 = 64
 GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F32:     (1, 4),
     GGMLQuantizationType.F16:     (1, 2),
@@ -3060,6 +3088,9 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F16_I2:  (QK_IFAIRY, 4 + QK_IFAIRY // 4), # newly added for ifairy
     GGMLQuantizationType.IFAIRY:  (4, 1), # newly added for ifairy
     GGMLQuantizationType.IFAIRY64:(QK_IFAIRY64, 4 + QK_IFAIRY64 // 4),
+    GGMLQuantizationType.IFAIRY64_Q16:(QK_IFAIRY64, 4 + QK_IFAIRY64 * 2),
+    GGMLQuantizationType.FAIRY2I_TILE64_V2:(QK_FAIRY2I_TILE64, 4 + QK_FAIRY2I_TILE64 // 4),
+    GGMLQuantizationType.FAIRY2I_ACT_Q16_64:(QK_FAIRY2I_ACT_Q16_64, 4 + QK_FAIRY2I_ACT_Q16_64 * 2),
 }
 
 
