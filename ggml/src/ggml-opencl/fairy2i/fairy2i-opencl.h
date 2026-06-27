@@ -37,12 +37,14 @@ struct ggml_opencl_fairy2i_state {
     cl_kernel kernel_complex_rope = nullptr;
     cl_kernel kernel_complex_split = nullptr;
     cl_kernel kernel_fairy2i_tile64_act_q16_64_quantize = nullptr;
+    cl_kernel kernel_fairy2i_tile64_act_q16_64_quantize_dot8_packed = nullptr;
     cl_kernel kernel_fairy2i_tile64_mul_mat_f32_act_q16_64 = nullptr;
     cl_kernel kernel_fairy2i_tile64_mul_mat_f32_direct = nullptr;
     cl_kernel kernel_fairy2i_tile64_mul_vec_f32_act_q16_64 = nullptr;
     cl_kernel kernel_fairy2i_tile64_mul_vec4_f32_act_q16_64 = nullptr;
     cl_kernel kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64 = nullptr;
     cl_kernel kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8 = nullptr;
+    cl_kernel kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8_packed = nullptr;
 };
 
 #ifndef GGML_OPENCL_PROGRAM_BUILDER_DEFINED

@@ -378,24 +378,6 @@ struct scoped_env_var {
     }
 };
 
-static bool opencl_ifairy64_wide_linear_w2_lut_requested() {
-    const char * env = getenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL");
-    return env && (strcmp(env, "lutlocal") == 0 || strcmp(env, "lut") == 0 ||
-                   strcmp(env, "lutglobal") == 0 || strcmp(env, "lutglobal16") == 0 ||
-                   strcmp(env, "lutglobal32") == 0 || strcmp(env, "lutglobal64") == 0);
-}
-
-static bool opencl_ifairy64_wide_linear_w2_lutlocal_requested() {
-    const char * env = getenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL");
-    return env && (strcmp(env, "lutlocal") == 0 || strcmp(env, "lut") == 0);
-}
-
-static bool opencl_ifairy64_wide_linear_w2_lutglobal_requested() {
-    const char * env = getenv("GGML_OPENCL_IFAIRY64_WIDE_LINEAR_W2_IMPL");
-    return env && (strcmp(env, "lutglobal") == 0 || strcmp(env, "lutglobal16") == 0 ||
-                   strcmp(env, "lutglobal32") == 0 || strcmp(env, "lutglobal64") == 0);
-}
-
 static float pack_bf16_pair(float real, float imag) {
     ggml_bf16_t pair[2];
     pair[0] = GGML_FP32_TO_BF16(real);
@@ -1974,159 +1956,6 @@ static bool run_ifairy64_wide_linear_w2_backend_generic(std::vector<uint32_t> & 
     return true;
 }
 
-static bool run_ifairy64_wide_linear_w2_lut_reference(std::vector<uint32_t> &             packed_out,
-                                                       int64_t                             M,
-                                                       int64_t                             N,
-                                                       int64_t                             K,
-                                                       const std::vector<block_ifairy64> & u_s0_data,
-                                                       const std::vector<block_ifairy64> & u_s1_data,
-                                                       const std::vector<block_ifairy64> & w_s0_data,
-                                                       const std::vector<block_ifairy64> & w_s1_data,
-                                                       const std::vector<float> &          x_data,
-                                                       const std::vector<float> *          bias_data) {
-    if (M <= 0 || N <= 0 || K <= 0 || (K % QK_IFAIRY64) != 0) {
-        return false;
-    }
-
-    const int64_t blocks = K / QK_IFAIRY64;
-    packed_out.assign((size_t) M * (size_t) N, 0);
-
-    std::vector<int>   q_real((size_t) K);
-    std::vector<int>   q_imag((size_t) K);
-    std::vector<float> s_real((size_t) blocks);
-    std::vector<float> s_imag((size_t) blocks);
-
-    auto unpack_pair = [](float packed, float & real, float & imag) {
-        uint32_t bits = 0;
-        memcpy(&bits, &packed, sizeof(bits));
-        ggml_bf16_t r;
-        ggml_bf16_t i;
-        r.bits = (uint16_t) (bits & 0xffffu);
-        i.bits = (uint16_t) (bits >> 16);
-        real = GGML_BF16_TO_FP32(r);
-        imag = GGML_BF16_TO_FP32(i);
-    };
-
-    auto decode_code = [](uint8_t code, int & wr, int & wi) {
-        if (code == 0) {
-            wr = -1;
-            wi = 0;
-        } else if (code == 1) {
-            wr = 1;
-            wi = 0;
-        } else if (code == 2) {
-            wr = 0;
-            wi = -1;
-        } else {
-            wr = 0;
-            wi = 1;
-        }
-    };
-
-    auto accumulate_weight_lane = [&](const std::vector<block_ifairy64> & weights,
-                                      int64_t row,
-                                      int64_t block,
-                                      int     pair_lane,
-                                      bool    conj,
-                                      float & acc_real,
-                                      float & acc_imag) {
-        const block_ifairy64 * row_blocks = weights.data() + (size_t) row * (size_t) blocks;
-        const block_ifairy64 & blk = row_blocks[block];
-        const float d_real = GGML_FP16_TO_FP32(blk.d_real);
-        const float d_imag = GGML_FP16_TO_FP32(blk.d_imag);
-
-        int sum_ac = 0;
-        int sum_bd = 0;
-        int sum_bc = 0;
-        int sum_ad = 0;
-        for (int part = 0; part < 4; ++part) {
-            const int j = pair_lane * 4 + part;
-            int wr = 0;
-            int wi = 0;
-            decode_code(get_ifairy64_code(row_blocks, (int) (block * QK_IFAIRY64 + j)), wr, wi);
-
-            const int64_t k_idx = block * QK_IFAIRY64 + j;
-            const int xr = q_real[(size_t) k_idx];
-            const int xi = q_imag[(size_t) k_idx];
-            sum_ac += xr * wr;
-            sum_bd += xi * wi;
-            sum_bc += xr * wi;
-            sum_ad -= xi * wr;
-        }
-
-        const float x_real = s_real[(size_t) block];
-        const float x_imag = s_imag[(size_t) block];
-        if (conj) {
-            acc_real += d_real * x_real * (float) sum_ac + d_imag * x_imag * (float) sum_bd;
-            acc_imag += d_imag * x_real * (float) sum_bc + d_real * x_imag * (float) sum_ad;
-        } else {
-            acc_real += d_real * x_real * (float) sum_ac - d_imag * x_imag * (float) sum_bd;
-            acc_imag += d_imag * x_real * (float) sum_bc - d_real * x_imag * (float) sum_ad;
-        }
-    };
-
-    for (int64_t col = 0; col < N; ++col) {
-        const float * x_col = x_data.data() + (size_t) col * (size_t) K;
-        for (int64_t block = 0; block < blocks; ++block) {
-            float max_real = 1.0e-5f;
-            float max_imag = 1.0e-5f;
-            for (int j = 0; j < QK_IFAIRY64; ++j) {
-                float xr = 0.0f;
-                float xi = 0.0f;
-                unpack_pair(x_col[block * QK_IFAIRY64 + j], xr, xi);
-                max_real = fmaxf(max_real, fabsf(xr));
-                max_imag = fmaxf(max_imag, fabsf(xi));
-            }
-
-            s_real[(size_t) block] = max_real / 63.0f;
-            s_imag[(size_t) block] = max_imag / 63.0f;
-            const float inv_real = 1.0f / s_real[(size_t) block];
-            const float inv_imag = 1.0f / s_imag[(size_t) block];
-
-            for (int j = 0; j < QK_IFAIRY64; ++j) {
-                float xr = 0.0f;
-                float xi = 0.0f;
-                unpack_pair(x_col[block * QK_IFAIRY64 + j], xr, xi);
-                const int64_t k_idx = block * QK_IFAIRY64 + j;
-                q_real[(size_t) k_idx] = std::max(-63, std::min(63, (int) lrintf(xr * inv_real)));
-                q_imag[(size_t) k_idx] = std::max(-63, std::min(63, (int) lrintf(xi * inv_imag)));
-            }
-        }
-
-        for (int64_t row = 0; row < M; ++row) {
-            float lane_real[16] = {};
-            float lane_imag[16] = {};
-            for (int64_t block = 0; block < blocks; ++block) {
-                for (int pair_lane = 0; pair_lane < 16; ++pair_lane) {
-                    accumulate_weight_lane(u_s0_data, row, block, pair_lane, /*conj*/ false,
-                                           lane_real[pair_lane], lane_imag[pair_lane]);
-                    accumulate_weight_lane(u_s1_data, row, block, pair_lane, /*conj*/ false,
-                                           lane_real[pair_lane], lane_imag[pair_lane]);
-                    accumulate_weight_lane(w_s0_data, row, block, pair_lane, /*conj*/ true,
-                                           lane_real[pair_lane], lane_imag[pair_lane]);
-                    accumulate_weight_lane(w_s1_data, row, block, pair_lane, /*conj*/ true,
-                                           lane_real[pair_lane], lane_imag[pair_lane]);
-                }
-            }
-
-            float out_real = 0.0f;
-            float out_imag = 0.0f;
-            for (int pair_lane = 0; pair_lane < 16; ++pair_lane) {
-                out_real += lane_real[pair_lane];
-                out_imag += lane_imag[pair_lane];
-            }
-            if (bias_data) {
-                out_real += (*bias_data)[(size_t) row];
-                out_imag += (*bias_data)[(size_t) row + (size_t) M];
-            }
-            const float packed = pack_bf16_pair(out_real, out_imag);
-            memcpy(&packed_out[(size_t) col * (size_t) M + (size_t) row], &packed, sizeof(uint32_t));
-        }
-    }
-
-    return true;
-}
-
 static bool test_ifairy64_wide_linear_w2_fused() {
     printf("\n=== Test 5.5: iFairy64 fused wide linear W2 ===\n");
 
@@ -2877,18 +2706,11 @@ static int run_ifairy_opencl_mul_tests(void) {
 }
 
 static bool run_ifairy64_opencl_mul_mat_compare_case(ggml_backend_dev_t dev,
-                                                     int64_t            m,
-                                                     int64_t            n,
-                                                     int64_t            k,
-                                                     const char *       impl = nullptr) {
+                                                      int64_t            m,
+                                                      int64_t            n,
+                                                      int64_t            k) {
     scoped_env_var env_gate("GGML_OPENCL_IFAIRY64");
-    scoped_env_var env_impl("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
     env_gate.set("1");
-    if (impl) {
-        env_impl.set(impl);
-    } else {
-        env_impl.unset();
-    }
 
     std::vector<block_ifairy64> weights;
     std::vector<float>          act_f32;
@@ -2927,8 +2749,8 @@ static bool run_ifairy64_opencl_mul_mat_compare_case(ggml_backend_dev_t dev,
         return false;
     }
 
-    printf("  compare IFAIRY64_MUL_MAT%s%s M=%lld N=%lld K=%lld\n",
-           impl ? " " : "", impl ? impl : "", (long long) m, (long long) n, (long long) k);
+    printf("  compare IFAIRY64_MUL_MAT M=%lld N=%lld K=%lld\n",
+           (long long) m, (long long) n, (long long) k);
     return compare_packed_complex_outputs(opencl_out.data(), cpu_out.data(), cpu_out.size(), 1e-2f);
 }
 
@@ -2992,16 +2814,6 @@ static int run_ifairy64_opencl_mul_mat_tests(void) {
     if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 8, 8, QK_IFAIRY)) {
         num_failed++;
     }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 256, 1, QK_IFAIRY, "lut16")) {
-        num_failed++;
-    }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 512, 1, 2 * QK_IFAIRY, "lut32")) {
-        num_failed++;
-    }
-    if (!run_ifairy64_opencl_mul_mat_compare_case(dev, 1024, 1, 4 * QK_IFAIRY, "lut64")) {
-        num_failed++;
-    }
-
     if (num_failed == 0) {
         printf("iFairy64 OpenCL MUL_MAT support and correctness tests PASSED!\n");
     } else {
@@ -3108,28 +2920,19 @@ static bool run_ifairy64_opencl_wide_linear_compare_case(ggml_backend_dev_t dev,
 
     std::vector<uint32_t> cpu_out;
     std::vector<uint32_t> opencl_out;
-    const bool use_lut_reference = opencl_ifairy64_wide_linear_w2_lut_requested();
-
-    bool cpu_ok = false;
-    if (use_lut_reference) {
-        cpu_ok = run_ifairy64_wide_linear_w2_lut_reference(cpu_out, m, n, k,
-                                                           u_s0, u_s1, w_s0, w_s1, x,
-                                                           with_bias ? &bias : nullptr);
-    } else {
-        ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-        if (!cpu_backend) {
-            fprintf(stderr, "Failed to init CPU backend for IFAIRY_WIDE_LINEAR_W2 compare\n");
-            ggml_backend_free(opencl_backend);
-            return false;
-        }
-        ggml_backend_cpu_set_n_threads(cpu_backend, 4);
-        cpu_ok = run_ifairy64_wide_linear_w2_backend_generic(cpu_out, cpu_backend, m, n, k,
-                                                             u_s0, u_s1, w_s0, w_s1, x,
-                                                             with_bias ? &bias : nullptr,
-                                                             /*fused*/ true,
-                                                             /*require_supported*/ false);
-        ggml_backend_free(cpu_backend);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    if (!cpu_backend) {
+        fprintf(stderr, "Failed to init CPU backend for IFAIRY_WIDE_LINEAR_W2 compare\n");
+        ggml_backend_free(opencl_backend);
+        return false;
     }
+    ggml_backend_cpu_set_n_threads(cpu_backend, 4);
+    const bool cpu_ok = run_ifairy64_wide_linear_w2_backend_generic(cpu_out, cpu_backend, m, n, k,
+                                                                    u_s0, u_s1, w_s0, w_s1, x,
+                                                                    with_bias ? &bias : nullptr,
+                                                                    /*fused*/ true,
+                                                                    /*require_supported*/ false);
+    ggml_backend_free(cpu_backend);
 
     const bool opencl_ok = run_ifairy64_wide_linear_w2_backend_generic(opencl_out, opencl_backend, m, n, k,
                                                                        u_s0, u_s1, w_s0, w_s1, x,
@@ -3150,8 +2953,7 @@ static bool run_ifairy64_opencl_wide_linear_compare_case(ggml_backend_dev_t dev,
 
     printf("  compare IFAIRY_WIDE_LINEAR_W2 M=%lld N=%lld K=%lld bias=%d\n",
            (long long) m, (long long) n, (long long) k, with_bias ? 1 : 0);
-    const float max_error = use_lut_reference ? 5e-2f : 1e-2f;
-    return compare_packed_complex_outputs(opencl_out.data(), cpu_out.data(), cpu_out.size(), max_error);
+    return compare_packed_complex_outputs(opencl_out.data(), cpu_out.data(), cpu_out.size(), 1e-2f);
 }
 
 static int run_ifairy64_opencl_wide_linear_tests(void) {
@@ -3622,15 +3424,6 @@ static int run_ifairy64_opencl_wide_linear_bench(void) {
 
     printf("OpenCL device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
 
-    scoped_env_var env_mul_mat_impl("GGML_OPENCL_IFAIRY64_MUL_MAT_IMPL");
-    if (opencl_ifairy64_wide_linear_w2_lutlocal_requested()) {
-        env_mul_mat_impl.set("lut64");
-        printf("  W2 LUTLOCAL reference: unfused MUL_MAT lut64\n");
-    } else if (opencl_ifairy64_wide_linear_w2_lutglobal_requested()) {
-        env_mul_mat_impl.set("lutglobal64");
-        printf("  W2 LUTGLOBAL reference: unfused MUL_MAT lutglobal64\n");
-    }
-
     int num_failed = 0;
     auto bench = [&](int64_t m, int64_t n, int64_t k) {
         std::vector<block_ifairy64> u_s0;
@@ -3656,8 +3449,7 @@ static int run_ifairy64_opencl_wide_linear_bench(void) {
             return;
         }
 
-        const float max_error = opencl_ifairy64_wide_linear_w2_lut_requested() ? 5e-2f : 1e-2f;
-        if (!compare_packed_complex_outputs(out_fused.data(), out_unfused.data(), out_unfused.size(), max_error)) {
+        if (!compare_packed_complex_outputs(out_fused.data(), out_unfused.data(), out_unfused.size(), 1e-2f)) {
             fprintf(stderr, "IFAIRY_WIDE_LINEAR_W2 bench output mismatch M=%lld N=%lld K=%lld\n",
                     (long long) m, (long long) n, (long long) k);
             num_failed++;
@@ -4053,26 +3845,17 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
         ifairy64_mulmat_bench_result gemv2;
         ifairy64_mulmat_bench_result gemv4;
         ifairy64_mulmat_bench_result gemm;
-        ifairy64_mulmat_bench_result lut16;
-        ifairy64_mulmat_bench_result lut32;
-        ifairy64_mulmat_bench_result lut64;
         ifairy64_mulmat_bench_result direct;
         ifairy64_mulmat_bench_result cpu4t;
         std::vector<uint32_t>        out_gemv2;
         std::vector<uint32_t>        out_gemv4;
         std::vector<uint32_t>        out_gemm;
-        std::vector<uint32_t>        out_lut16;
-        std::vector<uint32_t>        out_lut32;
-        std::vector<uint32_t>        out_lut64;
         std::vector<uint32_t>        out_direct;
         std::vector<uint32_t>        out_cpu4t;
 
         if (!run_ifairy64_opencl_mul_mat_bench_once(gemv2, out_gemv2, dev, m, n, k, "gemv2") ||
             !run_ifairy64_opencl_mul_mat_bench_once(gemv4, out_gemv4, dev, m, n, k, "gemv4") ||
             !run_ifairy64_opencl_mul_mat_bench_once(gemm, out_gemm, dev, m, n, k, "gemm") ||
-            !run_ifairy64_opencl_mul_mat_bench_once(lut16, out_lut16, dev, m, n, k, "lut16") ||
-            !run_ifairy64_opencl_mul_mat_bench_once(lut32, out_lut32, dev, m, n, k, "lut32") ||
-            !run_ifairy64_opencl_mul_mat_bench_once(lut64, out_lut64, dev, m, n, k, "lut64") ||
             !run_ifairy64_opencl_mul_mat_bench_once(direct, out_direct, dev, m, n, k, "direct") ||
             !run_ifairy64_cpu_mul_mat_bench_once(cpu4t, out_cpu4t, m, n, k, 4)) {
             num_failed++;
@@ -4081,9 +3864,6 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
 
         if (!compare_packed_complex_outputs(out_gemv2.data(), out_gemm.data(), out_gemm.size()) ||
             !compare_packed_complex_outputs(out_gemv4.data(), out_gemm.data(), out_gemm.size()) ||
-            !compare_packed_complex_outputs(out_lut16.data(), out_gemm.data(), out_gemm.size()) ||
-            !compare_packed_complex_outputs(out_lut32.data(), out_gemm.data(), out_gemm.size()) ||
-            !compare_packed_complex_outputs(out_lut64.data(), out_gemm.data(), out_gemm.size()) ||
             !compare_packed_complex_outputs(out_gemm.data(), out_cpu4t.data(), out_cpu4t.size())) {
             fprintf(stderr, "IFAIRY64 MUL_MAT bench output mismatch M=%lld N=%lld K=%lld\n",
                     (long long) m, (long long) n, (long long) k);
@@ -4103,36 +3883,19 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
             best = "gemv4";
             best_us = gemv4.us_per_run;
         }
-        if (lut16.us_per_run < best_us) {
-            best = "lut16";
-            best_us = lut16.us_per_run;
-        }
-        if (lut32.us_per_run < best_us) {
-            best = "lut32";
-            best_us = lut32.us_per_run;
-        }
-        if (lut64.us_per_run < best_us) {
-            best = "lut64";
-        }
-
         printf("  M=%lld N=%lld K=%lld gemv2_us=%.2f gemv4_us=%.2f gemm_us=%.2f "
-               "lut16_us=%.2f lut32_us=%.2f lut64_us=%.2f direct_us=%.2f cpu4t_us=%.2f "
-               "gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx lut16_vs_gemm=%.3fx lut32_vs_gemm=%.3fx "
-               "lut64_vs_gemm=%.3fx direct_over_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
-               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx "
-               "runs=%d/%d/%d/%d/%d/%d/%d/%d\n",
+               "direct_us=%.2f cpu4t_us=%.2f gemv2_vs_gemm=%.3fx gemv4_vs_gemm=%.3fx "
+               "direct_over_gemm=%.3fx gemm_vs_cpu4t=%.3fx best=%s "
+               "hashes=0x%016llx/0x%016llx/0x%016llx/0x%016llx/0x%016llx runs=%d/%d/%d/%d/%d\n",
                (long long) m, (long long) n, (long long) k,
                gemv2.us_per_run, gemv4.us_per_run, gemm.us_per_run,
-               lut16.us_per_run, lut32.us_per_run, lut64.us_per_run, direct.us_per_run, cpu4t.us_per_run,
-               speedup_gemv2, speedup_gemv4, gemm.us_per_run / lut16.us_per_run, gemm.us_per_run / lut32.us_per_run,
-               gemm.us_per_run / lut64.us_per_run, direct.us_per_run / gemm.us_per_run,
+               direct.us_per_run, cpu4t.us_per_run, speedup_gemv2, speedup_gemv4,
+               direct.us_per_run / gemm.us_per_run,
                cpu4t.us_per_run / gemm.us_per_run, best,
                (unsigned long long) gemv2.hash, (unsigned long long) gemv4.hash,
-               (unsigned long long) gemm.hash, (unsigned long long) lut16.hash,
-               (unsigned long long) lut32.hash, (unsigned long long) lut64.hash,
-               (unsigned long long) direct.hash,
+               (unsigned long long) gemm.hash, (unsigned long long) direct.hash,
                (unsigned long long) cpu4t.hash,
-               gemv2.runs, gemv4.runs, gemm.runs, lut16.runs, lut32.runs, lut64.runs, direct.runs, cpu4t.runs);
+               gemv2.runs, gemv4.runs, gemm.runs, direct.runs, cpu4t.runs);
     };
 
     bench(128, 1, QK_IFAIRY64);
@@ -4150,7 +3913,7 @@ static int run_ifairy64_opencl_mul_mat_bench(void) {
 }
 
 static int run_ifairy64_opencl_gemv_tile_bench(void) {
-    printf("\n=== iFairy64 OpenCL GEMV tile microbench (q16 no-LUT) ===\n");
+    printf("\n=== iFairy64 OpenCL GEMV tile microbench (q16) ===\n");
 
     ggml_backend_dev_t dev = find_opencl_test_device();
     if (!dev) {
@@ -4304,7 +4067,6 @@ int main(int argc, char ** argv) {
         bool         opencl_ifairy64_gemv_tile_bench = false;
         bool         opencl_ifairy64_wide_linear_only = false;
         bool         opencl_ifairy64_wide_linear_bench = false;
-        bool         fused_only = false;
         const char * vecdot_mode = NULL;
         int64_t      bench_M     = 4096;
         int64_t      bench_N     = 1;

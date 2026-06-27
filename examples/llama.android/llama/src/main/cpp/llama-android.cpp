@@ -91,6 +91,8 @@ static void enable_android_opencl_fairy2i_gate() {
     LOGi("Runtime toggle: GGML_OPENCL_FAIRY2I=1 for OpenCL build");
     setenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2", "1", 1);
     LOGi("Runtime toggle: LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1 for OpenCL build");
+    setenv("GGML_OPENCL_PROFILING_FILE", "/sdcard/Android/data/com.example.llama/files/bench/cl_profiling.csv", 0);
+    setenv("GGML_OPENCL_TRACE_FILE", "/sdcard/Android/data/com.example.llama/files/bench/cl_trace.json", 0);
 #endif
 }
 
@@ -128,7 +130,9 @@ static void configure_opencl_fairy2i_wide_linear_w2_impl(const char * impl) {
 
     if (
             strcmp(impl, "q16dot8") == 0 ||
-            strcmp(impl, "dot8") == 0) {
+            strcmp(impl, "dot8") == 0 ||
+            strcmp(impl, "q16dot8packed") == 0 ||
+            strcmp(impl, "dot8packed") == 0) {
         setenv("GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL", impl, 1);
         LOGi("Runtime toggle: GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL=%s", impl);
         return;

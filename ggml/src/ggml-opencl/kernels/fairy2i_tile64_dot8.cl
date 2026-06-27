@@ -1,9 +1,25 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
 #pragma OPENCL EXTENSION cl_qcom_dot_product8 : enable
+
+#ifdef cl_qcom_reqd_sub_group_size
+#pragma OPENCL EXTENSION cl_qcom_reqd_sub_group_size : enable
+#define FAIRY2I_REQD_SUBGROUP_SIZE_64 __attribute__((qcom_reqd_sub_group_size("half")))
+#else
+#define FAIRY2I_REQD_SUBGROUP_SIZE_64
+#endif
 
 #define QK_FAIRY2I_TILE64     64
 #define QK_FAIRY2I_ACT_Q16_64 64
 #define FAIRY2I_TILE64_WIDE_TILE_M 4
+
+static inline float fairy2i_bf16_to_f32(ushort h) {
+    return as_float((uint) h << 16);
+}
+
+static inline int fairy2i_clamp_i32(int v, int lo, int hi) {
+    return min(max(v, lo), hi);
+}
 
 static inline ushort fairy2i_f32_to_bf16(float x) {
     uint bits = as_uint(x);
@@ -77,6 +93,90 @@ static inline int4 fairy2i_tile64_dot8_sums_packed(
         fairy2i_tile64_dot4_s8u8_qcom(xi_pack, cr_pack, xi_correction),
         fairy2i_tile64_dot4_s8u8_qcom(xr_pack, ci_pack, xr_correction),
         fairy2i_tile64_dot4_s8u8_qcom(xi_pack, ci_pack, xi_correction));
+}
+
+/**
+ * Quantizes one tile64 activation block directly into dot8 lane packs. Each
+ * lane stores four K positions separated by 16, matching one packed weight
+ * byte and allowing the W2 kernel to use aligned uint4 loads.
+ */
+__attribute__((reqd_work_group_size(64, 1, 1)))
+kernel void kernel_fairy2i_tile64_act_q16_64_quantize_dot8_packed(
+        global char * src,
+        ulong         offset,
+        global uint * act_q,
+        global half * act_d,
+        int           k,
+        int           n,
+        ulong         nb10,
+        ulong         nb11,
+        local float * tmp_real,
+        local float * tmp_imag
+) {
+    src = src + offset;
+
+    const int block = get_group_id(0);
+    const int col = get_group_id(1);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int blocks_per_col = k / QK_FAIRY2I_ACT_Q16_64;
+
+    if (col >= n || block >= blocks_per_col) {
+        return;
+    }
+
+    float max_real = 1.0e-5f;
+    float max_imag = 1.0e-5f;
+    const int k_idx = block * QK_FAIRY2I_ACT_Q16_64 + lid;
+    const uint pair = *((global uint *) (src + (ulong) col * nb11 + (ulong) k_idx * nb10));
+    const float xr = fairy2i_bf16_to_f32((ushort) (pair & 0xffffU));
+    const float xi = fairy2i_bf16_to_f32((ushort) (pair >> 16));
+    max_real = fmax(max_real, fabs(xr));
+    max_imag = fmax(max_imag, fabs(xi));
+
+    tmp_real[lid] = max_real;
+    tmp_imag[lid] = max_imag;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int stride = lsize >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            tmp_real[lid] = fmax(tmp_real[lid], tmp_real[lid + stride]);
+            tmp_imag[lid] = fmax(tmp_imag[lid], tmp_imag[lid + stride]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const float scale_real = tmp_real[0] / 127.0f;
+    const float scale_imag = tmp_imag[0] / 127.0f;
+    const float iscale_real = 1.0f / scale_real;
+    const float iscale_imag = 1.0f / scale_imag;
+    const int block_index = col * blocks_per_col + block;
+
+    if (lid == 0) {
+        vstore_half(scale_real, 0, act_d + block_index * 2 + 0);
+        vstore_half(scale_imag, 0, act_d + block_index * 2 + 1);
+    }
+
+    if (lid < 16) {
+        uint qr_pack = 0;
+        uint qi_pack = 0;
+#pragma unroll
+        for (int part = 0; part < 4; ++part) {
+            const int j = lid + 16 * part;
+            const int src_k = block * QK_FAIRY2I_ACT_Q16_64 + j;
+            const uint src_pair = *((global uint *) (src + (ulong) col * nb11 + (ulong) src_k * nb10));
+            const float src_r = fairy2i_bf16_to_f32((ushort) (src_pair & 0xffffU));
+            const float src_i = fairy2i_bf16_to_f32((ushort) (src_pair >> 16));
+            const int qr = fairy2i_clamp_i32((int) rint(src_r * iscale_real), -127, 127);
+            const int qi = fairy2i_clamp_i32((int) rint(src_i * iscale_imag), -127, 127);
+            qr_pack |= (uint) (uchar) (char) qr << (8 * part);
+            qi_pack |= (uint) (uchar) (char) qi << (8 * part);
+        }
+
+        const int q_base = block_index * 32;
+        act_q[q_base + lid] = qr_pack;
+        act_q[q_base + 16 + lid] = qi_pack;
+    }
 }
 
 /**
@@ -234,6 +334,162 @@ kernel void kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8(
             if (row < m) {
                 float out_real = tmp_real[tr * lsize];
                 float out_imag = tmp_imag[tr * lsize];
+
+                if (has_bias) {
+                    const ulong bias_real_off =
+                        (ulong) (row % bias_ne0) * bias_nb0 +
+                        (ulong) (i1 % bias_ne1) * bias_nb1 +
+                        (ulong) (i2 % bias_ne2) * bias_nb2 +
+                        (ulong) (i3 % bias_ne3) * bias_nb3;
+                    const ulong bias_imag_off =
+                        (ulong) ((row + m) % bias_ne0) * bias_nb0 +
+                        (ulong) (i1 % bias_ne1) * bias_nb1 +
+                        (ulong) (i2 % bias_ne2) * bias_nb2 +
+                        (ulong) (i3 % bias_ne3) * bias_nb3;
+                    out_real += *((global float *) (bias + bias_real_off));
+                    out_imag += *((global float *) (bias + bias_imag_off));
+                }
+
+                *((global uint *) (dst + (ulong) col * nb1 + (ulong) row * nb0)) =
+                    fairy2i_tile64_pack_bf16_pair(out_real, out_imag);
+            }
+        }
+    }
+}
+
+/**
+ * Adreno packed-activation W2 variant. Each work-item consumes one uint pack
+ * per real/imaginary plane instead of gathering eight scalar activation bytes.
+ */
+FAIRY2I_REQD_SUBGROUP_SIZE_64
+__attribute__((reqd_work_group_size(64, 1, 1)))
+kernel void kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8_packed(
+        global uchar * u0_q,
+        global half  * u0_d,
+        global uchar * u1_q,
+        global half  * u1_d,
+        global uchar * w0_q,
+        global half  * w0_d,
+        global uchar * w1_q,
+        global half  * w1_d,
+        global uint  * act_q,
+        global half  * act_d,
+        global char  * bias,
+        ulong         offsetb,
+        int           has_bias,
+        global char  * dst,
+        ulong         offsetd,
+        int           k,
+        int           m,
+        int           n,
+        int           x_ne1,
+        int           x_ne2,
+        int           bias_ne0,
+        int           bias_ne1,
+        int           bias_ne2,
+        int           bias_ne3,
+        ulong         bias_nb0,
+        ulong         bias_nb1,
+        ulong         bias_nb2,
+        ulong         bias_nb3,
+        ulong         nb0,
+        ulong         nb1
+) {
+    dst = dst + offsetd;
+    bias = bias + offsetb;
+
+    const int row_base = get_group_id(0) * FAIRY2I_TILE64_WIDE_TILE_M;
+    const int col = get_group_id(1);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    const int block_slot = lid >> 4;
+    const int lane = lid & 15;
+    const int nb64 = k / QK_FAIRY2I_TILE64;
+    const int nbq = k / QK_FAIRY2I_ACT_Q16_64;
+
+    if (col >= n) {
+        return;
+    }
+
+    float acc_real[FAIRY2I_TILE64_WIDE_TILE_M];
+    float acc_imag[FAIRY2I_TILE64_WIDE_TILE_M];
+#pragma unroll
+    for (int i = 0; i < FAIRY2I_TILE64_WIDE_TILE_M; ++i) {
+        acc_real[i] = 0.0f;
+        acc_imag[i] = 0.0f;
+    }
+
+    for (int wb_base = 0; wb_base < nb64; wb_base += 4) {
+        const int wb = wb_base + block_slot;
+
+        if (wb < nb64) {
+            const int act_index = col * nbq + wb;
+            const int q_base = act_index * 32;
+            const uint xr_pack = act_q[q_base + lane];
+            const uint xi_pack = act_q[q_base + 16 + lane];
+            const int xr_correction = -(fairy2i_tile64_sum4_s8(xr_pack) << 7);
+            const int xi_correction = -(fairy2i_tile64_sum4_s8(xi_pack) << 7);
+            const float x_real = vload_half(act_index * 2 + 0, act_d);
+            const float x_imag = vload_half(act_index * 2 + 1, act_d);
+
+#pragma unroll
+            for (int tr = 0; tr < FAIRY2I_TILE64_WIDE_TILE_M; ++tr) {
+                const int row = row_base + tr;
+                if (row >= m) {
+                    continue;
+                }
+
+                const int w_block = row * nb64 + wb;
+                const uint packed_u0 = (uint) u0_q[w_block * 16 + lane];
+                const uint packed_u1 = (uint) u1_q[w_block * 16 + lane];
+                const uint packed_w0 = (uint) w0_q[w_block * 16 + lane];
+                const uint packed_w1 = (uint) w1_q[w_block * 16 + lane];
+
+                const float2 u0_s = vload_half2(w_block, u0_d);
+                const float2 u1_s = vload_half2(w_block, u1_d);
+                const float2 w0_s = vload_half2(w_block, w0_d);
+                const float2 w1_s = vload_half2(w_block, w1_d);
+
+                const int4 u0 = fairy2i_tile64_dot8_sums_packed(packed_u0, xr_pack, xi_pack,
+                                                                 xr_correction, xi_correction);
+                const int4 u1 = fairy2i_tile64_dot8_sums_packed(packed_u1, xr_pack, xi_pack,
+                                                                 xr_correction, xi_correction);
+                const int4 w0 = fairy2i_tile64_dot8_sums_packed(packed_w0, xr_pack, xi_pack,
+                                                                 xr_correction, xi_correction);
+                const int4 w1 = fairy2i_tile64_dot8_sums_packed(packed_w1, xr_pack, xi_pack,
+                                                                 xr_correction, xi_correction);
+
+                acc_real[tr] +=
+                    u0_s.x * x_real * (float) u0.x - u0_s.y * x_imag * (float) u0.w +
+                    u1_s.x * x_real * (float) u1.x - u1_s.y * x_imag * (float) u1.w +
+                    w0_s.x * x_real * (float) w0.x + w0_s.y * x_imag * (float) w0.w +
+                    w1_s.x * x_real * (float) w1.x + w1_s.y * x_imag * (float) w1.w;
+
+                acc_imag[tr] +=
+                    u0_s.y * x_real * (float) u0.z + u0_s.x * x_imag * (float) u0.y +
+                    u1_s.y * x_real * (float) u1.z + u1_s.x * x_imag * (float) u1.y +
+                    w0_s.y * x_real * (float) w0.z - w0_s.x * x_imag * (float) w0.y +
+                    w1_s.y * x_real * (float) w1.z - w1_s.x * x_imag * (float) w1.y;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int tr = 0; tr < FAIRY2I_TILE64_WIDE_TILE_M; ++tr) {
+        acc_real[tr] = sub_group_reduce_add(acc_real[tr]);
+        acc_imag[tr] = sub_group_reduce_add(acc_imag[tr]);
+    }
+
+    if (get_sub_group_local_id() == 0) {
+        const int i1 = col % x_ne1;
+        const int i2 = (col / x_ne1) % x_ne2;
+        const int i3 = col / (x_ne1 * x_ne2);
+#pragma unroll
+        for (int tr = 0; tr < FAIRY2I_TILE64_WIDE_TILE_M; ++tr) {
+            const int row = row_base + tr;
+            if (row < m) {
+                float out_real = acc_real[tr];
+                float out_imag = acc_imag[tr];
 
                 if (has_bias) {
                     const ulong bias_real_off =

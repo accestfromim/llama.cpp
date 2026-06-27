@@ -499,9 +499,13 @@ struct ggml_backend_opencl_context {
     std::vector<ProfilingInfo> profiling_info;
 
     void write_profiling_info() {
-        FILE * fperf = fopen("cl_profiling.csv", "w");
+        const char * fperf_path = getenv("GGML_OPENCL_PROFILING_FILE");
+        if (fperf_path == nullptr || fperf_path[0] == '\0') {
+            fperf_path = "cl_profiling.csv";
+        }
+        FILE * fperf = fopen(fperf_path, "w");
         if (!fperf) {
-            GGML_LOG_ERROR("Failed to open cl_profiling.csv\n");
+            GGML_LOG_ERROR("Failed to open %s\n", fperf_path);
             return;
         }
 
@@ -564,9 +568,13 @@ struct ggml_backend_opencl_context {
         GGML_LOG_INFO("ggml_opencl: total kernel time: %f\n", total_kernel_time);
 
         // Dump a simple chrome trace
-        FILE* ftrace = fopen("cl_trace.json", "w");
+        const char * ftrace_path = getenv("GGML_OPENCL_TRACE_FILE");
+        if (ftrace_path == nullptr || ftrace_path[0] == '\0') {
+            ftrace_path = "cl_trace.json";
+        }
+        FILE* ftrace = fopen(ftrace_path, "w");
         if (!ftrace) {
-            GGML_LOG_ERROR("Failed to open cl_trace.json\n");
+            GGML_LOG_ERROR("Failed to open %s\n", ftrace_path);
             return;
         }
 
@@ -722,7 +730,9 @@ static cl_program build_program_from_source(cl_context ctx, cl_device_id dev, co
 
 static bool ggml_opencl_fairy2i_wide_linear_w2_dot8_requested_env() {
     const char * env = getenv(ggml_opencl_fairy2i_wide_linear_w2_impl_env());
-    return env != nullptr && (strcmp(env, "q16dot8") == 0 || strcmp(env, "dot8") == 0);
+    return env != nullptr &&
+           (strcmp(env, "q16dot8") == 0 || strcmp(env, "dot8") == 0 ||
+            strcmp(env, "q16dot8packed") == 0 || strcmp(env, "dot8packed") == 0);
 }
 
 static bool ggml_opencl_lazy_flash_attn_enabled(const ggml_backend_opencl_context * backend_ctx) {
@@ -808,6 +818,14 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx, ggml_cl_ve
         CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8 =
                       clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64_dot8,
                                      "kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8", &err),
+                  err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_act_q16_64_quantize_dot8_packed =
+                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64_dot8,
+                                     "kernel_fairy2i_tile64_act_q16_64_quantize_dot8_packed", &err),
+                  err));
+        CL_CHECK((backend_ctx->fairy2i.kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8_packed =
+                      clCreateKernel(backend_ctx->fairy2i.program_fairy2i_tile64_dot8,
+                                     "kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8_packed", &err),
                   err));
         GGML_LOG_CONT(".");
     }
@@ -5589,6 +5607,7 @@ static ggml_opencl_tile64_mul_mat_impl ggml_opencl_tile64_mul_mat_impl_from_env(
 enum ggml_opencl_fairy2i_wide_linear_w2_impl {
     GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16,
     GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8,
+    GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8_PACKED,
 };
 
 static ggml_opencl_fairy2i_wide_linear_w2_impl ggml_opencl_fairy2i_wide_linear_w2_impl_from_env() {
@@ -5599,6 +5618,9 @@ static ggml_opencl_fairy2i_wide_linear_w2_impl ggml_opencl_fairy2i_wide_linear_w
     }
     if (strcmp(env, "q16dot8") == 0 || strcmp(env, "dot8") == 0) {
         return GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8;
+    }
+    if (strcmp(env, "q16dot8packed") == 0 || strcmp(env, "dot8packed") == 0) {
+        return GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8_PACKED;
     }
 
     GGML_LOG_WARN("ggml_opencl: ignoring unknown %s=%s\n", env_name, env);
@@ -5874,9 +5896,14 @@ static void ggml_cl_fairy2i_wide_linear_w2(ggml_backend_t backend, ggml_tensor *
     cl_mem act_d = backend_ctx->fairy2i.fairy2i_tile64_act_d_scratch;
     GGML_ASSERT(act_q != nullptr);
     GGML_ASSERT(act_d != nullptr);
+    const ggml_opencl_fairy2i_wide_linear_w2_impl impl = ggml_opencl_fairy2i_wide_linear_w2_impl_from_env();
+    const bool packed_dot8 = impl == GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8_PACKED;
 
     {
-        cl_kernel kernel = backend_ctx->fairy2i.kernel_fairy2i_tile64_act_q16_64_quantize;
+        cl_kernel kernel = packed_dot8 ?
+            backend_ctx->fairy2i.kernel_fairy2i_tile64_act_q16_64_quantize_dot8_packed :
+            backend_ctx->fairy2i.kernel_fairy2i_tile64_act_q16_64_quantize;
+        GGML_ASSERT(kernel != nullptr);
         const int nth = ggml_cl_complex_rms_norm_nth(backend_ctx, kernel);
 
         cl_ulong offset_x = extra_x->offset + x->view_offs;
@@ -5901,9 +5928,11 @@ static void ggml_cl_fairy2i_wide_linear_w2(ggml_backend_t backend, ggml_tensor *
     }
 
     {
-        const ggml_opencl_fairy2i_wide_linear_w2_impl impl = ggml_opencl_fairy2i_wide_linear_w2_impl_from_env();
         cl_kernel kernel = nullptr;
-        if (impl == GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8) {
+        if (packed_dot8) {
+            kernel = backend_ctx->fairy2i.kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8_packed;
+            GGML_ASSERT(kernel != nullptr);
+        } else if (impl == GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8) {
             kernel = backend_ctx->fairy2i.kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8;
             GGML_ASSERT(kernel != nullptr);
         } else {
@@ -5968,9 +5997,11 @@ static void ggml_cl_fairy2i_wide_linear_w2(ggml_backend_t backend, ggml_tensor *
         CL_CHECK(clSetKernelArg(kernel, 27, sizeof(cl_ulong), &bias_nb3));
         CL_CHECK(clSetKernelArg(kernel, 28, sizeof(cl_ulong), &nb0));
         CL_CHECK(clSetKernelArg(kernel, 29, sizeof(cl_ulong), &nb1));
-        CL_CHECK(clSetKernelArg(kernel, 30, sizeof(float) * tile_m * nth, NULL));
-        CL_CHECK(clSetKernelArg(kernel, 31, sizeof(float) * tile_m * nth, NULL));
-        if (impl != GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8) {
+        if (!packed_dot8) {
+            CL_CHECK(clSetKernelArg(kernel, 30, sizeof(float) * tile_m * nth, NULL));
+            CL_CHECK(clSetKernelArg(kernel, 31, sizeof(float) * tile_m * nth, NULL));
+        }
+        if (impl == GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16) {
             CL_CHECK(clSetKernelArg(kernel, 32, sizeof(char) * 4 * tile64_block, NULL));
             CL_CHECK(clSetKernelArg(kernel, 33, sizeof(char) * 4 * tile64_block, NULL));
         }

@@ -88,6 +88,7 @@ android {
                         arguments += "-DGGML_OPENCL=ON"
                         arguments += "-DGGML_OPENCL_USE_ADRENO_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_ADRENO", true)) "ON" else "OFF"}"
                         arguments += "-DGGML_OPENCL_EMBED_KERNELS=${if (envFlag("LLAMA_ANDROID_OPENCL_EMBED_KERNELS", true)) "ON" else "OFF"}"
+                        arguments += "-DGGML_OPENCL_PROFILING=${if (envFlag("LLAMA_ANDROID_OPENCL_PROFILING", false)) "ON" else "OFF"}"
                         arguments += "-DGGML_OPENCL_TARGET_VERSION=${envValue("LLAMA_ANDROID_OPENCL_TARGET_VERSION") ?: "300"}"
                         arguments += "-DOpenCL_INCLUDE_DIR=$includeDir"
                         arguments += "-DOpenCL_LIBRARY=$library"

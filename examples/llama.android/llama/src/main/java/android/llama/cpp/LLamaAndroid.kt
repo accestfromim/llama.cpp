@@ -120,7 +120,9 @@ class LLamaAndroid {
                     Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL unset (q16)")
                 }
                 "q16dot8",
-                "dot8" -> {
+                "dot8",
+                "q16dot8packed",
+                "dot8packed" -> {
                     Os.setenv("GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL", normalized, true)
                     Log.i(LOG_TAG, "Early runtime toggle: GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL=$normalized")
                 }
