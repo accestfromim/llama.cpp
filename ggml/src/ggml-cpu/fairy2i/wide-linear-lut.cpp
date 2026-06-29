@@ -323,10 +323,12 @@ bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * 
     const void * packed_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) tile0 * packed_tile_bytes;
     const void * packed_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
 
-    ggml_fairy2i_tile64_lut_qgemm_lut16((int) nrows, (int) K, (int) N, packed_u0, lut, scales, output + row0 * 2,
-                                        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false, true, false);
-    ggml_fairy2i_tile64_lut_qgemm_lut16((int) nrows, (int) K, (int) N, packed_w0, lut, scales, output + row0 * 2,
-                                        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false, false, true);
+    const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_two_cpu(
+        (int) nrows, (int) K, (int) N, packed_u0, packed_w0, lut, scales, output + row0 * 2,
+        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+    if (!qgemm_ok) {
+        return false;
+    }
 
     for (int64_t col = 0; col < N; ++col) {
         const int64_t i1 = col % x->ne[1];
