@@ -1147,6 +1147,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "COMPLEX_ADD",
     "COMPLEX_RMS_NORM",
     "COMPLEX_MUL",
+    "FAIRY2I_WIDE_LINEAR_W1",
     "FAIRY2I_WIDE_LINEAR_W2",
 };
 
@@ -1266,6 +1267,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "complex_add(x, y)",
     "complex_rms_norm(x)",
     "complex_mul(x,y)",
+    "fairy2i_wide_linear_w1(x)",
     "fairy2i_wide_linear_w2(x)",
 };
 
@@ -4283,6 +4285,44 @@ struct ggml_tensor * ggml_fairy2i_wide_linear_w2(struct ggml_context * ctx,
                                                  struct ggml_tensor *  bias) {
     return ggml_wide_linear_w2_impl(ctx, x, u_s0, u_s1, w_s0, w_s1, bias, GGML_TYPE_FAIRY2I_TILE64_V2,
                                     GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+}
+
+struct ggml_tensor * ggml_fairy2i_wide_linear_w1(struct ggml_context * ctx,
+                                                 struct ggml_tensor *  x,
+                                                 struct ggml_tensor *  u_s0,
+                                                 struct ggml_tensor *  w_s0,
+                                                 struct ggml_tensor *  bias) {
+    GGML_ASSERT(x);
+    GGML_ASSERT(u_s0);
+    GGML_ASSERT(w_s0);
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(u_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2);
+    GGML_ASSERT(w_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2);
+    GGML_ASSERT(ggml_can_mul_mat(u_s0, x));
+    GGML_ASSERT(ggml_can_mul_mat(w_s0, x));
+    GGML_ASSERT(x->ne[0] % QK_FAIRY2I_TILE64 == 0);
+    GGML_ASSERT(u_s0->ne[1] == w_s0->ne[1]);
+
+    const int64_t ne[4] = { u_s0->ne[1], x->ne[1], x->ne[2], x->ne[3] };
+
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT((2 * ne[0]) % bias->ne[0] == 0);
+        GGML_ASSERT(ne[1] % bias->ne[1] == 0);
+        GGML_ASSERT(ne[2] % bias->ne[2] == 0);
+        GGML_ASSERT(ne[3] % bias->ne[3] == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_FAIRY2I_WIDE_LINEAR_W1;
+    result->src[0] = x;
+    result->src[1] = u_s0;
+    result->src[2] = w_s0;
+    result->src[3] = bias;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,

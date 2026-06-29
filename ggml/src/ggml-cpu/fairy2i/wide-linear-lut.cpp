@@ -32,8 +32,8 @@ static inline float ggml_fairy2i_wide_linear_lut_bias_at(const struct ggml_tenso
     return *(const float *) ptr;
 }
 
-static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_tensor * dst) {
-    for (int i = 1; i <= 4; ++i) {
+static bool ggml_fairy2i_wide_linear_have_packed_weights(const struct ggml_tensor * dst, int first_src, int last_src) {
+    for (int i = first_src; i <= last_src; ++i) {
         const struct ggml_tensor * weight = dst->src[i];
         const struct fairy2i_lut_extra * extra = weight ? (const struct fairy2i_lut_extra *) weight->extra : nullptr;
         if (!extra || !extra->packed_w) {
@@ -41,6 +41,14 @@ static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_te
         }
     }
     return true;
+}
+
+static bool ggml_fairy2i_wide_linear_w1_have_packed_weights(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_have_packed_weights(dst, 1, 2);
+}
+
+static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_have_packed_weights(dst, 1, 4);
 }
 
 void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
@@ -189,7 +197,7 @@ void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *       
     ggml_fairy2i_tile64_lut_quantize_block_q16_64(x, y, true);
 }
 
-size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
+static size_t ggml_fairy2i_wide_linear_lut_wsize_common(const struct ggml_tensor * dst) {
     const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
     if (!x || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || x->ne[0] % QK_FAIRY2I_TILE64 != 0) {
         return 0;
@@ -231,6 +239,114 @@ size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
     GGML_ASSERT(q_bytes <= SIZE_MAX - shared_bytes);
     GGML_ASSERT(q_bytes + shared_bytes <= SIZE_MAX - output_bytes);
     return q_bytes + shared_bytes + output_bytes;
+}
+
+size_t ggml_fairy2i_wide_linear_w1_lut_wsize(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_lut_wsize_common(dst);
+}
+
+size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_lut_wsize_common(dst);
+}
+
+bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * params,
+                                              struct ggml_tensor *                dst,
+                                              bool                                lut_c) {
+    if (lut_c) {
+        return false;
+    }
+    if (!ggml_fairy2i_wide_linear_w1_have_packed_weights(dst)) {
+        return false;
+    }
+
+    const struct ggml_tensor * x      = dst->src[0];
+    const struct ggml_tensor * bias   = dst->src[3];
+    const int64_t K                   = x->ne[0];
+    const int64_t M                   = dst->ne[0];
+    const int64_t N                   = ggml_nrows(x);
+    const int64_t weight_blocks       = K / QK_FAIRY2I_TILE64;
+    const int64_t groups              = weight_blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    const size_t  q_bytes             = GGML_PAD((size_t) N * (size_t) weight_blocks * sizeof(block_fairy2i_act_q16_64), 64);
+    const size_t  lut_bytes           = (size_t) N * (size_t) groups * k_fairy2i_lut_group_bytes;
+    const size_t  shared_bytes        =
+        GGML_PAD(lut_bytes + (size_t) N * (size_t) weight_blocks * 2u * sizeof(float), 64);
+    const size_t  need                = ggml_fairy2i_wide_linear_w1_lut_wsize(dst);
+
+    if (!params->wdata || params->wsize < need) {
+        return false;
+    }
+
+    block_fairy2i_act_q16_64 * q_x    = (block_fairy2i_act_q16_64 *) params->wdata;
+    uint8_t *            shared = (uint8_t *) params->wdata + q_bytes;
+    void *               lut    = shared;
+    float *              scales = (float *) (shared + lut_bytes);
+    float *              output = (float *) (shared + shared_bytes);
+
+    if (N >= params->nth) {
+        for (int64_t ir = params->ith; ir < N; ir += params->nth) {
+            const float * x_row = (const float *) ((const char *) x->data + ir * x->nb[1]);
+            block_fairy2i_act_q16_64 * q_row = q_x + ir * weight_blocks;
+            for (int64_t ib = 0; ib < weight_blocks; ++ib) {
+                ggml_fairy2i_tile64_lut_quantize_block_q16_64(x_row + ib * QK_FAIRY2I_TILE64, q_row + ib, true);
+            }
+        }
+        ggml_fairy2i_tile64_lut_preprocess_ex_q16_64_lut16((int) M, (int) K, (int) N, q_x,
+                                                       (size_t) weight_blocks * sizeof(block_fairy2i_act_q16_64), scales,
+                                                       lut, params->ith, params->nth);
+    } else {
+        for (int64_t ir = 0; ir < N; ++ir) {
+            const float * x_row = (const float *) ((const char *) x->data + ir * x->nb[1]);
+            block_fairy2i_act_q16_64 * q_row = q_x + ir * weight_blocks;
+            float * scale_row = scales + ir * weight_blocks * 2;
+            int8_t * lut_row = (int8_t *) lut + ir * groups * k_fairy2i_lut_group_bytes;
+
+            for (int64_t ib = params->ith; ib < weight_blocks; ib += params->nth) {
+                ggml_fairy2i_tile64_lut_quantize_block_q16_64(x_row + ib * QK_FAIRY2I_TILE64, q_row + ib, false);
+                ggml_fairy2i_tile64_lut_preprocess_q16_64_block_lut16(
+                    q_row + ib, scale_row + ib * 2,
+                    lut_row + ib * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK * k_fairy2i_lut_group_bytes);
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    const int64_t tiles_total = (M + 15) / 16;
+    const int64_t tile0       = (tiles_total * params->ith) / params->nth;
+    const int64_t tile1       = (tiles_total * (params->ith + 1)) / params->nth;
+    const int64_t row0        = tile0 * 16;
+    const int64_t row1        = std::min<int64_t>(tile1 * 16, M);
+    const int64_t nrows       = row1 - row0;
+    const size_t  packed_tile_bytes = (size_t) weight_blocks * sizeof(fairy2i_tile64_lut_wtile_16);
+
+    const fairy2i_lut_extra * extra_u0 = (const fairy2i_lut_extra *) dst->src[1]->extra;
+    const fairy2i_lut_extra * extra_w0 = (const fairy2i_lut_extra *) dst->src[2]->extra;
+    const void * packed_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const void * packed_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
+
+    ggml_fairy2i_tile64_lut_qgemm_lut16((int) nrows, (int) K, (int) N, packed_u0, lut, scales, output + row0 * 2,
+                                        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false, true, false);
+    ggml_fairy2i_tile64_lut_qgemm_lut16((int) nrows, (int) K, (int) N, packed_w0, lut, scales, output + row0 * 2,
+                                        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false, false, true);
+
+    for (int64_t col = 0; col < N; ++col) {
+        const int64_t i1 = col % x->ne[1];
+        const int64_t i2 = (col / x->ne[1]) % x->ne[2];
+        const int64_t i3 = col / (x->ne[1] * x->ne[2]);
+        const float * output_col = output + col * M * 2;
+        char * dst_col = (char *) dst->data + col * dst->nb[1];
+        for (int64_t row = row0; row < row1; ++row) {
+            float real = output_col[row * 2 + 0];
+            float imag = output_col[row * 2 + 1];
+            if (bias) {
+                real += ggml_fairy2i_wide_linear_lut_bias_at(bias, row, i1, i2, i3);
+                imag += ggml_fairy2i_wide_linear_lut_bias_at(bias, row + M, i1, i2, i3);
+            }
+            ggml_bf16_t * out = (ggml_bf16_t *) (dst_col + row * dst->nb[0]);
+            out[0]             = GGML_FP32_TO_BF16(real);
+            out[1]             = GGML_FP32_TO_BF16(imag);
+        }
+    }
+    return true;
 }
 
 bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * params,
@@ -340,9 +456,23 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
 
 #else
 
+size_t ggml_fairy2i_wide_linear_w1_lut_wsize(const struct ggml_tensor * dst) {
+    (void) dst;
+    return 0;
+}
+
 size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
     (void) dst;
     return 0;
+}
+
+bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * params,
+                                              struct ggml_tensor *                dst,
+                                              bool                                lut_c) {
+    (void) params;
+    (void) dst;
+    (void) lut_c;
+    return false;
 }
 
 bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * params,

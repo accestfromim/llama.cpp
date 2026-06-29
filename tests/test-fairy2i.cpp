@@ -16,18 +16,30 @@ void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_til
                                                          const block_fairy2i_tile64_v2 *  w1,
                                                          const block_fairy2i_act_q16_64 * x,
                                                          int32_t                          sums[4][4]);
+void ggml_fairy2i_tile64_fuse_accumulate_block_two_neon(const block_fairy2i_tile64_v2 *  u0,
+                                                        const block_fairy2i_tile64_v2 *  w0,
+                                                        const block_fairy2i_act_q16_64 * x,
+                                                        int32_t                          sums[2][4]);
 void ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(const block_fairy2i_tile64_v2 *  u0,
                                                             const block_fairy2i_tile64_v2 *  u1,
                                                             const block_fairy2i_tile64_v2 *  w0,
                                                             const block_fairy2i_tile64_v2 *  w1,
                                                             const block_fairy2i_act_q16_64 * x,
                                                             int32_t                          sums[4][4]);
+void ggml_fairy2i_tile64_fuse_accumulate_block_two_dotprod(const block_fairy2i_tile64_v2 *  u0,
+                                                           const block_fairy2i_tile64_v2 *  w0,
+                                                           const block_fairy2i_act_q16_64 * x,
+                                                           int32_t                          sums[2][4]);
 bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile64_v2 *  u0,
                                                         const block_fairy2i_tile64_v2 *  u1,
                                                         const block_fairy2i_tile64_v2 *  w0,
                                                         const block_fairy2i_tile64_v2 *  w1,
                                                         const block_fairy2i_act_q16_64 * x,
                                                         int32_t                          sums[4][4]);
+bool ggml_fairy2i_tile64_fuse_accumulate_block_two_arm(const block_fairy2i_tile64_v2 *  u0,
+                                                       const block_fairy2i_tile64_v2 *  w0,
+                                                       const block_fairy2i_act_q16_64 * x,
+                                                       int32_t                          sums[2][4]);
 #endif
 }
 
@@ -116,6 +128,13 @@ struct fairy2i_w2_data {
     std::vector<block_fairy2i_tile64_v2> w_s1;
 };
 
+struct fairy2i_w1_data {
+    std::vector<float>                   x;
+    std::vector<float>                   bias;
+    std::vector<block_fairy2i_tile64_v2> u_s0;
+    std::vector<block_fairy2i_tile64_v2> w_s0;
+};
+
 static uint32_t pack_bf16_pair(float real, float imag) {
     ggml_bf16_t pair[2];
     pair[0] = GGML_FP32_TO_BF16(real);
@@ -202,6 +221,17 @@ static fairy2i_w2_data make_fairy2i_w2_data(const fairy2i_w2_case & tc) {
     fill_fairy2i_weights(data.u_s1, tc.M, tc.K, 5);
     fill_fairy2i_weights(data.w_s0, tc.M, tc.K, 9);
     fill_fairy2i_weights(data.w_s1, tc.M, tc.K, 13);
+    return data;
+}
+
+static fairy2i_w1_data make_fairy2i_w1_data(const fairy2i_w2_case & tc) {
+    fairy2i_w1_data data;
+    data.x = make_fairy2i_input(tc.N, tc.K);
+    if (tc.bias) {
+        data.bias = make_fairy2i_bias(tc.M);
+    }
+    fill_fairy2i_weights(data.u_s0, tc.M, tc.K, 1);
+    fill_fairy2i_weights(data.w_s0, tc.M, tc.K, 9);
     return data;
 }
 
@@ -528,6 +558,19 @@ static bool compare_fairy2i_sums(const char * label, const int32_t actual[4][4],
     return true;
 }
 
+static bool compare_fairy2i_sums_two(const char * label, const int32_t actual[2][4], const int32_t expected[2][4]) {
+    for (int branch = 0; branch < 2; ++branch) {
+        for (int channel = 0; channel < 4; ++channel) {
+            if (actual[branch][channel] != expected[branch][channel]) {
+                fprintf(stderr, "%s mismatch branch=%d channel=%d actual=%d expected=%d\n", label, branch, channel,
+                        actual[branch][channel], expected[branch][channel]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static block_fairy2i_act_q16_64 make_fairy2i_test_act_block(int salt) {
     block_fairy2i_act_q16_64 x{};
     x.d_real = GGML_FP32_TO_FP16(0.03125f);
@@ -623,6 +666,14 @@ static void fairy2i_accumulate_four_scalar(const block_fairy2i_tile64_v2 &  u0,
     fairy2i_accumulate_block_scalar(w1, x, sums[3]);
 }
 
+static void fairy2i_accumulate_two_scalar(const block_fairy2i_tile64_v2 &  u0,
+                                          const block_fairy2i_tile64_v2 &  w0,
+                                          const block_fairy2i_act_q16_64 & x,
+                                          int32_t                          sums[2][4]) {
+    fairy2i_accumulate_block_scalar(u0, x, sums[0]);
+    fairy2i_accumulate_block_scalar(w0, x, sums[1]);
+}
+
 static bool test_fairy2i_arm_accumulate_neon() {
 #if defined(__aarch64__) && defined(__ARM_NEON)
     if (!ggml_fairy2i_tile64_w2_arm_neon_available()) {
@@ -645,10 +696,21 @@ static bool test_fairy2i_arm_accumulate_neon() {
         int32_t actual_arm[4][4]     = {};
         int32_t actual_no_dot[4][4]  = {};
         int32_t actual_dotprod[4][4] = {};
+        int32_t expected_two[2][4]       = {};
+        int32_t actual_two_neon[2][4]    = {};
+        int32_t actual_two_arm[2][4]     = {};
+        int32_t actual_two_no_dot[2][4]  = {};
+        int32_t actual_two_dotprod[2][4] = {};
         fairy2i_accumulate_four_scalar(u0, u1, w0, w1, x, expected);
+        fairy2i_accumulate_two_scalar(u0, w0, x, expected_two);
         ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(&u0, &u1, &w0, &w1, &x, actual_neon);
+        ggml_fairy2i_tile64_fuse_accumulate_block_two_neon(&u0, &w0, &x, actual_two_neon);
         if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0, &u1, &w0, &w1, &x, actual_arm)) {
             fprintf(stderr, "Fairy2i ARM dispatcher unexpectedly declined pattern=%d\n", pattern);
+            ok = false;
+        }
+        if (!ggml_fairy2i_tile64_fuse_accumulate_block_two_arm(&u0, &w0, &x, actual_two_arm)) {
+            fprintf(stderr, "Fairy2i ARM W1 dispatcher unexpectedly declined pattern=%d\n", pattern);
             ok = false;
         }
 
@@ -657,22 +719,35 @@ static bool test_fairy2i_arm_accumulate_neon() {
             fprintf(stderr, "Fairy2i ARM NEON fallback unexpectedly declined pattern=%d\n", pattern);
             ok = false;
         }
+        if (!ggml_fairy2i_tile64_fuse_accumulate_block_two_arm(&u0, &w0, &x, actual_two_no_dot)) {
+            fprintf(stderr, "Fairy2i ARM W1 NEON fallback unexpectedly declined pattern=%d\n", pattern);
+            ok = false;
+        }
         env_disable_dotprod.unset();
 
         if (has_dotprod) {
             ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(&u0, &u1, &w0, &w1, &x, actual_dotprod);
+            ggml_fairy2i_tile64_fuse_accumulate_block_two_dotprod(&u0, &w0, &x, actual_two_dotprod);
         }
 
         char label[96];
         snprintf(label, sizeof(label), "Fairy2i ARM NEON accumulate pattern=%d", pattern);
         ok = compare_fairy2i_sums(label, actual_neon, expected) && ok;
+        snprintf(label, sizeof(label), "Fairy2i ARM W1 NEON accumulate pattern=%d", pattern);
+        ok = compare_fairy2i_sums_two(label, actual_two_neon, expected_two) && ok;
         snprintf(label, sizeof(label), "Fairy2i ARM dispatcher accumulate pattern=%d", pattern);
         ok = compare_fairy2i_sums(label, actual_arm, expected) && ok;
+        snprintf(label, sizeof(label), "Fairy2i ARM W1 dispatcher accumulate pattern=%d", pattern);
+        ok = compare_fairy2i_sums_two(label, actual_two_arm, expected_two) && ok;
         snprintf(label, sizeof(label), "Fairy2i ARM NEON fallback accumulate pattern=%d", pattern);
         ok = compare_fairy2i_sums(label, actual_no_dot, expected) && ok;
+        snprintf(label, sizeof(label), "Fairy2i ARM W1 NEON fallback accumulate pattern=%d", pattern);
+        ok = compare_fairy2i_sums_two(label, actual_two_no_dot, expected_two) && ok;
         if (has_dotprod) {
             snprintf(label, sizeof(label), "Fairy2i ARM dotprod accumulate pattern=%d", pattern);
             ok = compare_fairy2i_sums(label, actual_dotprod, expected) && ok;
+            snprintf(label, sizeof(label), "Fairy2i ARM W1 dotprod accumulate pattern=%d", pattern);
+            ok = compare_fairy2i_sums_two(label, actual_two_dotprod, expected_two) && ok;
         }
     }
 
@@ -738,6 +813,124 @@ static std::vector<uint32_t> fairy2i_w2_scalar_reference(const fairy2i_w2_case &
         }
     }
     return out;
+}
+
+static std::vector<uint32_t> fairy2i_w1_scalar_reference(const fairy2i_w2_case & tc, const fairy2i_w1_data & data) {
+    const int64_t blocks = tc.K / QK_FAIRY2I_TILE64;
+    std::vector<block_fairy2i_act_q16_64> q_x;
+    quantize_fairy2i_act_q16_64(q_x, data.x, tc.N, tc.K);
+
+    std::vector<uint32_t> out((size_t) tc.M * (size_t) tc.N);
+    for (int64_t n = 0; n < tc.N; ++n) {
+        for (int64_t row = 0; row < tc.M; ++row) {
+            float real = 0.0f;
+            float imag = 0.0f;
+            for (int64_t ib = 0; ib < blocks; ++ib) {
+                const block_fairy2i_act_q16_64 & x =
+                    q_x[(size_t) n * (size_t) blocks + (size_t) ib];
+                const size_t w_idx = (size_t) row * (size_t) blocks + (size_t) ib;
+
+                int32_t sums[2][4] = {};
+                fairy2i_accumulate_block_scalar(data.u_s0[w_idx], x, sums[0]);
+                fairy2i_accumulate_block_scalar(data.w_s0[w_idx], x, sums[1]);
+
+                fairy2i_apply_branch(data.u_s0[w_idx], x, sums[0], false, real, imag);
+                fairy2i_apply_branch(data.w_s0[w_idx], x, sums[1], true, real, imag);
+            }
+
+            if (tc.bias) {
+                real += data.bias[(size_t) row];
+                imag += data.bias[(size_t) row + (size_t) tc.M];
+            }
+
+            out[(size_t) n * (size_t) tc.M + (size_t) row] = pack_bf16_pair(real, imag);
+        }
+    }
+    return out;
+}
+
+static bool run_fairy2i_w1_backend(std::vector<uint32_t> & out,
+                                   const fairy2i_w2_case & tc,
+                                   const fairy2i_w1_data & data,
+                                   bool                    lut_enabled,
+                                   bool                    force_scalar) {
+    scoped_env_var env_lut("GGML_FAIRY2I_LUT");
+    scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
+    scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
+    scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+    env_lut.set(lut_enabled ? "1" : "0");
+    env_impl.set("lut16");
+    env_require_lut.set(lut_enabled ? "1" : "0");
+    if (force_scalar) {
+        env_force_scalar.set("1");
+    } else {
+        env_force_scalar.unset();
+    }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        fprintf(stderr, "failed to initialize CPU backend\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, 4);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/32 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "failed to initialize ggml context\n");
+        return false;
+    }
+
+    ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * u_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * bias = tc.bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tc.M) : nullptr;
+    ggml_tensor * y    = ggml_fairy2i_wide_linear_w1(ctx, x, u_s0, w_s0, bias);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "failed to allocate backend buffer\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, data.x.data(), 0, data.x.size() * sizeof(float));
+    ggml_backend_tensor_set(u_s0, data.u_s0.data(), 0, data.u_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w_s0, data.w_s0.data(), 0, data.w_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    if (bias) {
+        ggml_backend_tensor_set(bias, data.bias.data(), 0, data.bias.size() * sizeof(float));
+    }
+
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "Fairy2i W1 graph compute failed: %s\n", ggml_status_to_string(status));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<float> out_f32((size_t) tc.M * (size_t) tc.N);
+    ggml_backend_tensor_get(y, out_f32.data(), 0, out_f32.size() * sizeof(float));
+
+    out.resize(out_f32.size());
+    for (size_t i = 0; i < out_f32.size(); ++i) {
+        memcpy(&out[i], &out_f32[i], sizeof(uint32_t));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
 }
 
 static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
@@ -1200,6 +1393,71 @@ static bool test_fairy2i_wide_linear_w2_variants() {
     return ok;
 }
 
+static bool test_fairy2i_wide_linear_w1_variants() {
+    const int64_t Ms[] = { 1, 7, 16, 17, 23, 32, 33 };
+    const int64_t Ks[] = { 64, 128, 192, 256, 320, 1024 };
+    const int64_t Ns[] = { 1, 2, 4, 8 };
+
+    int  cases_run = 0;
+    bool ok        = true;
+    const bool compare_scalar_default =
+        ggml_cpu_has_avx2() != 0 || ggml_cpu_has_neon() != 0 || ggml_cpu_has_dotprod() != 0;
+
+    for (int64_t M : Ms) {
+        for (int64_t K : Ks) {
+            for (int64_t N : Ns) {
+                for (bool with_bias : { false, true }) {
+                    const fairy2i_w2_case tc = { M, N, K, with_bias };
+                    const fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+                    const std::vector<uint32_t> ref = fairy2i_w1_scalar_reference(tc, data);
+
+                    std::vector<uint32_t> direct;
+                    std::vector<uint32_t> direct_scalar;
+                    std::vector<uint32_t> lut;
+                    if (!run_fairy2i_w1_backend(direct, tc, data, false, false)) {
+                        return false;
+                    }
+                    if (compare_scalar_default && !run_fairy2i_w1_backend(direct_scalar, tc, data, false, true)) {
+                        return false;
+                    }
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+                    if (!run_fairy2i_w1_backend(lut, tc, data, true, false)) {
+                        return false;
+                    }
+#endif
+
+                    char label[160];
+                    snprintf(label, sizeof(label), "W1 reference vs direct M=%lld N=%lld K=%lld bias=%d",
+                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    ok = compare_exact(label, direct, ref) && ok;
+
+                    if (compare_scalar_default) {
+                        snprintf(label, sizeof(label), "W1 forced scalar vs default M=%lld N=%lld K=%lld bias=%d",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias);
+                        ok = compare_exact(label, direct_scalar, direct) && ok;
+                    }
+
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+                    snprintf(label, sizeof(label), "W1 direct vs LUT M=%lld N=%lld K=%lld bias=%d",
+                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    ok = compare_packed_complex(label, lut, direct, 1e-2f) && ok;
+#endif
+                    ++cases_run;
+                }
+            }
+        }
+    }
+
+    if (!compare_scalar_default) {
+        printf("  Fairy2i W1 scalar/default fast-path compare skipped: CPU backend lacks AVX2/NEON/dotprod\n");
+    }
+#if !defined(GGML_USE_FAIRY2I_CPU_LUT)
+    printf("  Fairy2i W1 LUT compare skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+#endif
+    printf("  Fairy2i W1 variant matrix: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main() {
     ggml_cpu_init();
 
@@ -1218,6 +1476,10 @@ int main() {
     }
     if (!test_fairy2i_lut_qgemm_add()) {
         fprintf(stderr, "Fairy2i LUT qgemm add FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_wide_linear_w1_variants()) {
+        fprintf(stderr, "Fairy2i W1 variant matrix FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w2_variants()) {

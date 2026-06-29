@@ -12,6 +12,14 @@ Status: Draft (2026-03-13)
 
 ---
 
+## 2026-06-29 — Fairy2i W1 learned-scale fused wide-linear
+
+- 新增 Fairy2i W1 专用 fused op：`GGML_OP_FAIRY2I_WIDE_LINEAR_W1`。
+- 新增 opt-in graph 开关：`LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=1`。
+- W1 路径只消费 `U.s0/W.s0`，服务 `tile64_v2_w1_learned_scale`；不使用空 `s1` 兼容 W2。
+- CPU direct 覆盖 scalar/AVX2/AVX512/ARM NEON/dotprod；CPU LUT16 路径复用 tile64 LUT preprocess，并用两次单权重 qgemm 组合 U/W。
+- 回归入口：`test-fairy2i` 的 W1 variant matrix；LUT build 下 `GGML_FAIRY2I_LUT=1` 会通过 require-lut 覆盖 W1 LUT。
+
 ## 基线（Baseline）
 
 ### vec_dot（现有 fastest 路径）

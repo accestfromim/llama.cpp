@@ -34,6 +34,11 @@ static bool llama_fairy2i_fused_wide_linear_w2_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
+static bool llama_fairy2i_fused_wide_linear_w1_enabled() {
+    const char * env = getenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -14214,6 +14219,17 @@ struct llm_build_fairy2i : public llm_graph_context {
         auto build_wide_linear = [&](const llama_widely_linear_ifairy & linear, ggml_tensor * x, ggml_tensor * x_conj,
                                      ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
             GGML_ASSERT(linear.U[0] && linear.W[0]);
+
+            const bool can_fuse_w1 =
+                model.fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE &&
+                llama_fairy2i_fused_wide_linear_w1_enabled() && loras->empty() && !linear.U[1] && !linear.W[1] &&
+                linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2;
+            if (can_fuse_w1) {
+                ggml_tensor * y = ggml_fairy2i_wide_linear_w1(ctx0, x, linear.U[0], linear.W[0], bias);
+                cb(y, name, il);
+                return y;
+            }
 
             const bool can_fuse_w2 = llama_fairy2i_fused_wide_linear_w2_enabled() && loras->empty() && linear.U[1] &&
                                      linear.W[1] &&

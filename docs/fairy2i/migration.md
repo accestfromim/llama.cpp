@@ -130,13 +130,14 @@ scripts/ci-fairy2i-cpu.sh
 | `GGML_TYPE_IFAIRY64` | legacy iFairy tile64 storage |
 | `GGML_TYPE_FAIRY2I_TILE64_V2` | Fairy2i tile64_v2 storage |
 | `GGML_OP_IFAIRY_WIDE_LINEAR_W2` | legacy iFairy W2 |
+| `GGML_OP_FAIRY2I_WIDE_LINEAR_W1` | Fairy2i W1 learned-scale |
 | `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` | Fairy2i W2 |
 
 ## Compatibility Matrix
 
 | Configuration | Expected behavior |
 | --- | --- |
-| Fairy2i CPU only | runs `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`; legacy iFairy ops are unsupported |
+| Fairy2i CPU only | runs Fairy2i W1/W2 fused wide-linear ops; legacy iFairy ops are unsupported |
 | legacy iFairy CPU only | runs legacy vecdot and W2; Fairy2i ops are unsupported |
 | Fairy2i OpenCL only | copies/embeds `complex_*` and `fairy2i_tile64` kernels only |
 | legacy iFairy with OpenCL enabled | OpenCL reports legacy iFairy unsupported; CPU legacy path remains available |
