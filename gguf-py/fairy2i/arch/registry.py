@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from . import llama, qwen2
+from . import llama, qwen2, qwen3
 from .base import Fairy2IArchInfo
 
 
-ADAPTERS = (llama, qwen2)
+ADAPTERS = (llama, qwen2, qwen3)
 
 
 def get_arch_info(name: str) -> Fairy2IArchInfo:
