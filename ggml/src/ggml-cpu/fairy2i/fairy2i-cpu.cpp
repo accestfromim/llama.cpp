@@ -81,6 +81,11 @@ static bool ggml_fairy2i_cpu_debug_enabled(void) {
     return env && strcmp(env, "0") != 0;
 }
 
+static bool ggml_fairy2i_cpu_timing_enabled(void) {
+    const char * env = getenv("GGML_FAIRY2I_CPU_TIMING");
+    return env && strcmp(env, "0") != 0;
+}
+
 static bool ggml_fairy2i_test_force_scalar(void) {
     const char * env = getenv("GGML_FAIRY2I_TEST_FORCE_SCALAR");
     return env && strcmp(env, "0") != 0;
@@ -174,6 +179,25 @@ static void ggml_fairy2i_cpu_debug_log_once(const struct ggml_compute_params *  
                   ggml_fairy2i_cpu_op_log_name(dst), path ? path : "unknown", (long long) (dst ? dst->ne[0] : 0),
                   (long long) (x ? ggml_nrows(x) : 0), (long long) (x ? x->ne[0] : 0), params ? params->nth : 1,
                   ggml_fairy2i_cpu_lut_packed_weights_ready(dst) ? 1 : 0, plan ? plan->lut_bytes : 0);
+}
+
+static int64_t ggml_fairy2i_cpu_timing_start_us(const struct ggml_compute_params * params) {
+    return ggml_fairy2i_cpu_timing_enabled() && params && params->ith == 0 ? ggml_time_us() : 0;
+}
+
+static void ggml_fairy2i_cpu_timing_log(const struct ggml_compute_params * params,
+                                        const struct ggml_tensor *         dst,
+                                        const char *                       path,
+                                        int64_t                            start_us) {
+    if (start_us == 0 || !params || params->ith != 0) {
+        return;
+    }
+
+    const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
+    GGML_LOG_INFO("%s: timing path=%s us=%lld M=%lld N=%lld K=%lld nth=%d\n",
+                  ggml_fairy2i_cpu_op_log_name(dst), path ? path : "unknown",
+                  (long long) (ggml_time_us() - start_us), (long long) (dst ? dst->ne[0] : 0),
+                  (long long) (x ? ggml_nrows(x) : 0), (long long) (x ? x->ne[0] : 0), params->nth);
 }
 
 static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_tasks, struct ggml_fairy2i_cpu_plan * plan) {
@@ -274,10 +298,14 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w1(const struct ggml_compute_pa
         return false;
     }
 
+    const int64_t timing_start_us = ggml_fairy2i_cpu_timing_start_us(params);
+
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
     if (plan.use_lut) {
         if (ggml_fairy2i_wide_linear_w1_compute_lut(params, dst, plan.lut_c)) {
-            ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, plan.lut_c ? "lut_c" : "lut16");
+            const char * path = plan.lut_c ? "lut_c" : "lut16";
+            ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, path);
+            ggml_fairy2i_cpu_timing_log(params, dst, path, timing_start_us);
             return true;
         }
         if (ggml_fairy2i_test_require_lut()) {
@@ -287,7 +315,9 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w1(const struct ggml_compute_pa
 #endif
 
     ggml_fairy2i_wide_linear_w1_compute(params, dst);
-    ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, ggml_fairy2i_cpu_direct_path_name());
+    const char * path = ggml_fairy2i_cpu_direct_path_name();
+    ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, path);
+    ggml_fairy2i_cpu_timing_log(params, dst, path, timing_start_us);
     return true;
 }
 
@@ -297,10 +327,14 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
         return false;
     }
 
+    const int64_t timing_start_us = ggml_fairy2i_cpu_timing_start_us(params);
+
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
     if (plan.use_lut) {
         if (ggml_fairy2i_wide_linear_w2_compute_lut(params, dst, plan.lut_c)) {
-            ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, plan.lut_c ? "lut_c" : "lut16");
+            const char * path = plan.lut_c ? "lut_c" : "lut16";
+            ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, path);
+            ggml_fairy2i_cpu_timing_log(params, dst, path, timing_start_us);
             return true;
         }
         if (ggml_fairy2i_test_require_lut()) {
@@ -310,7 +344,9 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
 #endif
 
     ggml_fairy2i_wide_linear_w2_compute(params, dst);
-    ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, ggml_fairy2i_cpu_direct_path_name());
+    const char * path = ggml_fairy2i_cpu_direct_path_name();
+    ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, path);
+    ggml_fairy2i_cpu_timing_log(params, dst, path, timing_start_us);
     return true;
 }
 

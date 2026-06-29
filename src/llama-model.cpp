@@ -14354,6 +14354,9 @@ struct llm_build_fairy2i : public llm_graph_context {
             cur = ggml_complex_add(ctx0, cur, ffn_inp);
             cb(cur, "ffn_res", il);
 
+            cur = build_cvec(cur, il);
+            cb(cur, "l_out", il);
+
             inpL = cur;
         }
 
@@ -20212,6 +20215,12 @@ int32_t llama_n_head(const llama_model * model) {
 }
 
 llama_rope_type llama_model_rope_type(const llama_model * model) {
+    if (model->arch == LLM_ARCH_FAIRY2I &&
+        (model->fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL ||
+         model->fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL)) {
+        return LLAMA_ROPE_TYPE_NEOX;
+    }
+
     switch (model->arch) {
         // these models do not use RoPE
         case LLM_ARCH_GPT2:

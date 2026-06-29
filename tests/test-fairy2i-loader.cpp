@@ -151,6 +151,14 @@ static bool load_model_expect(const char * label, fairy2i_loader_case tc, bool e
 
     llama_model * model = llama_model_load_from_file(path.c_str(), params);
     const bool    ok    = model != nullptr;
+    if (ok && expect_success && tc == fairy2i_loader_case::valid_w1 &&
+        llama_model_rope_type(model) != LLAMA_ROPE_TYPE_NEOX) {
+        fprintf(stderr, "%s: expected Qwen3-real Fairy2i rope type NEOX, got %d\n", label,
+                (int) llama_model_rope_type(model));
+        llama_model_free(model);
+        unlink(path.c_str());
+        return false;
+    }
     llama_model_free(model);
     unlink(path.c_str());
 

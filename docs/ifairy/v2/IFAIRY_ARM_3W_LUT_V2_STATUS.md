@@ -69,9 +69,10 @@ Status: Draft (2026-03-13)
   - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1`：在支持 dotprod 的 ARM64 设备上强制 dispatcher 走 NEON fallback，用于覆盖 direct wide-linear-fused 的 NEON 路径。
 - 这两个变量只用于测试/CI 覆盖，不作为生产调优 knob。
 - 新增 debug-only 环境变量：
-  - `GGML_FAIRY2I_CPU_DEBUG=1`：默认关闭；W2 compute 每种 CPU path 首次命中时打印 `path=direct_scalar|direct_neon|direct_dotprod|lut16|lut_c`、`M/N/K/nth` 和 packed-weight 状态。
+  - `GGML_FAIRY2I_CPU_DEBUG=1`：默认关闭；W1/W2 compute 每种 CPU path 首次命中时打印 `path=direct_scalar|direct_avx2|direct_avx512|direct_neon|direct_dotprod|lut16|lut_c`、`M/N/K/nth` 和 packed-weight 状态。
+  - `GGML_FAIRY2I_CPU_TIMING=1`：默认关闭；W1/W2 fused wide-linear 在 CPU 后端上按 op 打印 `path`、`us`、`M/N/K/nth`，用于区分 AVX2 direct 与 LUT decode/prefill 耗时。
   - ARM LUT qgemm 的 `add=true` vector path 首次命中时打印 `path=arm_lut_add_vector`，用于确认 fused four 的追加分支没有回到 scalar add row loop。
-  - 该变量只用于 debug/测试观测，不作为生产调优 knob。
+  - 这些变量只用于 debug/测试观测，不作为生产调优 knob。
 - ARM LUT add follow-up:
   - `ggml_fairy2i_lut_store_tile_arm()` 支持 `add=true`，覆盖 `pack_bf16=true/false` 和 partial tile；`add=false` 仍保持覆盖写。
   - ARM NEON 编译下 `ggml_fairy2i_lut_qgemm_lut16_one()` 不再因为 `add=true` 提前进入 scalar row loop，而是继续走现有 ARM tile qgemm，由 ARM store 处理累加。

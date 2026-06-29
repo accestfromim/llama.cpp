@@ -154,6 +154,9 @@ Fairy2i-only builds no longer compile `quants-ifairy.*`.
   `GGML_FAIRY2I_CPU=ON`.
 - Fairy2i LUT is not selected: check `GGML_FAIRY2I_CPU_LUT=ON` at build time
   and `GGML_FAIRY2I_LUT=1` at runtime.
+- Fairy2i W1/W2 path or timing is unclear: set `GGML_FAIRY2I_CPU_DEBUG=1`
+  for first-hit path logs and `GGML_FAIRY2I_CPU_TIMING=1` for per fused
+  wide-linear timing logs.
 - Legacy iFairy direct vecdot is unavailable: check
   `GGML_LEGACY_IFAIRY_CPU=ON`; old `GGML_IFAIRY_LUT_CPU` only enables the
   legacy LUT alias path.
