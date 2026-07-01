@@ -10,6 +10,8 @@ extern "C" {
 #if defined(__aarch64__) && defined(__ARM_NEON)
 bool ggml_fairy2i_tile64_w2_arm_neon_available(void);
 bool ggml_fairy2i_tile64_w2_arm_dotprod_available(void);
+bool ggml_fairy2i_tile64_w2_arm_sve2_available(void);
+const char * ggml_fairy2i_tile64_w2_arm_path_name(void);
 void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_tile64_v2 *  u0,
                                                          const block_fairy2i_tile64_v2 *  u1,
                                                          const block_fairy2i_tile64_v2 *  w0,
@@ -22,6 +24,12 @@ void ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(const block_fairy2i_
                                                             const block_fairy2i_tile64_v2 *  w1,
                                                             const block_fairy2i_act_q16_64 * x,
                                                             int32_t                          sums[4][4]);
+void ggml_fairy2i_tile64_fuse_accumulate_block_four_sve2(const block_fairy2i_tile64_v2 *  u0,
+                                                         const block_fairy2i_tile64_v2 *  u1,
+                                                         const block_fairy2i_tile64_v2 *  w0,
+                                                         const block_fairy2i_tile64_v2 *  w1,
+                                                         const block_fairy2i_act_q16_64 * x,
+                                                         int32_t                          sums[4][4]);
 bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile64_v2 *  u0,
                                                         const block_fairy2i_tile64_v2 *  u1,
                                                         const block_fairy2i_tile64_v2 *  w0,
@@ -623,16 +631,26 @@ static void fairy2i_accumulate_four_scalar(const block_fairy2i_tile64_v2 &  u0,
     fairy2i_accumulate_block_scalar(w1, x, sums[3]);
 }
 
-static bool test_fairy2i_arm_accumulate_neon() {
+static bool test_fairy2i_arm_accumulate_helpers() {
 #if defined(__aarch64__) && defined(__ARM_NEON)
     if (!ggml_fairy2i_tile64_w2_arm_neon_available()) {
-        printf("  Fairy2i ARM NEON accumulate skipped: runtime lacks NEON\n");
+        printf("  Fairy2i ARM accumulate helpers skipped: runtime lacks NEON\n");
         return true;
     }
 
     bool           ok          = true;
     const bool     has_dotprod = ggml_fairy2i_tile64_w2_arm_dotprod_available() && ggml_cpu_has_dotprod();
+    const bool     has_sve2    = ggml_fairy2i_tile64_w2_arm_sve2_available() && ggml_cpu_has_sve2();
     scoped_env_var env_disable_dotprod("GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD");
+    scoped_env_var env_disable_sve2("GGML_FAIRY2I_TEST_DISABLE_ARM_SVE2");
+    scoped_env_var env_require_sve2("GGML_FAIRY2I_TEST_REQUIRE_ARM_SVE2");
+
+    env_disable_dotprod.unset();
+    env_disable_sve2.unset();
+    if (has_sve2) {
+        env_require_sve2.set("1");
+    }
+
     for (int pattern = 0; pattern < 12; ++pattern) {
         const block_fairy2i_act_q16_64 x  = make_fairy2i_test_act_block(pattern * 13 + 11);
         const block_fairy2i_tile64_v2  u0 = make_fairy2i_test_weight_block(pattern, 1);
@@ -640,11 +658,13 @@ static bool test_fairy2i_arm_accumulate_neon() {
         const block_fairy2i_tile64_v2  w0 = make_fairy2i_test_weight_block(pattern + 2, 9);
         const block_fairy2i_tile64_v2  w1 = make_fairy2i_test_weight_block(pattern + 3, 13);
 
-        int32_t expected[4][4]       = {};
-        int32_t actual_neon[4][4]    = {};
-        int32_t actual_arm[4][4]     = {};
-        int32_t actual_no_dot[4][4]  = {};
-        int32_t actual_dotprod[4][4] = {};
+        int32_t expected[4][4]        = {};
+        int32_t actual_neon[4][4]     = {};
+        int32_t actual_arm[4][4]      = {};
+        int32_t actual_no_sve2[4][4]  = {};
+        int32_t actual_fallback[4][4] = {};
+        int32_t actual_dotprod[4][4]  = {};
+        int32_t actual_sve2[4][4]     = {};
         fairy2i_accumulate_four_scalar(u0, u1, w0, w1, x, expected);
         ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(&u0, &u1, &w0, &w1, &x, actual_neon);
         if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0, &u1, &w0, &w1, &x, actual_arm)) {
@@ -652,15 +672,31 @@ static bool test_fairy2i_arm_accumulate_neon() {
             ok = false;
         }
 
+        if (has_sve2) {
+            ggml_fairy2i_tile64_fuse_accumulate_block_four_sve2(&u0, &u1, &w0, &w1, &x, actual_sve2);
+        }
+        if (has_dotprod) {
+            ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(&u0, &u1, &w0, &w1, &x, actual_dotprod);
+        }
+
+        env_require_sve2.unset();
+        env_disable_sve2.set("1");
+        env_disable_dotprod.unset();
+        if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0, &u1, &w0, &w1, &x, actual_no_sve2)) {
+            fprintf(stderr, "Fairy2i ARM no-SVE2 fallback unexpectedly declined pattern=%d\n", pattern);
+            ok = false;
+        }
+
         env_disable_dotprod.set("1");
-        if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0, &u1, &w0, &w1, &x, actual_no_dot)) {
+        if (!ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(&u0, &u1, &w0, &w1, &x, actual_fallback)) {
             fprintf(stderr, "Fairy2i ARM NEON fallback unexpectedly declined pattern=%d\n", pattern);
             ok = false;
         }
-        env_disable_dotprod.unset();
 
-        if (has_dotprod) {
-            ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(&u0, &u1, &w0, &w1, &x, actual_dotprod);
+        env_disable_dotprod.unset();
+        env_disable_sve2.unset();
+        if (has_sve2) {
+            env_require_sve2.set("1");
         }
 
         char label[96];
@@ -668,19 +704,49 @@ static bool test_fairy2i_arm_accumulate_neon() {
         ok = compare_fairy2i_sums(label, actual_neon, expected) && ok;
         snprintf(label, sizeof(label), "Fairy2i ARM dispatcher accumulate pattern=%d", pattern);
         ok = compare_fairy2i_sums(label, actual_arm, expected) && ok;
+        snprintf(label, sizeof(label), "Fairy2i ARM no-SVE2 fallback accumulate pattern=%d", pattern);
+        ok = compare_fairy2i_sums(label, actual_no_sve2, expected) && ok;
         snprintf(label, sizeof(label), "Fairy2i ARM NEON fallback accumulate pattern=%d", pattern);
-        ok = compare_fairy2i_sums(label, actual_no_dot, expected) && ok;
+        ok = compare_fairy2i_sums(label, actual_fallback, expected) && ok;
         if (has_dotprod) {
             snprintf(label, sizeof(label), "Fairy2i ARM dotprod accumulate pattern=%d", pattern);
             ok = compare_fairy2i_sums(label, actual_dotprod, expected) && ok;
         }
+        if (has_sve2) {
+            snprintf(label, sizeof(label), "Fairy2i ARM SVE2 accumulate pattern=%d", pattern);
+            ok = compare_fairy2i_sums(label, actual_sve2, expected) && ok;
+        }
     }
 
-    printf("  Fairy2i ARM accumulate helpers%s: %s\n", has_dotprod ? " (NEON+dotprod)" : " (NEON)",
-           ok ? "PASS" : "FAIL");
+    const char * expected_default_path = has_sve2 ? "direct_sve2" : has_dotprod ? "direct_dotprod" : "direct_neon";
+    if (strcmp(ggml_fairy2i_tile64_w2_arm_path_name(), expected_default_path) != 0) {
+        fprintf(stderr, "Fairy2i ARM default path mismatch: actual=%s expected=%s\n",
+                ggml_fairy2i_tile64_w2_arm_path_name(), expected_default_path);
+        ok = false;
+    }
+
+    env_require_sve2.unset();
+    env_disable_sve2.set("1");
+    env_disable_dotprod.unset();
+    const char * expected_no_sve2_path = has_dotprod ? "direct_dotprod" : "direct_neon";
+    if (strcmp(ggml_fairy2i_tile64_w2_arm_path_name(), expected_no_sve2_path) != 0) {
+        fprintf(stderr, "Fairy2i ARM no-SVE2 path mismatch: actual=%s expected=%s\n",
+                ggml_fairy2i_tile64_w2_arm_path_name(), expected_no_sve2_path);
+        ok = false;
+    }
+
+    env_disable_dotprod.set("1");
+    if (strcmp(ggml_fairy2i_tile64_w2_arm_path_name(), "direct_neon") != 0) {
+        fprintf(stderr, "Fairy2i ARM NEON fallback path mismatch: actual=%s expected=direct_neon\n",
+                ggml_fairy2i_tile64_w2_arm_path_name());
+        ok = false;
+    }
+
+    printf("  Fairy2i ARM accumulate helpers (NEON%s%s): %s\n", has_dotprod ? "+dotprod" : "",
+           has_sve2 ? "+SVE2" : "", ok ? "PASS" : "FAIL");
     return ok;
 #else
-    printf("  Fairy2i ARM NEON accumulate skipped: non-ARM build\n");
+    printf("  Fairy2i ARM accumulate helpers skipped: non-ARM build\n");
     return true;
 #endif
 }
@@ -744,14 +810,19 @@ static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
                                    const fairy2i_w2_case & tc,
                                    const fairy2i_w2_data & data,
                                    bool                    lut_enabled,
-                                   bool                    force_scalar) {
+                                   bool                    force_scalar,
+                                   bool                    require_sve2) {
     scoped_env_var env_lut("GGML_FAIRY2I_LUT");
     scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
     scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
     scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+    scoped_env_var env_require_sve2("GGML_FAIRY2I_TEST_REQUIRE_ARM_SVE2");
     env_lut.set(lut_enabled ? "1" : "0");
     env_impl.set("lut16");
     env_require_lut.set(lut_enabled ? "1" : "0");
+    if (require_sve2) {
+        env_require_sve2.set("1");
+    }
     if (force_scalar) {
         env_force_scalar.set("1");
     } else {
@@ -1143,7 +1214,11 @@ static bool test_fairy2i_wide_linear_w2_variants() {
     int  cases_run = 0;
     bool ok        = true;
     const bool compare_scalar_default =
-        ggml_cpu_has_avx2() != 0 || ggml_cpu_has_neon() != 0 || ggml_cpu_has_dotprod() != 0;
+        ggml_cpu_has_avx2() != 0 || ggml_cpu_has_neon() != 0 || ggml_cpu_has_dotprod() != 0 || ggml_cpu_has_sve2() != 0;
+    bool require_sve2 = false;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    require_sve2 = ggml_fairy2i_tile64_w2_arm_sve2_available() && ggml_cpu_has_sve2();
+#endif
 
     for (int64_t M : Ms) {
         for (int64_t K : Ks) {
@@ -1156,14 +1231,14 @@ static bool test_fairy2i_wide_linear_w2_variants() {
                     std::vector<uint32_t> direct;
                     std::vector<uint32_t> direct_scalar;
                     std::vector<uint32_t> lut;
-                    if (!run_fairy2i_w2_backend(direct, tc, data, false, false)) {
+                    if (!run_fairy2i_w2_backend(direct, tc, data, false, false, require_sve2)) {
                         return false;
                     }
-                    if (compare_scalar_default && !run_fairy2i_w2_backend(direct_scalar, tc, data, false, true)) {
+                    if (compare_scalar_default && !run_fairy2i_w2_backend(direct_scalar, tc, data, false, true, false)) {
                         return false;
                     }
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
-                    if (!run_fairy2i_w2_backend(lut, tc, data, true, false)) {
+                    if (!run_fairy2i_w2_backend(lut, tc, data, true, false, false)) {
                         return false;
                     }
 #endif
@@ -1191,7 +1266,7 @@ static bool test_fairy2i_wide_linear_w2_variants() {
     }
 
     if (!compare_scalar_default) {
-        printf("  Fairy2i W2 scalar/default fast-path compare skipped: CPU backend lacks AVX2/NEON/dotprod\n");
+        printf("  Fairy2i W2 scalar/default fast-path compare skipped: CPU backend lacks AVX2/NEON/dotprod/SVE2\n");
     }
 #if !defined(GGML_USE_FAIRY2I_CPU_LUT)
     printf("  Fairy2i W2 LUT compare skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
@@ -1208,8 +1283,8 @@ int main() {
     printf("========================================\n");
 
     int num_failed = 0;
-    if (!test_fairy2i_arm_accumulate_neon()) {
-        fprintf(stderr, "Fairy2i ARM NEON accumulate helper FAILED\n");
+    if (!test_fairy2i_arm_accumulate_helpers()) {
+        fprintf(stderr, "Fairy2i ARM accumulate helpers FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_lut_quantize_arm_neon()) {

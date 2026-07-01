@@ -120,6 +120,21 @@ void ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(const block_fairy2i_
 }
 #endif
 
+#if !defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+bool ggml_fairy2i_tile64_w2_arm_sve2_available(void) {
+    return false;
+}
+
+void ggml_fairy2i_tile64_fuse_accumulate_block_four_sve2(const block_fairy2i_tile64_v2 *  u0,
+                                                         const block_fairy2i_tile64_v2 *  u1,
+                                                         const block_fairy2i_tile64_v2 *  w0,
+                                                         const block_fairy2i_tile64_v2 *  w1,
+                                                         const block_fairy2i_act_q16_64 * x,
+                                                         int32_t                          sums[4][4]) {
+    ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(u0, u1, w0, w1, x, sums);
+}
+#endif
+
 void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_tile64_v2 *  u0,
                                                          const block_fairy2i_tile64_v2 *  u1,
                                                          const block_fairy2i_tile64_v2 *  w0,
@@ -144,8 +159,39 @@ static bool ggml_fairy2i_test_disable_arm_dotprod(void) {
     return env && strcmp(env, "0") != 0;
 }
 
+static bool ggml_fairy2i_test_disable_arm_sve2(void) {
+    const char * env = getenv("GGML_FAIRY2I_TEST_DISABLE_ARM_SVE2");
+    return env && strcmp(env, "0") != 0;
+}
+
+static bool ggml_fairy2i_test_require_arm_sve2(void) {
+    const char * env = getenv("GGML_FAIRY2I_TEST_REQUIRE_ARM_SVE2");
+    return env && strcmp(env, "0") != 0;
+}
+
+static bool ggml_fairy2i_tile64_w2_arm_sve2_enabled(void) {
+    return !ggml_fairy2i_test_disable_arm_sve2() && ggml_fairy2i_tile64_w2_arm_sve2_available() &&
+           ggml_cpu_has_sve2();
+}
+
+static void ggml_fairy2i_tile64_w2_arm_require_sve2(void) {
+    if (ggml_fairy2i_test_require_arm_sve2() && !ggml_fairy2i_tile64_w2_arm_sve2_enabled()) {
+        GGML_ABORT("GGML_FAIRY2I_TEST_REQUIRE_ARM_SVE2 is set, but the Fairy2i direct SVE2 path is unavailable "
+                   "(disabled=%d, kernel=%d, cpu=%d)",
+                   ggml_fairy2i_test_disable_arm_sve2() ? 1 : 0,
+                   ggml_fairy2i_tile64_w2_arm_sve2_available() ? 1 : 0,
+                   ggml_cpu_has_sve2() ? 1 : 0);
+    }
+}
+
 const char * ggml_fairy2i_tile64_w2_arm_path_name(void) {
 #if defined(__ARM_NEON) && defined(__aarch64__)
+    ggml_fairy2i_tile64_w2_arm_require_sve2();
+
+    if (ggml_fairy2i_tile64_w2_arm_sve2_enabled()) {
+        return "direct_sve2";
+    }
+
     if (!ggml_fairy2i_test_disable_arm_dotprod() && ggml_fairy2i_tile64_w2_arm_dotprod_available() &&
         ggml_cpu_has_dotprod()) {
         return "direct_dotprod";
@@ -166,6 +212,13 @@ bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile
                                                         const block_fairy2i_act_q16_64 * x,
                                                         int32_t                          sums[4][4]) {
 #if defined(__ARM_NEON) && defined(__aarch64__)
+    ggml_fairy2i_tile64_w2_arm_require_sve2();
+
+    if (ggml_fairy2i_tile64_w2_arm_sve2_enabled()) {
+        ggml_fairy2i_tile64_fuse_accumulate_block_four_sve2(u0, u1, w0, w1, x, sums);
+        return true;
+    }
+
     if (!ggml_fairy2i_test_disable_arm_dotprod() && ggml_fairy2i_tile64_w2_arm_dotprod_available() &&
         ggml_cpu_has_dotprod()) {
         ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(u0, u1, w0, w1, x, sums);

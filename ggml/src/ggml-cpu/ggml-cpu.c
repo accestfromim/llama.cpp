@@ -49,6 +49,7 @@ extern struct ggml_tensor * ggml_debug_last_node;
 #endif
 
 #if defined(__aarch64__) && defined(__linux__)
+#include <asm/hwcap.h>
 #include <pthread.h>
 #include <sys/auxv.h>
 #endif
@@ -103,20 +104,33 @@ struct ggml_arm_arch_features_type {
 #ifndef HWCAP_ASIMDDP
 #define HWCAP_ASIMDDP (1UL << 20)
 #endif
+#ifndef HWCAP_SVE
+// Linux arm64 UAPI asm/hwcap.h: HWCAP_SVE
+#define HWCAP_SVE (1UL << 22)
+#endif
+#ifndef HWCAP2_SVE2
+// Linux arm64 UAPI asm/hwcap.h: HWCAP2_SVE2
+#define HWCAP2_SVE2 (1UL << 1)
+#endif
 
 struct ggml_arm_runtime_features_type {
     int has_neon;
     int has_dotprod;
+    int has_sve;
+    int has_sve2;
 };
 
 static pthread_once_t ggml_arm_runtime_features_once = PTHREAD_ONCE_INIT;
-static struct ggml_arm_runtime_features_type ggml_arm_runtime_features = { 1, 0 };
+static struct ggml_arm_runtime_features_type ggml_arm_runtime_features = { 1, 0, 0, 0 };
 
 static void ggml_arm_runtime_features_init(void) {
-    const unsigned long hwcap = getauxval(AT_HWCAP);
+    const unsigned long hwcap  = getauxval(AT_HWCAP);
+    const unsigned long hwcap2 = getauxval(AT_HWCAP2);
 
     ggml_arm_runtime_features.has_neon    = (hwcap & HWCAP_ASIMD) != 0;
     ggml_arm_runtime_features.has_dotprod = (hwcap & HWCAP_ASIMDDP) != 0;
+    ggml_arm_runtime_features.has_sve     = (hwcap & HWCAP_SVE) != 0;
+    ggml_arm_runtime_features.has_sve2    = (hwcap2 & HWCAP2_SVE2) != 0;
 }
 #endif
 
@@ -3749,7 +3763,21 @@ int ggml_cpu_has_dotprod(void) {
 }
 
 int ggml_cpu_has_sve(void) {
-#if defined(__ARM_ARCH) && defined(__ARM_FEATURE_SVE)
+#if defined(__aarch64__) && defined(__linux__)
+    pthread_once(&ggml_arm_runtime_features_once, ggml_arm_runtime_features_init);
+    return ggml_arm_runtime_features.has_sve;
+#elif defined(__ARM_ARCH) && defined(__ARM_FEATURE_SVE)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_sve2(void) {
+#if defined(__aarch64__) && defined(__linux__)
+    pthread_once(&ggml_arm_runtime_features_once, ggml_arm_runtime_features_init);
+    return ggml_arm_runtime_features.has_sve2;
+#elif defined(__ARM_ARCH) && defined(__ARM_FEATURE_SVE2)
     return 1;
 #else
     return 0;

@@ -134,6 +134,7 @@ static void ggml_fairy2i_cpu_debug_log_w2_once(const struct ggml_compute_params 
     static bool logged_direct_avx512  = false;
     static bool logged_direct_neon    = false;
     static bool logged_direct_dotprod = false;
+    static bool logged_direct_sve2    = false;
     static bool logged_lut16          = false;
     static bool logged_lut_c          = false;
     static bool logged_unknown        = false;
@@ -149,6 +150,8 @@ static void ggml_fairy2i_cpu_debug_log_w2_once(const struct ggml_compute_params 
         logged = &logged_direct_neon;
     } else if (path && strcmp(path, "direct_dotprod") == 0) {
         logged = &logged_direct_dotprod;
+    } else if (path && strcmp(path, "direct_sve2") == 0) {
+        logged = &logged_direct_sve2;
     } else if (path && strcmp(path, "lut16") == 0) {
         logged = &logged_lut16;
     } else if (path && strcmp(path, "lut_c") == 0) {
