@@ -20,6 +20,11 @@ void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_til
                                                          const block_fairy2i_act_q16_64 * x,
                                                          int32_t                          sums[4][4]);
 
+void ggml_fairy2i_tile64_fuse_accumulate_block_two_neon(const block_fairy2i_tile64_v2 *  u0,
+                                                        const block_fairy2i_tile64_v2 *  w0,
+                                                        const block_fairy2i_act_q16_64 * x,
+                                                        int32_t                          sums[2][4]);
+
 void ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(const block_fairy2i_tile64_v2 *  u0,
                                                             const block_fairy2i_tile64_v2 *  u1,
                                                             const block_fairy2i_tile64_v2 *  w0,
@@ -27,12 +32,22 @@ void ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(const block_fairy2i_
                                                             const block_fairy2i_act_q16_64 * x,
                                                             int32_t                          sums[4][4]);
 
+void ggml_fairy2i_tile64_fuse_accumulate_block_two_dotprod(const block_fairy2i_tile64_v2 *  u0,
+                                                           const block_fairy2i_tile64_v2 *  w0,
+                                                           const block_fairy2i_act_q16_64 * x,
+                                                           int32_t                          sums[2][4]);
+
 bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile64_v2 *  u0,
                                                         const block_fairy2i_tile64_v2 *  u1,
                                                         const block_fairy2i_tile64_v2 *  w0,
                                                         const block_fairy2i_tile64_v2 *  w1,
                                                         const block_fairy2i_act_q16_64 * x,
                                                         int32_t                          sums[4][4]);
+
+bool ggml_fairy2i_tile64_fuse_accumulate_block_two_arm(const block_fairy2i_tile64_v2 *  u0,
+                                                       const block_fairy2i_tile64_v2 *  w0,
+                                                       const block_fairy2i_act_q16_64 * x,
+                                                       int32_t                          sums[2][4]);
 
 #ifdef __cplusplus
 }

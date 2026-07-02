@@ -575,6 +575,7 @@ extern "C" {
         GGML_OP_COMPLEX_ADD,
         GGML_OP_COMPLEX_RMSNORM,
         GGML_OP_COMPLEX_MUL,
+        GGML_OP_FAIRY2I_WIDE_LINEAR_W1,
         GGML_OP_FAIRY2I_WIDE_LINEAR_W2,
 
         GGML_OP_COUNT,
@@ -1704,6 +1705,12 @@ extern "C" {
                                                               struct ggml_tensor *  u_s1,
                                                               struct ggml_tensor *  w_s0,
                                                               struct ggml_tensor *  w_s1,
+                                                              struct ggml_tensor *  bias);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_wide_linear_w1(struct ggml_context * ctx,
+                                                              struct ggml_tensor *  x,
+                                                              struct ggml_tensor *  u_s0,
+                                                              struct ggml_tensor *  w_s0,
                                                               struct ggml_tensor *  bias);
 
     GGML_API struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps);

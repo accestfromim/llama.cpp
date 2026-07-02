@@ -119,6 +119,39 @@ static inline void ggml_fairy2i_tile64_lut_apply_pair_component(const fairy2i_ti
     }
 }
 
+static inline void ggml_fairy2i_tile64_lut_apply_pair_component_mixed(const __m256i &   sum0_lo,
+                                                                const __m256i &   sum0_hi,
+                                                                const __m256i &   sum1_lo,
+                                                                const __m256i &   sum1_hi,
+                                                                const ggml_half * scale_a0,
+                                                                const ggml_half * scale_b0,
+                                                                const ggml_half * scale_a1,
+                                                                const ggml_half * scale_b1,
+                                                                const __m256 &    v_a0,
+                                                                const __m256 &    v_b0,
+                                                                const __m256 &    v_a1,
+                                                                const __m256 &    v_b1,
+                                                                __m256 &          acc_lo,
+                                                                __m256 &          acc_hi) {
+    for (int half = 0; half < 2; ++half) {
+        const __m128i s0_a = half == 0 ? _mm256_castsi256_si128(sum0_lo) : _mm256_castsi256_si128(sum0_hi);
+        const __m128i s0_b = half == 0 ? _mm256_extracti128_si256(sum0_lo, 1) : _mm256_extracti128_si256(sum0_hi, 1);
+        const __m128i s1_a = half == 0 ? _mm256_castsi256_si128(sum1_lo) : _mm256_castsi256_si128(sum1_hi);
+        const __m128i s1_b = half == 0 ? _mm256_extracti128_si256(sum1_lo, 1) : _mm256_extracti128_si256(sum1_hi, 1);
+        __m256 &      acc  = half == 0 ? acc_lo : acc_hi;
+        const int     offset = half * 8;
+
+        acc = ggml_fairy2i_tile64_lut_madd(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(s0_a)),
+                                     _mm256_mul_ps(v_a0, ggml_fairy2i_tile64_lut_load_scale8(scale_a0 + offset)), acc);
+        acc = ggml_fairy2i_tile64_lut_madd(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(s0_b)),
+                                     _mm256_mul_ps(v_b0, ggml_fairy2i_tile64_lut_load_scale8(scale_b0 + offset)), acc);
+        acc = ggml_fairy2i_tile64_lut_madd(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(s1_a)),
+                                     _mm256_mul_ps(v_a1, ggml_fairy2i_tile64_lut_load_scale8(scale_a1 + offset)), acc);
+        acc = ggml_fairy2i_tile64_lut_madd(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(s1_b)),
+                                     _mm256_mul_ps(v_b1, ggml_fairy2i_tile64_lut_load_scale8(scale_b1 + offset)), acc);
+    }
+}
+
 static inline void ggml_fairy2i_tile64_lut_accumulate_pair(const fairy2i_tile64_lut_wtile_16 * wt0,
                                                      const fairy2i_tile64_lut_wtile_16 * wt1,
                                                      const int8_t *                lut_blk,
@@ -143,6 +176,35 @@ static inline void ggml_fairy2i_tile64_lut_accumulate_pair(const fairy2i_tile64_
                                            wt0->d_imag, wt1->d_real, wt1->d_imag, v_lr, v_li, acc_r_lo, acc_r_hi);
     ggml_fairy2i_tile64_lut_apply_pair_component(wt0, wt1, sum0_i_lo, sum0_i_hi, sum1_i_lo, sum1_i_hi, wt0->d_imag,
                                            wt0->d_real, wt1->d_imag, wt1->d_real, v_lr, v_li, acc_i_lo, acc_i_hi);
+}
+
+static inline void ggml_fairy2i_tile64_lut_accumulate_w1_pair(const fairy2i_tile64_lut_wtile_16 * u0,
+                                                        const fairy2i_tile64_lut_wtile_16 * w0,
+                                                        const int8_t *                lut_blk,
+                                                        const __m256 &                v_lr,
+                                                        const __m256 &                v_li_u,
+                                                        const __m256 &                v_li_w,
+                                                        __m256 &                      acc_r_lo,
+                                                        __m256 &                      acc_r_hi,
+                                                        __m256 &                      acc_i_lo,
+                                                        __m256 &                      acc_i_hi) {
+    __m256i sum_u_r_lo;
+    __m256i sum_u_r_hi;
+    __m256i sum_w_r_lo;
+    __m256i sum_w_r_hi;
+    __m256i sum_u_i_lo;
+    __m256i sum_u_i_hi;
+    __m256i sum_w_i_lo;
+    __m256i sum_w_i_hi;
+
+    ggml_fairy2i_tile64_lut_accumulate_pair_channels(u0, w0, lut_blk, sum_u_r_lo, sum_u_r_hi, sum_w_r_lo, sum_w_r_hi,
+                                               sum_u_i_lo, sum_u_i_hi, sum_w_i_lo, sum_w_i_hi);
+    ggml_fairy2i_tile64_lut_apply_pair_component_mixed(sum_u_r_lo, sum_u_r_hi, sum_w_r_lo, sum_w_r_hi, u0->d_real,
+                                                 u0->d_imag, w0->d_real, w0->d_imag, v_lr, v_li_u, v_lr, v_li_w,
+                                                 acc_r_lo, acc_r_hi);
+    ggml_fairy2i_tile64_lut_apply_pair_component_mixed(sum_u_i_lo, sum_u_i_hi, sum_w_i_lo, sum_w_i_hi, u0->d_imag,
+                                                 u0->d_real, w0->d_imag, w0->d_real, v_lr, v_li_u, v_lr, v_li_w,
+                                                 acc_i_lo, acc_i_hi);
 }
 
 static inline void ggml_fairy2i_tile64_lut_store_pair(int            tile,
@@ -229,6 +291,55 @@ static GGML_FAIRY2I_NOINLINE void ggml_fairy2i_tile64_lut_qgemm_pair_avx2(int   
     }
 }
 
+static GGML_FAIRY2I_NOINLINE void ggml_fairy2i_tile64_lut_qgemm_w1_pair_avx2(int          m,
+                                                                       int          k,
+                                                                       int          n,
+                                                                       const void * packed_u0,
+                                                                       const void * packed_w0,
+                                                                       const void * lut,
+                                                                       const void * lut_scales,
+                                                                       float *      dst,
+                                                                       size_t       dst_col_stride,
+                                                                       size_t       dst_row_stride,
+                                                                       bool         pack_bf16) {
+    const int64_t blocks           = k / QK_FAIRY2I_TILE64;
+    const int64_t groups_per_block = QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    const int64_t groups           = blocks * groups_per_block;
+    const int     tiles            = (m + 15) / 16;
+    const auto *  utiles           = (const fairy2i_tile64_lut_wtile_16 *) packed_u0;
+    const auto *  wtiles           = (const fairy2i_tile64_lut_wtile_16 *) packed_w0;
+    const __m256  imag_sign_u      = _mm256_set1_ps(-0.0f);
+
+    for (int col = 0; col < n; ++col) {
+        const int8_t * lut_col = (const int8_t *) lut + (size_t) col * (size_t) groups * k_fairy2i_lut_group_bytes;
+        const float *  scales  = (const float *) lut_scales + (size_t) col * (size_t) blocks * 2u;
+        uint8_t *      dst_col = (uint8_t *) dst + (size_t) col * dst_col_stride;
+
+        for (int tile = 0; tile < tiles; ++tile) {
+            __m256 acc_r_lo = _mm256_setzero_ps();
+            __m256 acc_r_hi = _mm256_setzero_ps();
+            __m256 acc_i_lo = _mm256_setzero_ps();
+            __m256 acc_i_hi = _mm256_setzero_ps();
+
+            for (int64_t blk = 0; blk < blocks; ++blk) {
+                const fairy2i_tile64_lut_wtile_16 * u0 =
+                    utiles + (size_t) tile * (size_t) blocks + (size_t) blk;
+                const fairy2i_tile64_lut_wtile_16 * w0 =
+                    wtiles + (size_t) tile * (size_t) blocks + (size_t) blk;
+                const int8_t * lut_blk =
+                    lut_col + (size_t) blk * (size_t) groups_per_block * k_fairy2i_lut_group_bytes;
+                const __m256 v_lr   = _mm256_set1_ps(scales[blk * 2 + 0]);
+                const __m256 v_li_w = _mm256_set1_ps(scales[blk * 2 + 1]);
+                const __m256 v_li_u = _mm256_xor_ps(v_li_w, imag_sign_u);
+                ggml_fairy2i_tile64_lut_accumulate_w1_pair(u0, w0, lut_blk, v_lr, v_li_u, v_li_w, acc_r_lo,
+                                                     acc_r_hi, acc_i_lo, acc_i_hi);
+            }
+            ggml_fairy2i_tile64_lut_store_pair(tile, m, dst_col, dst_row_stride, pack_bf16, /*add*/ false, acc_r_lo,
+                                         acc_r_hi, acc_i_lo, acc_i_hi);
+        }
+    }
+}
+
 #    undef GGML_FAIRY2I_NOINLINE
 #endif
 
@@ -255,6 +366,37 @@ void ggml_fairy2i_tile64_lut_qgemm_pair_cpu(int          m,
                                              dst_col_stride, dst_row_stride, pack_bf16,
                                              /*negate_imag_scale=*/false, /*add=*/false);
 #endif
+}
+
+bool ggml_fairy2i_tile64_lut_qgemm_two_cpu(int          m,
+                                      int          k,
+                                      int          n,
+                                      const void * packed_u0,
+                                      const void * packed_w0,
+                                      const void * lut,
+                                      const void * lut_scales,
+                                      float *      dst,
+                                      size_t       dst_col_stride,
+                                      size_t       dst_row_stride,
+                                      bool         pack_bf16) {
+    if (m == 0) {
+        return true;
+    }
+    if (!packed_u0 || !packed_w0 || !dst || !lut || !lut_scales || m < 0 || k <= 0 || n <= 0) {
+        return false;
+    }
+
+#if defined(__AVX2__)
+    // LUT preprocessing folds in conjugation. Negating the imaginary scale recovers U * x while W stays W * conj(x).
+    ggml_fairy2i_tile64_lut_qgemm_w1_pair_avx2(m, k, n, packed_u0, packed_w0, lut, lut_scales, dst, dst_col_stride,
+                                               dst_row_stride, pack_bf16);
+#else
+    ggml_fairy2i_tile64_lut_qgemm_lut16(m, k, n, packed_u0, lut, lut_scales, dst, dst_col_stride, dst_row_stride,
+                                        pack_bf16, /*negate_imag_scale=*/true, /*add=*/false);
+    ggml_fairy2i_tile64_lut_qgemm_lut16(m, k, n, packed_w0, lut, lut_scales, dst, dst_col_stride, dst_row_stride,
+                                        pack_bf16, /*negate_imag_scale=*/false, /*add=*/true);
+#endif
+    return true;
 }
 
 bool ggml_fairy2i_tile64_lut_qgemm_four_cpu(int          m,

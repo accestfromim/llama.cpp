@@ -12,6 +12,14 @@ Status: Draft (2026-03-13)
 
 ---
 
+## 2026-06-29 — Fairy2i W1 learned-scale fused wide-linear
+
+- 新增 Fairy2i W1 专用 fused op：`GGML_OP_FAIRY2I_WIDE_LINEAR_W1`。
+- 新增 opt-in graph 开关：`LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=1`。
+- W1 路径只消费 `U.s0/W.s0`，服务 `tile64_v2_w1_learned_scale`；不使用空 `s1` 兼容 W2。
+- CPU direct 覆盖 scalar/AVX2/AVX512/ARM NEON/dotprod；CPU LUT16 路径复用 tile64 LUT preprocess，并用两次单权重 qgemm 组合 U/W。
+- 回归入口：`test-fairy2i` 的 W1 variant matrix；LUT build 下 `GGML_FAIRY2I_LUT=1` 会通过 require-lut 覆盖 W1 LUT。
+
 ## 基线（Baseline）
 
 ### vec_dot（现有 fastest 路径）
@@ -61,9 +69,10 @@ Status: Draft (2026-03-13)
   - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1`：在支持 dotprod 的 ARM64 设备上强制 dispatcher 走 NEON fallback，用于覆盖 direct wide-linear-fused 的 NEON 路径。
 - 这两个变量只用于测试/CI 覆盖，不作为生产调优 knob。
 - 新增 debug-only 环境变量：
-  - `GGML_FAIRY2I_CPU_DEBUG=1`：默认关闭；W2 compute 每种 CPU path 首次命中时打印 `path=direct_scalar|direct_neon|direct_dotprod|lut16|lut_c`、`M/N/K/nth` 和 packed-weight 状态。
+  - `GGML_FAIRY2I_CPU_DEBUG=1`：默认关闭；W1/W2 compute 每种 CPU path 首次命中时打印 `path=direct_scalar|direct_avx2|direct_avx512|direct_neon|direct_dotprod|lut16|lut_c`、`M/N/K/nth` 和 packed-weight 状态。
+  - `GGML_FAIRY2I_CPU_TIMING=1`：默认关闭；W1/W2 fused wide-linear 在 CPU 后端上按 op 打印 `path`、`us`、`M/N/K/nth`，用于区分 AVX2 direct 与 LUT decode/prefill 耗时。
   - ARM LUT qgemm 的 `add=true` vector path 首次命中时打印 `path=arm_lut_add_vector`，用于确认 fused four 的追加分支没有回到 scalar add row loop。
-  - 该变量只用于 debug/测试观测，不作为生产调优 knob。
+  - 这些变量只用于 debug/测试观测，不作为生产调优 knob。
 - ARM LUT add follow-up:
   - `ggml_fairy2i_lut_store_tile_arm()` 支持 `add=true`，覆盖 `pack_bf16=true/false` 和 partial tile；`add=false` 仍保持覆盖写。
   - ARM NEON 编译下 `ggml_fairy2i_lut_qgemm_lut16_one()` 不再因为 `add=true` 提前进入 scalar row loop，而是继续走现有 ARM tile qgemm，由 ARM store 处理累加。

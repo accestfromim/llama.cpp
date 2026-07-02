@@ -101,9 +101,10 @@ ggml/src/ggml-cpu/fairy2i/fairy2i-cpu.h
 ggml/src/ggml-cpu/fairy2i/fairy2i-cpu.cpp
 ```
 
-`ggml-cpu.c` calls this shim for `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` work-size,
-graph prepare, free, and compute dispatch. Fairy2i LUT env parsing, impl
-selection, weight prepack, scratch planning, and execution policy live under
+`ggml-cpu.c` calls this shim for `GGML_OP_FAIRY2I_WIDE_LINEAR_W1` and
+`GGML_OP_FAIRY2I_WIDE_LINEAR_W2` work-size, graph prepare, free, and compute
+dispatch. Fairy2i LUT env parsing, impl selection, weight prepack, scratch
+planning, and execution policy live under
 `ggml/src/ggml-cpu/fairy2i/`; `ggml_threadpool` does not store Fairy2i LUT
 configuration.
 
@@ -144,14 +145,18 @@ Fairy2i-only builds no longer compile `quants-ifairy.*`.
 | `GGML_TYPE_IFAIRY64` | legacy iFairy tile64 storage |
 | `GGML_TYPE_FAIRY2I_TILE64_V2` | Fairy2i tile64_v2 storage |
 | `GGML_OP_IFAIRY_WIDE_LINEAR_W2` | legacy iFairy W2 op |
+| `GGML_OP_FAIRY2I_WIDE_LINEAR_W1` | Fairy2i W1 learned-scale op |
 | `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` | Fairy2i W2 op |
 
 ## Troubleshooting
 
-- Fairy2i W2 is unsupported: check `GGML_FAIRY2I=ON` and
+- Fairy2i W1/W2 is unsupported: check `GGML_FAIRY2I=ON` and
   `GGML_FAIRY2I_CPU=ON`.
 - Fairy2i LUT is not selected: check `GGML_FAIRY2I_CPU_LUT=ON` at build time
   and `GGML_FAIRY2I_LUT=1` at runtime.
+- Fairy2i W1/W2 path or timing is unclear: set `GGML_FAIRY2I_CPU_DEBUG=1`
+  for first-hit path logs and `GGML_FAIRY2I_CPU_TIMING=1` for per fused
+  wide-linear timing logs.
 - Legacy iFairy direct vecdot is unavailable: check
   `GGML_LEGACY_IFAIRY_CPU=ON`; old `GGML_IFAIRY_LUT_CPU` only enables the
   legacy LUT alias path.
@@ -173,8 +178,9 @@ Fairy2i-only builds no longer compile `quants-ifairy.*`.
 ## Current Limits
 
 - `GGML_TYPE_FAIRY2I_TILE64_V2` is the storage type for new tile64_v2 weights.
-- New graph code uses `GGML_OP_COMPLEX_*` plus
-  `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`.
+- New graph code uses `GGML_OP_COMPLEX_*` plus Fairy2i W1/W2 fused wide-linear
+  ops when explicitly enabled by `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=1` or
+  `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1`.
 - Fairy2i LUT configuration uses `GGML_FAIRY2I_LUT*`; legacy iFairy LUT
   configuration uses `GGML_IFAIRY_LUT*`.
 - Reference/planner/dispatch split is started by the shim but not yet a full
