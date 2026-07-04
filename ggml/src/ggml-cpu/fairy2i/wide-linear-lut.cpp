@@ -1,4 +1,5 @@
 #include "wide-linear.h"
+#include "fairy2i-policy.h"
 #include "lut-qgemm.h"
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
@@ -203,8 +204,7 @@ static size_t ggml_fairy2i_wide_linear_lut_wsize_common(const struct ggml_tensor
         return 0;
     }
 
-    const char * enabled_env = getenv("GGML_FAIRY2I_LUT");
-    if (!enabled_env || strcmp(enabled_env, "0") == 0) {
+    if (!ggml_fairy2i_lut_enabled_by_policy()) {
         return 0;
     }
 

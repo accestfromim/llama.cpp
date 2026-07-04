@@ -29,14 +29,56 @@ static bool llama_fairy2i_merged_output_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
-static bool llama_fairy2i_fused_wide_linear_w2_enabled() {
-    const char * env = getenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2");
-    return env != nullptr && strcmp(env, "0") != 0;
+enum llama_fairy2i_env_policy {
+    LLAMA_FAIRY2I_ENV_POLICY_AUTO,
+    LLAMA_FAIRY2I_ENV_POLICY_DISABLED,
+    LLAMA_FAIRY2I_ENV_POLICY_ENABLED,
+};
+
+static llama_fairy2i_env_policy llama_fairy2i_env_policy_from_env(const char * name) {
+    const char * env = getenv(name);
+    if (!env || env[0] == '\0' || strcmp(env, "auto") == 0) {
+        return LLAMA_FAIRY2I_ENV_POLICY_AUTO;
+    }
+    if (strcmp(env, "0") == 0) {
+        return LLAMA_FAIRY2I_ENV_POLICY_DISABLED;
+    }
+    return LLAMA_FAIRY2I_ENV_POLICY_ENABLED;
 }
 
-static bool llama_fairy2i_fused_wide_linear_w1_enabled() {
-    const char * env = getenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1");
-    return env != nullptr && strcmp(env, "0") != 0;
+static void llama_fairy2i_fused_wide_linear_warn_unsupported_once(const char * env_name, const char * op_name) {
+    static bool warned_w1 = false;
+    static bool warned_w2 = false;
+
+    bool * warned = strcmp(env_name, "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1") == 0 ? &warned_w1 : &warned_w2;
+    if (*warned) {
+        return;
+    }
+    *warned = true;
+
+    LLAMA_LOG_WARN("%s: %s was requested, but the CPU backend does not support %s; falling back to the unfused graph\n",
+            __func__, env_name, op_name);
+}
+
+static bool llama_fairy2i_should_use_fused_wide_linear(const char *         env_name,
+                                                       const char *         op_name,
+                                                       bool                 auto_target_cpu,
+                                                       ggml_backend_t       backend_cpu,
+                                                       const ggml_tensor *  op) {
+    const llama_fairy2i_env_policy policy = llama_fairy2i_env_policy_from_env(env_name);
+    if (policy == LLAMA_FAIRY2I_ENV_POLICY_DISABLED) {
+        return false;
+    }
+    if (policy == LLAMA_FAIRY2I_ENV_POLICY_AUTO && !auto_target_cpu) {
+        return false;
+    }
+    if (backend_cpu && ggml_backend_supports_op(backend_cpu, op)) {
+        return true;
+    }
+    if (policy == LLAMA_FAIRY2I_ENV_POLICY_ENABLED) {
+        llama_fairy2i_fused_wide_linear_warn_unsupported_once(env_name, op_name);
+    }
+    return false;
 }
 
 const char * llm_type_name(llm_type type) {
@@ -14220,19 +14262,27 @@ struct llm_build_fairy2i : public llm_graph_context {
                                      ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
             GGML_ASSERT(linear.U[0] && linear.W[0]);
 
+            auto target_dev_is_cpu = [&]() {
+                ggml_backend_dev_t dev = il >= 0 ? model.dev_layer(il) : model.dev_output();
+                return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            };
+
             const bool can_fuse_w1 =
                 model.fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE &&
-                llama_fairy2i_fused_wide_linear_w1_enabled() && loras->empty() && !linear.U[1] && !linear.W[1] &&
+                loras->empty() && !linear.U[1] && !linear.W[1] &&
                 linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
                 linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2;
             if (can_fuse_w1) {
                 ggml_tensor * y = ggml_fairy2i_wide_linear_w1(ctx0, x, linear.U[0], linear.W[0], bias);
-                cb(y, name, il);
-                return y;
+                if (llama_fairy2i_should_use_fused_wide_linear("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1",
+                                                               "GGML_OP_FAIRY2I_WIDE_LINEAR_W1", target_dev_is_cpu(),
+                                                               backend_cpu, y)) {
+                    cb(y, name, il);
+                    return y;
+                }
             }
 
-            const bool can_fuse_w2 = llama_fairy2i_fused_wide_linear_w2_enabled() && loras->empty() && linear.U[1] &&
-                                     linear.W[1] &&
+            const bool can_fuse_w2 = loras->empty() && linear.U[1] && linear.W[1] &&
                                      linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
                                      linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
                                      linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
@@ -14240,8 +14290,12 @@ struct llm_build_fairy2i : public llm_graph_context {
             if (can_fuse_w2) {
                 ggml_tensor * y =
                     ggml_fairy2i_wide_linear_w2(ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
-                cb(y, name, il);
-                return y;
+                if (llama_fairy2i_should_use_fused_wide_linear("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2",
+                                                               "GGML_OP_FAIRY2I_WIDE_LINEAR_W2", target_dev_is_cpu(),
+                                                               backend_cpu, y)) {
+                    cb(y, name, il);
+                    return y;
+                }
             }
 
             ggml_tensor * u0 = build_lora_mm(linear.U[0], x_conj);

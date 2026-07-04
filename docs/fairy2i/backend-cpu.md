@@ -32,7 +32,7 @@ behavior and disables accelerator backends.
 | --- | --- | --- | --- | --- |
 | `GGML_FAIRY2I=OFF`, `GGML_LEGACY_IFAIRY_CPU=OFF` | no | no | no | no |
 | `GGML_FAIRY2I=ON`, `GGML_FAIRY2I_CPU=ON` | yes | no | no unless legacy is also enabled | no |
-| `GGML_FAIRY2I_CPU_LUT=ON` | yes | yes, via `GGML_FAIRY2I_LUT*` | no unless legacy is also enabled | no |
+| `GGML_FAIRY2I_CPU_LUT=ON` | yes | yes, defaults to LUT16; `GGML_FAIRY2I_LUT=0` disables | no unless legacy is also enabled | no |
 | `GGML_LEGACY_IFAIRY_CPU=ON`, `GGML_FAIRY2I=OFF` | no | no | yes | no |
 | `GGML_LEGACY_IFAIRY_CPU_LUT=ON`, `GGML_FAIRY2I=OFF` | no | no | yes | yes, via `GGML_IFAIRY_LUT*` |
 
@@ -60,10 +60,11 @@ cmake -B build-rel-fairy2i \
     -DGGML_FAIRY2I_CPU=ON \
     -DGGML_FAIRY2I_CPU_LUT=ON
 
-cmake --build build-rel-fairy2i --target test-fairy2i -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
-GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+cmake --build build-rel-fairy2i --target test-fairy2i test-fairy2i-loader -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
+ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+GGML_FAIRY2I_LUT=0 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
-GGML_FAIRY2I_LUT=1 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
+GGML_FAIRY2I_LUT=0 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
 ```
 
 Legacy iFairy CPU direct-only:
@@ -153,7 +154,7 @@ Fairy2i-only builds no longer compile `quants-ifairy.*`.
 - Fairy2i W1/W2 is unsupported: check `GGML_FAIRY2I=ON` and
   `GGML_FAIRY2I_CPU=ON`.
 - Fairy2i LUT is not selected: check `GGML_FAIRY2I_CPU_LUT=ON` at build time
-  and `GGML_FAIRY2I_LUT=1` at runtime.
+  and make sure `GGML_FAIRY2I_LUT=0` is not set at runtime.
 - Fairy2i W1/W2 path or timing is unclear: set `GGML_FAIRY2I_CPU_DEBUG=1`
   for first-hit path logs and `GGML_FAIRY2I_CPU_TIMING=1` for per fused
   wide-linear timing logs.
@@ -178,10 +179,12 @@ Fairy2i-only builds no longer compile `quants-ifairy.*`.
 ## Current Limits
 
 - `GGML_TYPE_FAIRY2I_TILE64_V2` is the storage type for new tile64_v2 weights.
-- New graph code uses `GGML_OP_COMPLEX_*` plus Fairy2i W1/W2 fused wide-linear
-  ops when explicitly enabled by `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=1` or
-  `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1`.
-- Fairy2i LUT configuration uses `GGML_FAIRY2I_LUT*`; legacy iFairy LUT
+- New graph code defaults to Fairy2i W1/W2 fused wide-linear ops when the model,
+  LoRA state, tensor types, and target CPU backend support the fused op. Set
+  `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=0` or
+  `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=0` to force the unfused graph.
+- Fairy2i LUT defaults to LUT16 when `GGML_FAIRY2I_CPU_LUT=ON`; set
+  `GGML_FAIRY2I_LUT=0` to force the direct CPU path. Legacy iFairy LUT
   configuration uses `GGML_IFAIRY_LUT*`.
 - Reference/planner/dispatch split is started by the shim but not yet a full
   kernel registry.
@@ -191,8 +194,9 @@ Fairy2i-only builds no longer compile `quants-ifairy.*`.
 For changes touching Fairy2i CPU behavior, run:
 
 ```bash
-cmake --build build-rel-fairy2i --target test-fairy2i -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
-GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+cmake --build build-rel-fairy2i --target test-fairy2i test-fairy2i-loader -j $(nproc 2>/dev/null || sysctl -n hw.ncpu)
+ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+GGML_FAIRY2I_LUT=0 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
 ```
 
 For changes touching legacy iFairy CPU behavior, also run:

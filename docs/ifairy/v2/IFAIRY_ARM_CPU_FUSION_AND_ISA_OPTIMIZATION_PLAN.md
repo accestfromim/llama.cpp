@@ -186,25 +186,26 @@ for output row assigned to thread:
 
 ### 3.5 当前 graph-only 实验入口
 
-- 新增环境变量：`LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1`。
-- 默认关闭；未设置时 Fairy2i wide linear 继续构造旧图。
-- 打开后，仅当 `U.s0`、`U.s1`、`W.s0`、`W.s1` 四个权重均存在且均为 `GGML_TYPE_IFAIRY64` 时，构造 `GGML_OP_IFAIRY_WIDE_LINEAR_W2`。
-- 该 op 的 graph 语义包含 optional bias，等价于当前 `build_ifairy_bias()` 的 split/add/merge。
-- 当前阶段只添加 graph op、builder 和 CPU dispatch stub；CPU/GPU 后端 fused kernel 尚未实现，实际执行会显式报 `GGML_OP_IFAIRY_WIDE_LINEAR_W2 not implemented`。
+- Fairy2i W2 fusion now follows the default CPU policy: auto-enable when the
+  model, LoRA state, tensor types, and CPU backend support the fused op.
+- Set `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=0` to force the old unfused graph.
+- 仅当 `U.s0`、`U.s1`、`W.s0`、`W.s1` 四个权重均存在且均为 `GGML_TYPE_FAIRY2I_TILE64_V2` 时，构造 `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`。
+- 该 op 的 graph 语义包含 optional bias，等价于当前 complex split/add/merge fallback。
+- CPU backend 已实现 fused W2 dispatch；未编译 Fairy2i CPU support 或 target placement 不适合时继续回退旧图。
 
 ### 3.6 后续完整 fused CPU 算子实现路线
 
 #### F1. 固化 fused op contract
 
-- 只支持 Fairy2i `IFAIRY64` W2：`U.s0`、`U.s1`、`W.s0`、`W.s1` 全存在。
+- 只支持 Fairy2i `GGML_TYPE_FAIRY2I_TILE64_V2` W2：`U.s0`、`U.s1`、`W.s0`、`W.s1` 全存在。
 - 固定 src 顺序、输出 shape、bias 语义，不在 kernel 内做隐式重解释。
-- 第一版不支持 LoRA、不支持非 `IFAIRY64`、不支持 GPU 后端。
+- 第一版不支持 LoRA、不支持非 `GGML_TYPE_FAIRY2I_TILE64_V2`、不支持 GPU 后端。
 - 第一版优先覆盖 decode / small-N；prefill 大 N 作为后续扩展。
 
 #### F2. 实现 CPU compute 入口
 
-- 新增 `ggml_compute_forward_ifairy_wide_linear_w2()`。
-- 将当前 `GGML_ABORT("GGML_OP_IFAIRY_WIDE_LINEAR_W2 not implemented")` 替换为真实 dispatch。
+- 通过 Fairy2i CPU shim dispatch `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`。
+- 未编译 `GGML_USE_FAIRY2I_CPU` 时 CPU backend 不声明支持该 op。
 - 补齐真实 `n_tasks` 和 `ggml_graph_plan()` workspace 需求。
 - workspace 至少包含 `x` 与 `x_conj` 的 activation quantization 缓冲。
 - 第一版只走 no-LUT baseline vecdot，不实现 LUT fused kernel。
@@ -221,11 +222,12 @@ for output row assigned to thread:
 - CPU fused op 内部按 output row / token 分片。
 - 每个输出元素完成四路累加：`U.s0*x_conj`、`U.s1*x_conj`、`W.s0*x`、`W.s1*x`。
 - 四路结果直接写入最终 `y`，不再生成 `u0/u1/w0/w1/u/w` 中间 tensor。
-- bias 在最终 store 前处理，语义等价当前 `ifairy_split -> add -> ifairy_merge`。
+- bias 在最终 store 前处理，语义等价当前 complex split/add/merge fallback。
 
 #### F5. 完善 graph / backend gate
 
-- 保持 `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1` opt-in，直到正确性和性能稳定。
+- Keep `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=0` as the fallback switch after the
+  default policy change.
 - 如果输入或权重 backend placement 不适合 CPU-only fused op，第一版回退旧图。
 - 不给 OpenCL / CUDA / Metal / Vulkan 声明支持，避免 scheduler 将 fused op 分配给未实现后端。
 - 后续若实现 GPU fused kernel，再为对应 backend 单独补 `supports_op` 和 kernel dispatch。

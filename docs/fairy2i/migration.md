@@ -103,10 +103,11 @@ cmake -B build-rel-fairy2i \
     -DGGML_FAIRY2I_CPU=ON \
     -DGGML_FAIRY2I_CPU_LUT=ON \
     -DGGML_LEGACY_IFAIRY_CPU=OFF
-cmake --build build-rel-fairy2i --target test-fairy2i test-backend-ops -j 4
-GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+cmake --build build-rel-fairy2i --target test-fairy2i test-fairy2i-loader test-backend-ops -j 4
+ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+GGML_FAIRY2I_LUT=0 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
-GGML_FAIRY2I_LUT=1 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
+GGML_FAIRY2I_LUT=0 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
 ```
 
 `ggml-base` no longer compiles Fairy2i or legacy iFairy LUT/QGEMM execution

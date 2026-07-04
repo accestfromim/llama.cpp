@@ -1,4 +1,5 @@
 #include "fairy2i-cpu.h"
+#include "fairy2i-policy.h"
 #include "wide-linear.h"
 
 #include "ggml.h"
@@ -8,20 +9,10 @@
 #    include "arm/fairy2i-quants.h"
 #endif
 
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-#    include "ggml-fairy2i-lut.h"
-#endif
-
 #include <stdlib.h>
 #include <string.h>
 
 static constexpr size_t GGML_FAIRY2I_CPU_CACHE_LINE = 64;
-
-enum ggml_fairy2i_lut_impl {
-    GGML_FAIRY2I_LUT_IMPL_AUTO  = 0,
-    GGML_FAIRY2I_LUT_IMPL_LUT16 = 1,
-    GGML_FAIRY2I_LUT_IMPL_LUT_C = 2,
-};
 
 struct ggml_fairy2i_cpu_plan {
     bool                       use_lut;
@@ -31,50 +22,6 @@ struct ggml_fairy2i_cpu_plan {
     size_t                     work_size;
     enum ggml_fairy2i_lut_impl impl;
 };
-
-#ifdef GGML_USE_FAIRY2I_CPU_LUT
-
-struct ggml_fairy2i_lut_config {
-    bool                      dbg;
-    bool                      lut_enabled;
-    bool                      lut_explicit;
-    enum ggml_fairy2i_lut_impl impl;
-};
-
-static enum ggml_fairy2i_lut_impl ggml_fairy2i_lut_impl_from_env(const char * env_name,
-                                                                  bool         dbg,
-                                                                  const char * log_prefix) {
-    enum ggml_fairy2i_lut_impl impl = GGML_FAIRY2I_LUT_IMPL_AUTO;
-    const char * impl_env           = getenv(env_name);
-    if (impl_env && impl_env[0] != '\0' && strcmp(impl_env, "0") != 0 && strcmp(impl_env, "auto") != 0) {
-        if (strcmp(impl_env, "lut16") == 0) {
-            impl = GGML_FAIRY2I_LUT_IMPL_LUT16;
-        } else if (strcmp(impl_env, "lut_c") == 0) {
-            impl = GGML_FAIRY2I_LUT_IMPL_LUT_C;
-        } else if (dbg) {
-            GGML_LOG_WARN("%s: unknown %s=%s (expected auto|lut16|lut_c)\n", log_prefix, env_name, impl_env);
-        }
-    }
-    return impl;
-}
-
-static struct ggml_fairy2i_lut_config ggml_fairy2i_lut_config_from_env(void) {
-    struct ggml_fairy2i_lut_config cfg;
-
-    cfg.dbg = ggml_fairy2i_env_enabled("GGML_FAIRY2I_LUT_DEBUG");
-
-    const char * enabled_env = getenv("GGML_FAIRY2I_LUT");
-    cfg.lut_enabled          = !(enabled_env && strcmp(enabled_env, "0") == 0);
-    cfg.lut_explicit         = enabled_env && strcmp(enabled_env, "0") != 0;
-    cfg.impl                 = ggml_fairy2i_lut_impl_from_env("GGML_FAIRY2I_LUT_IMPL", cfg.dbg, "fairy2i_lut");
-
-    return cfg;
-}
-
-static bool ggml_fairy2i_test_require_lut(void) {
-    return ggml_fairy2i_env_enabled("GGML_FAIRY2I_TEST_REQUIRE_LUT");
-}
-#endif
 
 static bool ggml_fairy2i_cpu_debug_enabled(void) {
     const char * env = getenv("GGML_FAIRY2I_CPU_DEBUG");
@@ -208,7 +155,7 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
     }
 
     memset(plan, 0, sizeof(*plan));
-    plan->impl = GGML_FAIRY2I_LUT_IMPL_AUTO;
+    plan->impl = GGML_FAIRY2I_LUT_IMPL_LUT16;
 
     if (!ggml_fairy2i_cpu_supports_op(dst)) {
         return false;
@@ -223,10 +170,10 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
     plan->work_size         = plan->q_bytes;
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
-    const struct ggml_fairy2i_lut_config cfg = ggml_fairy2i_lut_config_from_env();
-    plan->use_lut                            = cfg.lut_enabled && cfg.lut_explicit;
-    plan->lut_c                              = cfg.impl == GGML_FAIRY2I_LUT_IMPL_LUT_C;
-    plan->impl                               = cfg.impl;
+    const struct ggml_fairy2i_lut_policy policy = ggml_fairy2i_lut_policy_from_env();
+    plan->use_lut                               = policy.lut_enabled;
+    plan->lut_c                                 = policy.impl == GGML_FAIRY2I_LUT_IMPL_LUT_C;
+    plan->impl                                  = policy.impl;
     if (plan->use_lut) {
         plan->lut_bytes = dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ?
                               ggml_fairy2i_wide_linear_w1_lut_wsize(dst) :
