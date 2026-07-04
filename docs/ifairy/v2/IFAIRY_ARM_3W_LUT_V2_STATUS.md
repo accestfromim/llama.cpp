@@ -1,6 +1,6 @@
 # iFairy ARM 3W LUT (V2) — 状态 / 性能记录
 
-Status: Draft (2026-03-13)
+Status: Draft (2026-07-04)
 
 本文件用于替代旧的 `../legacy/IFAIRY_ARM_3W_LUT_STATUS.md` 的后续增量记录（旧文件不再修改）。
 
@@ -18,6 +18,46 @@ Status: Draft (2026-03-13)
 - Fairy2i CPU LUT builds default to LUT16. `GGML_FAIRY2I_LUT=0` forces the direct CPU path; `GGML_FAIRY2I_LUT_IMPL=lut_c` remains an explicit experimental override.
 - `GGML_FAIRY2I_CPU_LUT` remains a build-time capability gate and still defaults to OFF, so normal builds do not become CPU-only.
 - Regression coverage now includes default LUT, explicit LUT, and explicit direct paths in `test-fairy2i`.
+
+## 2026-07-04 — Fairy2i ARM W1 build gate and real-GGUF baseline
+
+- Build gate fix:
+  - Commit `6bf3474f` makes the documented Fairy2i-only ARM LUT build link without enabling legacy iFairy.
+  - Legacy `GGML_TYPE_IFAIRY/IFAIRY64` vecdot traits are only exposed when `GGML_LEGACY_IFAIRY_CPU=ON`.
+  - CPU `supports_op(MUL_MAT)` rejects legacy iFairy weight types when legacy CPU is off; `GGML_OP_IFAIRY_WIDE_LINEAR_W2` is also rejected unless legacy CPU is compiled.
+- W1 ARM LUT optimization:
+  - Commit `43fccc6c` adds an ARM NEON W1 mixed-sign pair qgemm for `ggml_fairy2i_tile64_lut_qgemm_two_cpu()`.
+  - The helper traverses the LUT once for `U.s0` and `W.s0`; `U` uses negated imaginary activation scale to recover `U * x`, while `W` keeps the LUT-preprocessed `W * conj(x)` scale.
+  - Non-ARM/non-AVX2 fallback remains the previous two single-weight qgemm calls.
+- Build used:
+  - `cmake -B build-rel-fairy2i -DCMAKE_BUILD_TYPE=Release -DGGML_FAIRY2I=ON -DGGML_FAIRY2I_CPU=ON -DGGML_FAIRY2I_CPU_LUT=ON`
+  - `cmake --build build-rel-fairy2i --target ggml-cpu test-fairy2i test-fairy2i-loader -j 8`
+  - `cmake --build build-rel-fairy2i --target llama-cli llama-bench -j 8`
+- Correctness/format validation (Apple arm64, `build-rel-fairy2i`):
+  - `ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i`: PASS
+  - `GGML_FAIRY2I_LUT=0 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i`: PASS
+  - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1 ./build-rel-fairy2i/bin/test-fairy2i`: PASS
+  - scoped `git clang-format --style=file --diff`: PASS
+  - scoped `clang-tidy -p build-rel-fairy2i`: not run (`clang-tidy` not available in PATH)
+- Real W1 GGUF:
+  - `/Users/a1806/llama/qwen_1bit_scale/qwen3-fairy2i-w1-learned-scale.gguf`
+  - Metadata/tensor validation: `general.architecture=fairy2i`, `fairy2i.quant.variant=tile64_v2_w1_learned_scale`, `fairy2i.quant.residual_steps=1`, `fairy2i.quant.scale_source=learned`, `*.U.s0=252`, `*.W.s0=252`, `*.U.s1=0`, `*.W.s1=0`.
+- Real-model smoke baseline (`llama-cli --no-warmup -p "I believe life is" -n 1 -t 4`, raw logs under `tmp/fairy2i-arm-w1-baseline/`):
+
+  | config | raw log | path marker | prompt eval |
+  |---|---|---|---:|
+  | direct fused | `direct_fused_cli.log` | `path=direct_dotprod` | `12172.83 ms / 4 tok`, `0.33 tok/s` |
+  | explicit LUT fused, before W1 ARM pair | `lut_fused_cli.log` | `path=lut16` | `2022.05 ms / 4 tok`, `1.98 tok/s` |
+  | default fused, before W1 ARM pair | `default_fused_cli.log` | `path=lut16` | `2022.96 ms / 4 tok`, `1.98 tok/s` |
+  | fused off | `fused_off_cli.log` | unfused graph | `245.36 ms / 4 tok`, `16.30 tok/s` |
+  | explicit LUT fused, after W1 ARM pair | `lut_fused_cli_after_w1_pair.log` | `path=lut16` | `1930.98 ms / 4 tok`, `2.07 tok/s` |
+  | explicit LUT fused + timing, after W1 ARM pair | `lut_fused_cli_after_w1_pair_timing.log` | `path=lut16`, `timing path=lut16` | timing markers captured |
+
+- Baseline notes:
+  - The short prompt-only smoke is intentionally small and dominated by graph/model overhead; it is useful for path validation and rough before/after signal, not a stable throughput claim.
+  - `llama-bench` with `--n-prompt 64 --n-gen 32 --repetitions 2` on direct fused was interrupted after running longer than the quick baseline window; `direct_fused.log` is empty and excluded from results.
+  - The tiny smoke shows W1 LUT fused improved from `2022.05 ms` to `1930.98 ms` prompt eval after the ARM mixed-sign pair helper, about `4.5%` lower latency in this path-validation run.
+  - The fused-off prompt-only case is much faster in this tiny setup because it avoids the W1 fused/LUT path and uses the unfused graph; decode-like or dedicated W1 microbench data is still needed before making production routing changes.
 
 ## 2026-06-29 — Fairy2i W1 learned-scale fused wide-linear
 
