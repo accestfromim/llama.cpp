@@ -81,24 +81,24 @@ For complex changes (e.g. adding a new architecture, changing hot-path kernels),
 - `llama-cli` loads the GGUF and runs deterministically for a fixed seed
 - If performance-related: provide reproducible `eval tok/s` logs (raw output) + summary
 
-## 5) iFairy / LUT Special Rules (global summary only)
+## 5) Optimize rules
 
-This repo includes an iFairy 3-weight complex LUT path. When touching it:
+### Goal
+Optimize ggml CPU operators on ARM without changing numerical behavior.
 
-- Semantic invariant: must match baseline exactly (`w * conj(x)`)
-- Correctness gate: `test-legacy-ifairy` must pass for legacy iFairy changes; `test-fairy2i` must pass for Fairy2i changes.
-- Performance claims must include reproducible commands + raw `eval tok/s` logs
-- Edge-case coverage lives in `tests/test-legacy-ifairy.cpp` (alignment, small/large dims, env semantics) and `tests/test-fairy2i.cpp`; keep docs in sync.
-- If adding/changing iFairy LUT env knobs or routing, update the V2 docs (do not modify the legacy `IFAIRY_ARM_3W_LUT_*.md` series):
-  - `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_REFACTOR_PLAN.md`
-  - `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_LUT_C_INTEGRATION_PLAN.md`
-  - `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_STATUS.md`
-- For profiling summaries, prefer `xcrun xctrace export ... | python3 scripts/ifairy_xctrace_leaf.py` and record traces/summary in `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_STATUS.md`.
+### Rules
+- Do not optimize without a baseline.
+- Do not accept speedups without correctness tests.
+- Do not modify multiple unrelated operators in one PR.
+- Preserve scalar and non-ARM fallback paths.
+- Report compiler, flags, CPU model, thread count, governor, and git commit.
+- DO NOT run multiple llama-bench simultaneously.
 
-Detailed iFairy rules live in:
-- `ggml/src/ggml-cpu/AGENTS.md`
-- V2 docs: `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_REFACTOR_PLAN.md`, `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_LUT_C_INTEGRATION_PLAN.md`, `docs/ifairy/v2/IFAIRY_ARM_3W_LUT_V2_STATUS.md`
-- Legacy reference docs (do not edit): `docs/ifairy/legacy/IFAIRY_ARM_3W_LUT_DESIGN.md`, `docs/ifairy/legacy/IFAIRY_ARM_3W_LUT_API_PLAN.md`, `docs/ifairy/legacy/IFAIRY_ARM_3W_LUT_STATUS.md`
+### Required validation
+- Build Release with documented CMake flags.
+- Run relevant test-backend-ops cases.
+- Run llama-bench pp/tg/pg before and after.
+- Provide benchmark table with mean, stdev, and percentage delta.
 
 ## 6) Coding Style & Naming Conventions
 
