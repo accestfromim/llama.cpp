@@ -12,13 +12,20 @@ Status: Draft (2026-03-13)
 
 ---
 
+## 2026-07-04 — Fairy2i CPU default policy cleanup
+
+- Fairy2i W1/W2 graph fusion moves from env opt-in to auto default: model variant, LoRA state, tensor types, and CPU backend support must all match; `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W{1,2}=0` keeps the unfused graph available.
+- Fairy2i CPU LUT builds default to LUT16. `GGML_FAIRY2I_LUT=0` forces the direct CPU path; `GGML_FAIRY2I_LUT_IMPL=lut_c` remains an explicit experimental override.
+- `GGML_FAIRY2I_CPU_LUT` remains a build-time capability gate and still defaults to OFF, so normal builds do not become CPU-only.
+- Regression coverage now includes default LUT, explicit LUT, and explicit direct paths in `test-fairy2i`.
+
 ## 2026-06-29 — Fairy2i W1 learned-scale fused wide-linear
 
 - 新增 Fairy2i W1 专用 fused op：`GGML_OP_FAIRY2I_WIDE_LINEAR_W1`。
-- 新增 opt-in graph 开关：`LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=1`。
+- W1 graph fusion now follows the default Fairy2i CPU policy; set `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=0` to force the unfused graph.
 - W1 路径只消费 `U.s0/W.s0`，服务 `tile64_v2_w1_learned_scale`；不使用空 `s1` 兼容 W2。
 - CPU direct 覆盖 scalar/AVX2/AVX512/ARM NEON/dotprod；CPU LUT16 路径复用 tile64 LUT preprocess，并用两次单权重 qgemm 组合 U/W。
-- 回归入口：`test-fairy2i` 的 W1 variant matrix；LUT build 下 `GGML_FAIRY2I_LUT=1` 会通过 require-lut 覆盖 W1 LUT。
+- 回归入口：`test-fairy2i` 的 W1 variant matrix；LUT build 下默认 LUT16 会通过 require-lut 覆盖 W1 LUT。
 
 ## 基线（Baseline）
 
@@ -65,7 +72,7 @@ Status: Draft (2026-03-13)
 
 ### 2026-06-18 (Fairy2i ARM W2 test gates)
 - 新增测试专用环境变量：
-  - `GGML_FAIRY2I_TEST_REQUIRE_LUT=1`：当 `GGML_FAIRY2I_LUT=1` 且 W2 LUT 计划已启用时，如果 LUT compute 返回 false，则测试直接失败，避免静默回落到 direct 路径。
+  - `GGML_FAIRY2I_TEST_REQUIRE_LUT=1`：当 Fairy2i LUT 计划已启用时（默认；除非 `GGML_FAIRY2I_LUT=0`），如果 LUT compute 返回 false，则测试直接失败，避免静默回落到 direct 路径。
   - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1`：在支持 dotprod 的 ARM64 设备上强制 dispatcher 走 NEON fallback，用于覆盖 direct wide-linear-fused 的 NEON 路径。
 - 这两个变量只用于测试/CI 覆盖，不作为生产调优 knob。
 - 新增 debug-only 环境变量：

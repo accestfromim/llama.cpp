@@ -434,6 +434,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
+#ifdef GGML_USE_FAIRY2I_CPU
+            return true;
+#else
+            return false;
+#endif
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             return true;
         case GGML_OP_SOFT_MAX_BACK: {

@@ -852,15 +852,25 @@ static std::vector<uint32_t> fairy2i_w1_scalar_reference(const fairy2i_w2_case &
 static bool run_fairy2i_w1_backend(std::vector<uint32_t> & out,
                                    const fairy2i_w2_case & tc,
                                    const fairy2i_w1_data & data,
-                                   bool                    lut_enabled,
+                                   const char *            lut_env,
+                                   const char *            lut_impl_env,
+                                   bool                    require_lut,
                                    bool                    force_scalar) {
     scoped_env_var env_lut("GGML_FAIRY2I_LUT");
     scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
     scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
     scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
-    env_lut.set(lut_enabled ? "1" : "0");
-    env_impl.set("lut16");
-    env_require_lut.set(lut_enabled ? "1" : "0");
+    if (lut_env) {
+        env_lut.set(lut_env);
+    } else {
+        env_lut.unset();
+    }
+    if (lut_impl_env) {
+        env_impl.set(lut_impl_env);
+    } else {
+        env_impl.unset();
+    }
+    env_require_lut.set(require_lut ? "1" : "0");
     if (force_scalar) {
         env_force_scalar.set("1");
     } else {
@@ -936,15 +946,25 @@ static bool run_fairy2i_w1_backend(std::vector<uint32_t> & out,
 static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
                                    const fairy2i_w2_case & tc,
                                    const fairy2i_w2_data & data,
-                                   bool                    lut_enabled,
+                                   const char *            lut_env,
+                                   const char *            lut_impl_env,
+                                   bool                    require_lut,
                                    bool                    force_scalar) {
     scoped_env_var env_lut("GGML_FAIRY2I_LUT");
     scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
     scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
     scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
-    env_lut.set(lut_enabled ? "1" : "0");
-    env_impl.set("lut16");
-    env_require_lut.set(lut_enabled ? "1" : "0");
+    if (lut_env) {
+        env_lut.set(lut_env);
+    } else {
+        env_lut.unset();
+    }
+    if (lut_impl_env) {
+        env_impl.set(lut_impl_env);
+    } else {
+        env_impl.unset();
+    }
+    env_require_lut.set(require_lut ? "1" : "0");
     if (force_scalar) {
         env_force_scalar.set("1");
     } else {
@@ -1349,14 +1369,18 @@ static bool test_fairy2i_wide_linear_w2_variants() {
                     std::vector<uint32_t> direct;
                     std::vector<uint32_t> direct_scalar;
                     std::vector<uint32_t> lut;
-                    if (!run_fairy2i_w2_backend(direct, tc, data, false, false)) {
+                    std::vector<uint32_t> lut_default;
+                    if (!run_fairy2i_w2_backend(direct, tc, data, "0", "lut16", false, false)) {
                         return false;
                     }
-                    if (compare_scalar_default && !run_fairy2i_w2_backend(direct_scalar, tc, data, false, true)) {
+                    if (compare_scalar_default && !run_fairy2i_w2_backend(direct_scalar, tc, data, "0", "lut16", false, true)) {
                         return false;
                     }
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
-                    if (!run_fairy2i_w2_backend(lut, tc, data, true, false)) {
+                    if (!run_fairy2i_w2_backend(lut, tc, data, "1", "lut16", true, false)) {
+                        return false;
+                    }
+                    if (!run_fairy2i_w2_backend(lut_default, tc, data, nullptr, nullptr, true, false)) {
                         return false;
                     }
 #endif
@@ -1376,6 +1400,10 @@ static bool test_fairy2i_wide_linear_w2_variants() {
                     snprintf(label, sizeof(label), "direct vs LUT M=%lld N=%lld K=%lld bias=%d",
                              (long long) M, (long long) N, (long long) K, (int) with_bias);
                     ok = compare_packed_complex(label, lut, direct, 1e-2f) && ok;
+
+                    snprintf(label, sizeof(label), "explicit LUT vs default LUT M=%lld N=%lld K=%lld bias=%d",
+                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    ok = compare_exact(label, lut_default, lut) && ok;
 #endif
                     ++cases_run;
                 }
@@ -1414,14 +1442,18 @@ static bool test_fairy2i_wide_linear_w1_variants() {
                     std::vector<uint32_t> direct;
                     std::vector<uint32_t> direct_scalar;
                     std::vector<uint32_t> lut;
-                    if (!run_fairy2i_w1_backend(direct, tc, data, false, false)) {
+                    std::vector<uint32_t> lut_default;
+                    if (!run_fairy2i_w1_backend(direct, tc, data, "0", "lut16", false, false)) {
                         return false;
                     }
-                    if (compare_scalar_default && !run_fairy2i_w1_backend(direct_scalar, tc, data, false, true)) {
+                    if (compare_scalar_default && !run_fairy2i_w1_backend(direct_scalar, tc, data, "0", "lut16", false, true)) {
                         return false;
                     }
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
-                    if (!run_fairy2i_w1_backend(lut, tc, data, true, false)) {
+                    if (!run_fairy2i_w1_backend(lut, tc, data, "1", "lut16", true, false)) {
+                        return false;
+                    }
+                    if (!run_fairy2i_w1_backend(lut_default, tc, data, nullptr, nullptr, true, false)) {
                         return false;
                     }
 #endif
@@ -1441,6 +1473,10 @@ static bool test_fairy2i_wide_linear_w1_variants() {
                     snprintf(label, sizeof(label), "W1 direct vs LUT M=%lld N=%lld K=%lld bias=%d",
                              (long long) M, (long long) N, (long long) K, (int) with_bias);
                     ok = compare_packed_complex(label, lut, direct, 1e-2f) && ok;
+
+                    snprintf(label, sizeof(label), "W1 explicit LUT vs default LUT M=%lld N=%lld K=%lld bias=%d",
+                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    ok = compare_exact(label, lut_default, lut) && ok;
 #endif
                     ++cases_run;
                 }
