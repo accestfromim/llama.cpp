@@ -425,15 +425,19 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_IFAIRY] = {
         .from_float               = quantize_row_ifairy,
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
         .vec_dot                  = ggml_vec_dot_ifairy_q16_K,
         .vec_dot_type             = GGML_TYPE_IFAIRY_Q16,
         .nrows                    = 1,
+#endif
     },
     [GGML_TYPE_IFAIRY64] = {
         .from_float               = quantize_row_ifairy64,
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
         .vec_dot                  = ggml_vec_dot_ifairy64_q16_K,
         .vec_dot_type             = GGML_TYPE_IFAIRY64_Q16,
         .nrows                    = 1,
+#endif
     },
     [GGML_TYPE_FAIRY2I_TILE64_V2] = {
         .from_float               = quantize_row_ifairy64,
