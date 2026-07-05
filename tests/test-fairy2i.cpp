@@ -430,6 +430,87 @@ static bool compare_f32_pairs(const char *               label,
     return true;
 }
 
+static void mark_bytes(std::vector<uint8_t> & touched, size_t offset, size_t size) {
+    std::fill(touched.begin() + offset, touched.begin() + offset + size, (uint8_t) 1);
+}
+
+static bool check_untouched_bytes(const char *                 label,
+                                  const std::vector<uint8_t> & data,
+                                  const std::vector<uint8_t> & touched,
+                                  uint8_t                      sentinel) {
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (!touched[i] && data[i] != sentinel) {
+            fprintf(stderr, "%s sentinel mismatch byte=%zu actual=0x%02x expected=0x%02x\n", label, i,
+                    (unsigned) data[i], (unsigned) sentinel);
+            return false;
+        }
+    }
+    return true;
+}
+
+static float fairy2i_pair_guard_seed_real(int64_t col, int64_t row) {
+    return 0.125f + 0.015625f * (float) ((3 * col + row) % 11);
+}
+
+static float fairy2i_pair_guard_seed_imag(int64_t col, int64_t row) {
+    return -0.1875f + 0.015625f * (float) ((5 * col + 2 * row) % 13);
+}
+
+static bool compare_fairy2i_pair_strided_f32(const char *                 label,
+                                             const std::vector<uint8_t> & actual,
+                                             const std::vector<float> &   expected,
+                                             int64_t                      M,
+                                             int64_t                      N,
+                                             size_t                       dst_col_stride,
+                                             size_t                       dst_row_stride) {
+    for (int64_t col = 0; col < N; ++col) {
+        for (int64_t row = 0; row < M; ++row) {
+            const size_t  off = (size_t) col * dst_col_stride + (size_t) row * dst_row_stride;
+            const float * out = (const float *) (actual.data() + off);
+            const size_t  idx = ((size_t) col * (size_t) M + (size_t) row) * 2u;
+            const float   dr  = fabsf(out[0] - expected[idx + 0]);
+            const float   di  = fabsf(out[1] - expected[idx + 1]);
+            if (dr > 1e-5f || di > 1e-5f) {
+                fprintf(stderr,
+                        "%s mismatch col=%lld row=%lld actual=(%.7g,%.7g) expected=(%.7g,%.7g) diff=(%.7g,%.7g)\n",
+                        label, (long long) col, (long long) row, out[0], out[1], expected[idx + 0], expected[idx + 1],
+                        dr, di);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool compare_fairy2i_pair_strided_bf16(const char *                 label,
+                                              const std::vector<uint8_t> & actual,
+                                              const std::vector<float> &   expected,
+                                              int64_t                      M,
+                                              int64_t                      N,
+                                              size_t                       dst_col_stride,
+                                              size_t                       dst_row_stride) {
+    for (int64_t col = 0; col < N; ++col) {
+        for (int64_t row = 0; row < M; ++row) {
+            const size_t off = (size_t) col * dst_col_stride + (size_t) row * dst_row_stride;
+            ggml_bf16_t  pair[2];
+            memcpy(pair, actual.data() + off, sizeof(pair));
+            const float  ar  = GGML_BF16_TO_FP32(pair[0]);
+            const float  ai  = GGML_BF16_TO_FP32(pair[1]);
+            const size_t idx = ((size_t) col * (size_t) M + (size_t) row) * 2u;
+            const float  dr  = fabsf(ar - expected[idx + 0]);
+            const float  di  = fabsf(ai - expected[idx + 1]);
+            if (dr > 2e-2f || di > 2e-2f) {
+                fprintf(stderr,
+                        "%s bf16 mismatch col=%lld row=%lld actual=(%.7g,%.7g) expected=(%.7g,%.7g) "
+                        "diff=(%.7g,%.7g)\n",
+                        label, (long long) col, (long long) row, ar, ai, expected[idx + 0], expected[idx + 1], dr, di);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool test_fairy2i_lut_qgemm_add() {
     const int64_t Ms[]      = { 1, 7, 16, 17, 23 };
     const int64_t Ks[]      = { 64, 128 };
@@ -549,6 +630,107 @@ static bool test_fairy2i_lut_qgemm_pair_extreme_same_lane() {
     return true;
 #    endif
 }
+
+static bool test_fairy2i_lut_qgemm_pair_layout_guardrails() {
+    const int64_t Ms[]      = { 1, 7, 16, 17, 32, 33 };
+    const int64_t Ks[]      = { 64, 128 };
+    const int64_t N         = 2;
+    const uint8_t sentinel  = 0xa5;
+    bool          ok        = true;
+    int           cases_run = 0;
+
+    struct pair_case {
+        bool pack_bf16;
+        bool negate_imag_scale;
+        bool add;
+        int  salt0;
+        int  salt1;
+    };
+
+    const pair_case cases[] = {
+        { false, true,  false, 41, 47 },
+        { false, false, true,  53, 59 },
+        { true,  true,  false, 61, 67 },
+        { true,  false, true,  71, 73 },
+    };
+
+    for (int64_t M : Ms) {
+        for (int64_t K : Ks) {
+            std::vector<int8_t> lut;
+            std::vector<float>  scales;
+            fill_fairy2i_lut_qgemm_inputs(lut, scales, N, K);
+
+            for (const pair_case & tc : cases) {
+                const std::vector<fairy2i_tile64_lut_wtile_16> w0 = make_fairy2i_lut_wtiles(M, K, tc.salt0);
+                const std::vector<fairy2i_tile64_lut_wtile_16> w1 = make_fairy2i_lut_wtiles(M, K, tc.salt1);
+                std::vector<float>                             pair_out((size_t) N * (size_t) M * 2u, 0.0f);
+                fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w0, lut, scales, pair_out, tc.negate_imag_scale, false);
+                fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w1, lut, scales, pair_out, tc.negate_imag_scale, true);
+
+                const size_t         elem_size      = tc.pack_bf16 ? sizeof(ggml_bf16_t) : sizeof(float);
+                const size_t         output_size    = 2u * elem_size;
+                const size_t         dst_row_stride = 4u * elem_size;
+                const size_t         dst_col_stride = ((size_t) M + 3u) * dst_row_stride;
+                std::vector<uint8_t> actual((size_t) N * dst_col_stride, sentinel);
+                std::vector<uint8_t> touched(actual.size(), 0);
+                std::vector<float>   expected((size_t) N * (size_t) M * 2u, 0.0f);
+
+                for (int64_t col = 0; col < N; ++col) {
+                    for (int64_t row = 0; row < M; ++row) {
+                        const size_t off = (size_t) col * dst_col_stride + (size_t) row * dst_row_stride;
+                        const size_t idx = ((size_t) col * (size_t) M + (size_t) row) * 2u;
+                        mark_bytes(touched, off, output_size);
+                        if (tc.add) {
+                            const float seed_r = fairy2i_pair_guard_seed_real(col, row);
+                            const float seed_i = fairy2i_pair_guard_seed_imag(col, row);
+                            if (tc.pack_bf16) {
+                                ggml_bf16_t pair[2] = {
+                                    GGML_FP32_TO_BF16(seed_r),
+                                    GGML_FP32_TO_BF16(seed_i),
+                                };
+                                memcpy(actual.data() + off, pair, sizeof(pair));
+                                expected[idx + 0] = GGML_BF16_TO_FP32(pair[0]);
+                                expected[idx + 1] = GGML_BF16_TO_FP32(pair[1]);
+                            } else {
+                                float pair[2] = { seed_r, seed_i };
+                                memcpy(actual.data() + off, pair, sizeof(pair));
+                                expected[idx + 0] = seed_r;
+                                expected[idx + 1] = seed_i;
+                            }
+                        }
+                    }
+                }
+                for (size_t i = 0; i < pair_out.size(); ++i) {
+                    expected[i] += pair_out[i];
+                }
+
+                ggml_fairy2i_tile64_lut_qgemm_pair_lut16((int) M, (int) K, (int) N, w0.data(), w1.data(), lut.data(),
+                                                         scales.data(), (float *) actual.data(), dst_col_stride,
+                                                         dst_row_stride, tc.pack_bf16, tc.negate_imag_scale, tc.add);
+
+                char label[192];
+                snprintf(label, sizeof(label),
+                         "Fairy2i LUT qgemm pair layout M=%lld K=%lld N=%lld pack_bf16=%d negate=%d add=%d",
+                         (long long) M, (long long) K, (long long) N, tc.pack_bf16 ? 1 : 0,
+                         tc.negate_imag_scale ? 1 : 0, tc.add ? 1 : 0);
+                if (tc.pack_bf16) {
+                    ok = compare_fairy2i_pair_strided_bf16(label, actual, expected, M, N, dst_col_stride,
+                                                           dst_row_stride) &&
+                         ok;
+                } else {
+                    ok = compare_fairy2i_pair_strided_f32(label, actual, expected, M, N, dst_col_stride,
+                                                          dst_row_stride) &&
+                         ok;
+                }
+                ok = check_untouched_bytes(label, actual, touched, sentinel) && ok;
+                ++cases_run;
+            }
+        }
+    }
+
+    printf("  Fairy2i LUT qgemm pair layout guardrails: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    return ok;
+}
 #else
 static bool test_fairy2i_lut_qgemm_add() {
     printf("  Fairy2i LUT qgemm add skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
@@ -557,6 +739,11 @@ static bool test_fairy2i_lut_qgemm_add() {
 
 static bool test_fairy2i_lut_qgemm_pair_extreme_same_lane() {
     printf("  Fairy2i LUT qgemm pair same-lane extremes skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+}
+
+static bool test_fairy2i_lut_qgemm_pair_layout_guardrails() {
+    printf("  Fairy2i LUT qgemm pair layout guardrails skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
     return true;
 }
 #endif
@@ -1602,6 +1789,10 @@ int main() {
     }
     if (!test_fairy2i_lut_qgemm_pair_extreme_same_lane()) {
         fprintf(stderr, "Fairy2i LUT qgemm pair same-lane extremes FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_lut_qgemm_pair_layout_guardrails()) {
+        fprintf(stderr, "Fairy2i LUT qgemm pair layout guardrails FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w1_variants()) {
