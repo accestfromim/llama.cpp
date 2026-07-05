@@ -468,9 +468,95 @@ static bool test_fairy2i_lut_qgemm_add() {
     printf("  Fairy2i LUT qgemm add: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
     return ok;
 }
+
+static bool test_fairy2i_lut_qgemm_pair_extreme_same_lane() {
+#    if defined(__aarch64__) && defined(__ARM_NEON)
+    const int64_t M                  = 17;
+    const int64_t K                  = 64;
+    const int64_t N                  = 2;
+    const int64_t blocks             = K / QK_FAIRY2I_TILE64;
+    const int64_t groups             = blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    const uint8_t selected_lut_index = 7;
+    const size_t  dst_size           = (size_t) N * (size_t) M * 2u;
+    bool          ok                 = true;
+    int           cases_run          = 0;
+
+    for (const int8_t lut_value : { (int8_t) 126, (int8_t) -126 }) {
+        std::vector<fairy2i_tile64_lut_wtile_16> wt0 = make_fairy2i_lut_wtiles(M, K, 23);
+        std::vector<fairy2i_tile64_lut_wtile_16> wt1 = make_fairy2i_lut_wtiles(M, K, 31);
+
+        for (fairy2i_tile64_lut_wtile_16 & wt : wt0) {
+            for (int lane = 0; lane < 16; ++lane) {
+                wt.d_real[lane] = GGML_FP32_TO_FP16(1.0f);
+                wt.d_imag[lane] = GGML_FP32_TO_FP16(0.0f);
+            }
+            for (int byte_idx = 0; byte_idx < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2; ++byte_idx) {
+                for (int lane = 0; lane < 16; ++lane) {
+                    wt.qs[byte_idx][lane] = (uint8_t) (selected_lut_index | (selected_lut_index << 4));
+                }
+            }
+        }
+        for (fairy2i_tile64_lut_wtile_16 & wt : wt1) {
+            for (int lane = 0; lane < 16; ++lane) {
+                wt.d_real[lane] = GGML_FP32_TO_FP16(1.0f);
+                wt.d_imag[lane] = GGML_FP32_TO_FP16(0.0f);
+            }
+            for (int byte_idx = 0; byte_idx < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2; ++byte_idx) {
+                for (int lane = 0; lane < 16; ++lane) {
+                    wt.qs[byte_idx][lane] = (uint8_t) (selected_lut_index | (selected_lut_index << 4));
+                }
+            }
+        }
+
+        std::vector<int8_t> lut((size_t) N * (size_t) groups * 64u, 0);
+        for (int64_t col = 0; col < N; ++col) {
+            int8_t * lut_col = lut.data() + (size_t) col * (size_t) groups * 64u;
+            for (int64_t group = 0; group < groups; ++group) {
+                int8_t * tbl = lut_col + (size_t) group * 64u;
+                for (int channel = 0; channel < 4; ++channel) {
+                    tbl[channel * 16 + selected_lut_index] = lut_value;
+                }
+            }
+        }
+
+        std::vector<float> scales((size_t) N * (size_t) blocks * 2u, 1.0f);
+        std::vector<float> expected(dst_size, 0.0f);
+        std::vector<float> actual(dst_size, 0.0f);
+        for (size_t i = 0; i < dst_size; ++i) {
+            const float seed = (i & 1u) ? -0.5f : 0.25f;
+            expected[i]      = seed;
+            actual[i]        = seed;
+        }
+
+        fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, wt0, lut, scales, expected, false, true);
+        fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, wt1, lut, scales, expected, false, true);
+
+        ggml_fairy2i_tile64_lut_qgemm_pair_lut16((int) M, (int) K, (int) N, wt0.data(), wt1.data(), lut.data(),
+                                                 scales.data(), actual.data(), (size_t) M * 2u * sizeof(float),
+                                                 2u * sizeof(float), false, false, true);
+
+        char label[160];
+        snprintf(label, sizeof(label), "Fairy2i LUT qgemm pair same-lane value=%d M=%lld K=%lld N=%lld",
+                 (int) lut_value, (long long) M, (long long) K, (long long) N);
+        ok = compare_f32_pairs(label, actual, expected) && ok;
+        ++cases_run;
+    }
+
+    printf("  Fairy2i LUT qgemm pair same-lane extremes: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    return ok;
+#    else
+    printf("  Fairy2i LUT qgemm pair same-lane extremes skipped: non-ARM build\n");
+    return true;
+#    endif
+}
 #else
 static bool test_fairy2i_lut_qgemm_add() {
     printf("  Fairy2i LUT qgemm add skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+}
+
+static bool test_fairy2i_lut_qgemm_pair_extreme_same_lane() {
+    printf("  Fairy2i LUT qgemm pair same-lane extremes skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
     return true;
 }
 #endif
@@ -1512,6 +1598,10 @@ int main() {
     }
     if (!test_fairy2i_lut_qgemm_add()) {
         fprintf(stderr, "Fairy2i LUT qgemm add FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_lut_qgemm_pair_extreme_same_lane()) {
+        fprintf(stderr, "Fairy2i LUT qgemm pair same-lane extremes FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w1_variants()) {
