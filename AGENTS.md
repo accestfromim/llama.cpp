@@ -97,8 +97,10 @@ Optimize ggml CPU operators on ARM without changing numerical behavior.
 ### Required validation
 - Build Release with documented CMake flags.
 - Run relevant test-backend-ops cases.
-- Run llama-bench pp/tg/pg before and after.
-- Provide benchmark table with mean, stdev, and percentage delta.
+- Run path-validated llama-bench before and after; do not run concurrent llama-bench jobs.
+- For Fairy2i W1/W2 CPU LUT work, use `perf/scripts/run_llama_bench_cpu.sh pp|tg` defaults: `pp512`, `tg128`, `THREADS=8`, `REPS=3`, CPU-only, verbose path markers, and warmup enabled.
+- For other operators, state the exact pp/tg/pg workload explicitly before measuring.
+- Provide a benchmark table with mean tok/s, percentage delta, path-marker evidence, and raw artifact paths; routine reports do not include variability columns.
 
 ## 6) Coding Style & Naming Conventions
 
