@@ -48,6 +48,10 @@ bool ggml_fairy2i_tile64_fuse_accumulate_block_two_arm(const block_fairy2i_tile6
 void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
                                                             block_fairy2i_act_q16_64 * y,
                                                             bool                       force_scalar);
+int  ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(bool reset);
+int  ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch_for_test(void);
+int  ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(bool reset);
+int  ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch_for_test(void);
 #endif
 
 #ifndef GGML_FP16_TO_FP32
@@ -430,6 +434,87 @@ static bool compare_f32_pairs(const char *               label,
     return true;
 }
 
+static void mark_bytes(std::vector<uint8_t> & touched, size_t offset, size_t size) {
+    std::fill(touched.begin() + offset, touched.begin() + offset + size, (uint8_t) 1);
+}
+
+static bool check_untouched_bytes(const char *                 label,
+                                  const std::vector<uint8_t> & data,
+                                  const std::vector<uint8_t> & touched,
+                                  uint8_t                      sentinel) {
+    for (size_t i = 0; i < data.size(); ++i) {
+        if (!touched[i] && data[i] != sentinel) {
+            fprintf(stderr, "%s sentinel mismatch byte=%zu actual=0x%02x expected=0x%02x\n", label, i,
+                    (unsigned) data[i], (unsigned) sentinel);
+            return false;
+        }
+    }
+    return true;
+}
+
+static float fairy2i_pair_guard_seed_real(int64_t col, int64_t row) {
+    return 0.125f + 0.015625f * (float) ((3 * col + row) % 11);
+}
+
+static float fairy2i_pair_guard_seed_imag(int64_t col, int64_t row) {
+    return -0.1875f + 0.015625f * (float) ((5 * col + 2 * row) % 13);
+}
+
+static bool compare_fairy2i_pair_strided_f32(const char *                 label,
+                                             const std::vector<uint8_t> & actual,
+                                             const std::vector<float> &   expected,
+                                             int64_t                      M,
+                                             int64_t                      N,
+                                             size_t                       dst_col_stride,
+                                             size_t                       dst_row_stride) {
+    for (int64_t col = 0; col < N; ++col) {
+        for (int64_t row = 0; row < M; ++row) {
+            const size_t  off = (size_t) col * dst_col_stride + (size_t) row * dst_row_stride;
+            const float * out = (const float *) (actual.data() + off);
+            const size_t  idx = ((size_t) col * (size_t) M + (size_t) row) * 2u;
+            const float   dr  = fabsf(out[0] - expected[idx + 0]);
+            const float   di  = fabsf(out[1] - expected[idx + 1]);
+            if (dr > 1e-5f || di > 1e-5f) {
+                fprintf(stderr,
+                        "%s mismatch col=%lld row=%lld actual=(%.7g,%.7g) expected=(%.7g,%.7g) diff=(%.7g,%.7g)\n",
+                        label, (long long) col, (long long) row, out[0], out[1], expected[idx + 0], expected[idx + 1],
+                        dr, di);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool compare_fairy2i_pair_strided_bf16(const char *                 label,
+                                              const std::vector<uint8_t> & actual,
+                                              const std::vector<float> &   expected,
+                                              int64_t                      M,
+                                              int64_t                      N,
+                                              size_t                       dst_col_stride,
+                                              size_t                       dst_row_stride) {
+    for (int64_t col = 0; col < N; ++col) {
+        for (int64_t row = 0; row < M; ++row) {
+            const size_t off = (size_t) col * dst_col_stride + (size_t) row * dst_row_stride;
+            ggml_bf16_t  pair[2];
+            memcpy(pair, actual.data() + off, sizeof(pair));
+            const float  ar  = GGML_BF16_TO_FP32(pair[0]);
+            const float  ai  = GGML_BF16_TO_FP32(pair[1]);
+            const size_t idx = ((size_t) col * (size_t) M + (size_t) row) * 2u;
+            const float  dr  = fabsf(ar - expected[idx + 0]);
+            const float  di  = fabsf(ai - expected[idx + 1]);
+            if (dr > 2e-2f || di > 2e-2f) {
+                fprintf(stderr,
+                        "%s bf16 mismatch col=%lld row=%lld actual=(%.7g,%.7g) expected=(%.7g,%.7g) "
+                        "diff=(%.7g,%.7g)\n",
+                        label, (long long) col, (long long) row, ar, ai, expected[idx + 0], expected[idx + 1], dr, di);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool test_fairy2i_lut_qgemm_add() {
     const int64_t Ms[]      = { 1, 7, 16, 17, 23 };
     const int64_t Ks[]      = { 64, 128 };
@@ -468,9 +553,201 @@ static bool test_fairy2i_lut_qgemm_add() {
     printf("  Fairy2i LUT qgemm add: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
     return ok;
 }
+
+static bool test_fairy2i_lut_qgemm_pair_extreme_same_lane() {
+#    if defined(__aarch64__) && defined(__ARM_NEON)
+    const int64_t M                  = 17;
+    const int64_t K                  = 64;
+    const int64_t N                  = 2;
+    const int64_t blocks             = K / QK_FAIRY2I_TILE64;
+    const int64_t groups             = blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    const uint8_t selected_lut_index = 7;
+    const size_t  dst_size           = (size_t) N * (size_t) M * 2u;
+    bool          ok                 = true;
+    int           cases_run          = 0;
+
+    for (const int8_t lut_value : { (int8_t) 126, (int8_t) -126 }) {
+        std::vector<fairy2i_tile64_lut_wtile_16> wt0 = make_fairy2i_lut_wtiles(M, K, 23);
+        std::vector<fairy2i_tile64_lut_wtile_16> wt1 = make_fairy2i_lut_wtiles(M, K, 31);
+
+        for (fairy2i_tile64_lut_wtile_16 & wt : wt0) {
+            for (int lane = 0; lane < 16; ++lane) {
+                wt.d_real[lane] = GGML_FP32_TO_FP16(1.0f);
+                wt.d_imag[lane] = GGML_FP32_TO_FP16(0.0f);
+            }
+            for (int byte_idx = 0; byte_idx < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2; ++byte_idx) {
+                for (int lane = 0; lane < 16; ++lane) {
+                    wt.qs[byte_idx][lane] = (uint8_t) (selected_lut_index | (selected_lut_index << 4));
+                }
+            }
+        }
+        for (fairy2i_tile64_lut_wtile_16 & wt : wt1) {
+            for (int lane = 0; lane < 16; ++lane) {
+                wt.d_real[lane] = GGML_FP32_TO_FP16(1.0f);
+                wt.d_imag[lane] = GGML_FP32_TO_FP16(0.0f);
+            }
+            for (int byte_idx = 0; byte_idx < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2; ++byte_idx) {
+                for (int lane = 0; lane < 16; ++lane) {
+                    wt.qs[byte_idx][lane] = (uint8_t) (selected_lut_index | (selected_lut_index << 4));
+                }
+            }
+        }
+
+        std::vector<int8_t> lut((size_t) N * (size_t) groups * 64u, 0);
+        for (int64_t col = 0; col < N; ++col) {
+            int8_t * lut_col = lut.data() + (size_t) col * (size_t) groups * 64u;
+            for (int64_t group = 0; group < groups; ++group) {
+                int8_t * tbl = lut_col + (size_t) group * 64u;
+                for (int channel = 0; channel < 4; ++channel) {
+                    tbl[channel * 16 + selected_lut_index] = lut_value;
+                }
+            }
+        }
+
+        std::vector<float> scales((size_t) N * (size_t) blocks * 2u, 1.0f);
+        std::vector<float> expected(dst_size, 0.0f);
+        std::vector<float> actual(dst_size, 0.0f);
+        for (size_t i = 0; i < dst_size; ++i) {
+            const float seed = (i & 1u) ? -0.5f : 0.25f;
+            expected[i]      = seed;
+            actual[i]        = seed;
+        }
+
+        fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, wt0, lut, scales, expected, false, true);
+        fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, wt1, lut, scales, expected, false, true);
+
+        ggml_fairy2i_tile64_lut_qgemm_pair_lut16((int) M, (int) K, (int) N, wt0.data(), wt1.data(), lut.data(),
+                                                 scales.data(), actual.data(), (size_t) M * 2u * sizeof(float),
+                                                 2u * sizeof(float), false, false, true);
+
+        char label[160];
+        snprintf(label, sizeof(label), "Fairy2i LUT qgemm pair same-lane value=%d M=%lld K=%lld N=%lld",
+                 (int) lut_value, (long long) M, (long long) K, (long long) N);
+        ok = compare_f32_pairs(label, actual, expected) && ok;
+        ++cases_run;
+    }
+
+    printf("  Fairy2i LUT qgemm pair same-lane extremes: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    return ok;
+#    else
+    printf("  Fairy2i LUT qgemm pair same-lane extremes skipped: non-ARM build\n");
+    return true;
+#    endif
+}
+
+static bool test_fairy2i_lut_qgemm_pair_layout_guardrails() {
+    const int64_t Ms[]      = { 1, 7, 16, 17, 32, 33 };
+    const int64_t Ks[]      = { 64, 128 };
+    const int64_t N         = 2;
+    const uint8_t sentinel  = 0xa5;
+    bool          ok        = true;
+    int           cases_run = 0;
+
+    struct pair_case {
+        bool pack_bf16;
+        bool negate_imag_scale;
+        bool add;
+        int  salt0;
+        int  salt1;
+    };
+
+    const pair_case cases[] = {
+        { false, true,  false, 41, 47 },
+        { false, false, true,  53, 59 },
+        { true,  true,  false, 61, 67 },
+        { true,  false, true,  71, 73 },
+    };
+
+    for (int64_t M : Ms) {
+        for (int64_t K : Ks) {
+            std::vector<int8_t> lut;
+            std::vector<float>  scales;
+            fill_fairy2i_lut_qgemm_inputs(lut, scales, N, K);
+
+            for (const pair_case & tc : cases) {
+                const std::vector<fairy2i_tile64_lut_wtile_16> w0 = make_fairy2i_lut_wtiles(M, K, tc.salt0);
+                const std::vector<fairy2i_tile64_lut_wtile_16> w1 = make_fairy2i_lut_wtiles(M, K, tc.salt1);
+                std::vector<float>                             pair_out((size_t) N * (size_t) M * 2u, 0.0f);
+                fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w0, lut, scales, pair_out, tc.negate_imag_scale, false);
+                fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w1, lut, scales, pair_out, tc.negate_imag_scale, true);
+
+                const size_t         elem_size      = tc.pack_bf16 ? sizeof(ggml_bf16_t) : sizeof(float);
+                const size_t         output_size    = 2u * elem_size;
+                const size_t         dst_row_stride = 4u * elem_size;
+                const size_t         dst_col_stride = ((size_t) M + 3u) * dst_row_stride;
+                std::vector<uint8_t> actual((size_t) N * dst_col_stride, sentinel);
+                std::vector<uint8_t> touched(actual.size(), 0);
+                std::vector<float>   expected((size_t) N * (size_t) M * 2u, 0.0f);
+
+                for (int64_t col = 0; col < N; ++col) {
+                    for (int64_t row = 0; row < M; ++row) {
+                        const size_t off = (size_t) col * dst_col_stride + (size_t) row * dst_row_stride;
+                        const size_t idx = ((size_t) col * (size_t) M + (size_t) row) * 2u;
+                        mark_bytes(touched, off, output_size);
+                        if (tc.add) {
+                            const float seed_r = fairy2i_pair_guard_seed_real(col, row);
+                            const float seed_i = fairy2i_pair_guard_seed_imag(col, row);
+                            if (tc.pack_bf16) {
+                                ggml_bf16_t pair[2] = {
+                                    GGML_FP32_TO_BF16(seed_r),
+                                    GGML_FP32_TO_BF16(seed_i),
+                                };
+                                memcpy(actual.data() + off, pair, sizeof(pair));
+                                expected[idx + 0] = GGML_BF16_TO_FP32(pair[0]);
+                                expected[idx + 1] = GGML_BF16_TO_FP32(pair[1]);
+                            } else {
+                                float pair[2] = { seed_r, seed_i };
+                                memcpy(actual.data() + off, pair, sizeof(pair));
+                                expected[idx + 0] = seed_r;
+                                expected[idx + 1] = seed_i;
+                            }
+                        }
+                    }
+                }
+                for (size_t i = 0; i < pair_out.size(); ++i) {
+                    expected[i] += pair_out[i];
+                }
+
+                ggml_fairy2i_tile64_lut_qgemm_pair_lut16((int) M, (int) K, (int) N, w0.data(), w1.data(), lut.data(),
+                                                         scales.data(), (float *) actual.data(), dst_col_stride,
+                                                         dst_row_stride, tc.pack_bf16, tc.negate_imag_scale, tc.add);
+
+                char label[192];
+                snprintf(label, sizeof(label),
+                         "Fairy2i LUT qgemm pair layout M=%lld K=%lld N=%lld pack_bf16=%d negate=%d add=%d",
+                         (long long) M, (long long) K, (long long) N, tc.pack_bf16 ? 1 : 0,
+                         tc.negate_imag_scale ? 1 : 0, tc.add ? 1 : 0);
+                if (tc.pack_bf16) {
+                    ok = compare_fairy2i_pair_strided_bf16(label, actual, expected, M, N, dst_col_stride,
+                                                           dst_row_stride) &&
+                         ok;
+                } else {
+                    ok = compare_fairy2i_pair_strided_f32(label, actual, expected, M, N, dst_col_stride,
+                                                          dst_row_stride) &&
+                         ok;
+                }
+                ok = check_untouched_bytes(label, actual, touched, sentinel) && ok;
+                ++cases_run;
+            }
+        }
+    }
+
+    printf("  Fairy2i LUT qgemm pair layout guardrails: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    return ok;
+}
 #else
 static bool test_fairy2i_lut_qgemm_add() {
     printf("  Fairy2i LUT qgemm add skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+}
+
+static bool test_fairy2i_lut_qgemm_pair_extreme_same_lane() {
+    printf("  Fairy2i LUT qgemm pair same-lane extremes skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+}
+
+static bool test_fairy2i_lut_qgemm_pair_layout_guardrails() {
+    printf("  Fairy2i LUT qgemm pair layout guardrails skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
     return true;
 }
 #endif
@@ -855,11 +1132,16 @@ static bool run_fairy2i_w1_backend(std::vector<uint32_t> & out,
                                    const char *            lut_env,
                                    const char *            lut_impl_env,
                                    bool                    require_lut,
-                                   bool                    force_scalar) {
+                                   bool                    force_scalar,
+                                   int                     n_threads              = 4,
+                                   const char *            dynamic_tiles_env      = nullptr,
+                                   const char *            dynamic_tile_batch_env = nullptr) {
     scoped_env_var env_lut("GGML_FAIRY2I_LUT");
     scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
     scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
     scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+    scoped_env_var env_dynamic_tiles("GGML_FAIRY2I_W1_DYNAMIC_TILES");
+    scoped_env_var env_dynamic_tile_batch("GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH");
     if (lut_env) {
         env_lut.set(lut_env);
     } else {
@@ -876,13 +1158,23 @@ static bool run_fairy2i_w1_backend(std::vector<uint32_t> & out,
     } else {
         env_force_scalar.unset();
     }
+    if (dynamic_tiles_env) {
+        env_dynamic_tiles.set(dynamic_tiles_env);
+    } else {
+        env_dynamic_tiles.unset();
+    }
+    if (dynamic_tile_batch_env) {
+        env_dynamic_tile_batch.set(dynamic_tile_batch_env);
+    } else {
+        env_dynamic_tile_batch.unset();
+    }
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
         fprintf(stderr, "failed to initialize CPU backend\n");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(backend, 4);
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
 
     struct ggml_init_params params = {
         /*.mem_size   =*/32 * 1024 * 1024,
@@ -949,11 +1241,16 @@ static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
                                    const char *            lut_env,
                                    const char *            lut_impl_env,
                                    bool                    require_lut,
-                                   bool                    force_scalar) {
+                                   bool                    force_scalar,
+                                   int                     n_threads              = 4,
+                                   const char *            dynamic_tiles_env      = nullptr,
+                                   const char *            dynamic_tile_batch_env = nullptr) {
     scoped_env_var env_lut("GGML_FAIRY2I_LUT");
     scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
     scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
     scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+    scoped_env_var env_dynamic_tiles("GGML_FAIRY2I_W2_DYNAMIC_TILES");
+    scoped_env_var env_dynamic_tile_batch("GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH");
     if (lut_env) {
         env_lut.set(lut_env);
     } else {
@@ -970,13 +1267,23 @@ static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
     } else {
         env_force_scalar.unset();
     }
+    if (dynamic_tiles_env) {
+        env_dynamic_tiles.set(dynamic_tiles_env);
+    } else {
+        env_dynamic_tiles.unset();
+    }
+    if (dynamic_tile_batch_env) {
+        env_dynamic_tile_batch.set(dynamic_tile_batch_env);
+    } else {
+        env_dynamic_tile_batch.unset();
+    }
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
         fprintf(stderr, "failed to initialize CPU backend\n");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(backend, 4);
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
 
     struct ggml_init_params params = {
         /*.mem_size   =*/32 * 1024 * 1024,
@@ -1037,6 +1344,376 @@ static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
     ggml_free(ctx);
     ggml_backend_free(backend);
     return true;
+}
+
+static bool compare_exact(const char *                  label,
+                          const std::vector<uint32_t> & actual,
+                          const std::vector<uint32_t> & expected);
+static bool compare_packed_complex(const char *                  label,
+                                   const std::vector<uint32_t> & actual,
+                                   const std::vector<uint32_t> & expected,
+                                   float                         max_error);
+
+static bool check_fairy2i_w1_dynamic_tiles_hit(const char * label, bool expected) {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int hits = ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(false);
+    if ((hits > 0) != expected) {
+        fprintf(stderr, "%s dynamic hit mismatch: hits=%d expected=%d\n", label, hits, expected ? 1 : 0);
+        return false;
+    }
+    return true;
+#else
+    (void) label;
+    (void) expected;
+    return true;
+#endif
+}
+
+static bool check_fairy2i_w1_dynamic_tiles_last_batch(const char * label, int expected) {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int batch = ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch_for_test();
+    if (batch != expected) {
+        fprintf(stderr, "%s dynamic batch mismatch: batch=%d expected=%d\n", label, batch, expected);
+        return false;
+    }
+    return true;
+#else
+    (void) label;
+    (void) expected;
+    return true;
+#endif
+}
+
+static bool check_fairy2i_w2_dynamic_tiles_hit(const char * label, bool expected) {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int hits = ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(false);
+    if ((hits > 0) != expected) {
+        fprintf(stderr, "%s dynamic hit mismatch: hits=%d expected=%d\n", label, hits, expected ? 1 : 0);
+        return false;
+    }
+    return true;
+#else
+    (void) label;
+    (void) expected;
+    return true;
+#endif
+}
+
+static bool check_fairy2i_w2_dynamic_tiles_last_batch(const char * label, int expected) {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int batch = ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch_for_test();
+    if (batch != expected) {
+        fprintf(stderr, "%s dynamic batch mismatch: batch=%d expected=%d\n", label, batch, expected);
+        return false;
+    }
+    return true;
+#else
+    (void) label;
+    (void) expected;
+    return true;
+#endif
+}
+
+static bool test_fairy2i_wide_linear_w1_lut_dynamic_tiles() {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int     threads[]     = { 1, 2, 3, 4, 6, 8 };
+    const int64_t Ms[]          = { 15, 16, 17, 31, 32, 33, 65, 127 };
+    const int64_t fallback_Ns[] = { 2, 3 };
+    const int64_t Ks[]          = { 256, 512 };
+    const char *  batches[]     = { nullptr, "1", "2", "4" };
+
+    int  dynamic_cases  = 0;
+    int  fallback_cases = 0;
+    bool ok             = true;
+
+    {
+        scoped_env_var        outer_dynamic_tiles("GGML_FAIRY2I_W1_DYNAMIC_TILES");
+        const fairy2i_w2_case tc   = { 65, 1, 512, true };
+        const fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+        std::vector<uint32_t> direct;
+        std::vector<uint32_t> lut_static;
+        std::vector<uint32_t> lut_default_off;
+        std::vector<uint32_t> lut_default_batch;
+        std::vector<uint32_t> lut_batch_one;
+        std::vector<uint32_t> lut_batch_invalid;
+        static const char *   invalid_batches[] = { "3", "2x" };
+        static const int      n_threads         = 6;
+        static const char *   label_default_off = "W1 LUT dynamic tiles default-off with polluted external environment";
+        static const char *   label_default     = "W1 LUT dynamic tiles default batch";
+        static const char *   label_invalid     = "W1 LUT dynamic tiles invalid batch fallback";
+
+        if (!run_fairy2i_w1_backend(direct, tc, data, "0", "lut16", false, false, n_threads)) {
+            return false;
+        }
+        if (!run_fairy2i_w1_backend(lut_static, tc, data, "1", "lut16", true, false, n_threads, "0")) {
+            return false;
+        }
+
+        outer_dynamic_tiles.set("1");
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w1_backend(lut_default_off, tc, data, "1", "lut16", true, false, n_threads)) {
+            return false;
+        }
+        ok = check_fairy2i_w1_dynamic_tiles_hit(label_default_off, false) && ok;
+        ok = compare_exact(label_default_off, lut_default_off, lut_static) && ok;
+
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w1_backend(lut_default_batch, tc, data, "1", "lut16", true, false, n_threads, "1")) {
+            return false;
+        }
+        ok = check_fairy2i_w1_dynamic_tiles_hit(label_default, true) && ok;
+        ok = check_fairy2i_w1_dynamic_tiles_last_batch(label_default, 2) && ok;
+        ok = compare_exact(label_default, lut_default_batch, lut_static) && ok;
+        ok = compare_packed_complex("W1 dynamic LUT semantic check vs direct", lut_default_batch, direct, 1e-2f) && ok;
+
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w1_backend(lut_batch_one, tc, data, "1", "lut16", true, false, n_threads, "1", "1")) {
+            return false;
+        }
+        ok = check_fairy2i_w1_dynamic_tiles_hit("W1 LUT dynamic tiles batch=1 control", true) && ok;
+        ok = check_fairy2i_w1_dynamic_tiles_last_batch("W1 LUT dynamic tiles batch=1 control", 1) && ok;
+
+        for (const char * invalid_batch : invalid_batches) {
+            ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+            if (!run_fairy2i_w1_backend(lut_batch_invalid, tc, data, "1", "lut16", true, false, n_threads, "1",
+                                        invalid_batch)) {
+                return false;
+            }
+            ok = check_fairy2i_w1_dynamic_tiles_hit(label_invalid, true) && ok;
+            ok = check_fairy2i_w1_dynamic_tiles_last_batch(label_invalid, 1) && ok;
+            ok = compare_exact(label_invalid, lut_batch_invalid, lut_batch_one) && ok;
+        }
+    }
+
+    for (int n_threads : threads) {
+        for (int64_t M : Ms) {
+            for (int64_t K : Ks) {
+                for (bool with_bias : { false, true }) {
+                    const fairy2i_w2_case tc   = { M, 1, K, with_bias };
+                    const fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+                    char                  label[192];
+
+                    std::vector<uint32_t> lut_static;
+                    std::vector<uint32_t> lut_dynamic;
+                    ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                    if (!run_fairy2i_w1_backend(lut_static, tc, data, "1", "lut16", true, false, n_threads, "0")) {
+                        return false;
+                    }
+                    snprintf(label, sizeof(label), "W1 LUT dynamic tiles disabled M=%lld N=1 K=%lld bias=%d threads=%d",
+                             (long long) M, (long long) K, (int) with_bias, n_threads);
+                    ok = check_fairy2i_w1_dynamic_tiles_hit(label, false) && ok;
+
+                    for (const char * batch : batches) {
+                        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w1_backend(lut_dynamic, tc, data, "1", "lut16", true, false, n_threads, "1",
+                                                    batch)) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles hit M=%lld N=1 K=%lld bias=%d threads=%d batch=%s",
+                                 (long long) M, (long long) K, (int) with_bias, n_threads, batch ? batch : "default");
+                        ok                       = check_fairy2i_w1_dynamic_tiles_hit(label, true) && ok;
+                        const int expected_batch = !batch                           ? 2 :
+                                                   batch && strcmp(batch, "2") == 0 ? 2 :
+                                                   batch && strcmp(batch, "4") == 0 ? 4 :
+                                                                                      1;
+                        ok = check_fairy2i_w1_dynamic_tiles_last_batch(label, expected_batch) && ok;
+
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles M=%lld N=1 K=%lld bias=%d threads=%d batch=%s", (long long) M,
+                                 (long long) K, (int) with_bias, n_threads, batch ? batch : "default");
+                        ok = compare_exact(label, lut_dynamic, lut_static) && ok;
+                        ++dynamic_cases;
+                    }
+
+                    for (int64_t N : fallback_Ns) {
+                        const fairy2i_w2_case fallback_tc   = { M, N, K, with_bias };
+                        const fairy2i_w1_data fallback_data = make_fairy2i_w1_data(fallback_tc);
+
+                        std::vector<uint32_t> fallback_static;
+                        std::vector<uint32_t> fallback_gate_on;
+                        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w1_backend(fallback_static, fallback_tc, fallback_data, "1", "lut16", true,
+                                                    false, n_threads, "0")) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles fallback disabled M=%lld N=%lld K=%lld bias=%d threads=%d",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = check_fairy2i_w1_dynamic_tiles_hit(label, false) && ok;
+
+                        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w1_backend(fallback_gate_on, fallback_tc, fallback_data, "1", "lut16", true,
+                                                    false, n_threads, "1", "4")) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles fallback hit M=%lld N=%lld K=%lld bias=%d threads=%d batch=4",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = check_fairy2i_w1_dynamic_tiles_hit(label, false) && ok;
+
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles fallback/static M=%lld N=%lld K=%lld bias=%d threads=%d batch=4",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = compare_exact(label, fallback_gate_on, fallback_static) && ok;
+                        ++fallback_cases;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("  Fairy2i W1 LUT dynamic tiles: %d N=1 cases, %d N>1 fallback cases - %s\n", dynamic_cases, fallback_cases,
+           ok ? "PASS" : "FAIL");
+    return ok;
+#else
+    printf("  Fairy2i W1 LUT dynamic tiles skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+#endif
+}
+
+static bool test_fairy2i_wide_linear_w2_lut_dynamic_tiles() {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int     threads[]     = { 1, 2, 3, 4, 6, 8, 10, 12 };
+    const int64_t Ms[]          = { 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255 };
+    const int64_t fallback_Ns[] = { 2, 3 };
+    const int64_t Ks[]          = { 256, 512 };
+    const char *  batches[]     = { nullptr, "1", "2", "4" };
+
+    int  dynamic_cases  = 0;
+    int  fallback_cases = 0;
+    bool ok             = true;
+
+    {
+        scoped_env_var        outer_dynamic_tiles("GGML_FAIRY2I_W2_DYNAMIC_TILES");
+        const fairy2i_w2_case tc   = { 65, 1, 512, true };
+        const fairy2i_w2_data data = make_fairy2i_w2_data(tc);
+        std::vector<uint32_t> lut_static;
+        std::vector<uint32_t> lut_default_on;
+        std::vector<uint32_t> lut_batch_one;
+        std::vector<uint32_t> lut_batch_invalid;
+        static const char *   invalid_batches[] = { "3", "2x" };
+        static const int      n_threads         = 6;
+        static const char * label_default = "W2 LUT dynamic tiles helper default-on with polluted external environment";
+        static const char * label_invalid = "W2 LUT dynamic tiles invalid batch fallback";
+
+        if (!run_fairy2i_w2_backend(lut_static, tc, data, "1", "lut16", true, false, n_threads, "0")) {
+            return false;
+        }
+
+        outer_dynamic_tiles.set("0");
+        ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w2_backend(lut_default_on, tc, data, "1", "lut16", true, false, n_threads)) {
+            return false;
+        }
+        ok = check_fairy2i_w2_dynamic_tiles_hit(label_default, true) && ok;
+        ok = check_fairy2i_w2_dynamic_tiles_last_batch(label_default, 2) && ok;
+        ok = compare_exact(label_default, lut_default_on, lut_static) && ok;
+
+        ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w2_backend(lut_batch_one, tc, data, "1", "lut16", true, false, n_threads, "1", "1")) {
+            return false;
+        }
+        ok = check_fairy2i_w2_dynamic_tiles_hit("W2 LUT dynamic tiles batch=1 control", true) && ok;
+        ok = check_fairy2i_w2_dynamic_tiles_last_batch("W2 LUT dynamic tiles batch=1 control", 1) && ok;
+
+        for (const char * invalid_batch : invalid_batches) {
+            ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+            if (!run_fairy2i_w2_backend(lut_batch_invalid, tc, data, "1", "lut16", true, false, n_threads, "1",
+                                        invalid_batch)) {
+                return false;
+            }
+            ok = check_fairy2i_w2_dynamic_tiles_hit(label_invalid, true) && ok;
+            ok = check_fairy2i_w2_dynamic_tiles_last_batch(label_invalid, 1) && ok;
+            ok = compare_exact(label_invalid, lut_batch_invalid, lut_batch_one) && ok;
+        }
+    }
+
+    for (int n_threads : threads) {
+        for (int64_t M : Ms) {
+            for (int64_t K : Ks) {
+                for (bool with_bias : { false, true }) {
+                    const fairy2i_w2_case tc   = { M, 1, K, with_bias };
+                    const fairy2i_w2_data data = make_fairy2i_w2_data(tc);
+                    char                  label[192];
+
+                    std::vector<uint32_t> lut_static;
+                    std::vector<uint32_t> lut_dynamic;
+                    ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+                    if (!run_fairy2i_w2_backend(lut_static, tc, data, "1", "lut16", true, false, n_threads, "0")) {
+                        return false;
+                    }
+                    snprintf(label, sizeof(label), "W2 LUT dynamic tiles disabled M=%lld N=1 K=%lld bias=%d threads=%d",
+                             (long long) M, (long long) K, (int) with_bias, n_threads);
+                    ok = check_fairy2i_w2_dynamic_tiles_hit(label, false) && ok;
+
+                    for (const char * batch : batches) {
+                        ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w2_backend(lut_dynamic, tc, data, "1", "lut16", true, false, n_threads, "1",
+                                                    batch)) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W2 LUT dynamic tiles hit M=%lld N=1 K=%lld bias=%d threads=%d batch=%s",
+                                 (long long) M, (long long) K, (int) with_bias, n_threads, batch ? batch : "default");
+                        ok                       = check_fairy2i_w2_dynamic_tiles_hit(label, true) && ok;
+                        const int expected_batch = !batch                           ? 2 :
+                                                   batch && strcmp(batch, "2") == 0 ? 2 :
+                                                   batch && strcmp(batch, "4") == 0 ? 4 :
+                                                                                      1;
+                        ok = check_fairy2i_w2_dynamic_tiles_last_batch(label, expected_batch) && ok;
+
+                        snprintf(label, sizeof(label),
+                                 "W2 LUT dynamic tiles M=%lld N=1 K=%lld bias=%d threads=%d batch=%s", (long long) M,
+                                 (long long) K, (int) with_bias, n_threads, batch ? batch : "default");
+                        ok = compare_exact(label, lut_dynamic, lut_static) && ok;
+                        ++dynamic_cases;
+                    }
+
+                    for (int64_t N : fallback_Ns) {
+                        const fairy2i_w2_case fallback_tc   = { M, N, K, with_bias };
+                        const fairy2i_w2_data fallback_data = make_fairy2i_w2_data(fallback_tc);
+
+                        std::vector<uint32_t> fallback_static;
+                        std::vector<uint32_t> fallback_gate_on;
+                        ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w2_backend(fallback_static, fallback_tc, fallback_data, "1", "lut16", true,
+                                                    false, n_threads, "0")) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W2 LUT dynamic tiles fallback disabled M=%lld N=%lld K=%lld bias=%d threads=%d",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = check_fairy2i_w2_dynamic_tiles_hit(label, false) && ok;
+
+                        ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w2_backend(fallback_gate_on, fallback_tc, fallback_data, "1", "lut16", true,
+                                                    false, n_threads, "1", "4")) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W2 LUT dynamic tiles fallback hit M=%lld N=%lld K=%lld bias=%d threads=%d batch=4",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = check_fairy2i_w2_dynamic_tiles_hit(label, false) && ok;
+
+                        snprintf(label, sizeof(label),
+                                 "W2 LUT dynamic tiles fallback/static M=%lld N=%lld K=%lld bias=%d threads=%d batch=4",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = compare_exact(label, fallback_gate_on, fallback_static) && ok;
+                        ++fallback_cases;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("  Fairy2i W2 LUT dynamic tiles: %d N=1 cases, %d N>1 fallback cases - %s\n", dynamic_cases, fallback_cases,
+           ok ? "PASS" : "FAIL");
+    return ok;
+#else
+    printf("  Fairy2i W2 LUT dynamic tiles skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+#endif
 }
 
 static bool compare_exact(const char * label, const std::vector<uint32_t> & actual, const std::vector<uint32_t> & expected) {
@@ -1514,12 +2191,28 @@ int main() {
         fprintf(stderr, "Fairy2i LUT qgemm add FAILED\n");
         ++num_failed;
     }
+    if (!test_fairy2i_lut_qgemm_pair_extreme_same_lane()) {
+        fprintf(stderr, "Fairy2i LUT qgemm pair same-lane extremes FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_lut_qgemm_pair_layout_guardrails()) {
+        fprintf(stderr, "Fairy2i LUT qgemm pair layout guardrails FAILED\n");
+        ++num_failed;
+    }
     if (!test_fairy2i_wide_linear_w1_variants()) {
         fprintf(stderr, "Fairy2i W1 variant matrix FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w2_variants()) {
         fprintf(stderr, "Fairy2i W2 variant matrix FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_wide_linear_w1_lut_dynamic_tiles()) {
+        fprintf(stderr, "Fairy2i W1 LUT dynamic tiles FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_wide_linear_w2_lut_dynamic_tiles()) {
+        fprintf(stderr, "Fairy2i W2 LUT dynamic tiles FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_opencl_tile64_mul_mat()) {
