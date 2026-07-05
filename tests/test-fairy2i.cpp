@@ -48,6 +48,8 @@ bool ggml_fairy2i_tile64_fuse_accumulate_block_two_arm(const block_fairy2i_tile6
 void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
                                                             block_fairy2i_act_q16_64 * y,
                                                             bool                       force_scalar);
+int  ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(bool reset);
+int  ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch_for_test(void);
 int  ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(bool reset);
 int  ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch_for_test(void);
 #endif
@@ -1130,11 +1132,16 @@ static bool run_fairy2i_w1_backend(std::vector<uint32_t> & out,
                                    const char *            lut_env,
                                    const char *            lut_impl_env,
                                    bool                    require_lut,
-                                   bool                    force_scalar) {
+                                   bool                    force_scalar,
+                                   int                     n_threads              = 4,
+                                   const char *            dynamic_tiles_env      = nullptr,
+                                   const char *            dynamic_tile_batch_env = nullptr) {
     scoped_env_var env_lut("GGML_FAIRY2I_LUT");
     scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
     scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
     scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+    scoped_env_var env_dynamic_tiles("GGML_FAIRY2I_W1_DYNAMIC_TILES");
+    scoped_env_var env_dynamic_tile_batch("GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH");
     if (lut_env) {
         env_lut.set(lut_env);
     } else {
@@ -1151,13 +1158,23 @@ static bool run_fairy2i_w1_backend(std::vector<uint32_t> & out,
     } else {
         env_force_scalar.unset();
     }
+    if (dynamic_tiles_env) {
+        env_dynamic_tiles.set(dynamic_tiles_env);
+    } else {
+        env_dynamic_tiles.unset();
+    }
+    if (dynamic_tile_batch_env) {
+        env_dynamic_tile_batch.set(dynamic_tile_batch_env);
+    } else {
+        env_dynamic_tile_batch.unset();
+    }
 
     ggml_backend_t backend = ggml_backend_cpu_init();
     if (!backend) {
         fprintf(stderr, "failed to initialize CPU backend\n");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(backend, 4);
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
 
     struct ggml_init_params params = {
         /*.mem_size   =*/32 * 1024 * 1024,
@@ -1332,6 +1349,40 @@ static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
 static bool compare_exact(const char *                  label,
                           const std::vector<uint32_t> & actual,
                           const std::vector<uint32_t> & expected);
+static bool compare_packed_complex(const char *                  label,
+                                   const std::vector<uint32_t> & actual,
+                                   const std::vector<uint32_t> & expected,
+                                   float                         max_error);
+
+static bool check_fairy2i_w1_dynamic_tiles_hit(const char * label, bool expected) {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int hits = ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(false);
+    if ((hits > 0) != expected) {
+        fprintf(stderr, "%s dynamic hit mismatch: hits=%d expected=%d\n", label, hits, expected ? 1 : 0);
+        return false;
+    }
+    return true;
+#else
+    (void) label;
+    (void) expected;
+    return true;
+#endif
+}
+
+static bool check_fairy2i_w1_dynamic_tiles_last_batch(const char * label, int expected) {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int batch = ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch_for_test();
+    if (batch != expected) {
+        fprintf(stderr, "%s dynamic batch mismatch: batch=%d expected=%d\n", label, batch, expected);
+        return false;
+    }
+    return true;
+#else
+    (void) label;
+    (void) expected;
+    return true;
+#endif
+}
 
 static bool check_fairy2i_w2_dynamic_tiles_hit(const char * label, bool expected) {
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
@@ -1359,6 +1410,164 @@ static bool check_fairy2i_w2_dynamic_tiles_last_batch(const char * label, int ex
 #else
     (void) label;
     (void) expected;
+    return true;
+#endif
+}
+
+static bool test_fairy2i_wide_linear_w1_lut_dynamic_tiles() {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    const int     threads[]     = { 1, 2, 3, 4, 6, 8 };
+    const int64_t Ms[]          = { 15, 16, 17, 31, 32, 33, 65, 127 };
+    const int64_t fallback_Ns[] = { 2, 3 };
+    const int64_t Ks[]          = { 256, 512 };
+    const char *  batches[]     = { nullptr, "1", "2", "4" };
+
+    int  dynamic_cases  = 0;
+    int  fallback_cases = 0;
+    bool ok             = true;
+
+    {
+        scoped_env_var        outer_dynamic_tiles("GGML_FAIRY2I_W1_DYNAMIC_TILES");
+        const fairy2i_w2_case tc   = { 65, 1, 512, true };
+        const fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+        std::vector<uint32_t> direct;
+        std::vector<uint32_t> lut_static;
+        std::vector<uint32_t> lut_default_off;
+        std::vector<uint32_t> lut_default_batch;
+        std::vector<uint32_t> lut_batch_one;
+        std::vector<uint32_t> lut_batch_invalid;
+        static const char *   invalid_batches[] = { "3", "2x" };
+        static const int      n_threads         = 6;
+        static const char *   label_default_off = "W1 LUT dynamic tiles default-off with polluted external environment";
+        static const char *   label_default     = "W1 LUT dynamic tiles default batch";
+        static const char *   label_invalid     = "W1 LUT dynamic tiles invalid batch fallback";
+
+        if (!run_fairy2i_w1_backend(direct, tc, data, "0", "lut16", false, false, n_threads)) {
+            return false;
+        }
+        if (!run_fairy2i_w1_backend(lut_static, tc, data, "1", "lut16", true, false, n_threads, "0")) {
+            return false;
+        }
+
+        outer_dynamic_tiles.set("1");
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w1_backend(lut_default_off, tc, data, "1", "lut16", true, false, n_threads)) {
+            return false;
+        }
+        ok = check_fairy2i_w1_dynamic_tiles_hit(label_default_off, false) && ok;
+        ok = compare_exact(label_default_off, lut_default_off, lut_static) && ok;
+
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w1_backend(lut_default_batch, tc, data, "1", "lut16", true, false, n_threads, "1")) {
+            return false;
+        }
+        ok = check_fairy2i_w1_dynamic_tiles_hit(label_default, true) && ok;
+        ok = check_fairy2i_w1_dynamic_tiles_last_batch(label_default, 2) && ok;
+        ok = compare_exact(label_default, lut_default_batch, lut_static) && ok;
+        ok = compare_packed_complex("W1 dynamic LUT semantic check vs direct", lut_default_batch, direct, 1e-2f) && ok;
+
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+        if (!run_fairy2i_w1_backend(lut_batch_one, tc, data, "1", "lut16", true, false, n_threads, "1", "1")) {
+            return false;
+        }
+        ok = check_fairy2i_w1_dynamic_tiles_hit("W1 LUT dynamic tiles batch=1 control", true) && ok;
+        ok = check_fairy2i_w1_dynamic_tiles_last_batch("W1 LUT dynamic tiles batch=1 control", 1) && ok;
+
+        for (const char * invalid_batch : invalid_batches) {
+            ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+            if (!run_fairy2i_w1_backend(lut_batch_invalid, tc, data, "1", "lut16", true, false, n_threads, "1",
+                                        invalid_batch)) {
+                return false;
+            }
+            ok = check_fairy2i_w1_dynamic_tiles_hit(label_invalid, true) && ok;
+            ok = check_fairy2i_w1_dynamic_tiles_last_batch(label_invalid, 1) && ok;
+            ok = compare_exact(label_invalid, lut_batch_invalid, lut_batch_one) && ok;
+        }
+    }
+
+    for (int n_threads : threads) {
+        for (int64_t M : Ms) {
+            for (int64_t K : Ks) {
+                for (bool with_bias : { false, true }) {
+                    const fairy2i_w2_case tc   = { M, 1, K, with_bias };
+                    const fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+                    char                  label[192];
+
+                    std::vector<uint32_t> lut_static;
+                    std::vector<uint32_t> lut_dynamic;
+                    ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                    if (!run_fairy2i_w1_backend(lut_static, tc, data, "1", "lut16", true, false, n_threads, "0")) {
+                        return false;
+                    }
+                    snprintf(label, sizeof(label), "W1 LUT dynamic tiles disabled M=%lld N=1 K=%lld bias=%d threads=%d",
+                             (long long) M, (long long) K, (int) with_bias, n_threads);
+                    ok = check_fairy2i_w1_dynamic_tiles_hit(label, false) && ok;
+
+                    for (const char * batch : batches) {
+                        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w1_backend(lut_dynamic, tc, data, "1", "lut16", true, false, n_threads, "1",
+                                                    batch)) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles hit M=%lld N=1 K=%lld bias=%d threads=%d batch=%s",
+                                 (long long) M, (long long) K, (int) with_bias, n_threads, batch ? batch : "default");
+                        ok                       = check_fairy2i_w1_dynamic_tiles_hit(label, true) && ok;
+                        const int expected_batch = !batch                           ? 2 :
+                                                   batch && strcmp(batch, "2") == 0 ? 2 :
+                                                   batch && strcmp(batch, "4") == 0 ? 4 :
+                                                                                      1;
+                        ok = check_fairy2i_w1_dynamic_tiles_last_batch(label, expected_batch) && ok;
+
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles M=%lld N=1 K=%lld bias=%d threads=%d batch=%s", (long long) M,
+                                 (long long) K, (int) with_bias, n_threads, batch ? batch : "default");
+                        ok = compare_exact(label, lut_dynamic, lut_static) && ok;
+                        ++dynamic_cases;
+                    }
+
+                    for (int64_t N : fallback_Ns) {
+                        const fairy2i_w2_case fallback_tc   = { M, N, K, with_bias };
+                        const fairy2i_w1_data fallback_data = make_fairy2i_w1_data(fallback_tc);
+
+                        std::vector<uint32_t> fallback_static;
+                        std::vector<uint32_t> fallback_gate_on;
+                        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w1_backend(fallback_static, fallback_tc, fallback_data, "1", "lut16", true,
+                                                    false, n_threads, "0")) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles fallback disabled M=%lld N=%lld K=%lld bias=%d threads=%d",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = check_fairy2i_w1_dynamic_tiles_hit(label, false) && ok;
+
+                        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+                        if (!run_fairy2i_w1_backend(fallback_gate_on, fallback_tc, fallback_data, "1", "lut16", true,
+                                                    false, n_threads, "1", "4")) {
+                            return false;
+                        }
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles fallback hit M=%lld N=%lld K=%lld bias=%d threads=%d batch=4",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = check_fairy2i_w1_dynamic_tiles_hit(label, false) && ok;
+
+                        snprintf(label, sizeof(label),
+                                 "W1 LUT dynamic tiles fallback/static M=%lld N=%lld K=%lld bias=%d threads=%d batch=4",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias, n_threads);
+                        ok = compare_exact(label, fallback_gate_on, fallback_static) && ok;
+                        ++fallback_cases;
+                    }
+                }
+            }
+        }
+    }
+
+    printf("  Fairy2i W1 LUT dynamic tiles: %d N=1 cases, %d N>1 fallback cases - %s\n", dynamic_cases, fallback_cases,
+           ok ? "PASS" : "FAIL");
+    return ok;
+#else
+    printf("  Fairy2i W1 LUT dynamic tiles skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
     return true;
 #endif
 }
@@ -1996,6 +2205,10 @@ int main() {
     }
     if (!test_fairy2i_wide_linear_w2_variants()) {
         fprintf(stderr, "Fairy2i W2 variant matrix FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_wide_linear_w1_lut_dynamic_tiles()) {
+        fprintf(stderr, "Fairy2i W1 LUT dynamic tiles FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w2_lut_dynamic_tiles()) {

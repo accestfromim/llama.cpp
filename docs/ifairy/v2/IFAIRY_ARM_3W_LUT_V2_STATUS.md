@@ -16,6 +16,7 @@ Status: Draft (2026-07-04)
 
 - Fairy2i W1/W2 graph fusion moves from env opt-in to auto default: model variant, LoRA state, tensor types, and CPU backend support must all match; `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W{1,2}=0` keeps the unfused graph available.
 - Fairy2i CPU LUT builds default to LUT16. `GGML_FAIRY2I_LUT=0` forces the direct CPU path; `GGML_FAIRY2I_LUT_IMPL=lut_c` remains an explicit experimental override.
+- W1 LUT16 dynamic tile claiming is an opt-in experiment. `GGML_FAIRY2I_W1_DYNAMIC_TILES=1` enables it only for W1 LUT with `N==1`; `N>1` keeps the static split. `GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size; unset uses `2`, and invalid values use `1`.
 - W2 LUT16 dynamic tile claiming is enabled by default. `GGML_FAIRY2I_W2_DYNAMIC_TILES=0` disables it; it only applies to W2 LUT with `N==1` (tg path); `N>1` keeps the static split. `GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH=1|2|4` controls the claim batch size; unset uses `2`, and invalid values use `1`.
   Current M4 tg128 evidence prefers `batch=1` for low thread counts (`nth<=4`); `batch=2` should only be considered for higher-thread tg after path-validated measurement, because it regressed tg4 in the focused sweep.
 - `GGML_FAIRY2I_CPU_LUT` remains a build-time capability gate and still defaults to OFF, so normal builds do not become CPU-only.
