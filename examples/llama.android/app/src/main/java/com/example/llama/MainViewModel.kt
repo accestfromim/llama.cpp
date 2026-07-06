@@ -167,7 +167,7 @@ private data class RuntimeBenchConfig(
     val openclSupportsDebug: Int = -1,
     val forceCpu: Int = -1,
     val openclMulMatImpl: String? = null,
-    val openclWideLinearW2Impl: String? = null,
+    val openclWideLinearW2Impl: String? = "q16dot8packed",
 )
 
 class MainViewModel(
@@ -297,6 +297,7 @@ class MainViewModel(
 
         val appContext = context.applicationContext
         this.appContext = appContext
+        llamaAndroid.configureOpenCLWideLinearW2ImplEarly(runtimeBenchConfig.openclWideLinearW2Impl)
         llamaAndroid.configureNativeLibraryDir(appContext.applicationInfo.nativeLibraryDir)
         refreshAvailableModels(appContext)
 
@@ -733,6 +734,7 @@ class MainViewModel(
         viewModelScope.launch {
             isBenchmarking = true
             try {
+                warmupBenchIfNeeded(preset)
                 val summary = runBenchPreset(model, preset)
                 logBenchSummary(summary)
             } catch (throwable: Throwable) {
@@ -1117,8 +1119,8 @@ class MainViewModel(
             ?: error("Failed to parse benchmark output for ${model.fileName} (${preset.label})")
     }
 
-    private suspend fun warmupBenchIfNeeded() {
-        val preset = benchmarkPresetOverride ?: BenchPreset("warmup", 8, 4, 1, 1)
+    private suspend fun warmupBenchIfNeeded(requestedPreset: BenchPreset? = null) {
+        val preset = requestedPreset ?: benchmarkPresetOverride ?: BenchPreset("warmup", 8, 4, 1, 1)
         log("Warmup benchmark: prompt=${preset.promptTokens} decode=${preset.genTokens}")
         runCatching {
             llamaAndroid.bench(pp = preset.promptTokens, tg = preset.genTokens, pl = preset.pl, nr = 1)

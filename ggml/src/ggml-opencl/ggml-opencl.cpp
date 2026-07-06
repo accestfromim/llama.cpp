@@ -5896,7 +5896,16 @@ static void ggml_cl_fairy2i_wide_linear_w2(ggml_backend_t backend, ggml_tensor *
     cl_mem act_d = backend_ctx->fairy2i.fairy2i_tile64_act_d_scratch;
     GGML_ASSERT(act_q != nullptr);
     GGML_ASSERT(act_d != nullptr);
-    const ggml_opencl_fairy2i_wide_linear_w2_impl impl = ggml_opencl_fairy2i_wide_linear_w2_impl_from_env();
+    ggml_opencl_fairy2i_wide_linear_w2_impl impl = ggml_opencl_fairy2i_wide_linear_w2_impl_from_env();
+    const bool dot8_available = backend_ctx->qcom_dot_product8_support &&
+        backend_ctx->fairy2i.kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8 != nullptr;
+    const bool packed_dot8_available = dot8_available &&
+        backend_ctx->fairy2i.kernel_fairy2i_tile64_act_q16_64_quantize_dot8_packed != nullptr &&
+        backend_ctx->fairy2i.kernel_fairy2i_tile64_wide_linear_w2_f32_act_q16_64_dot8_packed != nullptr;
+    if ((impl == GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8 && !dot8_available) ||
+        (impl == GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8_PACKED && !packed_dot8_available)) {
+        impl = GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16;
+    }
     const bool packed_dot8 = impl == GGML_OPENCL_FAIRY2I_WIDE_LINEAR_W2_IMPL_Q16_DOT8_PACKED;
 
     {
