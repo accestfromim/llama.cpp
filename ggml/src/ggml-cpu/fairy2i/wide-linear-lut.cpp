@@ -5,6 +5,7 @@
 
 #include "ggml-fairy2i-lut-impl.h"
 #include "ggml-fairy2i-lut.h"
+#include "ggml-cpu.h"
 #include "quants.h"
 
 #include <algorithm>
@@ -20,6 +21,16 @@
 #    if defined(__ARM_NEON) && defined(__aarch64__)
 #        include <arm_neon.h>
 #    endif
+#    if defined(__aarch64__) && defined(__ARM_FEATURE_SVE2)
+#        include <arm_sve.h>
+#    endif
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE2) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+static bool ggml_fairy2i_lut_quantize_test_disable_arm_sve2(void) {
+    const char * env = getenv("GGML_FAIRY2I_TEST_DISABLE_ARM_SVE2");
+    return env && strcmp(env, "0") != 0;
+}
+#endif
 
 static inline float ggml_fairy2i_wide_linear_lut_bias_at(const struct ggml_tensor * bias,
                                                          int64_t                    i0,
@@ -70,6 +81,57 @@ static void ggml_fairy2i_tile64_lut_quantize_block_q16_64_scalar(const float * x
         y->x_imag[j]              = (uint8_t) std::max(-63, std::min(63, qi));
     }
 }
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE2) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+static void ggml_fairy2i_tile64_lut_quantize_block_q16_64_sve2(const float * x,
+                                                               block_fairy2i_act_q16_64 * y) {
+    const uint32_t * src_words = (const uint32_t *) x;
+    svfloat32_t      max_real  = svdup_n_f32(1e-5f);
+    svfloat32_t      max_imag  = svdup_n_f32(1e-5f);
+
+    for (int j = 0; j < QK_FAIRY2I_TILE64; j += (int) svcntw()) {
+        const svbool_t   pg        = svwhilelt_b32_u64((uint64_t) j, (uint64_t) QK_FAIRY2I_TILE64);
+        const svuint32_t words     = svld1_u32(pg, src_words + j);
+        const svuint32_t real_bits = svlsl_n_u32_x(pg, words, 16);
+        const svuint32_t imag_bits = svand_n_u32_x(pg, words, 0xffff0000u);
+        const svfloat32_t real     = svreinterpret_f32_u32(real_bits);
+        const svfloat32_t imag     = svreinterpret_f32_u32(imag_bits);
+
+        max_real = svmax_f32_m(pg, max_real, svabs_f32_x(pg, real));
+        max_imag = svmax_f32_m(pg, max_imag, svabs_f32_x(pg, imag));
+    }
+
+    const svbool_t all_b32         = svptrue_b32();
+    const float    scalar_max_real = svmaxv_f32(all_b32, max_real);
+    const float    scalar_max_imag = svmaxv_f32(all_b32, max_imag);
+    const float    iscale_real     = 63.0f / scalar_max_real;
+    const float    iscale_imag     = 63.0f / scalar_max_imag;
+    y->d_real                      = GGML_FP32_TO_FP16(1.0f / iscale_real);
+    y->d_imag                      = GGML_FP32_TO_FP16(1.0f / iscale_imag);
+
+    const svfloat32_t scale_real = svdup_n_f32(iscale_real);
+    const svfloat32_t scale_imag = svdup_n_f32(iscale_imag);
+    for (int j = 0; j < QK_FAIRY2I_TILE64; j += (int) svcntw()) {
+        const svbool_t   pg        = svwhilelt_b32_u64((uint64_t) j, (uint64_t) QK_FAIRY2I_TILE64);
+        const svuint32_t words     = svld1_u32(pg, src_words + j);
+        const svuint32_t real_bits = svlsl_n_u32_x(pg, words, 16);
+        const svuint32_t imag_bits = svand_n_u32_x(pg, words, 0xffff0000u);
+        const svfloat32_t real     = svreinterpret_f32_u32(real_bits);
+        const svfloat32_t imag     = svreinterpret_f32_u32(imag_bits);
+
+        const svfloat32_t rounded_real = svrinta_f32_x(pg, svmul_f32_x(pg, real, scale_real));
+        const svfloat32_t rounded_imag = svrinta_f32_x(pg, svmul_f32_x(pg, imag, scale_imag));
+        svint32_t         qr           = svcvt_s32_f32_x(pg, rounded_real);
+        svint32_t         qi           = svcvt_s32_f32_x(pg, rounded_imag);
+
+        qr = svmin_n_s32_x(pg, svmax_n_s32_x(pg, qr, -63), 63);
+        qi = svmin_n_s32_x(pg, svmax_n_s32_x(pg, qi, -63), 63);
+
+        svst1b_s32(pg, (int8_t *) (y->x_real + j), qr);
+        svst1b_s32(pg, (int8_t *) (y->x_imag + j), qi);
+    }
+}
+#endif
 
 #    if defined(__ARM_NEON) && defined(__aarch64__)
 static inline void ggml_fairy2i_tile64_lut_store_i32x4_as_i8_neon(uint8_t * dst, int32x4_t v) {
@@ -170,6 +232,13 @@ static void ggml_fairy2i_tile64_lut_quantize_block_q16_64(const float * x, block
 #else
     (void) use_avx2;
 #endif
+
+#    if defined(__aarch64__) && defined(__ARM_FEATURE_SVE2) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+    if (!ggml_fairy2i_lut_quantize_test_disable_arm_sve2() && ggml_cpu_has_sve2()) {
+        ggml_fairy2i_tile64_lut_quantize_block_q16_64_sve2(x, y);
+        return;
+    }
+#    endif
 
 #    if defined(__ARM_NEON) && defined(__aarch64__)
     ggml_fairy2i_tile64_lut_quantize_block_q16_64_neon(x, y);

@@ -10,6 +10,7 @@
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
 #    include "ggml-fairy2i-lut.h"
+#    include "lut-qgemm.h"
 #endif
 
 #include <stdlib.h>
@@ -136,6 +137,7 @@ static void ggml_fairy2i_cpu_debug_log_w2_once(const struct ggml_compute_params 
     static bool logged_direct_dotprod = false;
     static bool logged_direct_sve2    = false;
     static bool logged_lut16          = false;
+    static bool logged_lut16_sve2     = false;
     static bool logged_lut_c          = false;
     static bool logged_unknown        = false;
 
@@ -154,6 +156,8 @@ static void ggml_fairy2i_cpu_debug_log_w2_once(const struct ggml_compute_params 
         logged = &logged_direct_sve2;
     } else if (path && strcmp(path, "lut16") == 0) {
         logged = &logged_lut16;
+    } else if (path && strcmp(path, "lut16_sve2") == 0) {
+        logged = &logged_lut16_sve2;
     } else if (path && strcmp(path, "lut_c") == 0) {
         logged = &logged_lut_c;
     }
@@ -266,7 +270,9 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
     if (plan.use_lut) {
         if (ggml_fairy2i_wide_linear_w2_compute_lut(params, dst, plan.lut_c)) {
-            ggml_fairy2i_cpu_debug_log_w2_once(params, dst, &plan, plan.lut_c ? "lut_c" : "lut16");
+            const char * path =
+                plan.lut_c ? "lut_c" : ggml_fairy2i_tile64_lut_qgemm_four_cpu_path_name();
+            ggml_fairy2i_cpu_debug_log_w2_once(params, dst, &plan, path);
             return true;
         }
         if (ggml_fairy2i_test_require_lut()) {

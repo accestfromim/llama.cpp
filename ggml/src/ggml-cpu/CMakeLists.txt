@@ -176,6 +176,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ggml-cpu/fairy2i/arm/fairy2i-sve2.c)
         endif()
 
+        if (GGML_FAIRY2I_CPU AND GGML_FAIRY2I_CPU_LUT AND GGML_FAIRY2I_CPU_ARM_SVE2)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/fairy2i/arm/fairy2i-lut-sve2.cpp)
+        endif()
+
         if (GGML_LEGACY_IFAIRY_CPU)
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/legacy-ifairy/arm/ifairy-quants.c)

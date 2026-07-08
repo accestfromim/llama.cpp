@@ -41,6 +41,7 @@ bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile
 
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
 #    include "../ggml/src/ggml-cpu/fairy2i/lut/ggml-fairy2i-lut.h"
+#    include "../ggml/src/ggml-cpu/fairy2i/lut-qgemm.h"
 void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
                                                             block_fairy2i_act_q16_64 * y,
                                                             bool                       force_scalar);
@@ -249,7 +250,7 @@ static bool compare_fairy2i_lut_quantize_block(const char *                     
     return true;
 }
 
-static bool test_fairy2i_lut_quantize_arm_neon() {
+static bool test_fairy2i_lut_quantize_arm() {
 #if defined(GGML_USE_FAIRY2I_CPU_LUT) && defined(__aarch64__) && defined(__ARM_NEON)
     bool ok = true;
     for (int salt = 0; salt < 13; ++salt) {
@@ -408,47 +409,202 @@ static bool compare_f32_pairs(const char *               label,
     return true;
 }
 
-static bool test_fairy2i_lut_qgemm_add() {
-    const int64_t Ms[]      = { 1, 7, 16, 17, 23 };
-    const int64_t Ks[]      = { 64, 128 };
-    const int64_t N         = 2;
-    bool          ok        = true;
-    int           cases_run = 0;
+static std::vector<float> fairy2i_lut_qgemm_four_scalar_ref(
+    int64_t M,
+    int64_t K,
+    int64_t N,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & u0,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & u1,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & w0,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & w1,
+    const std::vector<int8_t> &                      lut,
+    const std::vector<float> &                       scales) {
+    std::vector<float> result((size_t) N * (size_t) M * 2u, 0.0f);
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, u0, lut, scales, result, true, false);
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, u1, lut, scales, result, true, true);
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w0, lut, scales, result, false, true);
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w1, lut, scales, result, false, true);
+    return result;
+}
 
+static std::vector<uint32_t> fairy2i_lut_qgemm_four_bf16_scalar_ref(
+    int64_t M,
+    int64_t K,
+    int64_t N,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & u0,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & u1,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & w0,
+    const std::vector<fairy2i_tile64_lut_wtile_16> & w1,
+    const std::vector<int8_t> &                      lut,
+    const std::vector<float> &                       scales) {
+    std::vector<float> stage((size_t) N * (size_t) M * 2u, 0.0f);
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, u0, lut, scales, stage, true, false);
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, u1, lut, scales, stage, true, true);
+
+    std::vector<uint32_t> packed((size_t) N * (size_t) M);
+    for (size_t i = 0; i < packed.size(); ++i) {
+        packed[i] = pack_bf16_pair(stage[2 * i + 0], stage[2 * i + 1]);
+        unpack_bf16_pair(packed[i], stage[2 * i + 0], stage[2 * i + 1]);
+    }
+
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w0, lut, scales, stage, false, true);
+    fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w1, lut, scales, stage, false, true);
+    for (size_t i = 0; i < packed.size(); ++i) {
+        packed[i] = pack_bf16_pair(stage[2 * i + 0], stage[2 * i + 1]);
+    }
+    return packed;
+}
+
+static bool compare_u32_exact(const char * label, const std::vector<uint32_t> & actual,
+                              const std::vector<uint32_t> & expected) {
+    if (actual.size() != expected.size()) {
+        fprintf(stderr, "%s size mismatch: %zu vs %zu\n", label, actual.size(), expected.size());
+        return false;
+    }
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (actual[i] != expected[i]) {
+            fprintf(stderr, "%s mismatch i=%zu actual=0x%08x expected=0x%08x\n", label, i,
+                    (unsigned) actual[i], (unsigned) expected[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool test_fairy2i_lut_qgemm_four_dispatch() {
+    const int64_t Ms[] = { 1, 7, 15, 16, 17, 63, 64, 65, 79 };
+    const int64_t Ks[] = { 64, 128, 192, 320 };
+    const int64_t Ns[] = { 1, 3 };
+
+    scoped_env_var env_disable_sve2("GGML_FAIRY2I_TEST_DISABLE_ARM_SVE2");
+    const char * require_sve2_env = getenv("GGML_FAIRY2I_TEST_REQUIRE_ARM_SVE2");
+    const bool require_sve2 = require_sve2_env && strcmp(require_sve2_env, "0") != 0;
+
+    env_disable_sve2.unset();
+    const bool selects_sve2 =
+        strcmp(ggml_fairy2i_tile64_lut_qgemm_four_cpu_path_name(), "lut16_sve2") == 0;
+    if (require_sve2 && !selects_sve2) {
+        fprintf(stderr, "Fairy2i LUT SVE2 is required, but qgemm path is %s\n",
+                ggml_fairy2i_tile64_lut_qgemm_four_cpu_path_name());
+        return false;
+    }
+
+    bool ok = true;
+    int cases_run = 0;
     for (int64_t M : Ms) {
         for (int64_t K : Ks) {
-            const std::vector<fairy2i_tile64_lut_wtile_16> w0 = make_fairy2i_lut_wtiles(M, K, 3);
-            const std::vector<fairy2i_tile64_lut_wtile_16> w1 = make_fairy2i_lut_wtiles(M, K, 11);
-            std::vector<int8_t>                            lut;
-            std::vector<float>                             scales;
-            fill_fairy2i_lut_qgemm_inputs(lut, scales, N, K);
+            for (int64_t N : Ns) {
+                const std::vector<fairy2i_tile64_lut_wtile_16> u0 = make_fairy2i_lut_wtiles(M, K, 3);
+                const std::vector<fairy2i_tile64_lut_wtile_16> u1 = make_fairy2i_lut_wtiles(M, K, 7);
+                const std::vector<fairy2i_tile64_lut_wtile_16> w0 = make_fairy2i_lut_wtiles(M, K, 11);
+                const std::vector<fairy2i_tile64_lut_wtile_16> w1 = make_fairy2i_lut_wtiles(M, K, 15);
+                std::vector<int8_t> lut;
+                std::vector<float>  scales;
+                fill_fairy2i_lut_qgemm_inputs(lut, scales, N, K);
 
-            std::vector<float> expected((size_t) N * (size_t) M * 2u, 0.0f);
-            fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w0, lut, scales, expected, true, false);
-            fairy2i_lut_qgemm_lut16_scalar_ref(M, K, N, w1, lut, scales, expected, false, true);
+                const std::vector<float> expected_f32 =
+                    fairy2i_lut_qgemm_four_scalar_ref(M, K, N, u0, u1, w0, w1, lut, scales);
+                const std::vector<uint32_t> expected_bf16 =
+                    fairy2i_lut_qgemm_four_bf16_scalar_ref(M, K, N, u0, u1, w0, w1, lut, scales);
 
-            std::vector<float> actual((size_t) N * (size_t) M * 2u, 0.0f);
-            ggml_fairy2i_tile64_lut_qgemm_lut16((int) M, (int) K, (int) N, w0.data(), lut.data(), scales.data(),
-                                                actual.data(), (size_t) M * 2u * sizeof(float), 2u * sizeof(float),
-                                                false, true, false);
-            ggml_fairy2i_tile64_lut_qgemm_lut16((int) M, (int) K, (int) N, w1.data(), lut.data(), scales.data(),
-                                                actual.data(), (size_t) M * 2u * sizeof(float), 2u * sizeof(float),
-                                                false, false, true);
+                std::vector<float> sve2_f32((size_t) N * (size_t) M * 2u, 0.0f);
+                env_disable_sve2.unset();
+                bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
+                    (int) M, (int) K, (int) N, u0.data(), u1.data(), w0.data(), w1.data(), lut.data(), scales.data(),
+                    sve2_f32.data(), (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+                if (!qgemm_ok) {
+                    fprintf(stderr, "Fairy2i LUT four qgemm F32 failed M=%lld K=%lld N=%lld\n",
+                            (long long) M, (long long) K, (long long) N);
+                    return false;
+                }
 
-            char label[128];
-            snprintf(label, sizeof(label), "Fairy2i LUT qgemm add M=%lld K=%lld N=%lld", (long long) M, (long long) K,
-                     (long long) N);
-            ok = compare_f32_pairs(label, actual, expected) && ok;
-            ++cases_run;
+#if defined(__aarch64__) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+                std::vector<float> explicit_sve2_f32((size_t) N * (size_t) M * 2u, 0.0f);
+                if (selects_sve2) {
+                    qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_sve2(
+                        (int) M, (int) K, (int) N, u0.data(), u1.data(), w0.data(), w1.data(), lut.data(),
+                        scales.data(), explicit_sve2_f32.data(), (size_t) M * 2u * sizeof(float),
+                        2u * sizeof(float), false);
+                    if (!qgemm_ok) {
+                        fprintf(stderr, "Fairy2i explicit LUT SVE2 qgemm F32 failed M=%lld K=%lld N=%lld\n",
+                                (long long) M, (long long) K, (long long) N);
+                        return false;
+                    }
+                }
+#endif
+
+                std::vector<float> fallback_f32((size_t) N * (size_t) M * 2u, 0.0f);
+                env_disable_sve2.set("1");
+                if (strcmp(ggml_fairy2i_tile64_lut_qgemm_four_cpu_path_name(), "lut16") != 0) {
+                    fprintf(stderr, "Fairy2i LUT qgemm did not select generic fallback\n");
+                    return false;
+                }
+                qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
+                    (int) M, (int) K, (int) N, u0.data(), u1.data(), w0.data(), w1.data(), lut.data(), scales.data(),
+                    fallback_f32.data(), (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+                if (!qgemm_ok) {
+                    fprintf(stderr, "Fairy2i LUT generic four qgemm F32 failed M=%lld K=%lld N=%lld\n",
+                            (long long) M, (long long) K, (long long) N);
+                    return false;
+                }
+
+                char label[160];
+                snprintf(label, sizeof(label), "LUT SVE2 F32 vs scalar M=%lld K=%lld N=%lld",
+                         (long long) M, (long long) K, (long long) N);
+                ok = compare_f32_pairs(label, sve2_f32, expected_f32) && ok;
+#if defined(__aarch64__) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+                if (selects_sve2) {
+                    snprintf(label, sizeof(label), "LUT explicit SVE2 F32 vs scalar M=%lld K=%lld N=%lld",
+                             (long long) M, (long long) K, (long long) N);
+                    ok = compare_f32_pairs(label, explicit_sve2_f32, expected_f32) && ok;
+                    snprintf(label, sizeof(label), "LUT dispatcher F32 vs explicit SVE2 M=%lld K=%lld N=%lld",
+                             (long long) M, (long long) K, (long long) N);
+                    ok = compare_f32_pairs(label, sve2_f32, explicit_sve2_f32) && ok;
+                }
+#endif
+                snprintf(label, sizeof(label), "LUT fallback F32 vs SVE2 M=%lld K=%lld N=%lld",
+                         (long long) M, (long long) K, (long long) N);
+                ok = compare_f32_pairs(label, fallback_f32, sve2_f32) && ok;
+
+                std::vector<uint32_t> sve2_bf16((size_t) N * (size_t) M, 0);
+                env_disable_sve2.unset();
+                qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
+                    (int) M, (int) K, (int) N, u0.data(), u1.data(), w0.data(), w1.data(), lut.data(), scales.data(),
+                    (float *) sve2_bf16.data(), (size_t) M * sizeof(uint32_t), sizeof(uint32_t), true);
+                if (!qgemm_ok) {
+                    fprintf(stderr, "Fairy2i LUT four qgemm BF16 failed M=%lld K=%lld N=%lld\n",
+                            (long long) M, (long long) K, (long long) N);
+                    return false;
+                }
+
+                std::vector<uint32_t> fallback_bf16((size_t) N * (size_t) M, 0);
+                env_disable_sve2.set("1");
+                qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
+                    (int) M, (int) K, (int) N, u0.data(), u1.data(), w0.data(), w1.data(), lut.data(), scales.data(),
+                    (float *) fallback_bf16.data(), (size_t) M * sizeof(uint32_t), sizeof(uint32_t), true);
+                if (!qgemm_ok) {
+                    fprintf(stderr, "Fairy2i LUT generic four qgemm BF16 failed M=%lld K=%lld N=%lld\n",
+                            (long long) M, (long long) K, (long long) N);
+                    return false;
+                }
+
+                snprintf(label, sizeof(label), "LUT SVE2 BF16 vs scalar M=%lld K=%lld N=%lld",
+                         (long long) M, (long long) K, (long long) N);
+                ok = compare_u32_exact(label, sve2_bf16, expected_bf16) && ok;
+                snprintf(label, sizeof(label), "LUT fallback BF16 vs SVE2 M=%lld K=%lld N=%lld",
+                         (long long) M, (long long) K, (long long) N);
+                ok = compare_u32_exact(label, fallback_bf16, sve2_bf16) && ok;
+                ++cases_run;
+            }
         }
     }
 
-    printf("  Fairy2i LUT qgemm add: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    printf("  Fairy2i LUT qgemm four dispatch: %d cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
     return ok;
 }
 #else
-static bool test_fairy2i_lut_qgemm_add() {
-    printf("  Fairy2i LUT qgemm add skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+static bool test_fairy2i_lut_qgemm_four_dispatch() {
+    printf("  Fairy2i LUT qgemm four dispatch skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
     return true;
 }
 #endif
@@ -1207,7 +1363,7 @@ static bool test_fairy2i_opencl_tile64_mul_mat() {
 }
 
 static bool test_fairy2i_wide_linear_w2_variants() {
-    const int64_t Ms[] = { 1, 7, 16, 17, 23, 32, 33 };
+    const int64_t Ms[] = { 1, 7, 16, 17, 23, 32, 33, 63, 64, 65 };
     const int64_t Ks[] = { 64, 128, 192, 256, 320, 1024 };
     const int64_t Ns[] = { 1, 2, 4, 8 };
 
@@ -1258,6 +1414,11 @@ static bool test_fairy2i_wide_linear_w2_variants() {
                     snprintf(label, sizeof(label), "direct vs LUT M=%lld N=%lld K=%lld bias=%d",
                              (long long) M, (long long) N, (long long) K, (int) with_bias);
                     ok = compare_packed_complex(label, lut, direct, 1e-2f) && ok;
+                    if (compare_scalar_default) {
+                        snprintf(label, sizeof(label), "forced scalar direct vs LUT M=%lld N=%lld K=%lld bias=%d",
+                                 (long long) M, (long long) N, (long long) K, (int) with_bias);
+                        ok = compare_packed_complex(label, lut, direct_scalar, 1e-2f) && ok;
+                    }
 #endif
                     ++cases_run;
                 }
@@ -1287,12 +1448,12 @@ int main() {
         fprintf(stderr, "Fairy2i ARM accumulate helpers FAILED\n");
         ++num_failed;
     }
-    if (!test_fairy2i_lut_quantize_arm_neon()) {
+    if (!test_fairy2i_lut_quantize_arm()) {
         fprintf(stderr, "Fairy2i LUT ARM quantize FAILED\n");
         ++num_failed;
     }
-    if (!test_fairy2i_lut_qgemm_add()) {
-        fprintf(stderr, "Fairy2i LUT qgemm add FAILED\n");
+    if (!test_fairy2i_lut_qgemm_four_dispatch()) {
+        fprintf(stderr, "Fairy2i LUT qgemm four dispatch FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_wide_linear_w2_variants()) {

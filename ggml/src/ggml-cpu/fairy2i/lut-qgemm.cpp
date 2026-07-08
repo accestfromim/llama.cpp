@@ -2,9 +2,31 @@
 
 #include "ggml-fairy2i-lut-impl.h"
 #include "ggml-fairy2i-lut.h"
+#include "ggml-cpu.h"
 #include "quants.h"
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(__aarch64__) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+static bool ggml_fairy2i_lut_test_disable_arm_sve2(void) {
+    const char * env = getenv("GGML_FAIRY2I_TEST_DISABLE_ARM_SVE2");
+    return env && strcmp(env, "0") != 0;
+}
+#endif
+
+const char * ggml_fairy2i_tile64_lut_qgemm_four_cpu_path_name(void) {
+#if defined(__AVX2__)
+    return "lut16";
+#elif defined(__aarch64__) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+    if (!ggml_fairy2i_lut_test_disable_arm_sve2() && ggml_cpu_has_sve2()) {
+        return "lut16_sve2";
+    }
+#endif
+
+    return "lut16";
+}
 
 #if defined(__AVX2__)
 #    include <immintrin.h>
@@ -270,7 +292,6 @@ bool ggml_fairy2i_tile64_lut_qgemm_four_cpu(int          m,
                                       size_t       dst_col_stride,
                                       size_t       dst_row_stride,
                                       bool         pack_bf16) {
-#if defined(__AVX2__)
     if (m == 0) {
         return true;
     }
@@ -279,6 +300,7 @@ bool ggml_fairy2i_tile64_lut_qgemm_four_cpu(int          m,
         return false;
     }
 
+#if defined(__AVX2__)
     // LUT preprocessing folds in conjugation. Negating the imaginary scale recovers U * x.
     ggml_fairy2i_tile64_lut_qgemm_pair_avx2(m, k, n, packed_u0, packed_u1, lut, lut_scales, dst, dst_col_stride,
                                       dst_row_stride, pack_bf16, /*negate_imag_scale*/ true, /*add*/ false);
@@ -286,13 +308,14 @@ bool ggml_fairy2i_tile64_lut_qgemm_four_cpu(int          m,
                                       dst_row_stride, pack_bf16, /*negate_imag_scale*/ false, /*add*/ true);
     return true;
 #else
-    if (m == 0) {
-        return true;
+#    if defined(__aarch64__) && defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
+    if (!ggml_fairy2i_lut_test_disable_arm_sve2() && ggml_cpu_has_sve2()) {
+        if (ggml_fairy2i_tile64_lut_qgemm_four_sve2(m, k, n, packed_u0, packed_u1, packed_w0, packed_w1, lut,
+                                                    lut_scales, dst, dst_col_stride, dst_row_stride, pack_bf16)) {
+            return true;
+        }
     }
-    if (!packed_u0 || !packed_u1 || !packed_w0 || !packed_w1 || !dst || !lut || !lut_scales || m < 0 || k <= 0 ||
-        n <= 0) {
-        return false;
-    }
+#    endif
 
     // LUT preprocessing folds in conjugation. Negating the imaginary scale recovers U * x.
     ggml_fairy2i_tile64_lut_qgemm_pair_lut16(m, k, n, packed_u0, packed_u1, lut, lut_scales, dst, dst_col_stride,
