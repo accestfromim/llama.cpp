@@ -78,21 +78,35 @@ static inline svuint8_t ggml_fairy2i_lut_pack_tiles_sve2(
     return packed;
 }
 
+static inline svuint8_t ggml_fairy2i_lut_load_single_tile_sve2(
+    const fairy2i_tile64_lut_wtile_16 * wtiles,
+    int64_t                              blocks,
+    int                                  tile_base,
+    int64_t                              blk,
+    int                                  byte_idx,
+    svbool_t                             pg_rows) {
+    const fairy2i_tile64_lut_wtile_16 * wt =
+        wtiles + (size_t) tile_base * (size_t) blocks + (size_t) blk;
+    return svld1_u8(pg_rows, wt->qs[byte_idx]);
+}
+
 static inline void ggml_fairy2i_lut_accumulate_channel_sve2(
     svint8_t    table_lo,
     svint8_t    table_hi,
     svuint8_t   index_lo,
     svuint8_t   index_hi,
-    svint16_t & sum_lo,
-    svint16_t & sum_hi) {
+    svint16_t & sum_even,
+    svint16_t & sum_odd) {
     const svint8_t out_lo = svtbl_s8(table_lo, index_lo);
     const svint8_t out_hi = svtbl_s8(table_hi, index_hi);
 
-    const svint16_t pair_lo = svadd_s16_x(svptrue_b16(), svunpklo_s16(out_lo), svunpklo_s16(out_hi));
-    const svint16_t pair_hi = svadd_s16_x(svptrue_b16(), svunpkhi_s16(out_lo), svunpkhi_s16(out_hi));
+    // svaddlb/svaddlt produce even/odd widened lane sums. Keep the hot byte loop
+    // in this order, then zip once per block before the row-ordered apply step.
+    const svint16_t pair_even = svaddlb_s16(out_lo, out_hi);
+    const svint16_t pair_odd  = svaddlt_s16(out_lo, out_hi);
 
-    sum_lo = svadd_s16_x(svptrue_b16(), sum_lo, pair_lo);
-    sum_hi = svadd_s16_x(svptrue_b16(), sum_hi, pair_hi);
+    sum_even = svadd_s16_x(svptrue_b16(), sum_even, pair_even);
+    sum_odd  = svadd_s16_x(svptrue_b16(), sum_odd, pair_odd);
 }
 
 static inline svint32_t ggml_fairy2i_lut_sum_quarter_sve2(svint16_t sum_lo, svint16_t sum_hi, int quarter) {
@@ -314,10 +328,14 @@ static bool ggml_fairy2i_tile64_lut_qgemm_pair_sve2(
                     lut_col + (size_t) blk * (size_t) groups_per_block * k_fairy2i_lut_group_bytes;
 
                 for (int byte_idx = 0; byte_idx < groups_per_block / 2; ++byte_idx) {
-                    const svuint8_t packed0 = ggml_fairy2i_lut_pack_tiles_sve2(
-                        wtiles0, blocks, tile_base, blk, byte_idx, tiles_this_pass, pg_rows, segment_id);
-                    const svuint8_t packed1 = ggml_fairy2i_lut_pack_tiles_sve2(
-                        wtiles1, blocks, tile_base, blk, byte_idx, tiles_this_pass, pg_rows, segment_id);
+                    const svuint8_t packed0 = tiles_this_pass == 1 ?
+                        ggml_fairy2i_lut_load_single_tile_sve2(wtiles0, blocks, tile_base, blk, byte_idx, pg_rows) :
+                        ggml_fairy2i_lut_pack_tiles_sve2(
+                            wtiles0, blocks, tile_base, blk, byte_idx, tiles_this_pass, pg_rows, segment_id);
+                    const svuint8_t packed1 = tiles_this_pass == 1 ?
+                        ggml_fairy2i_lut_load_single_tile_sve2(wtiles1, blocks, tile_base, blk, byte_idx, pg_rows) :
+                        ggml_fairy2i_lut_pack_tiles_sve2(
+                            wtiles1, blocks, tile_base, blk, byte_idx, tiles_this_pass, pg_rows, segment_id);
 
                     const svuint8_t index0_lo = svand_n_u8_x(pg_rows, packed0, 0x0f);
                     const svuint8_t index0_hi = svand_n_u8_x(pg_rows, svlsr_n_u8_x(pg_rows, packed0, 4), 0x0f);
@@ -345,6 +363,24 @@ static bool ggml_fairy2i_tile64_lut_qgemm_pair_sve2(
 #undef GGML_FAIRY2I_LUT_ACCUMULATE_SVE2
                 }
 
+                const svint16_t sum0_ac_row_lo = svzip1_s16(sum0_ac_lo, sum0_ac_hi);
+                const svint16_t sum0_ac_row_hi = svzip2_s16(sum0_ac_lo, sum0_ac_hi);
+                const svint16_t sum0_bd_row_lo = svzip1_s16(sum0_bd_lo, sum0_bd_hi);
+                const svint16_t sum0_bd_row_hi = svzip2_s16(sum0_bd_lo, sum0_bd_hi);
+                const svint16_t sum0_bc_row_lo = svzip1_s16(sum0_bc_lo, sum0_bc_hi);
+                const svint16_t sum0_bc_row_hi = svzip2_s16(sum0_bc_lo, sum0_bc_hi);
+                const svint16_t sum0_ad_row_lo = svzip1_s16(sum0_ad_lo, sum0_ad_hi);
+                const svint16_t sum0_ad_row_hi = svzip2_s16(sum0_ad_lo, sum0_ad_hi);
+
+                const svint16_t sum1_ac_row_lo = svzip1_s16(sum1_ac_lo, sum1_ac_hi);
+                const svint16_t sum1_ac_row_hi = svzip2_s16(sum1_ac_lo, sum1_ac_hi);
+                const svint16_t sum1_bd_row_lo = svzip1_s16(sum1_bd_lo, sum1_bd_hi);
+                const svint16_t sum1_bd_row_hi = svzip2_s16(sum1_bd_lo, sum1_bd_hi);
+                const svint16_t sum1_bc_row_lo = svzip1_s16(sum1_bc_lo, sum1_bc_hi);
+                const svint16_t sum1_bc_row_hi = svzip2_s16(sum1_bc_lo, sum1_bc_hi);
+                const svint16_t sum1_ad_row_lo = svzip1_s16(sum1_ad_lo, sum1_ad_hi);
+                const svint16_t sum1_ad_row_hi = svzip2_s16(sum1_ad_lo, sum1_ad_hi);
+
                 const float lr = scales[blk * 2 + 0];
                 const float li = negate_imag_scale ? -scales[blk * 2 + 1] : scales[blk * 2 + 1];
 
@@ -355,16 +391,16 @@ static bool ggml_fairy2i_tile64_lut_qgemm_pair_sve2(
             const size_t count = std::min((size_t) active_rows - virtual_row, (size_t) svcntw());          \
             ggml_fairy2i_lut_apply_quarter_sve2(                                                            \
                 wtiles0, blocks, tile_base, blk, virtual_row, count, lr, li,                               \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum0_ac_lo, sum0_ac_hi, q),                              \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum0_bd_lo, sum0_bd_hi, q),                              \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum0_bc_lo, sum0_bc_hi, q),                              \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum0_ad_lo, sum0_ad_hi, q), acc_r, acc_i);                \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum0_ac_row_lo, sum0_ac_row_hi, q),                      \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum0_bd_row_lo, sum0_bd_row_hi, q),                      \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum0_bc_row_lo, sum0_bc_row_hi, q),                      \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum0_ad_row_lo, sum0_ad_row_hi, q), acc_r, acc_i);        \
             ggml_fairy2i_lut_apply_quarter_sve2(                                                            \
                 wtiles1, blocks, tile_base, blk, virtual_row, count, lr, li,                               \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum1_ac_lo, sum1_ac_hi, q),                              \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum1_bd_lo, sum1_bd_hi, q),                              \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum1_bc_lo, sum1_bc_hi, q),                              \
-                ggml_fairy2i_lut_sum_quarter_sve2(sum1_ad_lo, sum1_ad_hi, q), acc_r, acc_i);                \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum1_ac_row_lo, sum1_ac_row_hi, q),                      \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum1_bd_row_lo, sum1_bd_row_hi, q),                      \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum1_bc_row_lo, sum1_bc_row_hi, q),                      \
+                ggml_fairy2i_lut_sum_quarter_sve2(sum1_ad_row_lo, sum1_ad_row_hi, q), acc_r, acc_i);        \
         }                                                                                                   \
     } while (false)
 
