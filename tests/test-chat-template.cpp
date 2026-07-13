@@ -371,6 +371,58 @@ int main(void) {
         }
     }
 
+    {
+        printf("\n\n=== Fairy2i Qwen3 chat template requires jinja ===\n\n");
+        const std::string tmpl = U8C(
+            "{{ bos_token }}"
+            "{%- for message in messages %}"
+            "{%- if message['role'] == 'system' %}"
+            "{{ message['content'] }}"
+            "{%- elif message['role'] == 'user' %}"
+            "{{ '<｜User｜>' + message['content'] + '<｜Assistant｜>' }}"
+            "{%- elif message['role'] == 'assistant' %}"
+            "{{ message['content'] + '<｜end▁of▁sentence｜>' }}"
+            "{%- endif %}"
+            "{%- endfor %}");
+        auto tmpls = common_chat_templates_init(
+            /* model= */ nullptr,
+            tmpl,
+            U8C("<｜begin▁of▁sentence｜>"),
+            U8C("<｜end▁of▁sentence｜>"));
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = {
+            simple_msg("system", "You are a helpful assistant"),
+            simple_msg("user", "Hello"),
+        };
+        inputs.add_generation_prompt = true;
+        inputs.use_jinja             = true;
+
+        const std::string expected_jinja =
+            U8C("<｜begin▁of▁sentence｜>You are a helpful assistant<｜User｜>Hello<｜Assistant｜>");
+        const std::string actual_jinja = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        if (actual_jinja != expected_jinja) {
+            printf("Expected jinja:\n%s\n", expected_jinja.c_str());
+            printf("-------------------------\n");
+            printf("Actual jinja:\n%s\n", actual_jinja.c_str());
+            fflush(stdout);
+            assert(actual_jinja == expected_jinja);
+        }
+
+        inputs.use_jinja = false;
+        const std::string legacy = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        const std::string expected_legacy =
+            U8C("You are a helpful assistant\n\n<｜User｜>Hello<｜Assistant｜>");
+        if (legacy != expected_legacy || legacy == actual_jinja) {
+            printf("Expected legacy:\n%s\n", expected_legacy.c_str());
+            printf("-------------------------\n");
+            printf("Actual legacy:\n%s\n", legacy.c_str());
+            fflush(stdout);
+            assert(legacy == expected_legacy);
+            assert(legacy != actual_jinja);
+        }
+    }
+
     // test llama_chat_format_single for system message
     printf("\n\n=== llama_chat_format_single (system message) ===\n\n");
     std::vector<common_chat_msg> chat2;

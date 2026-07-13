@@ -103,10 +103,11 @@ cmake -B build-rel-fairy2i \
     -DGGML_FAIRY2I_CPU=ON \
     -DGGML_FAIRY2I_CPU_LUT=ON \
     -DGGML_LEGACY_IFAIRY_CPU=OFF
-cmake --build build-rel-fairy2i --target test-fairy2i test-backend-ops -j 4
-GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+cmake --build build-rel-fairy2i --target test-fairy2i test-fairy2i-loader test-backend-ops -j 4
+ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+GGML_FAIRY2I_LUT=0 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
-GGML_FAIRY2I_LUT=1 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
+GGML_FAIRY2I_LUT=0 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
 ```
 
 `ggml-base` no longer compiles Fairy2i or legacy iFairy LUT/QGEMM execution
@@ -130,13 +131,14 @@ scripts/ci-fairy2i-cpu.sh
 | `GGML_TYPE_IFAIRY64` | legacy iFairy tile64 storage |
 | `GGML_TYPE_FAIRY2I_TILE64_V2` | Fairy2i tile64_v2 storage |
 | `GGML_OP_IFAIRY_WIDE_LINEAR_W2` | legacy iFairy W2 |
+| `GGML_OP_FAIRY2I_WIDE_LINEAR_W1` | Fairy2i W1 learned-scale |
 | `GGML_OP_FAIRY2I_WIDE_LINEAR_W2` | Fairy2i W2 |
 
 ## Compatibility Matrix
 
 | Configuration | Expected behavior |
 | --- | --- |
-| Fairy2i CPU only | runs `GGML_OP_FAIRY2I_WIDE_LINEAR_W2`; legacy iFairy ops are unsupported |
+| Fairy2i CPU only | runs Fairy2i W1/W2 fused wide-linear ops; legacy iFairy ops are unsupported |
 | legacy iFairy CPU only | runs legacy vecdot and W2; Fairy2i ops are unsupported |
 | Fairy2i OpenCL only | copies/embeds `complex_*` and `fairy2i_tile64` kernels only |
 | legacy iFairy with OpenCL enabled | OpenCL reports legacy iFairy unsupported; CPU legacy path remains available |

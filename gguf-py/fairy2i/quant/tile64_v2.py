@@ -72,6 +72,49 @@ def pad_complex_matrix(mat: np.ndarray, out_dim: int, in_dim: int) -> np.ndarray
     return out
 
 
+def pad_scale_matrix(scale: np.ndarray, out_dim: int, in_dim: int) -> np.ndarray:
+    out_tiles = out_dim // TILE64
+    in_tiles = in_dim // TILE64
+    scale = np.asarray(scale, dtype=np.float32)
+    if scale.ndim != 2:
+        raise ValueError(f"scale must be a 2D tile matrix, got shape {scale.shape}")
+    if scale.shape[0] > out_tiles or scale.shape[1] > in_tiles:
+        raise ValueError(f"cannot pad scale from {scale.shape} to {(out_tiles, in_tiles)}")
+    if scale.shape == (out_tiles, in_tiles):
+        return scale.astype(np.float32, copy=False)
+
+    out = np.zeros((out_tiles, in_tiles), dtype=np.float32)
+    out[: scale.shape[0], : scale.shape[1]] = scale
+    return out
+
+
+def split_wide_linear_components(
+    weight: "torch.Tensor", out_target: int, in_target: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+    _require_torch()
+
+    a = weight.to(torch.float32).cpu().numpy()
+    out_real, in_real = a.shape
+    if out_real % 2 != 0 or in_real % 2 != 0:
+        raise ValueError(f"linear weight shape must be even, got {a.shape}")
+
+    out_c = out_real // 2
+    in_c = in_real // 2
+
+    a11 = a[:out_c, :in_c]
+    a12 = a[:out_c, in_c:]
+    a21 = a[out_c:, :in_c]
+    a22 = a[out_c:, in_c:]
+
+    u_real = pad_complex_matrix(0.5 * (a11 + a22), out_target, in_target)
+    u_imag = pad_complex_matrix(0.5 * (a21 - a12), out_target, in_target)
+    w_real = pad_complex_matrix(0.5 * (a11 - a22), out_target, in_target)
+    w_imag = pad_complex_matrix(0.5 * (a12 + a21), out_target, in_target)
+
+    del a
+    return u_real, u_imag, w_real, w_imag, out_c, in_c
+
+
 def quantize_tile64_once(tile_real: np.ndarray, tile_imag: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float]:
     abs_real = np.abs(tile_real)
     abs_imag = np.abs(tile_imag)
@@ -209,25 +252,7 @@ def _require_torch() -> None:
 def quantize_linear_to_fairy2i_tile64_v2_stages(
     weight: "torch.Tensor", out_target: int, in_target: int
 ) -> dict[str, np.ndarray]:
-    _require_torch()
-
-    a = weight.to(torch.float32).cpu().numpy()
-    out_real, in_real = a.shape
-    if out_real % 2 != 0 or in_real % 2 != 0:
-        raise ValueError(f"linear weight shape must be even, got {a.shape}")
-
-    out_c = out_real // 2
-    in_c = in_real // 2
-
-    a11 = a[:out_c, :in_c]
-    a12 = a[:out_c, in_c:]
-    a21 = a[out_c:, :in_c]
-    a22 = a[out_c:, in_c:]
-
-    u_real = pad_complex_matrix(0.5 * (a11 + a22), out_target, in_target)
-    u_imag = pad_complex_matrix(0.5 * (a21 - a12), out_target, in_target)
-    w_real = pad_complex_matrix(0.5 * (a11 - a22), out_target, in_target)
-    w_imag = pad_complex_matrix(0.5 * (a12 + a21), out_target, in_target)
+    u_real, u_imag, w_real, w_imag, _, _ = split_wide_linear_components(weight, out_target, in_target)
 
     (u0_real, u0_imag, u0_s_real, u0_s_imag), (u1_real, u1_imag, u1_s_real, u1_s_imag) = quantize_matrix_tile64_v2(
         u_real, u_imag
@@ -243,10 +268,41 @@ def quantize_linear_to_fairy2i_tile64_v2_stages(
         "W.s1": pack_fairy2i_tile64_v2_stage(w1_real, w1_imag, w1_s_real, w1_s_imag),
     }
 
-    del a
     del u_real, u_imag, w_real, w_imag
     del u0_real, u0_imag, u1_real, u1_imag
     del w0_real, w0_imag, w1_real, w1_imag
+    gc.collect()
+
+    return out
+
+
+def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(
+    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+) -> dict[str, np.ndarray]:
+    _require_torch()
+
+    u_real, u_imag, w_real, w_imag, out_c, in_c = split_wide_linear_components(weight, out_target, in_target)
+
+    if out_target % TILE64 != 0 or in_target % TILE64 != 0:
+        raise ValueError(f"tile64 packing requires target dims divisible by {TILE64}, got {(out_target, in_target)}")
+
+    expected_scale_shape = (4, out_c // TILE64, in_c // TILE64)
+    scale = quant_scale.to(torch.float32).cpu().numpy()
+    if scale.shape != expected_scale_shape:
+        raise ValueError(f"learned scale shape mismatch: expected {expected_scale_shape}, got {scale.shape}")
+
+    u_s_real = pad_scale_matrix(scale[0], out_target, in_target)
+    u_s_imag = pad_scale_matrix(scale[1], out_target, in_target)
+    w_s_real = pad_scale_matrix(scale[2], out_target, in_target)
+    w_s_imag = pad_scale_matrix(scale[3], out_target, in_target)
+
+    out = {
+        "U.s0": pack_fairy2i_tile64_v2_stage(u_real, u_imag, u_s_real, u_s_imag),
+        "W.s0": pack_fairy2i_tile64_v2_stage(w_real, w_imag, w_s_real, w_s_imag),
+    }
+
+    del u_real, u_imag, w_real, w_imag
+    del scale, u_s_real, u_s_imag, w_s_real, w_s_imag
     gc.collect()
 
     return out

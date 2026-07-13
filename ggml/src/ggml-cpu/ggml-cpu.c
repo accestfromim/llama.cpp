@@ -439,15 +439,19 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_IFAIRY] = {
         .from_float               = quantize_row_ifairy,
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
         .vec_dot                  = ggml_vec_dot_ifairy_q16_K,
         .vec_dot_type             = GGML_TYPE_IFAIRY_Q16,
         .nrows                    = 1,
+#endif
     },
     [GGML_TYPE_IFAIRY64] = {
         .from_float               = quantize_row_ifairy64,
+#ifdef GGML_USE_LEGACY_IFAIRY_CPU
         .vec_dot                  = ggml_vec_dot_ifairy64_q16_K,
         .vec_dot_type             = GGML_TYPE_IFAIRY64_Q16,
         .nrows                    = 1,
+#endif
     },
     [GGML_TYPE_FAIRY2I_TILE64_V2] = {
         .from_float               = quantize_row_ifairy64,
@@ -2074,6 +2078,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ifairy_mul(params, tensor);
             }
             break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
             {
                 GGML_ABORT("%s requires GGML_FAIRY2I_CPU", ggml_op_name(tensor->op));
@@ -2499,6 +2504,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = n_threads;
             } break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
@@ -3028,6 +3034,7 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;
+                case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                     {

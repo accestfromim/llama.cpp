@@ -26,7 +26,7 @@ run cmake -B build-rel-fairy2i-direct \
     -DGGML_FAIRY2I_CPU=ON \
     -DGGML_FAIRY2I_CPU_LUT=OFF \
     -DGGML_LEGACY_IFAIRY_CPU=OFF
-run cmake --build build-rel-fairy2i-direct --target test-fairy2i -j "${JOBS}"
+run cmake --build build-rel-fairy2i-direct --target test-fairy2i test-fairy2i-loader -j "${JOBS}"
 run ctest --test-dir build-rel-fairy2i-direct --output-on-failure -R fairy2i
 
 run cmake -B build-rel-fairy2i \
@@ -35,10 +35,12 @@ run cmake -B build-rel-fairy2i \
     -DGGML_FAIRY2I_CPU=ON \
     -DGGML_FAIRY2I_CPU_LUT=ON \
     -DGGML_LEGACY_IFAIRY_CPU=OFF
-run cmake --build build-rel-fairy2i --target test-fairy2i test-backend-ops -j "${JOBS}"
-run env GGML_FAIRY2I_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+run cmake --build build-rel-fairy2i --target test-fairy2i test-fairy2i-loader test-backend-ops -j "${JOBS}"
+run ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+run env GGML_FAIRY2I_TEST_REQUIRE_LUT=1 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
+run env GGML_FAIRY2I_LUT=0 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i
 run ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
-run env GGML_FAIRY2I_LUT=1 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
+run env GGML_FAIRY2I_LUT=0 ./build-rel-fairy2i/bin/test-backend-ops test -b CPU -o FAIRY2I_WIDE_LINEAR_W2
 
 run cmake -B build-ifairy-direct \
     -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \

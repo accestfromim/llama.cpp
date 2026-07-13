@@ -1396,6 +1396,8 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
           { LLM_TENSOR_ATTN_V, "blk.%d.attn_v" },
           { LLM_TENSOR_ATTN_OUT, "blk.%d.attn_output" },
           { LLM_TENSOR_ATTN_NORM, "blk.%d.attn_norm" },
+          { LLM_TENSOR_ATTN_Q_NORM, "blk.%d.attn_q_norm" },
+          { LLM_TENSOR_ATTN_K_NORM, "blk.%d.attn_k_norm" },
           { LLM_TENSOR_FFN_GATE, "blk.%d.ffn_gate" },
           { LLM_TENSOR_FFN_DOWN, "blk.%d.ffn_down" },
           { LLM_TENSOR_FFN_UP, "blk.%d.ffn_up" },

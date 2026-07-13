@@ -25,11 +25,15 @@ The fused CPU path:
   weight scales;
 - supports optional bias, multi-threaded execution, and a scalar fallback.
 
-The graph path is opt-in:
+Historical runs used an opt-in graph path:
 
 ```text
 LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1
 ```
+
+Current Fairy2i `GGML_TYPE_FAIRY2I_TILE64_V2` W2 follows the default CPU policy:
+auto-enable when model, LoRA state, tensor types, and CPU backend support match;
+use `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=0` to force the unfused graph.
 
 The dedicated CPU implementation lives in:
 
@@ -339,11 +343,11 @@ each fused wide-linear node:
     convert FP32 accumulation to bf16-pair output
 ```
 
-The graph node is enabled by `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1`. Its fused
-LUT implementation additionally requires `GGML_IFAIRY_LUT=1`, packed IFAIRY64
-weights, and the LUT16 implementation. If those conditions are not satisfied,
-CPU routing falls back to the no-LUT FairyFuse implementation of the same
-graph node.
+In the historical IFAIRY64 path, the graph node was enabled by
+`LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1`. Its fused LUT implementation
+additionally required `GGML_IFAIRY_LUT=1`, packed IFAIRY64 weights, and the
+LUT16 implementation. Current Fairy2i TILE64_V2 CPU LUT builds default to
+LUT16 and use `GGML_FAIRY2I_LUT=0` as the direct-path override.
 
 The current fusion boundaries are therefore:
 
@@ -498,4 +502,3 @@ The current fused LUT path also passes a WikiText-2 perplexity spot check:
 No NaN, invalid output, or quality regression was observed. The high absolute
 PPL at context 256 is an existing property of this single-chunk test setup,
 not a regression introduced by shared channel index decoding.
-

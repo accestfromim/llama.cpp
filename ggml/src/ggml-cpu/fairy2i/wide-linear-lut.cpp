@@ -1,4 +1,5 @@
 #include "wide-linear.h"
+#include "fairy2i-policy.h"
 #include "lut-qgemm.h"
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
@@ -8,16 +9,18 @@
 #include "ggml-cpu.h"
 #include "quants.h"
 
-#include <algorithm>
-#include <math.h>
-#include <math.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+#    include <math.h>
+#    include <stdint.h>
+#    include <stdlib.h>
+#    include <string.h>
 
-#if defined(__AVX2__)
-#    include <immintrin.h>
-#endif
+#    include <algorithm>
+#    include <atomic>
+#    include <new>
+
+#    if defined(__AVX2__)
+#        include <immintrin.h>
+#    endif
 #    if defined(__ARM_NEON) && defined(__aarch64__)
 #        include <arm_neon.h>
 #    endif
@@ -43,8 +46,8 @@ static inline float ggml_fairy2i_wide_linear_lut_bias_at(const struct ggml_tenso
     return *(const float *) ptr;
 }
 
-static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_tensor * dst) {
-    for (int i = 1; i <= 4; ++i) {
+static bool ggml_fairy2i_wide_linear_have_packed_weights(const struct ggml_tensor * dst, int first_src, int last_src) {
+    for (int i = first_src; i <= last_src; ++i) {
         const struct ggml_tensor * weight = dst->src[i];
         const struct fairy2i_lut_extra * extra = weight ? (const struct fairy2i_lut_extra *) weight->extra : nullptr;
         if (!extra || !extra->packed_w) {
@@ -52,6 +55,136 @@ static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_te
         }
     }
     return true;
+}
+
+static bool ggml_fairy2i_wide_linear_w1_have_packed_weights(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_have_packed_weights(dst, 1, 2);
+}
+
+static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_have_packed_weights(dst, 1, 4);
+}
+
+static bool ggml_fairy2i_wide_linear_w1_dynamic_tiles_enabled(void) {
+    const char * env = getenv("GGML_FAIRY2I_W1_DYNAMIC_TILES");
+    return env && strcmp(env, "1") == 0;
+}
+
+static int64_t ggml_fairy2i_wide_linear_w1_dynamic_tile_batch(void) {
+    const char * batch = getenv("GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH");
+    if (!batch) {
+        return 2;
+    }
+    if (strcmp(batch, "1") == 0) {
+        return 1;
+    }
+    if (strcmp(batch, "2") == 0) {
+        return 2;
+    }
+    if (strcmp(batch, "4") == 0) {
+        return 4;
+    }
+    return 1;
+}
+
+static bool ggml_fairy2i_wide_linear_w2_dynamic_tiles_enabled(void) {
+    const char * env = getenv("GGML_FAIRY2I_W2_DYNAMIC_TILES");
+    return !env || strcmp(env, "0") != 0;
+}
+
+static int64_t ggml_fairy2i_wide_linear_w2_dynamic_tile_batch(void) {
+    const char * batch = getenv("GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH");
+    if (!batch) {
+        return 2;
+    }
+    if (strcmp(batch, "1") == 0) {
+        return 1;
+    }
+    if (strcmp(batch, "2") == 0) {
+        return 2;
+    }
+    if (strcmp(batch, "4") == 0) {
+        return 4;
+    }
+    return 1;
+}
+
+static std::atomic<int> ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits{ 0 };
+static std::atomic<int> ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch{ 0 };
+static std::atomic<int> ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits{ 0 };
+static std::atomic<int> ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch{ 0 };
+
+int ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(bool reset);
+int ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch_for_test(void);
+int ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(bool reset);
+int ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch_for_test(void);
+
+int ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(bool reset) {
+    if (reset) {
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch.store(0, std::memory_order_release);
+        return ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits.exchange(0, std::memory_order_acq_rel);
+    }
+    return ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits.load(std::memory_order_acquire);
+}
+
+int ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch_for_test(void) {
+    return ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch.load(std::memory_order_acquire);
+}
+
+int ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(bool reset) {
+    if (reset) {
+        ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch.store(0, std::memory_order_release);
+        return ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits.exchange(0, std::memory_order_acq_rel);
+    }
+    return ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits.load(std::memory_order_acquire);
+}
+
+int ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch_for_test(void) {
+    return ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch.load(std::memory_order_acquire);
+}
+
+static void ggml_fairy2i_wide_linear_w1_log_dynamic_tiles_marker(const struct ggml_compute_params * params,
+                                                                 const struct ggml_tensor *         dst,
+                                                                 int64_t                            batch) {
+    if (!params || params->ith != 0 || !ggml_fairy2i_env_enabled("GGML_FAIRY2I_CPU_DEBUG")) {
+        return;
+    }
+
+    const unsigned               batch_bit = batch == 4 ? 4u : batch == 2 ? 2u : 1u;
+    static std::atomic<unsigned> logged_batches{ 0 };
+    unsigned                     logged = logged_batches.load(std::memory_order_acquire);
+    while ((logged & batch_bit) == 0) {
+        if (logged_batches.compare_exchange_weak(logged, logged | batch_bit, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+            const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
+            GGML_LOG_INFO("fairy2i_w1: path=lut16 dynamic_tiles=1 batch=%lld M=%lld N=%lld K=%lld nth=%d\n",
+                          (long long) batch, (long long) (dst ? dst->ne[0] : 0), (long long) (x ? ggml_nrows(x) : 0),
+                          (long long) (x ? x->ne[0] : 0), params->nth);
+            return;
+        }
+    }
+}
+
+static void ggml_fairy2i_wide_linear_w2_log_dynamic_tiles_marker(const struct ggml_compute_params * params,
+                                                                 const struct ggml_tensor *         dst,
+                                                                 int64_t                            batch) {
+    if (!params || params->ith != 0 || !ggml_fairy2i_env_enabled("GGML_FAIRY2I_CPU_DEBUG")) {
+        return;
+    }
+
+    const unsigned               batch_bit = batch == 4 ? 4u : batch == 2 ? 2u : 1u;
+    static std::atomic<unsigned> logged_batches{ 0 };
+    unsigned                     logged = logged_batches.load(std::memory_order_acquire);
+    while ((logged & batch_bit) == 0) {
+        if (logged_batches.compare_exchange_weak(logged, logged | batch_bit, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
+            const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
+            GGML_LOG_INFO("fairy2i_w2: path=lut16 dynamic_tiles=1 batch=%lld M=%lld N=%lld K=%lld nth=%d\n",
+                          (long long) batch, (long long) (dst ? dst->ne[0] : 0), (long long) (x ? ggml_nrows(x) : 0),
+                          (long long) (x ? x->ne[0] : 0), params->nth);
+            return;
+        }
+    }
 }
 
 void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *              x,
@@ -258,14 +391,13 @@ void ggml_fairy2i_tile64_lut_quantize_block_q16_64_for_test(const float *       
     ggml_fairy2i_tile64_lut_quantize_block_q16_64(x, y, true);
 }
 
-size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
+static size_t ggml_fairy2i_wide_linear_lut_wsize_common(const struct ggml_tensor * dst) {
     const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
     if (!x || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || x->ne[0] % QK_FAIRY2I_TILE64 != 0) {
         return 0;
     }
 
-    const char * enabled_env = getenv("GGML_FAIRY2I_LUT");
-    if (!enabled_env || strcmp(enabled_env, "0") == 0) {
+    if (!ggml_fairy2i_lut_enabled_by_policy()) {
         return 0;
     }
 
@@ -300,6 +432,176 @@ size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
     GGML_ASSERT(q_bytes <= SIZE_MAX - shared_bytes);
     GGML_ASSERT(q_bytes + shared_bytes <= SIZE_MAX - output_bytes);
     return q_bytes + shared_bytes + output_bytes;
+}
+
+size_t ggml_fairy2i_wide_linear_w1_lut_wsize(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_lut_wsize_common(dst);
+}
+
+size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
+    return ggml_fairy2i_wide_linear_lut_wsize_common(dst);
+}
+
+bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * params,
+                                              struct ggml_tensor *                dst,
+                                              bool                                lut_c) {
+    if (lut_c) {
+        return false;
+    }
+    if (!ggml_fairy2i_wide_linear_w1_have_packed_weights(dst)) {
+        return false;
+    }
+
+    const struct ggml_tensor * x      = dst->src[0];
+    const struct ggml_tensor * bias   = dst->src[3];
+    const int64_t K                   = x->ne[0];
+    const int64_t M                   = dst->ne[0];
+    const int64_t N                   = ggml_nrows(x);
+    const int64_t weight_blocks       = K / QK_FAIRY2I_TILE64;
+    const int64_t groups              = weight_blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    const size_t  q_bytes             = GGML_PAD((size_t) N * (size_t) weight_blocks * sizeof(block_fairy2i_act_q16_64), 64);
+    const size_t  lut_bytes           = (size_t) N * (size_t) groups * k_fairy2i_lut_group_bytes;
+    const size_t  shared_bytes        =
+        GGML_PAD(lut_bytes + (size_t) N * (size_t) weight_blocks * 2u * sizeof(float), 64);
+    const size_t  need                = ggml_fairy2i_wide_linear_w1_lut_wsize(dst);
+
+    if (!params->wdata || params->wsize < need) {
+        return false;
+    }
+
+    block_fairy2i_act_q16_64 * q_x    = (block_fairy2i_act_q16_64 *) params->wdata;
+    uint8_t *            shared = (uint8_t *) params->wdata + q_bytes;
+    void *               lut    = shared;
+    float *              scales = (float *) (shared + lut_bytes);
+    float *              output = (float *) (shared + shared_bytes);
+
+    if (N >= params->nth) {
+        for (int64_t ir = params->ith; ir < N; ir += params->nth) {
+            const float * x_row = (const float *) ((const char *) x->data + ir * x->nb[1]);
+            block_fairy2i_act_q16_64 * q_row = q_x + ir * weight_blocks;
+            for (int64_t ib = 0; ib < weight_blocks; ++ib) {
+                ggml_fairy2i_tile64_lut_quantize_block_q16_64(x_row + ib * QK_FAIRY2I_TILE64, q_row + ib, true);
+            }
+        }
+        ggml_fairy2i_tile64_lut_preprocess_ex_q16_64_lut16((int) M, (int) K, (int) N, q_x,
+                                                       (size_t) weight_blocks * sizeof(block_fairy2i_act_q16_64), scales,
+                                                       lut, params->ith, params->nth);
+    } else {
+        for (int64_t ir = 0; ir < N; ++ir) {
+            const float * x_row = (const float *) ((const char *) x->data + ir * x->nb[1]);
+            block_fairy2i_act_q16_64 * q_row = q_x + ir * weight_blocks;
+            float * scale_row = scales + ir * weight_blocks * 2;
+            int8_t * lut_row = (int8_t *) lut + ir * groups * k_fairy2i_lut_group_bytes;
+
+            for (int64_t ib = params->ith; ib < weight_blocks; ib += params->nth) {
+                ggml_fairy2i_tile64_lut_quantize_block_q16_64(x_row + ib * QK_FAIRY2I_TILE64, q_row + ib, false);
+                ggml_fairy2i_tile64_lut_preprocess_q16_64_block_lut16(
+                    q_row + ib, scale_row + ib * 2,
+                    lut_row + ib * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK * k_fairy2i_lut_group_bytes);
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    const int64_t tiles_total = (M + 15) / 16;
+    const int64_t tile0       = (tiles_total * params->ith) / params->nth;
+    const int64_t tile1       = (tiles_total * (params->ith + 1)) / params->nth;
+    const int64_t row0        = tile0 * 16;
+    const int64_t row1        = std::min<int64_t>(tile1 * 16, M);
+    const int64_t nrows       = row1 - row0;
+    const size_t  packed_tile_bytes = (size_t) weight_blocks * sizeof(fairy2i_tile64_lut_wtile_16);
+
+    const fairy2i_lut_extra * extra_u0 = (const fairy2i_lut_extra *) dst->src[1]->extra;
+    const fairy2i_lut_extra * extra_w0 = (const fairy2i_lut_extra *) dst->src[2]->extra;
+    const void * packed_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const void * packed_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
+
+    if (N == 1 && ggml_fairy2i_wide_linear_w1_dynamic_tiles_enabled()) {
+        GGML_ASSERT(((uintptr_t) q_x % alignof(std::atomic<int64_t>)) == 0);
+        std::atomic<int64_t> * next_tile = reinterpret_cast<std::atomic<int64_t> *>(q_x);
+        if (params->ith == 0) {
+            new (next_tile) std::atomic<int64_t>();
+            next_tile->store(0, std::memory_order_release);
+        }
+        ggml_barrier(params->threadpool);
+
+        const int64_t dynamic_tile_batch = ggml_fairy2i_wide_linear_w1_dynamic_tile_batch();
+        if (params->ith == 0) {
+            ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits.fetch_add(1, std::memory_order_acq_rel);
+            ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch.store((int) dynamic_tile_batch,
+                                                                       std::memory_order_release);
+        }
+        ggml_fairy2i_wide_linear_w1_log_dynamic_tiles_marker(params, dst, dynamic_tile_batch);
+
+        for (;;) {
+            const int64_t claim_tile0 = next_tile->fetch_add(dynamic_tile_batch, std::memory_order_acq_rel);
+            if (claim_tile0 >= tiles_total) {
+                break;
+            }
+
+            const int64_t claim_tile1 = std::min<int64_t>(claim_tile0 + dynamic_tile_batch, tiles_total);
+            const int64_t claim_row0  = claim_tile0 * 16;
+            const int64_t claim_row1  = std::min<int64_t>(claim_tile1 * 16, M);
+            const int64_t claim_rows  = claim_row1 - claim_row0;
+
+            const void * claim_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+
+            const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_two_cpu(
+                (int) claim_rows, (int) K, (int) N, claim_u0, claim_w0, lut, scales, output + claim_row0 * 2,
+                (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+            if (!qgemm_ok) {
+                return false;
+            }
+
+            for (int64_t col = 0; col < N; ++col) {
+                const int64_t i1         = col % x->ne[1];
+                const int64_t i2         = (col / x->ne[1]) % x->ne[2];
+                const int64_t i3         = col / (x->ne[1] * x->ne[2]);
+                const float * output_col = output + col * M * 2;
+                char *        dst_col    = (char *) dst->data + col * dst->nb[1];
+                for (int64_t row = claim_row0; row < claim_row1; ++row) {
+                    float real = output_col[row * 2 + 0];
+                    float imag = output_col[row * 2 + 1];
+                    if (bias) {
+                        real += ggml_fairy2i_wide_linear_lut_bias_at(bias, row, i1, i2, i3);
+                        imag += ggml_fairy2i_wide_linear_lut_bias_at(bias, row + M, i1, i2, i3);
+                    }
+                    ggml_bf16_t * out = (ggml_bf16_t *) (dst_col + row * dst->nb[0]);
+                    out[0]            = GGML_FP32_TO_BF16(real);
+                    out[1]            = GGML_FP32_TO_BF16(imag);
+                }
+            }
+        }
+        return true;
+    }
+
+    const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_two_cpu(
+        (int) nrows, (int) K, (int) N, packed_u0, packed_w0, lut, scales, output + row0 * 2,
+        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+    if (!qgemm_ok) {
+        return false;
+    }
+
+    for (int64_t col = 0; col < N; ++col) {
+        const int64_t i1 = col % x->ne[1];
+        const int64_t i2 = (col / x->ne[1]) % x->ne[2];
+        const int64_t i3 = col / (x->ne[1] * x->ne[2]);
+        const float * output_col = output + col * M * 2;
+        char * dst_col = (char *) dst->data + col * dst->nb[1];
+        for (int64_t row = row0; row < row1; ++row) {
+            float real = output_col[row * 2 + 0];
+            float imag = output_col[row * 2 + 1];
+            if (bias) {
+                real += ggml_fairy2i_wide_linear_lut_bias_at(bias, row, i1, i2, i3);
+                imag += ggml_fairy2i_wide_linear_lut_bias_at(bias, row + M, i1, i2, i3);
+            }
+            ggml_bf16_t * out = (ggml_bf16_t *) (dst_col + row * dst->nb[0]);
+            out[0]             = GGML_FP32_TO_BF16(real);
+            out[1]             = GGML_FP32_TO_BF16(imag);
+        }
+    }
+    return true;
 }
 
 bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * params,
@@ -379,6 +681,69 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
     const void * packed_u1 = (const uint8_t *) extra_u1->packed_w + (size_t) tile0 * packed_tile_bytes;
     const void * packed_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
     const void * packed_w1 = (const uint8_t *) extra_w1->packed_w + (size_t) tile0 * packed_tile_bytes;
+
+    if (N == 1 && ggml_fairy2i_wide_linear_w2_dynamic_tiles_enabled()) {
+        GGML_ASSERT(((uintptr_t) q_x % alignof(std::atomic<int64_t>)) == 0);
+        std::atomic<int64_t> * next_tile = reinterpret_cast<std::atomic<int64_t> *>(q_x);
+        if (params->ith == 0) {
+            new (next_tile) std::atomic<int64_t>();
+            next_tile->store(0, std::memory_order_release);
+        }
+        ggml_barrier(params->threadpool);
+
+        const int64_t dynamic_tile_batch = ggml_fairy2i_wide_linear_w2_dynamic_tile_batch();
+        if (params->ith == 0) {
+            ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits.fetch_add(1, std::memory_order_acq_rel);
+            ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch.store((int) dynamic_tile_batch,
+                                                                       std::memory_order_release);
+        }
+        ggml_fairy2i_wide_linear_w2_log_dynamic_tiles_marker(params, dst, dynamic_tile_batch);
+
+        for (;;) {
+            const int64_t claim_tile0 = next_tile->fetch_add(dynamic_tile_batch, std::memory_order_acq_rel);
+            if (claim_tile0 >= tiles_total) {
+                break;
+            }
+
+            const int64_t claim_tile1 = std::min<int64_t>(claim_tile0 + dynamic_tile_batch, tiles_total);
+            const int64_t claim_row0  = claim_tile0 * 16;
+            const int64_t claim_row1  = std::min<int64_t>(claim_tile1 * 16, M);
+            const int64_t claim_rows  = claim_row1 - claim_row0;
+
+            const void * claim_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_u1 = (const uint8_t *) extra_u1->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_w1 = (const uint8_t *) extra_w1->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+
+            const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
+                (int) claim_rows, (int) K, (int) N, claim_u0, claim_u1, claim_w0, claim_w1, lut, scales,
+                output + claim_row0 * 2, (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+            if (!qgemm_ok) {
+                return false;
+            }
+
+            for (int64_t col = 0; col < N; ++col) {
+                const int64_t i1         = col % x->ne[1];
+                const int64_t i2         = (col / x->ne[1]) % x->ne[2];
+                const int64_t i3         = col / (x->ne[1] * x->ne[2]);
+                const float * output_col = output + col * M * 2;
+                char *        dst_col    = (char *) dst->data + col * dst->nb[1];
+                for (int64_t row = claim_row0; row < claim_row1; ++row) {
+                    float real = output_col[row * 2 + 0];
+                    float imag = output_col[row * 2 + 1];
+                    if (bias) {
+                        real += ggml_fairy2i_wide_linear_lut_bias_at(bias, row, i1, i2, i3);
+                        imag += ggml_fairy2i_wide_linear_lut_bias_at(bias, row + M, i1, i2, i3);
+                    }
+                    ggml_bf16_t * out = (ggml_bf16_t *) (dst_col + row * dst->nb[0]);
+                    out[0]            = GGML_FP32_TO_BF16(real);
+                    out[1]            = GGML_FP32_TO_BF16(imag);
+                }
+            }
+        }
+        return true;
+    }
+
     const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
         (int) nrows, (int) K, (int) N, packed_u0, packed_u1, packed_w0, packed_w1, lut, scales, output + row0 * 2,
         (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
@@ -409,9 +774,23 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
 
 #else
 
+size_t ggml_fairy2i_wide_linear_w1_lut_wsize(const struct ggml_tensor * dst) {
+    (void) dst;
+    return 0;
+}
+
 size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst) {
     (void) dst;
     return 0;
+}
+
+bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * params,
+                                              struct ggml_tensor *                dst,
+                                              bool                                lut_c) {
+    (void) params;
+    (void) dst;
+    (void) lut_c;
+    return false;
 }
 
 bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * params,

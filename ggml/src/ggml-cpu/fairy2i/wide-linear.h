@@ -11,10 +11,17 @@ extern "C" {
 
 void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 
+void ggml_fairy2i_wide_linear_w1_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+
 bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * params,
                                               struct ggml_tensor *                dst,
                                               bool                                lut_c);
 size_t ggml_fairy2i_wide_linear_w2_lut_wsize(const struct ggml_tensor * dst);
+
+bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * params,
+                                              struct ggml_tensor *                dst,
+                                              bool                                lut_c);
+size_t ggml_fairy2i_wide_linear_w1_lut_wsize(const struct ggml_tensor * dst);
 
 #ifdef __cplusplus
 }

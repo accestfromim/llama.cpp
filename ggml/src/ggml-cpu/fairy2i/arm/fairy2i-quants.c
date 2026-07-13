@@ -118,6 +118,13 @@ void ggml_fairy2i_tile64_fuse_accumulate_block_four_dotprod(const block_fairy2i_
                                                             int32_t                          sums[4][4]) {
     ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(u0, u1, w0, w1, x, sums);
 }
+
+void ggml_fairy2i_tile64_fuse_accumulate_block_two_dotprod(const block_fairy2i_tile64_v2 *  u0,
+                                                           const block_fairy2i_tile64_v2 *  w0,
+                                                           const block_fairy2i_act_q16_64 * x,
+                                                           int32_t                          sums[2][4]) {
+    ggml_fairy2i_tile64_fuse_accumulate_block_two_neon(u0, w0, x, sums);
+}
 #endif
 
 #if !defined(GGML_USE_FAIRY2I_CPU_ARM_SVE2)
@@ -149,6 +156,20 @@ void ggml_fairy2i_tile64_fuse_accumulate_block_four_neon(const block_fairy2i_til
     (void) u1;
     (void) w0;
     (void) w1;
+    (void) x;
+    (void) sums;
+#endif
+}
+
+void ggml_fairy2i_tile64_fuse_accumulate_block_two_neon(const block_fairy2i_tile64_v2 *  u0,
+                                                        const block_fairy2i_tile64_v2 *  w0,
+                                                        const block_fairy2i_act_q16_64 * x,
+                                                        int32_t                          sums[2][4]) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    ggml_fairy2i_tile64_fuse_accumulate_pair_neon(u0, w0, x, sums[0], sums[1]);
+#else
+    (void) u0;
+    (void) w0;
     (void) x;
     (void) sums;
 #endif
@@ -234,6 +255,31 @@ bool ggml_fairy2i_tile64_fuse_accumulate_block_four_arm(const block_fairy2i_tile
     (void) u1;
     (void) w0;
     (void) w1;
+    (void) x;
+    (void) sums;
+#endif
+
+    return false;
+}
+
+bool ggml_fairy2i_tile64_fuse_accumulate_block_two_arm(const block_fairy2i_tile64_v2 *  u0,
+                                                       const block_fairy2i_tile64_v2 *  w0,
+                                                       const block_fairy2i_act_q16_64 * x,
+                                                       int32_t                          sums[2][4]) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if (!ggml_fairy2i_test_disable_arm_dotprod() && ggml_fairy2i_tile64_w2_arm_dotprod_available() &&
+        ggml_cpu_has_dotprod()) {
+        ggml_fairy2i_tile64_fuse_accumulate_block_two_dotprod(u0, w0, x, sums);
+        return true;
+    }
+
+    if (ggml_fairy2i_tile64_w2_arm_neon_available()) {
+        ggml_fairy2i_tile64_fuse_accumulate_block_two_neon(u0, w0, x, sums);
+        return true;
+    }
+#else
+    (void) u0;
+    (void) w0;
     (void) x;
     (void) sums;
 #endif
