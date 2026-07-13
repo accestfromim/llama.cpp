@@ -905,6 +905,197 @@ static ggml_backend_dev_t find_opencl_test_device() {
     return nullptr;
 }
 
+static ggml_backend_dev_t find_metal_test_device() {
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev      = ggml_backend_dev_get(i);
+        const char *       name     = ggml_backend_dev_name(dev);
+        ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+        const char *       reg_name = ggml_backend_reg_name(reg);
+
+        if ((name && strcmp(name, "Metal") == 0) || (reg_name && strcmp(reg_name, "Metal") == 0)) {
+            return dev;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool run_fairy2i_w2_metal_backend(std::vector<uint32_t> & out,
+                                         ggml_backend_dev_t      dev,
+                                         const fairy2i_w2_case & tc,
+                                         const fairy2i_w2_data & data) {
+    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
+    if (!backend) {
+        fprintf(stderr, "failed to initialize Metal backend\n");
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/4 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "failed to initialize ggml context for Fairy2i Metal W2\n");
+        return false;
+    }
+
+    ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * u_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * u_s1 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s1 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * bias = tc.bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tc.M) : nullptr;
+    ggml_tensor * y    = ggml_fairy2i_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
+    ggml_set_name(y, "fairy2i_metal_wide_linear_w2");
+
+    if (!ggml_backend_supports_op(backend, y)) {
+        fprintf(stderr, "Metal does not support Fairy2i W2 M=%lld N=%lld K=%lld\n", (long long) tc.M, (long long) tc.N,
+                (long long) tc.K);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "failed to allocate Metal backend buffer for Fairy2i W2\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, data.x.data(), 0, data.x.size() * sizeof(float));
+    ggml_backend_tensor_set(u_s0, data.u_s0.data(), 0, data.u_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(u_s1, data.u_s1.data(), 0, data.u_s1.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w_s0, data.w_s0.data(), 0, data.w_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w_s1, data.w_s1.data(), 0, data.w_s1.size() * sizeof(block_fairy2i_tile64_v2));
+    if (bias) {
+        ggml_backend_tensor_set(bias, data.bias.data(), 0, data.bias.size() * sizeof(float));
+    }
+
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "Fairy2i Metal W2 graph compute failed: %s\n", ggml_status_to_string(status));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> out_f32((size_t) tc.M * (size_t) tc.N);
+    ggml_backend_tensor_get(y, out_f32.data(), 0, out_f32.size() * sizeof(float));
+
+    out.resize(out_f32.size());
+    memcpy(out.data(), out_f32.data(), out_f32.size() * sizeof(float));
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+static bool test_fairy2i_metal_wide_linear_w2() {
+    printf("\n=== Fairy2i Metal W2 tests ===\n");
+
+    ggml_backend_dev_t dev = find_metal_test_device();
+    if (!dev) {
+        printf("Metal backend not found; skipping Fairy2i Metal W2 tests.\n");
+        return true;
+    }
+
+    printf("Metal device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    const std::vector<fairy2i_w2_case> cases = {
+        { 7,  3, 128, true },
+        { 17, 1, 256, true },
+    };
+
+    struct metal_w2_mode {
+        const char * label;
+        const char * lut;
+        const char * stream;
+        const char * block_sum;
+        const char * prefill_tile4x4;
+        const char * prefill_tile8x4;
+        const char * prefill_act_q8;
+    };
+
+    const metal_w2_mode modes[] = {
+        { "Fairy2i Metal W2",                 nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
+        { "Fairy2i Metal W2 LUT",             "1",     nullptr, nullptr, nullptr, nullptr, nullptr },
+        { "Fairy2i Metal W2 LUT stream",      nullptr, "1",     nullptr, nullptr, nullptr, nullptr },
+        { "Fairy2i Metal W2 block sum",       nullptr, nullptr, "1",     nullptr, nullptr, nullptr },
+        { "Fairy2i Metal W2 prefill tile4x4", nullptr, nullptr, "1",     "1",     nullptr, nullptr },
+        { "Fairy2i Metal W2 prefill tile8x4", nullptr, nullptr, "1",     nullptr, "1",     nullptr },
+        { "Fairy2i Metal W2 prefill act q8",  nullptr, nullptr, nullptr, nullptr, nullptr, "1"     },
+    };
+
+    scoped_env_var lut_env("GGML_METAL_FAIRY2I_W2_LUT");
+    scoped_env_var stream_env("GGML_METAL_FAIRY2I_W2_LUT_STREAM");
+    scoped_env_var block_sum_env("GGML_METAL_FAIRY2I_W2_BLOCK_SUM");
+    scoped_env_var prefill_tile4x4_env("GGML_METAL_FAIRY2I_W2_PREFILL_TILE4X4");
+    scoped_env_var prefill_tile8x4_env("GGML_METAL_FAIRY2I_W2_PREFILL_TILE8X4");
+    scoped_env_var prefill_act_q8_env("GGML_METAL_FAIRY2I_W2_PREFILL_ACT_Q8");
+
+    for (const metal_w2_mode & mode : modes) {
+        if (mode.lut) {
+            lut_env.set(mode.lut);
+        } else {
+            lut_env.unset();
+        }
+        if (mode.stream) {
+            stream_env.set(mode.stream);
+        } else {
+            stream_env.unset();
+        }
+        if (mode.block_sum) {
+            block_sum_env.set(mode.block_sum);
+        } else {
+            block_sum_env.unset();
+        }
+        if (mode.prefill_tile4x4) {
+            prefill_tile4x4_env.set(mode.prefill_tile4x4);
+        } else {
+            prefill_tile4x4_env.unset();
+        }
+        if (mode.prefill_tile8x4) {
+            prefill_tile8x4_env.set(mode.prefill_tile8x4);
+        } else {
+            prefill_tile8x4_env.unset();
+        }
+        if (mode.prefill_act_q8) {
+            prefill_act_q8_env.set(mode.prefill_act_q8);
+        } else {
+            prefill_act_q8_env.unset();
+        }
+
+        for (const fairy2i_w2_case & tc : cases) {
+            const fairy2i_w2_data       data = make_fairy2i_w2_data(tc);
+            const std::vector<uint32_t> ref  = fairy2i_w2_scalar_reference(tc, data);
+
+            std::vector<uint32_t> metal;
+            if (!run_fairy2i_w2_metal_backend(metal, dev, tc, data)) {
+                return false;
+            }
+
+            if (!compare_packed_complex(mode.label, metal, ref, 1e-2f)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 static bool check_fairy2i_opencl_mul_mat_support(ggml_backend_dev_t dev,
                                                  const char *       label,
                                                  const char *       fairy_gate_value,
@@ -1222,6 +1413,10 @@ int main() {
     }
     if (!test_fairy2i_wide_linear_w2_variants()) {
         fprintf(stderr, "Fairy2i W2 variant matrix FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_metal_wide_linear_w2()) {
+        fprintf(stderr, "Fairy2i Metal W2 FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_opencl_tile64_mul_mat()) {

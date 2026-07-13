@@ -175,6 +175,32 @@ typedef struct {
 } ggml_metal_kargs_scale;
 
 typedef struct {
+    int32_t  k;
+    int32_t  m;
+    int32_t  act_rows;
+    int32_t  has_bias;
+    int32_t  x_ne1;
+    int32_t  x_ne2;
+    int32_t  x_ne3;
+    uint64_t x_nb0;
+    uint64_t x_nb1;
+    uint64_t x_nb2;
+    uint64_t x_nb3;
+    int32_t  bias_ne0;
+    int32_t  bias_ne1;
+    int32_t  bias_ne2;
+    int32_t  bias_ne3;
+    uint64_t bias_nb0;
+    uint64_t bias_nb1;
+    uint64_t bias_nb2;
+    uint64_t bias_nb3;
+    uint64_t dst_nb0;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+    uint64_t dst_nb3;
+} ggml_metal_kargs_fairy2i_wide_linear_w2;
+
+typedef struct {
     float min;
     float max;
 } ggml_metal_kargs_clamp;

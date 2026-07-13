@@ -303,6 +303,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
+static bool buft_list_has_non_cpu_dev(const buft_list_t & buft_list) {
+    for (const auto & cur : buft_list) {
+        if (cur.first && ggml_backend_dev_type(cur.first) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list) {
     GGML_ASSERT(!buft_list.empty());
@@ -2351,6 +2360,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         break;
                     }
                 }
+            }
+
+            if (t_meta->type == GGML_TYPE_FAIRY2I_TILE64_V2 && llama_fairy2i_fused_wide_linear_w2_enabled() &&
+                buft_list_has_non_cpu_dev(*buft_list)) {
+                // These tensors are consumed by GGML_OP_FAIRY2I_WIDE_LINEAR_W2, not by a generic MUL_MAT.
+                // Keep them eligible for layer offload so the scheduler can place the fused op on the same device.
+                op = GGML_OP_NONE;
             }
 
             if (!buft) {
