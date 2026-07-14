@@ -1201,77 +1201,17 @@ static bool test_fairy2i_metal_wide_linear_w2() {
         { 17, 1, 256, true },
     };
 
-    struct metal_w2_mode {
-        const char * label;
-        const char * lut;
-        const char * stream;
-        const char * block_sum;
-        const char * prefill_tile4x4;
-        const char * prefill_tile8x4;
-        const char * prefill_act_q8;
-    };
+    for (const fairy2i_w2_case & tc : cases) {
+        const fairy2i_w2_data       data = make_fairy2i_w2_data(tc);
+        const std::vector<uint32_t> ref  = fairy2i_w2_scalar_reference(tc, data);
 
-    const metal_w2_mode modes[] = {
-        { "Fairy2i Metal W2",                 nullptr, nullptr, nullptr, nullptr, nullptr, nullptr },
-        { "Fairy2i Metal W2 LUT",             "1",     nullptr, nullptr, nullptr, nullptr, nullptr },
-        { "Fairy2i Metal W2 LUT stream",      nullptr, "1",     nullptr, nullptr, nullptr, nullptr },
-        { "Fairy2i Metal W2 block sum",       nullptr, nullptr, "1",     nullptr, nullptr, nullptr },
-        { "Fairy2i Metal W2 prefill tile4x4", nullptr, nullptr, "1",     "1",     nullptr, nullptr },
-        { "Fairy2i Metal W2 prefill tile8x4", nullptr, nullptr, "1",     nullptr, "1",     nullptr },
-        { "Fairy2i Metal W2 prefill act q8",  nullptr, nullptr, nullptr, nullptr, nullptr, "1"     },
-    };
-
-    scoped_env_var lut_env("GGML_METAL_FAIRY2I_W2_LUT");
-    scoped_env_var stream_env("GGML_METAL_FAIRY2I_W2_LUT_STREAM");
-    scoped_env_var block_sum_env("GGML_METAL_FAIRY2I_W2_BLOCK_SUM");
-    scoped_env_var prefill_tile4x4_env("GGML_METAL_FAIRY2I_W2_PREFILL_TILE4X4");
-    scoped_env_var prefill_tile8x4_env("GGML_METAL_FAIRY2I_W2_PREFILL_TILE8X4");
-    scoped_env_var prefill_act_q8_env("GGML_METAL_FAIRY2I_W2_PREFILL_ACT_Q8");
-
-    for (const metal_w2_mode & mode : modes) {
-        if (mode.lut) {
-            lut_env.set(mode.lut);
-        } else {
-            lut_env.unset();
-        }
-        if (mode.stream) {
-            stream_env.set(mode.stream);
-        } else {
-            stream_env.unset();
-        }
-        if (mode.block_sum) {
-            block_sum_env.set(mode.block_sum);
-        } else {
-            block_sum_env.unset();
-        }
-        if (mode.prefill_tile4x4) {
-            prefill_tile4x4_env.set(mode.prefill_tile4x4);
-        } else {
-            prefill_tile4x4_env.unset();
-        }
-        if (mode.prefill_tile8x4) {
-            prefill_tile8x4_env.set(mode.prefill_tile8x4);
-        } else {
-            prefill_tile8x4_env.unset();
-        }
-        if (mode.prefill_act_q8) {
-            prefill_act_q8_env.set(mode.prefill_act_q8);
-        } else {
-            prefill_act_q8_env.unset();
+        std::vector<uint32_t> metal;
+        if (!run_fairy2i_w2_metal_backend(metal, dev, tc, data)) {
+            return false;
         }
 
-        for (const fairy2i_w2_case & tc : cases) {
-            const fairy2i_w2_data       data = make_fairy2i_w2_data(tc);
-            const std::vector<uint32_t> ref  = fairy2i_w2_scalar_reference(tc, data);
-
-            std::vector<uint32_t> metal;
-            if (!run_fairy2i_w2_metal_backend(metal, dev, tc, data)) {
-                return false;
-            }
-
-            if (!compare_packed_complex(mode.label, metal, ref, 1e-2f)) {
-                return false;
-            }
+        if (!compare_packed_complex("Fairy2i Metal W2", metal, ref, 1e-2f)) {
+            return false;
         }
     }
 
