@@ -1,11 +1,12 @@
 #include "ggml-metal.h"
 
-#include "ggml-impl.h"
 #include "ggml-backend-impl.h"
-
-#include "ggml-metal-device.h"
+#include "ggml-impl.h"
 #include "ggml-metal-context.h"
+#include "ggml-metal-device.h"
 #include "ggml-metal-ops.h"
+
+#include <cstdlib>
 
 // globals
 
@@ -184,6 +185,8 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
 static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t res = ggml_nbytes(tensor);
 
+    res += ggml_metal_fairy2i_packed_weight_extra(tensor);
+
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
         case GGML_OP_MUL_MAT_ID:
@@ -197,6 +200,13 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                     res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
                 }
             } break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
+            {
+                res += ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(tensor);
+                res += ggml_metal_op_fairy2i_wide_linear_w2_extra_act_d(tensor);
+                res += ggml_metal_op_fairy2i_wide_linear_w2_extra_partial(tensor);
+            }
+            break;
         default:
             break;
     }
@@ -429,6 +439,16 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
 
 }
 
+static int ggml_backend_metal_default_n_cb(void) {
+    const char * env = getenv("GGML_METAL_N_CB");
+    if (!env || env[0] == '\0') {
+        return 1;
+    }
+
+    const int n_cb = atoi(env);
+    return n_cb > 0 ? n_cb : 1;
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -482,7 +502,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 }
@@ -574,7 +594,7 @@ static ggml_backend_t ggml_backend_metal_device_init(ggml_backend_dev_t dev, con
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_default_n_cb());
 
     return backend;
 

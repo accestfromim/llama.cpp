@@ -193,6 +193,8 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQue
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
+struct ggml_metal_buffer_id ggml_metal_device_get_scratch(ggml_metal_device_t dev, size_t size);
+
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total);
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
@@ -221,6 +223,8 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+
+size_t ggml_metal_fairy2i_packed_weight_extra(const struct ggml_tensor * tensor);
 
 #ifdef __cplusplus
 }
