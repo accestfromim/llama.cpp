@@ -34,6 +34,11 @@ static bool llama_fairy2i_fused_wide_linear_w2_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
+static bool llama_fairy2i_output_neon_enabled() {
+    const char * env = getenv("LLAMA_FAIRY2I_OUTPUT_NEON");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -1653,12 +1658,37 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         throw std::runtime_error(
                             format("invalid FAIRY2I tile64_v2 scale stat: %s, expected dominant_mean_abs", scale_stat.c_str()));
                     }
+                } else if (quant_variant == "tile64_v2_w1_learned_scale") {
+                    fairy2i_quant_variant = LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE;
+
+                    uint32_t tile_size = 0;
+                    ml.get_key("fairy2i.quant.tile_size", tile_size);
+                    if (tile_size != 64) {
+                        throw std::runtime_error(
+                            format("invalid FAIRY2I tile64_v2_w1_learned_scale tile size: %u, expected 64", tile_size));
+                    }
+
+                    uint32_t residual_steps = 0;
+                    ml.get_key("fairy2i.quant.residual_steps", residual_steps);
+                    if (residual_steps != 1) {
+                        throw std::runtime_error(format(
+                            "invalid FAIRY2I tile64_v2_w1_learned_scale residual steps: %u, expected 1",
+                            residual_steps));
+                    }
+
+                    std::string scale_source;
+                    ml.get_key("fairy2i.quant.scale_source", scale_source);
+                    if (scale_source != "learned") {
+                        throw std::runtime_error(format(
+                            "invalid FAIRY2I tile64_v2_w1_learned_scale scale source: %s, expected learned",
+                            scale_source.c_str()));
+                    }
                 } else {
                     throw std::runtime_error(
                         format("unsupported FAIRY2I quant variant: %s", quant_variant.c_str()));
                 }
 
-                std::string attn_layout = fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2
+                std::string attn_layout = fairy2i_quant_variant != LLAMA_FAIRY2I_QUANT_VARIANT_LEGACY
                                               ? "qwen2_real"
                                               : "legacy_complex";
                 ml.get_key("fairy2i.attn.layout", attn_layout, false);
@@ -1669,6 +1699,8 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL;
                 } else if (attn_layout == "qwen2_real") {
                     fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL;
+                } else if (attn_layout == "qwen3_real") {
+                    fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL;
                 } else {
                     throw std::runtime_error(
                         format("unsupported FAIRY2I attention layout: %s", attn_layout.c_str()));
@@ -1677,6 +1709,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 switch (hparams.n_layer) {
                     case 32:
                         type = LLM_TYPE_7B;
+                        break;
+                    case 36:
+                        type = LLM_TYPE_8B;
                         break;
                     case 64:
                         type = LLM_TYPE_32B;
@@ -2130,10 +2165,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer = hparams.n_layer;
+    const bool fairy2i_output_neon = arch == LLM_ARCH_FAIRY2I && llama_fairy2i_output_neon_enabled();
 
     const bool use_mmap_buffer = true;
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s)\n", __func__, ml.use_mmap ? "true" : "false");
+    if (fairy2i_output_neon) {
+        LLAMA_LOG_INFO("%s: LLAMA_FAIRY2I_OUTPUT_NEON=1, dense output matmul will use the CPU backend when available\n",
+                       __func__);
+    }
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts);
@@ -2310,6 +2350,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             } else {
                 op = info.op;
             }
+            const bool dense_fairy2i_output = fairy2i_output_neon && tn_tensor == LLM_TENSOR_OUTPUT && !bias &&
+                                              (tn.suffix == nullptr || strcmp(tn.suffix, "weight") == 0) &&
+                                              t_meta->type != GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                              t_meta->type != GGML_TYPE_IFAIRY;
 
             // sanity checks
             if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
@@ -2337,6 +2381,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
             }
+            if (dense_fairy2i_output) {
+                LLAMA_LOG_INFO("%s: placing dense output tensor %s on CPU backend for LLAMA_FAIRY2I_OUTPUT_NEON\n",
+                               __func__, tn.str().c_str());
+            }
 
             ggml_backend_buffer_type_t buft = nullptr;
 
@@ -2359,6 +2407,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 ggml_backend_buft_name(buft));
                         break;
                     }
+                }
+            }
+
+            if (dense_fairy2i_output) {
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+                if (!weight_buft_supported(hparams, t_meta, op, buft, cpu_dev)) {
+                    throw std::runtime_error(
+                        format("CPU backend does not support dense Fairy2i output tensor %s", tn.str().c_str()));
                 }
             }
 
@@ -4640,12 +4696,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     // Optional dense output for ablation/fallback.
                     output      = create_tensor(tn(LLM_TENSOR_OUTPUT), { n_embd * 2, n_vocab }, TENSOR_NOT_REQUIRED);
 
+                    const bool fairy2i_tile64_v2 =
+                        fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2 ||
+                        fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE;
+                    const bool fairy2i_w1 =
+                        fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE;
+
                     auto create_fairy2i_stage = [&](ggml_tensor * & stage, llm_tensor tensor, const char * suffix, int bid,
                                                     const std::initializer_list<int64_t> & ne, int flags) {
                         const auto stage_tn = bid >= 0 ? tn(tensor, suffix, bid) : tn(tensor, suffix);
-                        const auto expected_type = fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2
-                            ? GGML_TYPE_FAIRY2I_TILE64_V2
-                            : GGML_TYPE_IFAIRY;
+                        const auto expected_type = fairy2i_tile64_v2 ? GGML_TYPE_FAIRY2I_TILE64_V2 : GGML_TYPE_IFAIRY;
 
                         const ggml_tensor * t_meta = ml.get_tensor_meta(stage_tn.str().c_str());
                         if (t_meta && t_meta->type != expected_type) {
@@ -4661,8 +4721,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                     auto create_fairy2i_linear = [&](llama_widely_linear_ifairy & linear, llm_tensor tensor, int bid,
                                                      int64_t in_dim, int64_t out_dim, int flags) {
-                        if (fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2 &&
-                            (in_dim % 64 != 0 || out_dim % 64 != 0)) {
+                        if (fairy2i_tile64_v2 && (in_dim % 64 != 0 || out_dim % 64 != 0)) {
                             const std::string tensor_name = bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str();
                             throw std::runtime_error(
                                 format("invalid FAIRY2I tile64_v2 dims for %s: in=%lld out=%lld, expected multiples of 64",
@@ -4670,9 +4729,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
 
                         create_fairy2i_stage(linear.U[0], tensor, "U.s0", bid, { in_dim, out_dim }, flags);
-                        create_fairy2i_stage(linear.U[1], tensor, "U.s1", bid, { in_dim, out_dim }, flags);
                         create_fairy2i_stage(linear.W[0], tensor, "W.s0", bid, { in_dim, out_dim }, flags);
-                        create_fairy2i_stage(linear.W[1], tensor, "W.s1", bid, { in_dim, out_dim }, flags);
+                        if (!fairy2i_w1) {
+                            create_fairy2i_stage(linear.U[1], tensor, "U.s1", bid, { in_dim, out_dim }, flags);
+                            create_fairy2i_stage(linear.W[1], tensor, "W.s1", bid, { in_dim, out_dim }, flags);
+                        }
                     };
 
                     if (n_vocab % 2 != 0) {
@@ -4683,22 +4744,34 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     create_fairy2i_linear(output_fairy2i, LLM_TENSOR_OUTPUT, -1, n_embd, n_vocab / 2, TENSOR_NOT_REQUIRED);
 
                     const bool has_output_fairy2i =
-                        output_fairy2i.U[0] && output_fairy2i.U[1] && output_fairy2i.W[0] && output_fairy2i.W[1];
+                        output_fairy2i.U[0] && output_fairy2i.W[0] &&
+                        (fairy2i_w1 || (output_fairy2i.U[1] && output_fairy2i.W[1]));
                     const bool has_output_fairy2i_any =
                         output_fairy2i.U[0] || output_fairy2i.U[1] || output_fairy2i.W[0] || output_fairy2i.W[1];
                     if (has_output_fairy2i_any && !has_output_fairy2i) {
-                        throw std::runtime_error("incomplete FAIRY2I output tensor set: expected output.{U,W}.s{0,1}");
+                        throw std::runtime_error(fairy2i_w1 ?
+                            "incomplete FAIRY2I output tensor set: expected output.{U,W}.s0" :
+                            "incomplete FAIRY2I output tensor set: expected output.{U,W}.s{0,1}");
                     }
                     if (!has_output_fairy2i && !output) {
-                        throw std::runtime_error("FAIRY2I requires either output.{U,W}.s{0,1} or dense output tensor");
+                        throw std::runtime_error(fairy2i_w1 ?
+                            "FAIRY2I requires either output.{U,W}.s0 or dense output tensor" :
+                            "FAIRY2I requires either output.{U,W}.s{0,1} or dense output tensor");
                     }
 
                     const char * force_dense_output_env = getenv("LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT");
                     const bool   force_dense_output =
                         force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0;
+                    const bool output_neon = llama_fairy2i_output_neon_enabled();
                     if (force_dense_output && !output && has_output_fairy2i) {
                         LLAMA_LOG_WARN(
                             "%s: LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT is set, but dense output tensor is missing; "
+                            "falling back to output.{U,W}.s{0,1}\n",
+                            __func__);
+                    }
+                    if (output_neon && !output && has_output_fairy2i) {
+                        LLAMA_LOG_WARN(
+                            "%s: LLAMA_FAIRY2I_OUTPUT_NEON is set, but dense output tensor is missing; "
                             "falling back to output.{U,W}.s{0,1}\n",
                             __func__);
                     }
@@ -4708,6 +4781,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, i), { n_embd * 2 }, 0);
                         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM, i), { n_embd * 2 }, 0);
+                        if (fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL) {
+                            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, i), { n_embd_head_k }, 0);
+                            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, i), { n_embd_head_k }, 0);
+                        }
 
                         // optional bias tensors from Qwen2-based Fairy2i checkpoints
                         layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
@@ -14099,7 +14176,8 @@ struct llm_build_fairy2i : public llm_graph_context {
     llm_build_fairy2i(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
         const int64_t n_embd_head = hparams.n_embd_head_v;
         const bool    use_real_attn = model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL ||
-                                      model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL;
+                                      model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL ||
+                                      model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL;
 
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head % 2 == 0);
@@ -14156,15 +14234,17 @@ struct llm_build_fairy2i : public llm_graph_context {
                                      ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
             GGML_ASSERT(linear.U[0] && linear.W[0]);
 
-            const bool can_fuse_w2 = llama_fairy2i_fused_wide_linear_w2_enabled() && loras->empty() && linear.U[1] &&
-                                     linear.W[1] &&
-                                     linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                     linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                     linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                     linear.W[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2;
-            if (can_fuse_w2) {
-                ggml_tensor * y =
-                    ggml_fairy2i_wide_linear_w2(ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
+            const bool has_stage1 = linear.U[1] && linear.W[1];
+            const bool can_fuse_tile64 =
+                llama_fairy2i_fused_wide_linear_w2_enabled() && loras->empty() &&
+                linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                (!has_stage1 ||
+                 (linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                  linear.W[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2));
+            if (can_fuse_tile64) {
+                ggml_tensor * y = ggml_fairy2i_wide_linear_w2(
+                    ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
                 cb(y, name, il);
                 return y;
             }
@@ -14203,6 +14283,15 @@ struct llm_build_fairy2i : public llm_graph_context {
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+
+                if (model.layers[il].attn_q_norm) {
+                    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+                    cb(Qcur, "Qcur_normed", il);
+                }
+                if (model.layers[il].attn_k_norm) {
+                    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+                    cb(Kcur, "Kcur_normed", il);
+                }
 
                 const int fairy2i_real_rope_type = LLAMA_ROPE_TYPE_NEOX;
 
@@ -14276,11 +14365,14 @@ struct llm_build_fairy2i : public llm_graph_context {
         ggml_tensor * cur = build_fairy2i_rms_norm(inpL, model.output_norm, -1, "result_norm");
         res->t_embd       = cur;
 
-        const bool has_output_fairy2i = model.output_fairy2i.U[0] && model.output_fairy2i.U[1] &&
-                                        model.output_fairy2i.W[0] && model.output_fairy2i.W[1];
+        const bool has_output_fairy2i = model.output_fairy2i.U[0] && model.output_fairy2i.W[0] &&
+                                        ((!model.output_fairy2i.U[1] && !model.output_fairy2i.W[1]) ||
+                                         (model.output_fairy2i.U[1] && model.output_fairy2i.W[1]));
         const bool has_output_fairy2i_merged = model.output_fairy2i_merged.U[0] && model.output_fairy2i_merged.W[0];
         const char * force_dense_output_env = getenv("LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT");
-        const bool   force_dense_output = force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0;
+        const bool   force_dense_output =
+            (force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0) ||
+            llama_fairy2i_output_neon_enabled();
 
         if (has_output_fairy2i_merged && (!force_dense_output || !model.output)) {
             ggml_tensor * cur_conj = build_complex_conj(cur, -1, "result_norm_conj");
@@ -14292,9 +14384,15 @@ struct llm_build_fairy2i : public llm_graph_context {
             cur                    = ggml_complex_split(ctx0, cur);
         } else if (model.output) {
             cur = ggml_complex_split(ctx0, cur);
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+            cb(cur, "result_output_inp_f16", -1);
             cur = build_lora_mm(model.output, cur);
+            if (llama_fairy2i_output_neon_enabled() && backend_cpu != nullptr &&
+                ggml_backend_supports_op(backend_cpu, cur)) {
+                ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+            }
         } else {
-            throw std::runtime_error("FAIRY2I output layer requires dense output tensor or output.{U,W}.s{0,1}");
+            throw std::runtime_error("FAIRY2I output layer requires dense output tensor or output.{U,W}.s0/s{0,1}");
         }
 
         cb(cur, "result_output", -1);

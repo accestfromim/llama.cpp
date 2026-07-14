@@ -148,6 +148,10 @@ static inline float fairy2i_sum_float4(float4 v) {
     return v.x + v.y + v.z + v.w;
 }
 
+static inline float fairy2i_sum_float2(float2 v) {
+    return v.x + v.y;
+}
+
 static inline void fairy2i_add_mma_coeff(
         device const block_fairy2i_tile64_v2 & w,
         int idx,
@@ -168,6 +172,28 @@ static inline void fairy2i_add_mma_coeff(
         coeff_real_from_imag += conjugate_input ? sign * wi : -sign * wi;
         coeff_imag_from_real += sign * wi;
     }
+}
+
+static inline void fairy2i_mma_coeff_w1_pair(
+        device const block_fairy2i_tile64_v2 & u,
+        device const block_fairy2i_tile64_v2 & w,
+        int idx,
+        thread float & coeff_real_from_real,
+        thread float & coeff_real_from_imag,
+        thread float & coeff_imag_from_real,
+        thread float & coeff_imag_from_imag) {
+    const uint2 code = uint2(fairy2i_tile64_code(u, idx), fairy2i_tile64_code(w, idx));
+    const float2 sign = select(float2(-1.0f), float2(1.0f), (code & uint2(1)) == uint2(1));
+    const bool2 is_real = (code & uint2(2)) == uint2(0);
+    const bool2 is_imag = !is_real;
+
+    const float2 real_coeff = select(float2(0.0f), sign * float2((float) u.d_real, (float) w.d_real), is_real);
+    const float2 imag_coeff = select(float2(0.0f), sign * float2((float) u.d_imag, (float) w.d_imag), is_imag);
+
+    coeff_real_from_real = real_coeff.x + real_coeff.y;
+    coeff_real_from_imag = -imag_coeff.x + imag_coeff.y;
+    coeff_imag_from_real = imag_coeff.x + imag_coeff.y;
+    coeff_imag_from_imag = real_coeff.x - real_coeff.y;
 }
 
 static inline void fairy2i_accumulate_tile_weight4_decode(
@@ -688,6 +714,45 @@ static inline void fairy2i_accumulate_tile_weight4_decode_f32_reg(
     acc_imag[out_idx] += fairy2i_sum_float4(wi * sum_bc + ad_sign * wr * sum_ad);
 }
 
+static inline void fairy2i_accumulate_tile_weight2_decode_f32_reg(
+        uint2 packed,
+        float2 wr,
+        float2 wi,
+        float4 act_real,
+        float4 act_imag,
+        int out_idx,
+        thread float * acc_real,
+        thread float * acc_imag) {
+    float2 sum_ac = float2(0.0f);
+    float2 sum_ad = float2(0.0f);
+    float2 sum_bc = float2(0.0f);
+    float2 sum_bd = float2(0.0f);
+
+    FOR_UNROLL (int part = 0; part < 4; ++part) {
+        const float xr = act_real[part];
+        const float xi = act_imag[part];
+
+        const uint2 code = (packed >> (uint) (2 * part)) & uint2(3);
+        const float2 sign = select(float2(-1.0f), float2(1.0f), (code & uint2(1)) == uint2(1));
+        const bool2 is_imag = (code & uint2(2)) == uint2(2);
+        const bool2 is_real = !is_imag;
+
+        const float2 signed_xr = float2(xr) * sign;
+        const float2 signed_xi = float2(xi) * sign;
+
+        sum_ac += select(float2(0.0f), signed_xr, is_real);
+        sum_ad += select(float2(0.0f), signed_xi, is_real);
+        sum_bc += select(float2(0.0f), signed_xr, is_imag);
+        sum_bd += select(float2(0.0f), signed_xi, is_imag);
+    }
+
+    const float2 bd_sign = float2(-1.0f, 1.0f);
+    const float2 ad_sign = float2(1.0f, -1.0f);
+
+    acc_real[out_idx] += fairy2i_sum_float2(wr * sum_ac + bd_sign * wi * sum_bd);
+    acc_imag[out_idx] += fairy2i_sum_float2(wi * sum_bc + ad_sign * wr * sum_ad);
+}
+
 kernel void kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w4_simd(
         constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
         device const block_fairy2i_tile64_v2 * u_s0            [[buffer(1)]],
@@ -780,7 +845,7 @@ kernel void kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w4_simd(
     }
 }
 
-#define FAIRY2I_DEFINE_BF16_DECODE_KERNEL(NAME, ROWS, BLOCK_SLOTS, NTHREADS)                                          \
+#define FAIRY2I_DEFINE_BF16_DECODE_KERNEL(NAME, ROWS, BLOCK_SLOTS, NTHREADS, CHECK_TAIL, SUPPORT_BIAS)                \
     kernel void NAME(                                                                                                  \
             constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],                                    \
             device const block_fairy2i_tile64_v2 * u_s0 [[buffer(1)]],                                                \
@@ -828,7 +893,7 @@ kernel void kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w4_simd(
             if (wb < blocks) {                                                                                         \
                 for (int tr = 0; tr < (ROWS); ++tr) {                                                                  \
                     const int row = row_base + tr;                                                                     \
-                    if (row >= args.m) {                                                                               \
+                    if ((CHECK_TAIL) && row >= args.m) {                                                               \
                         continue;                                                                                      \
                     }                                                                                                  \
                                                                                                                        \
@@ -856,20 +921,17 @@ kernel void kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w4_simd(
         }                                                                                                              \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                                              \
                                                                                                                        \
-        if (lid == 0) {                                                                                                \
-            for (int tr = 0; tr < (ROWS); ++tr) {                                                                      \
-                const int row = row_base + tr;                                                                         \
-                if (row >= args.m) {                                                                                   \
-                    continue;                                                                                          \
-                }                                                                                                      \
-                                                                                                                       \
+        if (lid < (uint) (ROWS)) {                                                                                     \
+            const int tr = (int) lid;                                                                                  \
+            const int row = row_base + tr;                                                                             \
+            if (!(CHECK_TAIL) || row < args.m) {                                                                       \
                 float real = 0.0f;                                                                                     \
                 float imag = 0.0f;                                                                                     \
                 for (int sg = 0; sg < simd_groups; ++sg) {                                                            \
                     real += tmp_real[tr * simd_groups + sg];                                                          \
                     imag += tmp_imag[tr * simd_groups + sg];                                                          \
                 }                                                                                                      \
-                if (args.has_bias) {                                                                                   \
+                if ((SUPPORT_BIAS) && args.has_bias) {                                                                 \
                     real += *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));         \
                     imag += *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0)); \
                 }                                                                                                      \
@@ -879,12 +941,130 @@ kernel void kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w4_simd(
         }                                                                                                              \
     }
 
-FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile2x1_w4_simd, 2, 4, 64)
-FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_simd, 4, 8, 128)
-FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile8x1_w4_simd, 8, 4, 64)
-FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile8x1_w8_simd, 8, 8, 128)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile2x1_w4_simd, 2, 4, 64, true, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_simd, 4, 8, 128, true, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile8x1_w4_simd, 8, 4, 64, true, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile8x1_w8_simd, 8, 8, 128, true, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile2x1_w4_full_simd, 2, 4, 64, false, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_full_simd, 4, 8, 128, false, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile8x1_w4_full_simd, 8, 4, 64, false, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile8x1_w8_full_simd, 8, 8, 128, false, true)
+FAIRY2I_DEFINE_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w2_bf16_tile8x1_w8_full_nobias_simd, 8, 8, 128, false, false)
 
 #undef FAIRY2I_DEFINE_BF16_DECODE_KERNEL
+
+#define FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(NAME, ROWS, BLOCK_SLOTS, NTHREADS, CHECK_TAIL, SUPPORT_BIAS)             \
+    kernel void NAME(                                                                                                  \
+            constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],                                    \
+            device const block_fairy2i_tile64_v2 * u_s0 [[buffer(1)]],                                                \
+            device const block_fairy2i_tile64_v2 * w_s0 [[buffer(2)]],                                                \
+            device const char * x [[buffer(3)]],                                                                       \
+            device const char * bias [[buffer(4)]],                                                                    \
+            device char * dst [[buffer(5)]],                                                                           \
+            threadgroup float * tmp_real [[threadgroup(0)]],                                                          \
+            threadgroup float * tmp_imag [[threadgroup(1)]],                                                          \
+            uint2 tgpig [[threadgroup_position_in_grid]],                                                             \
+            uint2 tiitg [[thread_position_in_threadgroup]]) {                                                         \
+        const uint lid = tiitg.x;                                                                                      \
+        const int row_base = (int) tgpig.x * (ROWS);                                                                   \
+        const int block_slot = (int) lid >> 4;                                                                         \
+        const int lane = (int) lid & 15;                                                                               \
+        const int simd_lane = (int) lid & 31;                                                                          \
+        const int simd_group = (int) lid >> 5;                                                                         \
+        const int blocks = args.k / QK_FAIRY2I_TILE64;                                                                 \
+        const int simd_groups = (NTHREADS) / 32;                                                                       \
+                                                                                                                       \
+        float acc_real[ROWS];                                                                                          \
+        float acc_imag[ROWS];                                                                                          \
+        for (int tr = 0; tr < (ROWS); ++tr) {                                                                          \
+            acc_real[tr] = 0.0f;                                                                                       \
+            acc_imag[tr] = 0.0f;                                                                                       \
+        }                                                                                                              \
+                                                                                                                       \
+        for (int wb_base = 0; wb_base < blocks; wb_base += (BLOCK_SLOTS)) {                                           \
+            const int wb = wb_base + block_slot;                                                                       \
+            float4 act_real = float4(0.0f);                                                                            \
+            float4 act_imag = float4(0.0f);                                                                            \
+                                                                                                                       \
+            if (wb < blocks) {                                                                                         \
+                FOR_UNROLL (int part = 0; part < 4; ++part) {                                                          \
+                    const int j = lane + 16 * part;                                                                    \
+                    const int k_idx = wb * QK_FAIRY2I_TILE64 + j;                                                     \
+                    const uint pair = *((device const uint *) (x + (ulong) k_idx * args.x_nb0));                      \
+                    act_real[part] = fairy2i_bf16_to_f32((ushort) (pair & 0xffffU));                                  \
+                    act_imag[part] = fairy2i_bf16_to_f32((ushort) (pair >> 16));                                      \
+                }                                                                                                      \
+            }                                                                                                          \
+                                                                                                                       \
+            if (wb < blocks) {                                                                                         \
+                for (int tr = 0; tr < (ROWS); ++tr) {                                                                  \
+                    const int row = row_base + tr;                                                                     \
+                    if ((CHECK_TAIL) && row >= args.m) {                                                               \
+                        continue;                                                                                      \
+                    }                                                                                                  \
+                                                                                                                       \
+                    const int w_index = row * blocks + wb;                                                            \
+                    device const block_fairy2i_tile64_v2 & u0 = u_s0[w_index];                                        \
+                    device const block_fairy2i_tile64_v2 & v0 = w_s0[w_index];                                        \
+                    const uint2 packed = uint2((uint) u0.qs[lane], (uint) v0.qs[lane]);                               \
+                    const float2 wr = float2((float) u0.d_real, (float) v0.d_real);                                   \
+                    const float2 wi = float2((float) u0.d_imag, (float) v0.d_imag);                                   \
+                    fairy2i_accumulate_tile_weight2_decode_f32_reg(                                                   \
+                        packed, wr, wi, act_real, act_imag, tr, acc_real, acc_imag);                                  \
+                }                                                                                                      \
+            }                                                                                                          \
+        }                                                                                                              \
+                                                                                                                       \
+        for (int out_idx = 0; out_idx < (ROWS); ++out_idx) {                                                          \
+            const float real_sum = simd_sum(acc_real[out_idx]);                                                       \
+            const float imag_sum = simd_sum(acc_imag[out_idx]);                                                       \
+            if (simd_lane == 0) {                                                                                      \
+                tmp_real[out_idx * simd_groups + simd_group] = real_sum;                                              \
+                tmp_imag[out_idx * simd_groups + simd_group] = imag_sum;                                              \
+            }                                                                                                          \
+        }                                                                                                              \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                                              \
+                                                                                                                       \
+        if (lid < (uint) (ROWS)) {                                                                                     \
+            const int tr = (int) lid;                                                                                  \
+            const int row = row_base + tr;                                                                             \
+            if (!(CHECK_TAIL) || row < args.m) {                                                                       \
+                float real = 0.0f;                                                                                     \
+                float imag = 0.0f;                                                                                     \
+                for (int sg = 0; sg < simd_groups; ++sg) {                                                            \
+                    real += tmp_real[tr * simd_groups + sg];                                                          \
+                    imag += tmp_imag[tr * simd_groups + sg];                                                          \
+                }                                                                                                      \
+                if ((SUPPORT_BIAS) && args.has_bias) {                                                                 \
+                    real += *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));         \
+                    imag += *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0)); \
+                }                                                                                                      \
+                                                                                                                       \
+                *((device uint *) (dst + (ulong) row * args.dst_nb0)) = fairy2i_pack_bf16_pair(real, imag);           \
+            }                                                                                                          \
+        }                                                                                                              \
+    }
+
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile4x1_w8_simd, 4, 8, 128, true, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile4x1_w16_simd, 4, 16, 256, true, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w8_simd, 8, 8, 128, true, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_simd, 8, 16, 256, true, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile16x1_w8_simd, 16, 8, 128, true, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile16x1_w16_simd, 16, 16, 256, true, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile4x1_w8_full_simd, 4, 8, 128, false, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile4x1_w16_full_simd, 4, 16, 256, false, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w8_full_simd, 8, 8, 128, false, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_full_simd, 8, 16, 256, false, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile16x1_w8_full_simd, 16, 8, 128, false, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile16x1_w16_full_simd, 16, 16, 256, false, true)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile4x1_w8_full_nobias_simd, 4, 8, 128, false, false)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile4x1_w16_full_nobias_simd, 4, 16, 256, false, false)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w8_full_nobias_simd, 8, 8, 128, false, false)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_full_nobias_simd, 8, 16, 256, false, false)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile16x1_w8_full_nobias_simd, 16, 8, 128, false, false)
+FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL(kernel_fairy2i_wide_linear_w1_bf16_tile16x1_w16_full_nobias_simd, 16, 16, 256, false, false)
+
+#undef FAIRY2I_DEFINE_W1_BF16_DECODE_KERNEL
 
 static inline void fairy2i_store_nibble_lut(
         threadgroup short * lut_tile,
@@ -1143,6 +1323,151 @@ kernel void kernel_fairy2i_wide_linear_w2_q8_mma8x16(
                         fairy2i_add_mma_coeff(u_s1[w_index], k, false, rr, ri, ir, ii);
                         fairy2i_add_mma_coeff(w_s0[w_index], k, true, rr, ri, ir, ii);
                         fairy2i_add_mma_coeff(w_s1[w_index], k, true, rr, ri, ir, ii);
+                    }
+
+                    coeff_real_from_real[local] = (half) rr;
+                    coeff_real_from_imag[local] = (half) ri;
+                    coeff_imag_from_real[local] = (half) ir;
+                    coeff_imag_from_imag[local] = (half) ii;
+                }
+
+                const int col_lane = row_lane;
+                const int col = col_base + (idx >= 64 ? 8 : 0) + col_lane;
+                half xr = (half) 0.0h;
+                half xi = (half) 0.0h;
+                if (col < args.act_rows) {
+                    const int act_index = col * blocks + wb;
+                    const int q_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
+                    xr = (half) ((float) act_q[q_base + k] * (float) act_d[act_index * 2 + 0]);
+                    xi = (half) ((float) act_q[q_base + QK_FAIRY2I_ACT_Q16_64 + k] * (float) act_d[act_index * 2 + 1]);
+                }
+
+                const int act_tile_idx = k_lane * 8 + col_lane;
+                if (idx < 64) {
+                    act_real_tile0[act_tile_idx] = xr;
+                    act_imag_tile0[act_tile_idx] = xi;
+                } else {
+                    act_real_tile1[act_tile_idx] = xr;
+                    act_imag_tile1[act_tile_idx] = xi;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_load(a_rr, coeff_real_from_real);
+            simdgroup_load(a_ri, coeff_real_from_imag);
+            simdgroup_load(a_ir, coeff_imag_from_real);
+            simdgroup_load(a_ii, coeff_imag_from_imag);
+            simdgroup_load(b_r0, act_real_tile0);
+            simdgroup_load(b_i0, act_imag_tile0);
+            simdgroup_load(b_r1, act_real_tile1);
+            simdgroup_load(b_i1, act_imag_tile1);
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    simdgroup_store(c_r0, out_tile, 8);
+    simdgroup_store(c_i0, out_tile + 64, 8);
+    simdgroup_store(c_r1, out_tile + 128, 8);
+    simdgroup_store(c_i1, out_tile + 192, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tiitg; idx < 128; idx += 32) {
+        const int tile = (int) idx >> 6;
+        const int local = (int) (idx & 63);
+        const int row_lane = local & 7;
+        const int col_lane = local >> 3;
+        const int row = row_base + row_lane;
+        const int col = col_base + tile * 8 + col_lane;
+        if (row < args.m && col < args.act_rows) {
+            const int i1 = col % args.x_ne1;
+            const int i2 = (col / args.x_ne1) % args.x_ne2;
+            const int i3 = col / (args.x_ne1 * args.x_ne2);
+            const int out_base = tile * 128;
+            float out_real = out_tile[out_base + row_lane * 8 + col_lane];
+            float out_imag = out_tile[out_base + 64 + row_lane * 8 + col_lane];
+
+            if (args.has_bias) {
+                const int b0r = row % args.bias_ne0;
+                const int b0i = (row + args.m) % args.bias_ne0;
+                const int b1 = i1 % args.bias_ne1;
+                const int b2 = i2 % args.bias_ne2;
+                const int b3 = i3 % args.bias_ne3;
+                out_real += *((device const float *) (bias + (ulong) b0r * args.bias_nb0 + (ulong) b1 * args.bias_nb1 +
+                                                      (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+                out_imag += *((device const float *) (bias + (ulong) b0i * args.bias_nb0 + (ulong) b1 * args.bias_nb1 +
+                                                      (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+            }
+
+            *((device uint *) (dst + (ulong) row * args.dst_nb0 + (ulong) i1 * args.dst_nb1 + (ulong) i2 * args.dst_nb2 +
+                               (ulong) i3 * args.dst_nb3)) = fairy2i_pack_bf16_pair(out_real, out_imag);
+        }
+    }
+}
+
+kernel void kernel_fairy2i_wide_linear_w1_q8_mma8x16(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const block_fairy2i_tile64_v2 * u_s0             [[buffer(1)]],
+        device const block_fairy2i_tile64_v2 * w_s0             [[buffer(2)]],
+        device const char * act_q                               [[buffer(3)]],
+        device const half * act_d                               [[buffer(4)]],
+        device const char * bias                                [[buffer(5)]],
+        device char * dst                                       [[buffer(6)]],
+        threadgroup half * coeff_real_from_real                 [[threadgroup(0)]],
+        threadgroup half * coeff_real_from_imag                 [[threadgroup(1)]],
+        threadgroup half * coeff_imag_from_real                 [[threadgroup(2)]],
+        threadgroup half * coeff_imag_from_imag                 [[threadgroup(3)]],
+        threadgroup half * act_real_tile0                       [[threadgroup(4)]],
+        threadgroup half * act_imag_tile0                       [[threadgroup(5)]],
+        threadgroup half * act_real_tile1                       [[threadgroup(6)]],
+        threadgroup half * act_imag_tile1                       [[threadgroup(7)]],
+        threadgroup float * out_tile                            [[threadgroup(8)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint tiitg                                              [[thread_index_in_threadgroup]]) {
+    const int row_base = (int) tgpig.x * 8;
+    const int col_base = (int) tgpig.y * 16;
+    const int blocks = args.k / QK_FAIRY2I_TILE64;
+
+    simdgroup_half8x8 a_rr;
+    simdgroup_half8x8 a_ri;
+    simdgroup_half8x8 a_ir;
+    simdgroup_half8x8 a_ii;
+    simdgroup_half8x8 b_r0;
+    simdgroup_half8x8 b_i0;
+    simdgroup_half8x8 b_r1;
+    simdgroup_half8x8 b_i1;
+    simdgroup_float8x8 c_r0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_r1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int wb = 0; wb < blocks; ++wb) {
+        for (int k_base = 0; k_base < QK_FAIRY2I_TILE64; k_base += 8) {
+            for (uint idx = tiitg; idx < 128; idx += 32) {
+                const int local = (int) (idx & 63);
+                const int row_lane = local >> 3;
+                const int k_lane = local & 7;
+                const int k = k_base + k_lane;
+
+                if (idx < 64) {
+                    const int row = row_base + row_lane;
+
+                    float rr = 0.0f;
+                    float ri = 0.0f;
+                    float ir = 0.0f;
+                    float ii = 0.0f;
+                    if (row < args.m) {
+                        const int w_index = row * blocks + wb;
+                        fairy2i_mma_coeff_w1_pair(u_s0[w_index], w_s0[w_index], k, rr, ri, ir, ii);
                     }
 
                     coeff_real_from_real[local] = (half) rr;

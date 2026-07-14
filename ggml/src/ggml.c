@@ -4231,25 +4231,31 @@ static struct ggml_tensor * ggml_wide_linear_w2_impl(struct ggml_context * ctx,
                                                      enum ggml_op          op) {
     GGML_ASSERT(x);
     GGML_ASSERT(u_s0);
-    GGML_ASSERT(u_s1);
     GGML_ASSERT(w_s0);
-    GGML_ASSERT(w_s1);
+    GGML_ASSERT((u_s1 != NULL) == (w_s1 != NULL));
+    const bool has_stage1 = u_s1 != NULL;
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
 
     GGML_ASSERT(u_s0->type == weight_type);
-    GGML_ASSERT(u_s1->type == weight_type);
     GGML_ASSERT(w_s0->type == weight_type);
-    GGML_ASSERT(w_s1->type == weight_type);
+    if (has_stage1) {
+        GGML_ASSERT(u_s1->type == weight_type);
+        GGML_ASSERT(w_s1->type == weight_type);
+    }
 
     GGML_ASSERT(ggml_can_mul_mat(u_s0, x));
-    GGML_ASSERT(ggml_can_mul_mat(u_s1, x));
     GGML_ASSERT(ggml_can_mul_mat(w_s0, x));
-    GGML_ASSERT(ggml_can_mul_mat(w_s1, x));
+    if (has_stage1) {
+        GGML_ASSERT(ggml_can_mul_mat(u_s1, x));
+        GGML_ASSERT(ggml_can_mul_mat(w_s1, x));
+    }
 
-    GGML_ASSERT(u_s0->ne[1] == u_s1->ne[1]);
     GGML_ASSERT(u_s0->ne[1] == w_s0->ne[1]);
-    GGML_ASSERT(u_s0->ne[1] == w_s1->ne[1]);
+    if (has_stage1) {
+        GGML_ASSERT(u_s0->ne[1] == u_s1->ne[1]);
+        GGML_ASSERT(u_s0->ne[1] == w_s1->ne[1]);
+    }
 
     const int64_t ne[4] = { u_s0->ne[1], x->ne[1], x->ne[2], x->ne[3] };
 

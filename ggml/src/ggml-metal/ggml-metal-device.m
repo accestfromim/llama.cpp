@@ -617,22 +617,27 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         const struct ggml_tensor * w_s1 = op->src[4];
         const struct ggml_tensor * bias = op->src[5];
 
-        if (!x || !u_s0 || !u_s1 || !w_s0 || !w_s1) {
+        if (!x || !u_s0 || !w_s0 || (u_s1 == NULL) != (w_s1 == NULL)) {
             return false;
         }
 
+        const bool has_stage1 = u_s1 != NULL;
+
         return op->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
-               u_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2 && u_s1->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-               w_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2 && w_s1->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+               u_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2 && w_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+               (!has_stage1 ||
+                (u_s1->type == GGML_TYPE_FAIRY2I_TILE64_V2 && w_s1->type == GGML_TYPE_FAIRY2I_TILE64_V2)) &&
                (!bias || bias->type == GGML_TYPE_F32) && ggml_is_contiguous(x) && ggml_is_contiguous(op) &&
-               ggml_is_contiguous(u_s0) && ggml_is_contiguous(u_s1) && ggml_is_contiguous(w_s0) &&
-               ggml_is_contiguous(w_s1) && x->ne[0] % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2) == 0 &&
-               op->ne[0] == u_s0->ne[1] &&
-               u_s0->ne[0] == x->ne[0] && u_s1->ne[0] == x->ne[0] && w_s0->ne[0] == x->ne[0] &&
-               w_s1->ne[0] == x->ne[0] && u_s1->ne[1] == op->ne[0] && w_s0->ne[1] == op->ne[0] &&
-               w_s1->ne[1] == op->ne[0] && u_s0->ne[2] == 1 && u_s0->ne[3] == 1 && u_s1->ne[2] == 1 &&
-               u_s1->ne[3] == 1 && w_s0->ne[2] == 1 && w_s0->ne[3] == 1 && w_s1->ne[2] == 1 &&
-               w_s1->ne[3] == 1;
+               ggml_is_contiguous(u_s0) && ggml_is_contiguous(w_s0) &&
+               (!has_stage1 || (ggml_is_contiguous(u_s1) && ggml_is_contiguous(w_s1))) &&
+               x->ne[0] % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2) == 0 && op->ne[0] == u_s0->ne[1] &&
+               u_s0->ne[0] == x->ne[0] && w_s0->ne[0] == x->ne[0] && w_s0->ne[1] == op->ne[0] &&
+               (!has_stage1 ||
+                (u_s1->ne[0] == x->ne[0] && w_s1->ne[0] == x->ne[0] && u_s1->ne[1] == op->ne[0] &&
+                 w_s1->ne[1] == op->ne[0])) &&
+               u_s0->ne[2] == 1 && u_s0->ne[3] == 1 && w_s0->ne[2] == 1 && w_s0->ne[3] == 1 &&
+               (!has_stage1 ||
+                (u_s1->ne[2] == 1 && u_s1->ne[3] == 1 && w_s1->ne[2] == 1 && w_s1->ne[3] == 1));
     }
 
     // custom complex types are CPU-only for compute ops, except when they are stored as leaf tensors for fused kernels.

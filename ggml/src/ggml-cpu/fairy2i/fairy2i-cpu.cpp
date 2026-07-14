@@ -190,7 +190,8 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
     const struct ggml_fairy2i_lut_config cfg = ggml_fairy2i_lut_config_from_env();
-    plan->use_lut                            = cfg.lut_enabled && cfg.lut_explicit;
+    const bool has_stage1                    = dst->src[2] != nullptr && dst->src[4] != nullptr;
+    plan->use_lut                            = has_stage1 && cfg.lut_enabled && cfg.lut_explicit;
     plan->lut_c                              = cfg.impl == GGML_FAIRY2I_LUT_IMPL_LUT_C;
     plan->impl                               = cfg.impl;
     if (plan->use_lut) {

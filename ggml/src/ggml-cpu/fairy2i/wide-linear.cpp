@@ -253,6 +253,22 @@ static inline void ggml_fairy2i_tile64_fuse_accumulate_four(const block_fairy2i_
     }
 }
 
+static inline void ggml_fairy2i_tile64_fuse_accumulate_two(const block_fairy2i_tile64_v2 *          u0,
+                                                           const block_fairy2i_tile64_v2 *          w0,
+                                                           const block_fairy2i_act_q16_64 *         x,
+                                                           int64_t                                  blocks,
+                                                           struct ggml_fairy2i_complex_acc *        acc) {
+    for (int64_t ib = 0; ib < blocks; ++ib) {
+        int32_t sums_u[4] = {};
+        int32_t sums_w[4] = {};
+
+        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&u0[ib], &x[ib], sums_u);
+        ggml_fairy2i_tile64_fuse_accumulate_block_scalar(&w0[ib], &x[ib], sums_w);
+        ggml_fairy2i_tile64_fuse_apply_branch(&u0[ib], &x[ib], sums_u, false, acc);
+        ggml_fairy2i_tile64_fuse_apply_branch(&w0[ib], &x[ib], sums_w, true, acc);
+    }
+}
+
 static inline float ggml_fairy2i_wide_linear_bias_at(const struct ggml_tensor * bias,
                                                      int64_t                    i0,
                                                      int64_t                    i1,
@@ -337,17 +353,25 @@ void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * para
     const struct ggml_tensor * w_s1   = dst->src[4];
     const struct ggml_tensor * bias   = dst->src[5];
 
-    GGML_ASSERT(x && u_s0 && u_s1 && w_s0 && w_s1);
+    GGML_ASSERT(x && u_s0 && w_s0);
+    GGML_ASSERT((u_s1 != nullptr) == (w_s1 != nullptr));
     GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_fairy2i_wide_linear_weight_type(u_s0->type));
-    GGML_ASSERT(u_s0->type == u_s1->type && u_s0->type == w_s0->type && u_s0->type == w_s1->type);
+    GGML_ASSERT(u_s0->type == w_s0->type);
+    if (u_s1) {
+        GGML_ASSERT(u_s0->type == u_s1->type && u_s0->type == w_s1->type);
+    }
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
-    GGML_ASSERT(ggml_is_contiguous(u_s0) && ggml_is_contiguous(u_s1));
-    GGML_ASSERT(ggml_is_contiguous(w_s0) && ggml_is_contiguous(w_s1));
+    GGML_ASSERT(ggml_is_contiguous(u_s0) && ggml_is_contiguous(w_s0));
+    if (u_s1) {
+        GGML_ASSERT(ggml_is_contiguous(u_s1) && ggml_is_contiguous(w_s1));
+    }
     GGML_ASSERT(u_s0->ne[2] == 1 && u_s0->ne[3] == 1);
-    GGML_ASSERT(u_s1->ne[2] == 1 && u_s1->ne[3] == 1);
     GGML_ASSERT(w_s0->ne[2] == 1 && w_s0->ne[3] == 1);
-    GGML_ASSERT(w_s1->ne[2] == 1 && w_s1->ne[3] == 1);
+    if (u_s1) {
+        GGML_ASSERT(u_s1->ne[2] == 1 && u_s1->ne[3] == 1);
+        GGML_ASSERT(w_s1->ne[2] == 1 && w_s1->ne[3] == 1);
+    }
     GGML_ASSERT(!bias || bias->type == GGML_TYPE_F32);
 
     const int64_t K          = x->ne[0];
@@ -357,6 +381,7 @@ void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * para
     const size_t  q_row_size = ggml_row_size(GGML_TYPE_FAIRY2I_ACT_Q16_64, K);
     const size_t  q_bytes    = GGML_PAD((size_t) act_rows * q_row_size, 64);
     const bool    force_scalar = ggml_fairy2i_test_force_scalar();
+    const bool    has_stage1   = u_s1 != nullptr;
 
     GGML_ASSERT(K % QK_FAIRY2I_TILE64 == 0);
     GGML_ASSERT(params->wdata && params->wsize >= q_bytes);
@@ -380,13 +405,19 @@ void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * para
         const int64_t i3      = act_row / (x->ne[1] * x->ne[2]);
 
         const block_fairy2i_tile64_v2 * u0_row = (const block_fairy2i_tile64_v2 *) u_s0->data + row * blocks;
-        const block_fairy2i_tile64_v2 * u1_row = (const block_fairy2i_tile64_v2 *) u_s1->data + row * blocks;
+        const block_fairy2i_tile64_v2 * u1_row =
+            has_stage1 ? (const block_fairy2i_tile64_v2 *) u_s1->data + row * blocks : nullptr;
         const block_fairy2i_tile64_v2 * w0_row = (const block_fairy2i_tile64_v2 *) w_s0->data + row * blocks;
-        const block_fairy2i_tile64_v2 * w1_row = (const block_fairy2i_tile64_v2 *) w_s1->data + row * blocks;
+        const block_fairy2i_tile64_v2 * w1_row =
+            has_stage1 ? (const block_fairy2i_tile64_v2 *) w_s1->data + row * blocks : nullptr;
         const block_fairy2i_act_q16_64 * xq = (const block_fairy2i_act_q16_64 *) ((const char *) q_x + act_row * q_row_size);
 
         struct ggml_fairy2i_complex_acc acc = { 0.0f, 0.0f };
-        ggml_fairy2i_tile64_fuse_accumulate_four(u0_row, u1_row, w0_row, w1_row, xq, blocks, force_scalar, &acc);
+        if (has_stage1) {
+            ggml_fairy2i_tile64_fuse_accumulate_four(u0_row, u1_row, w0_row, w1_row, xq, blocks, force_scalar, &acc);
+        } else {
+            ggml_fairy2i_tile64_fuse_accumulate_two(u0_row, w0_row, xq, blocks, &acc);
+        }
 
         if (bias) {
             acc.real += ggml_fairy2i_wide_linear_bias_at(bias, row, i1, i2, i3);
