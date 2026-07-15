@@ -205,6 +205,26 @@ static fairy2i_w2_data make_fairy2i_w2_data(const fairy2i_w2_case & tc) {
     return data;
 }
 
+static void share_fairy2i_w64_scales(std::vector<block_fairy2i_tile64_v2> & weights, int64_t M, int64_t K) {
+    const int64_t blocks = K / QK_FAIRY2I_TILE64;
+    for (int64_t row = 0; row < M; ++row) {
+        const int64_t scale_row = (row / QK_FAIRY2I_TILE64) * QK_FAIRY2I_TILE64;
+        for (int64_t ib = 0; ib < blocks; ++ib) {
+            block_fairy2i_tile64_v2 &       dst = weights[(size_t) row * (size_t) blocks + (size_t) ib];
+            const block_fairy2i_tile64_v2 & src = weights[(size_t) scale_row * (size_t) blocks + (size_t) ib];
+            dst.d_real                          = src.d_real;
+            dst.d_imag                          = src.d_imag;
+        }
+    }
+}
+
+static void share_fairy2i_w64_scales(fairy2i_w2_data & data, const fairy2i_w2_case & tc) {
+    share_fairy2i_w64_scales(data.u_s0, tc.M, tc.K);
+    share_fairy2i_w64_scales(data.u_s1, tc.M, tc.K);
+    share_fairy2i_w64_scales(data.w_s0, tc.M, tc.K);
+    share_fairy2i_w64_scales(data.w_s1, tc.M, tc.K);
+}
+
 static std::vector<float> make_fairy2i_lut_quantize_input(int salt) {
     static const float values[] = {
         0.0f,         1.0f,          -1.0f,          0.5f / 63.0f,    -0.5f / 63.0f,
@@ -1196,14 +1216,20 @@ static bool test_fairy2i_metal_wide_linear_w2() {
 
     printf("Metal device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
 
+    const char * w64_scale_env = getenv("GGML_METAL_FAIRY2I_PREFILL_W64_SCALE");
+    const bool   use_w64_scale = w64_scale_env && atoi(w64_scale_env) > 0;
+
     const std::vector<fairy2i_w2_case> cases = {
         { 7,  3, 128, true },
         { 17, 1, 256, true },
     };
 
     for (const fairy2i_w2_case & tc : cases) {
-        const fairy2i_w2_data       data = make_fairy2i_w2_data(tc);
-        const std::vector<uint32_t> ref  = fairy2i_w2_scalar_reference(tc, data);
+        fairy2i_w2_data data = make_fairy2i_w2_data(tc);
+        if (use_w64_scale) {
+            share_fairy2i_w64_scales(data, tc);
+        }
+        const std::vector<uint32_t> ref = fairy2i_w2_scalar_reference(tc, data);
 
         std::vector<uint32_t> metal;
         if (!run_fairy2i_w2_metal_backend(metal, dev, tc, data)) {
@@ -1220,8 +1246,11 @@ static bool test_fairy2i_metal_wide_linear_w2() {
         { 16, 1, 256, false },
     };
     for (const fairy2i_w2_case & tc : w1_cases) {
-        const fairy2i_w2_data       data = make_fairy2i_w2_data(tc);
-        const std::vector<uint32_t> ref  = fairy2i_w1_scalar_reference(tc, data);
+        fairy2i_w2_data data = make_fairy2i_w2_data(tc);
+        if (use_w64_scale) {
+            share_fairy2i_w64_scales(data, tc);
+        }
+        const std::vector<uint32_t> ref = fairy2i_w1_scalar_reference(tc, data);
 
         std::vector<uint32_t> metal;
         if (!run_fairy2i_w1_metal_backend(metal, dev, tc, data)) {
