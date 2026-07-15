@@ -76,6 +76,8 @@
 #define FC_FLASH_ATTN_EXT_VEC          200
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   300
 #define FC_MUL_MV                      400
+#define FC_FAIRY2I_W2_DECODE           500
+#define FC_FAIRY2I_W1_DECODE           600
 
 // kernel argument structs
 //

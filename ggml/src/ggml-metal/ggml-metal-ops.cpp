@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstdlib>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
@@ -21,6 +22,78 @@ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) buffer->context;
 
     return ggml_metal_buffer_get_id(ctx, t);
+}
+
+static int ggml_metal_fairy2i_w2_decode_fc_mode() {
+    const char * value = getenv("GGML_METAL_FAIRY2I_W2_DECODE_FC");
+    return value ? atoi(value) : 0;
+}
+
+static int ggml_metal_fairy2i_w1_decode_fc_mode() {
+    const char * value = getenv("GGML_METAL_FAIRY2I_W1_DECODE_FC");
+    return value ? atoi(value) : 0;
+}
+
+static int ggml_metal_fairy2i_prefill_bf16_mode() {
+    const char * value = getenv("GGML_METAL_FAIRY2I_PREFILL_BF16");
+    return value ? atoi(value) : 0;
+}
+
+static int ggml_metal_fairy2i_prefill_half_stage_mode() {
+    const char * value = getenv("GGML_METAL_FAIRY2I_PREFILL_HALF_STAGE");
+    return value ? atoi(value) : 0;
+}
+
+static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_w2_decode_fc(ggml_metal_library_t lib,
+                                                                          int32_t              blocks,
+                                                                          int32_t              x_nb0,
+                                                                          int32_t              dst_nb0) {
+    const char * base = "kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_full_nobias_fc_simd";
+    char         name[256];
+
+    snprintf(name, sizeof(name), "%s_blocks=%d_xnb0=%d_dstnb0=%d", base, blocks, x_nb0, dst_nb0);
+
+    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
+    if (pipeline) {
+        return pipeline;
+    }
+
+    ggml_metal_cv_t cv = ggml_metal_cv_init();
+    ggml_metal_cv_set_int32(cv, blocks, FC_FAIRY2I_W2_DECODE + 0);
+    ggml_metal_cv_set_int32(cv, x_nb0, FC_FAIRY2I_W2_DECODE + 1);
+    ggml_metal_cv_set_int32(cv, dst_nb0, FC_FAIRY2I_W2_DECODE + 2);
+
+    pipeline = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+    ggml_metal_cv_free(cv);
+
+    return pipeline;
+}
+
+static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_w1_decode_fc(ggml_metal_library_t lib,
+                                                                          int32_t              blocks,
+                                                                          int32_t              x_nb0,
+                                                                          int32_t              dst_nb0) {
+    const char * base = "kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_full_nobias_fc_simd";
+    char         name[256];
+
+    snprintf(name, sizeof(name), "%s_blocks=%d_xnb0=%d_dstnb0=%d", base, blocks, x_nb0, dst_nb0);
+
+    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
+    if (pipeline) {
+        return pipeline;
+    }
+
+    ggml_metal_cv_t cv = ggml_metal_cv_init();
+    ggml_metal_cv_set_int32(cv, blocks, FC_FAIRY2I_W1_DECODE + 0);
+    ggml_metal_cv_set_int32(cv, x_nb0, FC_FAIRY2I_W1_DECODE + 1);
+    ggml_metal_cv_set_int32(cv, dst_nb0, FC_FAIRY2I_W1_DECODE + 2);
+
+    pipeline = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+    ggml_metal_cv_free(cv);
+
+    return pipeline;
 }
 
 struct ggml_metal_op {
@@ -1718,9 +1791,14 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id act_d = act_q;
     act_d.offs += act_q_size;
 
-    if (act_rows != 1) {
-        const char *          pipeline_name = "kernel_fairy2i_act_q16_64_quantize_f32";
-        ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
+    const bool use_half_stage_prefill = act_rows != 1 && ggml_metal_fairy2i_prefill_half_stage_mode() > 0;
+    const bool use_bf16_prefill =
+        act_rows != 1 && !use_half_stage_prefill && ggml_metal_fairy2i_prefill_bf16_mode() > 0;
+
+    if (use_half_stage_prefill || (act_rows != 1 && !use_bf16_prefill)) {
+        const char * pipeline_name =
+            use_half_stage_prefill ? "kernel_fairy2i_act_half_64_stage_bf16" : "kernel_fairy2i_act_q16_64_quantize_f32";
+        ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
         }
@@ -1732,9 +1810,11 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 1);
         ggml_metal_encoder_set_buffer(enc, act_q, 2);
-        ggml_metal_encoder_set_buffer(enc, act_d, 3);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, nth * sizeof(float), 0);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, nth * sizeof(float), 1);
+        if (!use_half_stage_prefill) {
+            ggml_metal_encoder_set_buffer(enc, act_d, 3);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, nth * sizeof(float), 0);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, nth * sizeof(float), 1);
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, k / nth, act_rows, 1, nth, 1, 1);
     }
 
@@ -1744,8 +1824,12 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
 
     if (act_rows != 1) {
         const char * pipeline_name =
-            is_w1 ? "kernel_fairy2i_wide_linear_w1_q8_mma8x16" : "kernel_fairy2i_wide_linear_w2_q8_mma8x16";
-        ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
+            use_half_stage_prefill ?
+                (is_w1 ? "kernel_fairy2i_wide_linear_w1_half_mma8x16" : "kernel_fairy2i_wide_linear_w2_half_mma8x16") :
+            use_bf16_prefill ?
+                (is_w1 ? "kernel_fairy2i_wide_linear_w1_bf16_mma8x16" : "kernel_fairy2i_wide_linear_w2_bf16_mma8x16") :
+                (is_w1 ? "kernel_fairy2i_wide_linear_w1_q8_mma8x16" : "kernel_fairy2i_wide_linear_w2_q8_mma8x16");
+        ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
         }
@@ -1755,7 +1839,35 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
-        if (is_w1) {
+        if (use_half_stage_prefill && is_w1) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s0), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 2);
+            ggml_metal_encoder_set_buffer(enc, act_q, 3);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+        } else if (use_half_stage_prefill) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s0), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s1), 2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 3);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s1), 4);
+            ggml_metal_encoder_set_buffer(enc, act_q, 5);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 6);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
+        } else if (use_bf16_prefill && is_w1) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s0), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 3);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+        } else if (use_bf16_prefill) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s0), 1);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s1), 2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 3);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s1), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 5);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 6);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
+        } else if (is_w1) {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s0), 1);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 2);
             ggml_metal_encoder_set_buffer(enc, act_q, 3);
@@ -1791,14 +1903,24 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         const int  block_slots   = 16;
         const int  nth           = block_slots * 16;
         const bool full_rows     = (m % rows_per_tile) == 0;
+        const int  blocks        = k / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
+        const bool use_fc_decode = ggml_metal_fairy2i_w1_decode_fc_mode() > 0 && full_rows && !bias &&
+                                   x->nb[0] == sizeof(uint32_t) && op->nb[0] == sizeof(uint32_t) &&
+                                   (k % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2)) == 0;
 
-        const char *          pipeline_name = !bias && full_rows ?
-                                                  "kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_full_nobias_simd" :
-                                              full_rows ? "kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_full_simd" :
-                                                          "kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_simd";
-        ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
-        if (!pipeline) {
-            pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+        ggml_metal_pipeline_t pipeline = nullptr;
+        if (use_fc_decode) {
+            pipeline =
+                ggml_metal_get_pipeline_fairy2i_w1_decode_fc(lib, blocks, (int32_t) x->nb[0], (int32_t) op->nb[0]);
+        } else {
+            const char * pipeline_name = !bias && full_rows ?
+                                             "kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_full_nobias_simd" :
+                                         full_rows ? "kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_full_simd" :
+                                                     "kernel_fairy2i_wide_linear_w1_bf16_tile8x1_w16_simd";
+            pipeline                   = ggml_metal_library_get_pipeline(lib, pipeline_name);
+            if (!pipeline) {
+                pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+            }
         }
 
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
@@ -1808,24 +1930,38 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s0), 1);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 2);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 3);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+        if (use_fc_decode) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 4);
+        } else {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+        }
         ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 0);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 1);
         ggml_metal_encoder_dispatch_threadgroups(enc, (m + rows_per_tile - 1) / rows_per_tile, 1, 1, nth, 1, 1);
         return 1;
     }
 
-    const int  rows_per_tile = 4;
-    const int  block_slots   = 8;
-    const int  nth           = block_slots * 16;
-    const bool full_rows     = (m % rows_per_tile) == 0;
+    const int rows_per_tile = 4;
+    const int block_slots   = 8;
+    const int nth           = block_slots * 16;
 
-    const char *          pipeline_name = full_rows ? "kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_full_simd" :
-                                                      "kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_simd";
-    ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
-    if (!pipeline) {
-        pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+    const int  fc_mode       = ggml_metal_fairy2i_w2_decode_fc_mode();
+    const bool full_rows     = (m % rows_per_tile) == 0;
+    const int  blocks        = k / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
+    const bool use_fc_decode = fc_mode > 0 && full_rows && !bias && x->nb[0] == sizeof(uint32_t) &&
+                               op->nb[0] == sizeof(uint32_t) && (k % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2)) == 0;
+
+    ggml_metal_pipeline_t pipeline = nullptr;
+    if (use_fc_decode) {
+        pipeline = ggml_metal_get_pipeline_fairy2i_w2_decode_fc(lib, blocks, (int32_t) x->nb[0], (int32_t) op->nb[0]);
+    } else {
+        const char * pipeline_name = full_rows ? "kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_full_simd" :
+                                                 "kernel_fairy2i_wide_linear_w2_bf16_tile4x1_w8_simd";
+        pipeline                   = ggml_metal_library_get_pipeline(lib, pipeline_name);
+        if (!pipeline) {
+            pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+        }
     }
 
     GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
@@ -1837,8 +1973,12 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 3);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s1), 4);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 5);
-    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 6);
-    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
+    if (use_fc_decode) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 6);
+    } else {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 6);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
+    }
     ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 0);
     ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 1);
     ggml_metal_encoder_dispatch_threadgroups(enc, (m + rows_per_tile - 1) / rows_per_tile, 1, 1, nth, 1, 1);
@@ -1855,8 +1995,11 @@ size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const ggml_tensor * op) 
     const int64_t blocks   = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
 
     const size_t pad = GGML_PAD(ggml_nbytes(op), 32) - ggml_nbytes(op);
+    const size_t q8_size =
+        (size_t) act_rows * (size_t) blocks * 2u * (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64);
+    const size_t half_stage_size = q8_size * sizeof(ggml_fp16_t);
 
-    return pad + (size_t) act_rows * (size_t) blocks * 2u * (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64);
+    return pad + (ggml_metal_fairy2i_prefill_half_stage_mode() > 0 ? half_stage_size : q8_size);
 }
 
 size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_d(const ggml_tensor * op) {
