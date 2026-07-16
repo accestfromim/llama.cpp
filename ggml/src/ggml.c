@@ -989,6 +989,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = sizeof(block_fairy2i_act_q16_64),
         .is_quantized             = true,
     },
+    [GGML_TYPE_FAIRY2I_BUNDLE_CODES] = {
+        .type_name                = "fairy2i_bundle_codes",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -4323,6 +4329,73 @@ struct ggml_tensor * ggml_fairy2i_wide_linear_w1(struct ggml_context * ctx,
     result->src[3] = bias;
 
     return result;
+}
+
+static struct ggml_tensor * ggml_fairy2i_wide_linear_bundle_impl(struct ggml_context * ctx,
+                                                                 struct ggml_tensor *  x,
+                                                                 struct ggml_tensor *  codes,
+                                                                 struct ggml_tensor *  scales,
+                                                                 struct ggml_tensor *  bias,
+                                                                 int64_t               logical_m,
+                                                                 int64_t               logical_k,
+                                                                 int32_t               branches,
+                                                                 enum ggml_op          op) {
+    GGML_ASSERT(x && codes && scales);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(codes->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES);
+    GGML_ASSERT(scales->type == GGML_TYPE_F16);
+    GGML_ASSERT(logical_m > 0 && logical_m % 64 == 0);
+    GGML_ASSERT(logical_k > 0 && logical_k % 64 == 0);
+    GGML_ASSERT(logical_m <= INT32_MAX && logical_k <= INT32_MAX);
+    GGML_ASSERT(x->ne[0] == logical_k);
+
+    const int64_t physical_tiles = (logical_m / 64) * (logical_k / 64);
+    GGML_ASSERT(codes->ne[0] == 16 && codes->ne[1] == branches && codes->ne[2] == 64 && codes->ne[3] == physical_tiles);
+    GGML_ASSERT(scales->ne[0] == 2 && scales->ne[1] == branches && scales->ne[2] == physical_tiles &&
+                scales->ne[3] == 1);
+
+    const int64_t ne[4] = { logical_m, x->ne[1], x->ne[2], x->ne[3] };
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT((2 * ne[0]) % bias->ne[0] == 0);
+        GGML_ASSERT(ne[1] % bias->ne[1] == 0);
+        GGML_ASSERT(ne[2] % bias->ne[2] == 0);
+        GGML_ASSERT(ne[3] % bias->ne[3] == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op                  = op;
+    result->src[0]              = x;
+    result->src[1]              = codes;
+    result->src[2]              = scales;
+    result->src[3]              = bias;
+    ggml_set_op_params_i32(result, 0, 1);  // bundle layout version
+    ggml_set_op_params_i32(result, 1, (int32_t) logical_m);
+    ggml_set_op_params_i32(result, 2, (int32_t) logical_k);
+    ggml_set_op_params_i32(result, 3, branches);
+    return result;
+}
+
+struct ggml_tensor * ggml_fairy2i_wide_linear_w1_bundle(struct ggml_context * ctx,
+                                                        struct ggml_tensor *  x,
+                                                        struct ggml_tensor *  codes,
+                                                        struct ggml_tensor *  scales,
+                                                        struct ggml_tensor *  bias,
+                                                        int64_t               logical_m,
+                                                        int64_t               logical_k) {
+    return ggml_fairy2i_wide_linear_bundle_impl(ctx, x, codes, scales, bias, logical_m, logical_k, 2,
+                                                GGML_OP_FAIRY2I_WIDE_LINEAR_W1);
+}
+
+struct ggml_tensor * ggml_fairy2i_wide_linear_w2_bundle(struct ggml_context * ctx,
+                                                        struct ggml_tensor *  x,
+                                                        struct ggml_tensor *  codes,
+                                                        struct ggml_tensor *  scales,
+                                                        struct ggml_tensor *  bias,
+                                                        int64_t               logical_m,
+                                                        int64_t               logical_k) {
+    return ggml_fairy2i_wide_linear_bundle_impl(ctx, x, codes, scales, bias, logical_m, logical_k, 4,
+                                                GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
 }
 
 struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
