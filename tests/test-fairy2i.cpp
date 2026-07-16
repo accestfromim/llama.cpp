@@ -1216,9 +1216,6 @@ static bool test_fairy2i_metal_wide_linear_w2() {
 
     printf("Metal device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
 
-    const char * w64_scale_env = getenv("GGML_METAL_FAIRY2I_PREFILL_W64_SCALE");
-    const bool   use_w64_scale = w64_scale_env && atoi(w64_scale_env) > 0;
-
     const std::vector<fairy2i_w2_case> cases = {
         { 7,  3, 128, true },
         { 17, 1, 256, true },
@@ -1226,9 +1223,7 @@ static bool test_fairy2i_metal_wide_linear_w2() {
 
     for (const fairy2i_w2_case & tc : cases) {
         fairy2i_w2_data data = make_fairy2i_w2_data(tc);
-        if (use_w64_scale) {
-            share_fairy2i_w64_scales(data, tc);
-        }
+        share_fairy2i_w64_scales(data, tc);
         const std::vector<uint32_t> ref = fairy2i_w2_scalar_reference(tc, data);
 
         std::vector<uint32_t> metal;
@@ -1247,9 +1242,7 @@ static bool test_fairy2i_metal_wide_linear_w2() {
     };
     for (const fairy2i_w2_case & tc : w1_cases) {
         fairy2i_w2_data data = make_fairy2i_w2_data(tc);
-        if (use_w64_scale) {
-            share_fairy2i_w64_scales(data, tc);
-        }
+        share_fairy2i_w64_scales(data, tc);
         const std::vector<uint32_t> ref = fairy2i_w1_scalar_reference(tc, data);
 
         std::vector<uint32_t> metal;

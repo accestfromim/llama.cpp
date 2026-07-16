@@ -94,12 +94,15 @@ barriers saved, so activation remains cooperatively loaded and shared.
 Sustained later runs thermally throttled the M4 from about 150 to 125 tok/s.
 Those absolute hot-state values are not mixed into the cold tile ranking above.
 Temporary K/SIMD-local dispatch variables and losing shader instances were
-removed after the sweep. The retained W2 W64-scale default is `32x16/K8`.
-For direct comparison, `GGML_METAL_FAIRY2I_W2_PREFILL_ROWS=8|16|32` selects
-the W2 row tile; unset or invalid values use 32. This switch does not affect W1.
-An adjacent hot-state rerun after retaining the selector measured `83.61 +/-
-0.06`, `118.14 +/- 0.37`, and `124.91 +/- 0.09 tok/s` respectively. The
-absolute values were thermally limited, but the ordering remained clear.
+removed after the sweep. The retained W2 path is `32x16/K8`. A final adjacent
+comparison measured `8x16 = 83.61 +/- 0.06`, `16x16 = 118.14 +/- 0.37`, and
+`32x16 = 124.91 +/- 0.09 tok/s`. The absolute values were thermally limited,
+but the ordering remained clear. The row selector was then removed.
+
+The final prefill implementation has no Fairy2i prefill environment variables.
+For `act_rows > 1`, Metal always stages BF16 activation to FP16 once, uses the
+W64 scale-sharing format invariant, and dispatches the fixed W1 or W2 32x16
+kernel. Decode selection is unchanged.
 
 The final Shader Profiler capture is
 `/private/tmp/fairy-prefill-w2-row32-k8-final-20260716.trace`. In the hot-state
@@ -110,66 +113,27 @@ capture, the main prefill frame contained 165 compute intervals with
 sampled shader. This trace is for structural inspection rather than cold-state
 throughput comparison.
 
-## Prefill kernels
+## Final prefill kernels
 
-### W2 prefill
+Only three Fairy2i prefill kernels remain in Metal:
 
-Kept path:
+- `kernel_fairy2i_act_half_64_stage_bf16`
+- `kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16`
+- `kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16`
 
-- `kernel_fairy2i_wide_linear_w2_q8_mma8x16`
-- Tile shape: 8 output rows by 16 activation columns.
-- Uses one activation int8 quantization pass, then builds four half coefficient
-  tiles in threadgroup memory and consumes them with `simdgroup_multiply_accumulate`.
+W1 uses a 32-row by 16-column output tile with K16 staging. W2 uses the same
+output tile with K8 staging. Both cooperatively stage one activation tile,
+construct four coefficient matrices, and execute them with simdgroup MMA.
+The old q8, BF16-direct, half 8x16, q8-postscale, and W64 8x16/16x16 prefill
+kernels and their dispatch controls were removed.
 
-Observed W2 7B with `-ngl 99 -fa 1 -p 256 -n 128 -r 3`:
+Final combined checks with `-t 8 -p 256 -n 128 -r 3` and no Fairy2i Metal
+path-selection variables measured:
 
-| threads | pp256 tok/s | tg128 tok/s |
-|---:|---:|---:|
-| 2 | 62.60 +/- 0.04 | 16.53 +/- 0.01 |
-| 4 | 62.35 +/- 0.07 | 16.57 +/- 0.01 |
-| 6 | 62.40 +/- 0.07 | 16.55 +/- 0.01 |
-| 8 | 61.18 +/- 0.80 | 16.54 +/- 0.02 |
-| 10 | 58.42 +/- 0.53 | 16.60 +/- 0.01 |
-
-Conclusion: CPU thread count has little effect on decode and starts to hurt
-prefill above 6 threads. The prefill kernel should remain 8x16.
-
-### W1 prefill
-
-Kept path:
-
-- `kernel_fairy2i_wide_linear_w1_q8_mma8x16`
-- Tile shape: 8 output rows by 16 activation columns.
-- Uses the W1-specific `fairy2i_mma_coeff_w1_pair()` helper, which decodes
-  `U.s0` and `W.s0` together and avoids the W2 four-stage path.
-
-Observed current complete Qwen3 W1 graph:
-
-| command shape | threads | pp256 tok/s |
+| model | pp256 tok/s | tg128 tok/s |
 |---|---:|---:|
-| `-p 256 -n 0 -r 10` | 8 | 85.23 +/- 0.11 |
-| `-p 256 -n 0 -r 5 --no-warmup` | 8 | 85.00 +/- 0.17 |
-| `-p 256 -n 0 -r 5` | 8 | 85.12 +/- 0.14 |
-
-An earlier `cf25d3b6` result showed `pp256 = 102.60 +/- 0.30`, but the current
-W1 GGUF has Qwen3 q/k norm tensors and the current graph computes those nodes.
-The old number should be treated as an older/incomplete graph-path comparison,
-not as the current semantic baseline.
-
-Thread sweep on current W1 complete graph:
-
-| threads | pp256 tok/s | tg128 tok/s | notes |
-|---:|---:|---:|---|
-| 1 | 85.30 +/- 0.06 | 4.76 +/- 0.00 | no BF16 decode env |
-| 2 | 84.86 +/- 0.17 | 4.77 +/- 0.00 | no BF16 decode env |
-| 2 | 85.12 +/- 1.21 | 20.52 +/- 0.07 | BF16 decode path enabled |
-| 4 | 80.01 +/- 0.86 | 20.41 +/- 0.04 | BF16 decode path enabled |
-| 6 | 79.08 +/- 0.13 | 20.47 +/- 0.02 | BF16 decode path enabled |
-| 8 | 78.98 +/- 0.19 | 20.38 +/- 0.01 | BF16 decode path enabled |
-| 10 | 79.00 +/- 0.24 | 20.30 +/- 0.09 | BF16 decode path enabled |
-
-Conclusion: W1 prefill should keep the 8x16 MMA kernel. Decode should use the
-BF16 direct path by default rather than falling back to q8-MMA-as-decode.
+| W2 Llama2 7B | `150.13 +/- 0.28` | `20.13 +/- 0.64` |
+| W1 Qwen3 | `173.85 +/- 4.56` | `25.01 +/- 0.23` |
 
 ## Decode kernels tried
 
@@ -179,8 +143,10 @@ BF16 direct path by default rather than falling back to q8-MMA-as-decode.
 |---|---|---|---|---|
 | W2 prefill | old `tile4x4` env path | activation quantized | historical experiment only; replaced by MMA path | remove dispatch/test knobs |
 | W2 prefill | old `tile8x4` env path | activation quantized | historical experiment only; replaced by MMA path | remove dispatch/test knobs |
-| W2 prefill | `q8_mma8x16` | one int8 activation quantization pass | stable current prefill path; pp256 around 62 tok/s on W2 7B | keep |
-| W1 prefill | `q8_mma8x16` | one int8 activation quantization pass | stable current W1 prefill path; pp256 around 85 tok/s on complete Qwen3 W1 graph | keep |
+| W2 prefill | `q8_mma8x16` | one int8 activation quantization pass | historical pp256 around 62 tok/s on W2 7B | removed |
+| W1 prefill | `q8_mma8x16` | one int8 activation quantization pass | historical pp256 around 85 tok/s on complete Qwen3 W1 graph | removed |
+| W2 prefill | `half_w64scale_mma32x16`, K8 | one shared FP16 activation stage | retained path; cold pp256 around 150 tok/s | keep |
+| W1 prefill | `half_w64scale_mma32x16_k16` | one shared FP16 activation stage | retained path; cold pp256 around 172 tok/s | keep |
 | W2 decode | `q16 tile2x1_w4` | activation q16 | early direct-accumulation experiment; not current best | remove |
 | W2 decode | `q16 tile4x1_w4` | activation q16 | early fallback path; extra decode quantization is not useful for current Metal decode | remove |
 | W2 decode | `q16 tile8x1_w4` | activation q16 | larger row tile did not become a winner | remove |
@@ -269,22 +235,34 @@ references (`U.s0`, `W.s0`). The main retained variant is:
 Cleanup decision: keep the `tile8x1_w16` W1 BF16 direct path and remove tile4,
 tile16, and w8 alternatives.
 
-## Cleanup target
+## Final cleanup
 
 Keep:
 
-- activation quantization kernel used by prefill
-- W2 prefill `q8_mma8x16`
-- W1 prefill `q8_mma8x16`
+- BF16-to-FP16 activation staging used by prefill
+- W2 prefill `half_w64scale_mma32x16`, K8
+- W1 prefill `half_w64scale_mma32x16_k16`
 - W2 BF16 direct decode `tile4x1_w8`
 - W1 BF16 direct decode `tile8x1_w16`
+- W1/W2 full-row no-bias function-constant decode specializations
 
 Remove from Metal:
 
+- q8, q8-postscale, BF16-direct, old half, and smaller W64 prefill kernels
+- all Fairy2i Metal path-selection environment variables
 - q16 activation-quantized W2 decode tile2/tile4/tile8/tile16 kernels
 - Metal W2 LUT decode helpers and kernel
 - W2 BF16 direct decode tile2/tile8/w4 variants
 - W1 BF16 direct decode tile4/tile16/w8 variants
-- env-only dispatch switches for removed kernels
+
+Eligible decode shapes now select the function-constant specialization
+automatically. Adjacent `tg128` checks measured W2 `16.61 -> 20.31 tok/s` and
+W1 `25.46 -> 26.06 tok/s`; the former values are the generic decode paths.
+No live `GGML_METAL_FAIRY2I_*` path-selection option remains.
+
+The benchmark still uses `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2=1` to select the
+shared graph-level fused operation. That gate is also used by CPU backends and
+is intentionally outside this Metal-only cleanup. `GGML_METAL_FORCE_SOURCE=1`
+only controls shader-library loading during development.
 
 The cleanup intentionally does not touch CPU/NEON/LUT implementations.
