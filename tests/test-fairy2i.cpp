@@ -139,6 +139,12 @@ struct fairy2i_w1_data {
     std::vector<block_fairy2i_tile64_v2> w_s0;
 };
 
+struct fairy2i_bundle_data {
+    std::vector<uint8_t>     codes;
+    std::vector<ggml_fp16_t> scales;
+    int                      branches;
+};
+
 static uint32_t pack_bf16_pair(float real, float imag) {
     ggml_bf16_t pair[2];
     pair[0] = GGML_FP32_TO_BF16(real);
@@ -174,6 +180,71 @@ static uint8_t get_fairy2i_code(const block_fairy2i_tile64_v2 & blk, int idx) {
     const int lane = idx % 16;
     const int part = idx / 16;
     return (uint8_t) ((blk.qs[lane] >> (2 * part)) & 0x3u);
+}
+
+static void make_fairy2i_weights_bundle_compatible(std::vector<block_fairy2i_tile64_v2> & weights,
+                                                   int64_t                                M,
+                                                   int64_t                                K) {
+    const int64_t blocks = K / QK_FAIRY2I_TILE64;
+    for (int64_t mb = 0; mb < M / 64; ++mb) {
+        for (int64_t kb = 0; kb < blocks; ++kb) {
+            const block_fairy2i_tile64_v2 & scale_source = weights[(size_t) (mb * 64) * blocks + (size_t) kb];
+            for (int64_t lane = 0; lane < 64; ++lane) {
+                block_fairy2i_tile64_v2 & block = weights[(size_t) (mb * 64 + lane) * blocks + (size_t) kb];
+                block.d_real                    = scale_source.d_real;
+                block.d_imag                    = scale_source.d_imag;
+            }
+        }
+    }
+}
+
+static fairy2i_bundle_data pack_fairy2i_bundle(
+    const std::vector<const std::vector<block_fairy2i_tile64_v2> *> & branch_weights,
+    int64_t                                                           M,
+    int64_t                                                           K) {
+    fairy2i_bundle_data result;
+    result.branches          = (int) branch_weights.size();
+    const int64_t blocks     = K / QK_FAIRY2I_TILE64;
+    const int64_t tile_count = (M / 64) * blocks;
+    result.codes.resize((size_t) tile_count * 64u * (size_t) result.branches * 16u);
+    result.scales.resize((size_t) tile_count * (size_t) result.branches * 2u);
+
+    for (int64_t mb = 0; mb < M / 64; ++mb) {
+        for (int64_t kb = 0; kb < blocks; ++kb) {
+            const int64_t physical_tile = mb * blocks + kb;
+            for (int branch = 0; branch < result.branches; ++branch) {
+                const auto &                    weights = *branch_weights[(size_t) branch];
+                const block_fairy2i_tile64_v2 & scale_source =
+                    weights[(size_t) (mb * 64) * (size_t) blocks + (size_t) kb];
+                result.scales[((size_t) physical_tile * (size_t) result.branches + (size_t) branch) * 2u + 0] =
+                    scale_source.d_real;
+                result.scales[((size_t) physical_tile * (size_t) result.branches + (size_t) branch) * 2u + 1] =
+                    scale_source.d_imag;
+
+                for (int m16 = 0; m16 < 4; ++m16) {
+                    for (int q4 = 0; q4 < 16; ++q4) {
+                        const int64_t slot = q4 + 16 * m16;
+                        for (int lane = 0; lane < 16; ++lane) {
+                            const int64_t                   row = mb * 64 + m16 * 16 + lane;
+                            const block_fairy2i_tile64_v2 & block =
+                                weights[(size_t) row * (size_t) blocks + (size_t) kb];
+                            const uint8_t p0 = (uint8_t) (get_fairy2i_code(block, q4 * 4 + 0) |
+                                                          (get_fairy2i_code(block, q4 * 4 + 1) << 2));
+                            const uint8_t p1 = (uint8_t) (get_fairy2i_code(block, q4 * 4 + 2) |
+                                                          (get_fairy2i_code(block, q4 * 4 + 3) << 2));
+                            const size_t  offset =
+                                ((((size_t) physical_tile * 64u + (size_t) slot) * (size_t) result.branches +
+                                  (size_t) branch) *
+                                     16u +
+                                 (size_t) lane);
+                            result.codes[offset] = (uint8_t) (p0 | (p1 << 4));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return result;
 }
 
 static void fill_fairy2i_weights(std::vector<block_fairy2i_tile64_v2> & weights, int64_t M, int64_t K, int salt) {
@@ -1346,6 +1417,115 @@ static bool run_fairy2i_w2_backend(std::vector<uint32_t> & out,
     return true;
 }
 
+static bool run_fairy2i_bundle_backend(std::vector<uint32_t> &     out,
+                                       const fairy2i_w2_case &     tc,
+                                       const std::vector<float> &  x_data,
+                                       const std::vector<float> &  bias_data,
+                                       const fairy2i_bundle_data & bundle_data,
+                                       bool                        is_w1,
+                                       const char *                lut_env,
+                                       const char *                lut_impl_env,
+                                       bool                        force_scalar,
+                                       int                         n_threads,
+                                       const char *                dynamic_tiles_env      = nullptr,
+                                       const char *                dynamic_tile_batch_env = nullptr,
+                                       bool                        expect_success         = true) {
+    scoped_env_var env_lut("GGML_FAIRY2I_LUT");
+    scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
+    scoped_env_var env_force_scalar("GGML_FAIRY2I_TEST_FORCE_SCALAR");
+    scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+    scoped_env_var env_dynamic_tiles(is_w1 ? "GGML_FAIRY2I_W1_DYNAMIC_TILES" : "GGML_FAIRY2I_W2_DYNAMIC_TILES");
+    scoped_env_var env_dynamic_tile_batch(is_w1 ? "GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH" :
+                                                  "GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH");
+    if (lut_env) {
+        env_lut.set(lut_env);
+    } else {
+        env_lut.unset();
+    }
+    if (lut_impl_env) {
+        env_impl.set(lut_impl_env);
+    } else {
+        env_impl.unset();
+    }
+    if (force_scalar) {
+        env_force_scalar.set("1");
+    } else {
+        env_force_scalar.unset();
+    }
+    env_require_lut.set(expect_success ? "1" : "0");
+    if (dynamic_tiles_env) {
+        env_dynamic_tiles.set(dynamic_tiles_env);
+    } else {
+        env_dynamic_tiles.unset();
+    }
+    if (dynamic_tile_batch_env) {
+        env_dynamic_tile_batch.set(dynamic_tile_batch_env);
+    } else {
+        env_dynamic_tile_batch.unset();
+    }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        fprintf(stderr, "failed to initialize CPU backend for Fairy2i bundle\n");
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/32 * 1024 * 1024,
+        /*.mem_buffer =*/NULL,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    const int64_t physical_tiles = (tc.M / 64) * (tc.K / 64);
+    ggml_tensor * x              = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * codes =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, bundle_data.branches, 64, physical_tiles);
+    ggml_tensor * scales = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, bundle_data.branches, physical_tiles);
+    ggml_tensor * bias   = tc.bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tc.M) : nullptr;
+    ggml_tensor * y      = is_w1 ? ggml_fairy2i_wide_linear_w1_bundle(ctx, x, codes, scales, bias, tc.M, tc.K) :
+                                   ggml_fairy2i_wide_linear_w2_bundle(ctx, x, codes, scales, bias, tc.M, tc.K);
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, x_data.data(), 0, x_data.size() * sizeof(float));
+    ggml_backend_tensor_set(codes, bundle_data.codes.data(), 0, bundle_data.codes.size());
+    ggml_backend_tensor_set(scales, bundle_data.scales.data(), 0, bundle_data.scales.size() * sizeof(ggml_fp16_t));
+    if (bias) {
+        ggml_backend_tensor_set(bias, bias_data.data(), 0, bias_data.size() * sizeof(float));
+    }
+
+    bool              ok     = codes->extra == nullptr && scales->extra == nullptr;
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    ok                       = (expect_success ? status == GGML_STATUS_SUCCESS : status != GGML_STATUS_SUCCESS) && ok;
+    ok                       = codes->extra == nullptr && scales->extra == nullptr && ok;
+    if (expect_success && status == GGML_STATUS_SUCCESS) {
+        std::vector<float> out_f32((size_t) tc.M * (size_t) tc.N);
+        ggml_backend_tensor_get(y, out_f32.data(), 0, out_f32.size() * sizeof(float));
+        out.resize(out_f32.size());
+        memcpy(out.data(), out_f32.data(), out_f32.size() * sizeof(float));
+    } else if (expect_success) {
+        fprintf(stderr, "Fairy2i bundle graph compute failed: %s\n", ggml_status_to_string(status));
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return ok;
+}
+
 static bool compare_exact(const char *                  label,
                           const std::vector<uint32_t> & actual,
                           const std::vector<uint32_t> & expected);
@@ -2171,6 +2351,117 @@ static bool test_fairy2i_wide_linear_w1_variants() {
     return ok;
 }
 
+static bool test_fairy2i_bundle_lut() {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    bool          ok         = true;
+    int           cases_run  = 0;
+    const int64_t k_values[] = { 64, 128, 256, 1024 };
+    const int     threads[]  = { 1, 2, 4, 8 };
+
+    for (int i = 0; i < 4; ++i) {
+        const fairy2i_w2_case tc = { 128, i == 1 ? 3 : 1, k_values[i], (i & 1) != 0 };
+
+        fairy2i_w1_data w1_data = make_fairy2i_w1_data(tc);
+        make_fairy2i_weights_bundle_compatible(w1_data.u_s0, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(w1_data.w_s0, tc.M, tc.K);
+        const fairy2i_bundle_data w1_bundle = pack_fairy2i_bundle({ &w1_data.u_s0, &w1_data.w_s0 }, tc.M, tc.K);
+        std::vector<uint32_t>     old_w1;
+        std::vector<uint32_t>     bundle_w1;
+        if (!run_fairy2i_w1_backend(old_w1, tc, w1_data, "1", "lut16", true, false, threads[i], "0") ||
+            !run_fairy2i_bundle_backend(bundle_w1, tc, w1_data.x, w1_data.bias, w1_bundle, true, "1", "lut16", false,
+                                        threads[i], "0")) {
+            return false;
+        }
+        char label[160];
+        snprintf(label, sizeof(label), "W1 old/bundle LUT bit exact M=%lld N=%lld K=%lld bias=%d threads=%d",
+                 (long long) tc.M, (long long) tc.N, (long long) tc.K, (int) tc.bias, threads[i]);
+        ok = compare_exact(label, bundle_w1, old_w1) && ok;
+        ++cases_run;
+
+        fairy2i_w2_data w2_data = make_fairy2i_w2_data(tc);
+        make_fairy2i_weights_bundle_compatible(w2_data.u_s0, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(w2_data.u_s1, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(w2_data.w_s0, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(w2_data.w_s1, tc.M, tc.K);
+        const fairy2i_bundle_data w2_bundle =
+            pack_fairy2i_bundle({ &w2_data.u_s0, &w2_data.u_s1, &w2_data.w_s0, &w2_data.w_s1 }, tc.M, tc.K);
+        std::vector<uint32_t> old_w2;
+        std::vector<uint32_t> bundle_w2;
+        if (!run_fairy2i_w2_backend(old_w2, tc, w2_data, "1", "lut16", true, false, threads[i], "0") ||
+            !run_fairy2i_bundle_backend(bundle_w2, tc, w2_data.x, w2_data.bias, w2_bundle, false, "1", "lut16", false,
+                                        threads[i], "0")) {
+            return false;
+        }
+        snprintf(label, sizeof(label), "W2 old/bundle LUT bit exact M=%lld N=%lld K=%lld bias=%d threads=%d",
+                 (long long) tc.M, (long long) tc.N, (long long) tc.K, (int) tc.bias, threads[i]);
+        ok = compare_exact(label, bundle_w2, old_w2) && ok;
+        ++cases_run;
+
+        if (tc.K == 256) {
+            std::vector<uint32_t> scalar_w1;
+            std::vector<uint32_t> scalar_w2;
+            if (!run_fairy2i_bundle_backend(scalar_w1, tc, w1_data.x, w1_data.bias, w1_bundle, true, "1", "lut16", true,
+                                            threads[i], "0") ||
+                !run_fairy2i_bundle_backend(scalar_w2, tc, w2_data.x, w2_data.bias, w2_bundle, false, "1", "lut16",
+                                            true, threads[i], "0")) {
+                return false;
+            }
+            ok = compare_packed_complex("W1 bundle scalar/ISA", scalar_w1, bundle_w1, 1e-2f) && ok;
+            ok = compare_packed_complex("W2 bundle scalar/ISA", scalar_w2, bundle_w2, 1e-2f) && ok;
+        }
+    }
+
+    const fairy2i_w2_case dynamic_tc = { 256, 1, 256, true };
+    fairy2i_w1_data       dynamic_w1 = make_fairy2i_w1_data(dynamic_tc);
+    make_fairy2i_weights_bundle_compatible(dynamic_w1.u_s0, dynamic_tc.M, dynamic_tc.K);
+    make_fairy2i_weights_bundle_compatible(dynamic_w1.w_s0, dynamic_tc.M, dynamic_tc.K);
+    const fairy2i_bundle_data dynamic_w1_bundle =
+        pack_fairy2i_bundle({ &dynamic_w1.u_s0, &dynamic_w1.w_s0 }, dynamic_tc.M, dynamic_tc.K);
+    std::vector<uint32_t> dynamic_w1_static;
+    if (!run_fairy2i_bundle_backend(dynamic_w1_static, dynamic_tc, dynamic_w1.x, dynamic_w1.bias, dynamic_w1_bundle,
+                                    true, "1", "lut16", false, 8, "0")) {
+        return false;
+    }
+    for (const char * batch : { "1", "2", "4" }) {
+        std::vector<uint32_t> output;
+        if (!run_fairy2i_bundle_backend(output, dynamic_tc, dynamic_w1.x, dynamic_w1.bias, dynamic_w1_bundle, true, "1",
+                                        "lut16", false, 8, "1", batch)) {
+            return false;
+        }
+        ok = compare_exact("W1 bundle dynamic/static", output, dynamic_w1_static) && ok;
+        ++cases_run;
+    }
+
+    fairy2i_w2_data dynamic_w2 = make_fairy2i_w2_data(dynamic_tc);
+    make_fairy2i_weights_bundle_compatible(dynamic_w2.u_s0, dynamic_tc.M, dynamic_tc.K);
+    make_fairy2i_weights_bundle_compatible(dynamic_w2.u_s1, dynamic_tc.M, dynamic_tc.K);
+    make_fairy2i_weights_bundle_compatible(dynamic_w2.w_s0, dynamic_tc.M, dynamic_tc.K);
+    make_fairy2i_weights_bundle_compatible(dynamic_w2.w_s1, dynamic_tc.M, dynamic_tc.K);
+    const fairy2i_bundle_data dynamic_w2_bundle = pack_fairy2i_bundle(
+        { &dynamic_w2.u_s0, &dynamic_w2.u_s1, &dynamic_w2.w_s0, &dynamic_w2.w_s1 }, dynamic_tc.M, dynamic_tc.K);
+    std::vector<uint32_t> dynamic_w2_static;
+    if (!run_fairy2i_bundle_backend(dynamic_w2_static, dynamic_tc, dynamic_w2.x, dynamic_w2.bias, dynamic_w2_bundle,
+                                    false, "1", "lut16", false, 8, "0")) {
+        return false;
+    }
+    for (const char * batch : { "1", "2", "4" }) {
+        std::vector<uint32_t> output;
+        if (!run_fairy2i_bundle_backend(output, dynamic_tc, dynamic_w2.x, dynamic_w2.bias, dynamic_w2_bundle, false,
+                                        "1", "lut16", false, 8, "1", batch)) {
+            return false;
+        }
+        ok = compare_exact("W2 bundle dynamic/static", output, dynamic_w2_static) && ok;
+        ++cases_run;
+    }
+
+    printf("  Fairy2i bundle LUT16: %d execution cases - %s\n", cases_run, ok ? "PASS" : "FAIL");
+    return ok;
+#else
+    printf("  Fairy2i bundle LUT16 skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+#endif
+}
+
 int main() {
     ggml_cpu_init();
 
@@ -2213,6 +2504,10 @@ int main() {
     }
     if (!test_fairy2i_wide_linear_w2_lut_dynamic_tiles()) {
         fprintf(stderr, "Fairy2i W2 LUT dynamic tiles FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_bundle_lut()) {
+        fprintf(stderr, "Fairy2i bundle LUT16 FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_opencl_tile64_mul_mat()) {

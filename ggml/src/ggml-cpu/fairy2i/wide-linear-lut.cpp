@@ -81,10 +81,10 @@ static bool ggml_fairy2i_wide_linear_w2_dynamic_tiles_enabled(void) {
     return !env || strcmp(env, "0") != 0;
 }
 
-static int64_t ggml_fairy2i_wide_linear_w2_dynamic_tile_batch(void) {
+static int64_t ggml_fairy2i_wide_linear_w2_dynamic_tile_batch(const struct ggml_tensor * dst) {
     const char * batch = getenv("GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH");
     if (!batch) {
-        return 2;
+        return ggml_fairy2i_is_bundle_op(dst) ? 4 : 2;
     }
     if (strcmp(batch, "1") == 0) {
         return 1;
@@ -379,7 +379,10 @@ bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * 
     if (lut_c) {
         return false;
     }
-    if (!ggml_fairy2i_wide_linear_w1_have_packed_weights(dst)) {
+    struct ggml_fairy2i_bundle_desc bundle    = {};
+    const bool                      is_bundle = ggml_fairy2i_is_bundle_op(dst);
+    if (is_bundle ? !ggml_fairy2i_bundle_desc_init(dst, &bundle, true) :
+                    !ggml_fairy2i_wide_linear_w1_have_packed_weights(dst)) {
         return false;
     }
 
@@ -442,10 +445,12 @@ bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * 
     const int64_t nrows       = row1 - row0;
     const size_t  packed_tile_bytes = (size_t) weight_blocks * sizeof(fairy2i_tile64_lut_wtile_16);
 
-    const fairy2i_lut_extra * extra_u0 = (const fairy2i_lut_extra *) dst->src[1]->extra;
-    const fairy2i_lut_extra * extra_w0 = (const fairy2i_lut_extra *) dst->src[2]->extra;
-    const void * packed_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) tile0 * packed_tile_bytes;
-    const void * packed_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const fairy2i_lut_extra * extra_u0 = is_bundle ? nullptr : (const fairy2i_lut_extra *) dst->src[1]->extra;
+    const fairy2i_lut_extra * extra_w0 = is_bundle ? nullptr : (const fairy2i_lut_extra *) dst->src[2]->extra;
+    const void *              packed_u0 =
+        is_bundle ? nullptr : (const uint8_t *) extra_u0->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const void * packed_w0 =
+        is_bundle ? nullptr : (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
 
     if (N == 1 && ggml_fairy2i_wide_linear_w1_dynamic_tiles_enabled()) {
         GGML_ASSERT(((uintptr_t) q_x % alignof(std::atomic<int64_t>)) == 0);
@@ -475,12 +480,19 @@ bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * 
             const int64_t claim_row1  = std::min<int64_t>(claim_tile1 * 16, M);
             const int64_t claim_rows  = claim_row1 - claim_row0;
 
-            const void * claim_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
-            const void * claim_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_u0 =
+                is_bundle ? nullptr : (const uint8_t *) extra_u0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_w0 =
+                is_bundle ? nullptr : (const uint8_t *) extra_w0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
 
-            const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_two_cpu(
-                (int) claim_rows, (int) K, (int) N, claim_u0, claim_w0, lut, scales, output + claim_row0 * 2,
-                (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+            const bool qgemm_ok =
+                is_bundle ?
+                    ggml_fairy2i_bundle_lut_qgemm_two_cpu((int) claim_rows, (int) K, (int) N, &bundle, claim_tile0, lut,
+                                                          scales, output + claim_row0 * 2,
+                                                          (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false) :
+                    ggml_fairy2i_tile64_lut_qgemm_two_cpu((int) claim_rows, (int) K, (int) N, claim_u0, claim_w0, lut,
+                                                          scales, output + claim_row0 * 2,
+                                                          (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
             if (!qgemm_ok) {
                 return false;
             }
@@ -507,9 +519,13 @@ bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * 
         return true;
     }
 
-    const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_two_cpu(
-        (int) nrows, (int) K, (int) N, packed_u0, packed_w0, lut, scales, output + row0 * 2,
-        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+    const bool qgemm_ok =
+        is_bundle ? ggml_fairy2i_bundle_lut_qgemm_two_cpu((int) nrows, (int) K, (int) N, &bundle, tile0, lut, scales,
+                                                          output + row0 * 2, (size_t) M * 2u * sizeof(float),
+                                                          2u * sizeof(float), false) :
+                    ggml_fairy2i_tile64_lut_qgemm_two_cpu((int) nrows, (int) K, (int) N, packed_u0, packed_w0, lut,
+                                                          scales, output + row0 * 2, (size_t) M * 2u * sizeof(float),
+                                                          2u * sizeof(float), false);
     if (!qgemm_ok) {
         return false;
     }
@@ -541,12 +557,15 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
     if (lut_c) {
         return false;
     }
-    if (!ggml_fairy2i_wide_linear_w2_have_packed_weights(dst)) {
+    struct ggml_fairy2i_bundle_desc bundle    = {};
+    const bool                      is_bundle = ggml_fairy2i_is_bundle_op(dst);
+    if (is_bundle ? !ggml_fairy2i_bundle_desc_init(dst, &bundle, true) :
+                    !ggml_fairy2i_wide_linear_w2_have_packed_weights(dst)) {
         return false;
     }
 
     const struct ggml_tensor * x      = dst->src[0];
-    const struct ggml_tensor * bias   = dst->src[5];
+    const struct ggml_tensor * bias                = dst->src[is_bundle ? 3 : 5];
     const int64_t K                   = x->ne[0];
     const int64_t M                   = dst->ne[0];
     const int64_t N                   = ggml_nrows(x);
@@ -604,14 +623,18 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
     const int64_t nrows       = row1 - row0;
     const size_t  packed_tile_bytes = (size_t) weight_blocks * sizeof(fairy2i_tile64_lut_wtile_16);
 
-    const fairy2i_lut_extra * extra_u0 = (const fairy2i_lut_extra *) dst->src[1]->extra;
-    const fairy2i_lut_extra * extra_u1 = (const fairy2i_lut_extra *) dst->src[2]->extra;
-    const fairy2i_lut_extra * extra_w0 = (const fairy2i_lut_extra *) dst->src[3]->extra;
-    const fairy2i_lut_extra * extra_w1 = (const fairy2i_lut_extra *) dst->src[4]->extra;
-    const void * packed_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) tile0 * packed_tile_bytes;
-    const void * packed_u1 = (const uint8_t *) extra_u1->packed_w + (size_t) tile0 * packed_tile_bytes;
-    const void * packed_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
-    const void * packed_w1 = (const uint8_t *) extra_w1->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const fairy2i_lut_extra * extra_u0 = is_bundle ? nullptr : (const fairy2i_lut_extra *) dst->src[1]->extra;
+    const fairy2i_lut_extra * extra_u1 = is_bundle ? nullptr : (const fairy2i_lut_extra *) dst->src[2]->extra;
+    const fairy2i_lut_extra * extra_w0 = is_bundle ? nullptr : (const fairy2i_lut_extra *) dst->src[3]->extra;
+    const fairy2i_lut_extra * extra_w1 = is_bundle ? nullptr : (const fairy2i_lut_extra *) dst->src[4]->extra;
+    const void *              packed_u0 =
+        is_bundle ? nullptr : (const uint8_t *) extra_u0->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const void * packed_u1 =
+        is_bundle ? nullptr : (const uint8_t *) extra_u1->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const void * packed_w0 =
+        is_bundle ? nullptr : (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
+    const void * packed_w1 =
+        is_bundle ? nullptr : (const uint8_t *) extra_w1->packed_w + (size_t) tile0 * packed_tile_bytes;
 
     if (N == 1 && ggml_fairy2i_wide_linear_w2_dynamic_tiles_enabled()) {
         GGML_ASSERT(((uintptr_t) q_x % alignof(std::atomic<int64_t>)) == 0);
@@ -622,7 +645,7 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
         }
         ggml_barrier(params->threadpool);
 
-        const int64_t dynamic_tile_batch = ggml_fairy2i_wide_linear_w2_dynamic_tile_batch();
+        const int64_t dynamic_tile_batch = ggml_fairy2i_wide_linear_w2_dynamic_tile_batch(dst);
         if (params->ith == 0) {
             ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits.fetch_add(1, std::memory_order_acq_rel);
             ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch.store((int) dynamic_tile_batch,
@@ -641,14 +664,23 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
             const int64_t claim_row1  = std::min<int64_t>(claim_tile1 * 16, M);
             const int64_t claim_rows  = claim_row1 - claim_row0;
 
-            const void * claim_u0 = (const uint8_t *) extra_u0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
-            const void * claim_u1 = (const uint8_t *) extra_u1->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
-            const void * claim_w0 = (const uint8_t *) extra_w0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
-            const void * claim_w1 = (const uint8_t *) extra_w1->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_u0 =
+                is_bundle ? nullptr : (const uint8_t *) extra_u0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_u1 =
+                is_bundle ? nullptr : (const uint8_t *) extra_u1->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_w0 =
+                is_bundle ? nullptr : (const uint8_t *) extra_w0->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
+            const void * claim_w1 =
+                is_bundle ? nullptr : (const uint8_t *) extra_w1->packed_w + (size_t) claim_tile0 * packed_tile_bytes;
 
-            const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
-                (int) claim_rows, (int) K, (int) N, claim_u0, claim_u1, claim_w0, claim_w1, lut, scales,
-                output + claim_row0 * 2, (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+            const bool qgemm_ok =
+                is_bundle ?
+                    ggml_fairy2i_bundle_lut_qgemm_four_cpu((int) claim_rows, (int) K, (int) N, &bundle, claim_tile0,
+                                                           lut, scales, output + claim_row0 * 2,
+                                                           (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false) :
+                    ggml_fairy2i_tile64_lut_qgemm_four_cpu((int) claim_rows, (int) K, (int) N, claim_u0, claim_u1,
+                                                           claim_w0, claim_w1, lut, scales, output + claim_row0 * 2,
+                                                           (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
             if (!qgemm_ok) {
                 return false;
             }
@@ -675,9 +707,13 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
         return true;
     }
 
-    const bool qgemm_ok = ggml_fairy2i_tile64_lut_qgemm_four_cpu(
-        (int) nrows, (int) K, (int) N, packed_u0, packed_u1, packed_w0, packed_w1, lut, scales, output + row0 * 2,
-        (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
+    const bool qgemm_ok =
+        is_bundle ? ggml_fairy2i_bundle_lut_qgemm_four_cpu((int) nrows, (int) K, (int) N, &bundle, tile0, lut, scales,
+                                                           output + row0 * 2, (size_t) M * 2u * sizeof(float),
+                                                           2u * sizeof(float), false) :
+                    ggml_fairy2i_tile64_lut_qgemm_four_cpu((int) nrows, (int) K, (int) N, packed_u0, packed_u1,
+                                                           packed_w0, packed_w1, lut, scales, output + row0 * 2,
+                                                           (size_t) M * 2u * sizeof(float), 2u * sizeof(float), false);
     if (!qgemm_ok) {
         return false;
     }
