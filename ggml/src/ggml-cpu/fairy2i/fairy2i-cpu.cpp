@@ -1,9 +1,10 @@
 #include "fairy2i-cpu.h"
-#include "fairy2i-policy.h"
-#include "wide-linear.h"
 
-#include "ggml.h"
+#include "fairy2i-bundle.h"
+#include "fairy2i-policy.h"
 #include "ggml-impl.h"
+#include "ggml.h"
+#include "wide-linear.h"
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #    include "arm/fairy2i-quants.h"
@@ -122,10 +123,13 @@ static void ggml_fairy2i_cpu_debug_log_once(const struct ggml_compute_params *  
     logged[op_idx][path_idx] = true;
 
     const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
-    GGML_LOG_INFO("%s: path=%s M=%lld N=%lld K=%lld nth=%d lut_packed=%d lut_wsize=%zu\n",
+    const bool                 bundle = ggml_fairy2i_is_bundle_op(dst);
+    GGML_LOG_INFO("%s: path=%s M=%lld N=%lld K=%lld nth=%d layout=%s packed_w=%d branches=%d lut_wsize=%zu\n",
                   ggml_fairy2i_cpu_op_log_name(dst), path ? path : "unknown", (long long) (dst ? dst->ne[0] : 0),
                   (long long) (x ? ggml_nrows(x) : 0), (long long) (x ? x->ne[0] : 0), params ? params->nth : 1,
-                  ggml_fairy2i_cpu_lut_packed_weights_ready(dst) ? 1 : 0, plan ? plan->lut_bytes : 0);
+                  bundle ? "bundle_m64k64_v1" : "tile64_v2", ggml_fairy2i_cpu_lut_packed_weights_ready(dst) ? 1 : 0,
+                  bundle ? ggml_get_op_params_i32(dst, 3) : (dst && dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ? 2 : 4),
+                  plan ? plan->lut_bytes : 0);
 }
 
 static int64_t ggml_fairy2i_cpu_timing_start_us(const struct ggml_compute_params * params) {
@@ -159,6 +163,13 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
 
     if (!ggml_fairy2i_cpu_supports_op(dst)) {
         return false;
+    }
+
+    if (ggml_fairy2i_is_bundle_op(dst)) {
+        struct ggml_fairy2i_bundle_desc bundle;
+        if (!ggml_fairy2i_bundle_desc_init(dst, &bundle, false)) {
+            return false;
+        }
     }
 
     const struct ggml_tensor * x = dst->src[0];
@@ -219,6 +230,10 @@ void ggml_fairy2i_cpu_prepare_graph(const struct ggml_cgraph * cgraph) {
             continue;
         }
 
+        if (ggml_fairy2i_is_bundle_op(node)) {
+            continue;
+        }
+
         const int last_src = node->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ? 2 : 4;
         for (int src = 1; src <= last_src; ++src) {
             struct ggml_tensor * weight = node->src[src];
@@ -261,6 +276,15 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w1(const struct ggml_compute_pa
     }
 #endif
 
+    if (ggml_fairy2i_is_bundle_op(dst)) {
+        if (!params || params->ith == 0) {
+            GGML_LOG_ERROR(
+                "fairy2i_w1: bundle_m64k64_v1 requires the CPU LUT16 path; check GGML_FAIRY2I_LUT and "
+                "GGML_FAIRY2I_LUT_IMPL\n");
+        }
+        return false;
+    }
+
     ggml_fairy2i_wide_linear_w1_compute(params, dst);
     const char * path = ggml_fairy2i_cpu_direct_path_name();
     ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, path);
@@ -289,6 +313,15 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
         }
     }
 #endif
+
+    if (ggml_fairy2i_is_bundle_op(dst)) {
+        if (!params || params->ith == 0) {
+            GGML_LOG_ERROR(
+                "fairy2i_w2: bundle_m64k64_v1 requires the CPU LUT16 path; check GGML_FAIRY2I_LUT and "
+                "GGML_FAIRY2I_LUT_IMPL\n");
+        }
+        return false;
+    }
 
     ggml_fairy2i_wide_linear_w2_compute(params, dst);
     const char * path = ggml_fairy2i_cpu_direct_path_name();

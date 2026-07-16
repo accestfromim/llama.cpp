@@ -25,11 +25,14 @@ from convert_fairy2i_qwen2 import (
 )
 from fairy2i.quant.tile64_v2 import (
     FAIRY2I_TILE64,
+    quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale,
     quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale,
     round_up,
 )
 from fairy2i.spec import (
     QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE,
+    WEIGHT_LAYOUT_BUNDLE_V1,
+    WEIGHT_LAYOUT_TILE64_V2,
     Fairy2IMetadata,
     SCALE_SOURCE_LEARNED,
     write_metadata,
@@ -135,6 +138,12 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Unsupported for learned-scale Qwen3; scale tiles are tied to the stored Q/K row order.",
     )
+    parser.add_argument(
+        "--weight-layout",
+        choices=[WEIGHT_LAYOUT_BUNDLE_V1, WEIGHT_LAYOUT_TILE64_V2],
+        default=WEIGHT_LAYOUT_BUNDLE_V1,
+        help="Fairy2i weight storage layout (default: bundle_v1)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs without writing GGUF")
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
     args = parser.parse_args(argv)
@@ -179,6 +188,8 @@ def main(argv: list[str] | None = None) -> None:
     reader = TensorReader(model_dir, weight_map)
 
     writer = gguf.GGUFWriter(str(output_file), arch="fairy2i")
+    if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+        writer.add_custom_alignment(64)
     writer.add_name(config.get("_name_or_path", "Fairy2i-Qwen3-W1"))
     writer.add_context_length(int(config["max_position_embeddings"]))
     writer.add_embedding_length(hidden_complex)
@@ -188,7 +199,11 @@ def main(argv: list[str] | None = None) -> None:
     writer.add_head_count_kv(n_head_kv)
     writer.add_layer_norm_rms_eps(float(config["rms_norm_eps"]))
     add_rope_metadata(config, writer)
-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2)
+    writer.add_file_type(
+        gguf.LlamaFileType.MOSTLY_FAIRY2I_BUNDLE_V1
+        if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1
+        else gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2
+    )
     writer.add_vocab_size(int(config["vocab_size"]))
     write_metadata(
         writer,
@@ -201,6 +216,7 @@ def main(argv: list[str] | None = None) -> None:
             quant_variant=args.quant_variant,
             residual_steps=args.residual_steps,
             scale_source=SCALE_SOURCE_LEARNED,
+            weight_layout=args.weight_layout,
         ),
     )
 
@@ -240,15 +256,28 @@ def main(argv: list[str] | None = None) -> None:
             out_target = ff_complex_padded if out_c == ff_complex else out_c
             in_target = ff_complex_padded if in_c == ff_complex else in_c
 
-            packed = quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(w, scale, out_target, in_target)
-            for stage_name, stage_data in packed.items():
-                writer.add_tensor(
-                    f"blk.{il}.{gguf_base}.{stage_name}",
-                    stage_data,
-                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+            if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+                codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+                    w, scale, out_target, in_target
                 )
+                writer.add_tensor(
+                    f"blk.{il}.{gguf_base}.bundle.codes",
+                    codes,
+                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_BUNDLE_CODES,
+                )
+                writer.add_tensor(f"blk.{il}.{gguf_base}.bundle.scales", scales)
+                del codes, scales
+            else:
+                packed = quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(w, scale, out_target, in_target)
+                for stage_name, stage_data in packed.items():
+                    writer.add_tensor(
+                        f"blk.{il}.{gguf_base}.{stage_name}",
+                        stage_data,
+                        raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+                    )
+                del packed
 
-            del w, scale, packed
+            del w, scale
             gc.collect()
 
         gc.collect()

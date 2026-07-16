@@ -2377,6 +2377,14 @@ void ggml_fairy2i_tile64_lut_qgemm_pair_lut16(int          m,
     }
 
 #if defined(__AVX2__)
+    if (add) {
+        ggml_fairy2i_tile64_lut_qgemm_lut16(m, k, n, packed_wtiles0, lut, lut_scales, dst, dst_col_stride,
+                                            dst_row_stride, pack_bf16, negate_imag_scale, true);
+        ggml_fairy2i_tile64_lut_qgemm_lut16(m, k, n, packed_wtiles1, lut, lut_scales, dst, dst_col_stride,
+                                            dst_row_stride, pack_bf16, negate_imag_scale, true);
+        return;
+    }
+
     const int64_t blocks           = k / QK_FAIRY2I_TILE64;
     const int64_t groups_per_block = QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
     const int64_t groups           = blocks * groups_per_block;
@@ -2415,7 +2423,6 @@ void ggml_fairy2i_tile64_lut_qgemm_pair_lut16(int          m,
                                                           acc1_r_hi, acc1_i_lo, acc1_i_hi);
             }
 
-            GGML_ASSERT(!add);
             ggml_fairy2i_lut_store_tile_avx2(tile, m, dst_col, dst_row_stride, pack_bf16,
                                             _mm256_add_ps(acc0_r_lo, acc1_r_lo),
                                             _mm256_add_ps(acc0_r_hi, acc1_r_hi),

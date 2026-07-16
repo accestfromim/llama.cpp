@@ -178,6 +178,11 @@ struct llama_layer_shortconv {
 struct llama_widely_linear_ifairy {
     std::array<ggml_tensor *, 2> U = { nullptr, nullptr };  // stage0, stage1
     std::array<ggml_tensor *, 2> W = { nullptr, nullptr };  // stage0, stage1
+    ggml_tensor *                bundle_codes  = nullptr;
+    ggml_tensor *                bundle_scales = nullptr;
+    int64_t                      logical_m     = 0;
+    int64_t                      logical_k     = 0;
+    int                          branch_count  = 0;
 };
 
 enum llama_fairy2i_quant_variant {
@@ -191,6 +196,11 @@ enum llama_fairy2i_attn_layout {
     LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL,
     LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL,
     LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL,
+};
+
+enum llama_fairy2i_weight_layout {
+    LLAMA_FAIRY2I_WEIGHT_LAYOUT_TILE64_V2 = 0,
+    LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1,
 };
 
 struct llama_layer_nextn {
@@ -418,6 +428,7 @@ struct llama_model {
     llama_vocab   vocab;
     llama_fairy2i_quant_variant fairy2i_quant_variant = LLAMA_FAIRY2I_QUANT_VARIANT_LEGACY;
     llama_fairy2i_attn_layout   fairy2i_attn_layout   = LLAMA_FAIRY2I_ATTN_LAYOUT_LEGACY_COMPLEX;
+    llama_fairy2i_weight_layout fairy2i_weight_layout = LLAMA_FAIRY2I_WEIGHT_LAYOUT_TILE64_V2;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
