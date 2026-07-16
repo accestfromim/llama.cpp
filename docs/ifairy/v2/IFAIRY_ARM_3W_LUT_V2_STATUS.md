@@ -1,6 +1,6 @@
 # iFairy ARM 3W LUT (V2) — 状态 / 性能记录
 
-Status: Draft (2026-03-13)
+Status: Draft (2026-07-04)
 
 本文件用于替代旧的 `../legacy/IFAIRY_ARM_3W_LUT_STATUS.md` 的后续增量记录（旧文件不再修改）。
 
@@ -11,6 +11,64 @@ Status: Draft (2026-03-13)
 - `IFAIRY64_STATUS.md`（`IFAIRY64` 专项记录）
 
 ---
+
+## 2026-07-04 — Fairy2i CPU default policy cleanup
+
+- Fairy2i W1/W2 graph fusion moves from env opt-in to auto default: model variant, LoRA state, tensor types, and CPU backend support must all match; `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W{1,2}=0` keeps the unfused graph available.
+- Fairy2i CPU LUT builds default to LUT16. `GGML_FAIRY2I_LUT=0` forces the direct CPU path; `GGML_FAIRY2I_LUT_IMPL=lut_c` remains an explicit experimental override.
+- W1 LUT16 dynamic tile claiming is an opt-in experiment. `GGML_FAIRY2I_W1_DYNAMIC_TILES=1` enables it only for W1 LUT with `N==1`; `N>1` keeps the static split. `GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size; unset uses `2`, and invalid values use `1`.
+- W2 LUT16 dynamic tile claiming is enabled by default. `GGML_FAIRY2I_W2_DYNAMIC_TILES=0` disables it; it only applies to W2 LUT with `N==1` (tg path); `N>1` keeps the static split. `GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH=1|2|4` controls the claim batch size; unset uses `2`, and invalid values use `1`.
+  Current M4 tg128 evidence prefers `batch=1` for low thread counts (`nth<=4`); `batch=2` should only be considered for higher-thread tg after path-validated measurement, because it regressed tg4 in the focused sweep.
+- `GGML_FAIRY2I_CPU_LUT` remains a build-time capability gate and still defaults to OFF, so normal builds do not become CPU-only.
+- Regression coverage now includes default LUT, explicit LUT, and explicit direct paths in `test-fairy2i`.
+
+## 2026-07-04 — Fairy2i ARM W1 build gate and real-GGUF baseline
+
+- Build gate fix:
+  - Commit `6bf3474f` makes the documented Fairy2i-only ARM LUT build link without enabling legacy iFairy.
+  - Legacy `GGML_TYPE_IFAIRY/IFAIRY64` vecdot traits are only exposed when `GGML_LEGACY_IFAIRY_CPU=ON`.
+  - CPU `supports_op(MUL_MAT)` rejects legacy iFairy weight types when legacy CPU is off; `GGML_OP_IFAIRY_WIDE_LINEAR_W2` is also rejected unless legacy CPU is compiled.
+- W1 ARM LUT optimization:
+  - Commit `43fccc6c` adds an ARM NEON W1 mixed-sign pair qgemm for `ggml_fairy2i_tile64_lut_qgemm_two_cpu()`.
+  - The helper traverses the LUT once for `U.s0` and `W.s0`; `U` uses negated imaginary activation scale to recover `U * x`, while `W` keeps the LUT-preprocessed `W * conj(x)` scale.
+  - Non-ARM/non-AVX2 fallback remains the previous two single-weight qgemm calls.
+- Build used:
+  - `cmake -B build-rel-fairy2i -DCMAKE_BUILD_TYPE=Release -DGGML_FAIRY2I=ON -DGGML_FAIRY2I_CPU=ON -DGGML_FAIRY2I_CPU_LUT=ON`
+  - `cmake --build build-rel-fairy2i --target ggml-cpu test-fairy2i test-fairy2i-loader -j 8`
+  - `cmake --build build-rel-fairy2i --target llama-cli llama-bench -j 8`
+- Correctness/format validation (Apple arm64, `build-rel-fairy2i`):
+  - `ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i`: PASS
+  - `GGML_FAIRY2I_LUT=0 ctest --test-dir build-rel-fairy2i --output-on-failure -R fairy2i`: PASS
+  - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1 ./build-rel-fairy2i/bin/test-fairy2i`: PASS
+  - scoped `git clang-format --style=file --diff`: PASS
+  - scoped `clang-tidy -p build-rel-fairy2i`: not run (`clang-tidy` not available in PATH)
+- Real W1 GGUF:
+  - `/Users/a1806/llama/qwen_1bit_scale/qwen3-fairy2i-w1-learned-scale.gguf`
+  - Metadata/tensor validation: `general.architecture=fairy2i`, `fairy2i.quant.variant=tile64_v2_w1_learned_scale`, `fairy2i.quant.residual_steps=1`, `fairy2i.quant.scale_source=learned`, `*.U.s0=252`, `*.W.s0=252`, `*.U.s1=0`, `*.W.s1=0`.
+- Real-model smoke baseline (`llama-cli --no-warmup -p "I believe life is" -n 1 -t 4`, raw logs under `tmp/fairy2i-arm-w1-baseline/`):
+
+  | config | raw log | path marker | prompt eval |
+  |---|---|---|---:|
+  | direct fused | `direct_fused_cli.log` | `path=direct_dotprod` | `12172.83 ms / 4 tok`, `0.33 tok/s` |
+  | explicit LUT fused, before W1 ARM pair | `lut_fused_cli.log` | `path=lut16` | `2022.05 ms / 4 tok`, `1.98 tok/s` |
+  | default fused, before W1 ARM pair | `default_fused_cli.log` | `path=lut16` | `2022.96 ms / 4 tok`, `1.98 tok/s` |
+  | fused off | `fused_off_cli.log` | unfused graph | `245.36 ms / 4 tok`, `16.30 tok/s` |
+  | explicit LUT fused, after W1 ARM pair | `lut_fused_cli_after_w1_pair.log` | `path=lut16` | `1930.98 ms / 4 tok`, `2.07 tok/s` |
+  | explicit LUT fused + timing, after W1 ARM pair | `lut_fused_cli_after_w1_pair_timing.log` | `path=lut16`, `timing path=lut16` | timing markers captured |
+
+- Baseline notes:
+  - The short prompt-only smoke is intentionally small and dominated by graph/model overhead; it is useful for path validation and rough before/after signal, not a stable throughput claim.
+  - `llama-bench` with `--n-prompt 64 --n-gen 32 --repetitions 2` on direct fused was interrupted after running longer than the quick baseline window; `direct_fused.log` is empty and excluded from results.
+  - The tiny smoke shows W1 LUT fused improved from `2022.05 ms` to `1930.98 ms` prompt eval after the ARM mixed-sign pair helper, about `4.5%` lower latency in this path-validation run.
+  - The fused-off prompt-only case is much faster in this tiny setup because it avoids the W1 fused/LUT path and uses the unfused graph; decode-like or dedicated W1 microbench data is still needed before making production routing changes.
+
+## 2026-06-29 — Fairy2i W1 learned-scale fused wide-linear
+
+- 新增 Fairy2i W1 专用 fused op：`GGML_OP_FAIRY2I_WIDE_LINEAR_W1`。
+- W1 graph fusion now follows the default Fairy2i CPU policy; set `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1=0` to force the unfused graph.
+- W1 路径只消费 `U.s0/W.s0`，服务 `tile64_v2_w1_learned_scale`；不使用空 `s1` 兼容 W2。
+- CPU direct 覆盖 scalar/AVX2/AVX512/ARM NEON/dotprod；CPU LUT16 路径复用 tile64 LUT preprocess，并用两次单权重 qgemm 组合 U/W。
+- 回归入口：`test-fairy2i` 的 W1 variant matrix；LUT build 下默认 LUT16 会通过 require-lut 覆盖 W1 LUT。
 
 ## 基线（Baseline）
 
@@ -57,13 +115,14 @@ Status: Draft (2026-03-13)
 
 ### 2026-06-18 (Fairy2i ARM W2 test gates)
 - 新增测试专用环境变量：
-  - `GGML_FAIRY2I_TEST_REQUIRE_LUT=1`：当 `GGML_FAIRY2I_LUT=1` 且 W2 LUT 计划已启用时，如果 LUT compute 返回 false，则测试直接失败，避免静默回落到 direct 路径。
+  - `GGML_FAIRY2I_TEST_REQUIRE_LUT=1`：当 Fairy2i LUT 计划已启用时（默认；除非 `GGML_FAIRY2I_LUT=0`），如果 LUT compute 返回 false，则测试直接失败，避免静默回落到 direct 路径。
   - `GGML_FAIRY2I_TEST_DISABLE_ARM_DOTPROD=1`：在支持 dotprod 的 ARM64 设备上强制 dispatcher 走 NEON fallback，用于覆盖 direct wide-linear-fused 的 NEON 路径。
 - 这两个变量只用于测试/CI 覆盖，不作为生产调优 knob。
 - 新增 debug-only 环境变量：
-  - `GGML_FAIRY2I_CPU_DEBUG=1`：默认关闭；W2 compute 每种 CPU path 首次命中时打印 `path=direct_scalar|direct_neon|direct_dotprod|lut16|lut_c`、`M/N/K/nth` 和 packed-weight 状态。
+  - `GGML_FAIRY2I_CPU_DEBUG=1`：默认关闭；W1/W2 compute 每种 CPU path 首次命中时打印 `path=direct_scalar|direct_avx2|direct_avx512|direct_neon|direct_dotprod|lut16|lut_c`、`M/N/K/nth` 和 packed-weight 状态。
+  - `GGML_FAIRY2I_CPU_TIMING=1`：默认关闭；W1/W2 fused wide-linear 在 CPU 后端上按 op 打印 `path`、`us`、`M/N/K/nth`，用于区分 AVX2 direct 与 LUT decode/prefill 耗时。
   - ARM LUT qgemm 的 `add=true` vector path 首次命中时打印 `path=arm_lut_add_vector`，用于确认 fused four 的追加分支没有回到 scalar add row loop。
-  - 该变量只用于 debug/测试观测，不作为生产调优 knob。
+  - 这些变量只用于 debug/测试观测，不作为生产调优 knob。
 - ARM LUT add follow-up:
   - `ggml_fairy2i_lut_store_tile_arm()` 支持 `add=true`，覆盖 `pack_bf16=true/false` 和 partial tile；`add=false` 仍保持覆盖写。
   - ARM NEON 编译下 `ggml_fairy2i_lut_qgemm_lut16_one()` 不再因为 `add=true` 提前进入 scalar row loop，而是继续走现有 ARM tile qgemm，由 ARM store 处理累加。

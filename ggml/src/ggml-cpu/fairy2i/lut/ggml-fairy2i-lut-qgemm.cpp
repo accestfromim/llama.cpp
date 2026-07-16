@@ -311,35 +311,49 @@ static inline void ggml_fairy2i_lut_accumulate_wtile_arm(const fairy2i_tile64_lu
     const uint8x16_t idx_lo = vandq_u8(packed, mask_4bit);
     const uint8x16_t idx_hi = vandq_u8(vshrq_n_u8(packed, 4), mask_4bit);
 
-    const int8x16_t v_ac_0 = vqtbl1q_s8(ilut_0.val[0], idx_lo);
-    const int8x16_t v_bd_0 = vqtbl1q_s8(ilut_0.val[1], idx_lo);
-    const int8x16_t v_bc_0 = vqtbl1q_s8(ilut_0.val[2], idx_lo);
-    const int8x16_t v_ad_0 = vqtbl1q_s8(ilut_0.val[3], idx_lo);
+    {
+        const int8x16_t v_ac = vqtbl1q_s8(ilut_0.val[0], idx_lo);
+        sum_ac_0             = vaddw_s8(sum_ac_0, vget_low_s8(v_ac));
+        sum_ac_1             = vaddw_s8(sum_ac_1, vget_high_s8(v_ac));
+    }
+    {
+        const int8x16_t v_ac = vqtbl1q_s8(ilut_1.val[0], idx_hi);
+        sum_ac_0             = vaddw_s8(sum_ac_0, vget_low_s8(v_ac));
+        sum_ac_1             = vaddw_s8(sum_ac_1, vget_high_s8(v_ac));
+    }
 
-    const int8x16_t v_ac_1 = vqtbl1q_s8(ilut_1.val[0], idx_hi);
-    const int8x16_t v_bd_1 = vqtbl1q_s8(ilut_1.val[1], idx_hi);
-    const int8x16_t v_bc_1 = vqtbl1q_s8(ilut_1.val[2], idx_hi);
-    const int8x16_t v_ad_1 = vqtbl1q_s8(ilut_1.val[3], idx_hi);
+    {
+        const int8x16_t v_bc = vqtbl1q_s8(ilut_0.val[2], idx_lo);
+        sum_bc_0             = vaddw_s8(sum_bc_0, vget_low_s8(v_bc));
+        sum_bc_1             = vaddw_s8(sum_bc_1, vget_high_s8(v_bc));
+    }
+    {
+        const int8x16_t v_bc = vqtbl1q_s8(ilut_1.val[2], idx_hi);
+        sum_bc_0             = vaddw_s8(sum_bc_0, vget_low_s8(v_bc));
+        sum_bc_1             = vaddw_s8(sum_bc_1, vget_high_s8(v_bc));
+    }
 
-    sum_ac_0 = vaddw_s8(sum_ac_0, vget_low_s8(v_ac_0));
-    sum_ac_1 = vaddw_s8(sum_ac_1, vget_high_s8(v_ac_0));
-    sum_ac_0 = vaddw_s8(sum_ac_0, vget_low_s8(v_ac_1));
-    sum_ac_1 = vaddw_s8(sum_ac_1, vget_high_s8(v_ac_1));
+    {
+        const int8x16_t v_ad = vqtbl1q_s8(ilut_0.val[3], idx_lo);
+        sum_ad_0             = vaddw_s8(sum_ad_0, vget_low_s8(v_ad));
+        sum_ad_1             = vaddw_s8(sum_ad_1, vget_high_s8(v_ad));
+    }
+    {
+        const int8x16_t v_ad = vqtbl1q_s8(ilut_1.val[3], idx_hi);
+        sum_ad_0             = vaddw_s8(sum_ad_0, vget_low_s8(v_ad));
+        sum_ad_1             = vaddw_s8(sum_ad_1, vget_high_s8(v_ad));
+    }
 
-    sum_bc_0 = vaddw_s8(sum_bc_0, vget_low_s8(v_bc_0));
-    sum_bc_1 = vaddw_s8(sum_bc_1, vget_high_s8(v_bc_0));
-    sum_bc_0 = vaddw_s8(sum_bc_0, vget_low_s8(v_bc_1));
-    sum_bc_1 = vaddw_s8(sum_bc_1, vget_high_s8(v_bc_1));
-
-    sum_ad_0 = vaddw_s8(sum_ad_0, vget_low_s8(v_ad_0));
-    sum_ad_1 = vaddw_s8(sum_ad_1, vget_high_s8(v_ad_0));
-    sum_ad_0 = vaddw_s8(sum_ad_0, vget_low_s8(v_ad_1));
-    sum_ad_1 = vaddw_s8(sum_ad_1, vget_high_s8(v_ad_1));
-
-    sum_bd_0 = vaddw_s8(sum_bd_0, vget_low_s8(v_bd_0));
-    sum_bd_1 = vaddw_s8(sum_bd_1, vget_high_s8(v_bd_0));
-    sum_bd_0 = vaddw_s8(sum_bd_0, vget_low_s8(v_bd_1));
-    sum_bd_1 = vaddw_s8(sum_bd_1, vget_high_s8(v_bd_1));
+    {
+        const int8x16_t v_bd = vqtbl1q_s8(ilut_0.val[1], idx_lo);
+        sum_bd_0             = vaddw_s8(sum_bd_0, vget_low_s8(v_bd));
+        sum_bd_1             = vaddw_s8(sum_bd_1, vget_high_s8(v_bd));
+    }
+    {
+        const int8x16_t v_bd = vqtbl1q_s8(ilut_1.val[1], idx_hi);
+        sum_bd_0             = vaddw_s8(sum_bd_0, vget_low_s8(v_bd));
+        sum_bd_1             = vaddw_s8(sum_bd_1, vget_high_s8(v_bd));
+    }
 }
 
 static void ggml_fairy2i_tile64_lut_qgemm_pair_neon(int          m,
