@@ -29,7 +29,7 @@ Additionally, there the following images, similar to the above:
 - `ghcr.io/ggml-org/llama.cpp:light-vulkan`: Same as `light` but compiled with Vulkan support. (platforms: `linux/amd64`)
 - `ghcr.io/ggml-org/llama.cpp:server-vulkan`: Same as `server` but compiled with Vulkan support. (platforms: `linux/amd64`)
 
-The GPU enabled images are not currently tested by CI beyond being built. They are not built with any variation from the ones in the Dockerfiles defined in [.devops/](../.devops/) and the GitHub Action defined in [.github/workflows/docker.yml](../.github/workflows/docker.yml). If you need different settings (for example, a different CUDA, ROCm or MUSA library, you'll need to build the images locally for now).
+The published images listed above are provided by the upstream `ggml-org/llama.cpp` project. This repository keeps the Dockerfiles in [.devops/](../.devops/) but does not publish images through GitHub Actions. Build images locally when you need fork-specific changes or different settings, such as another CUDA, ROCm, or MUSA version.
 
 ## Usage
 
