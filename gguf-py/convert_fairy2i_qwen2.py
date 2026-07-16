@@ -26,10 +26,16 @@ from safetensors import safe_open
 import gguf
 from fairy2i.quant.tile64_v2 import (
     FAIRY2I_TILE64,
+    quantize_linear_to_fairy2i_bundle_v1_stages,
     quantize_linear_to_fairy2i_tile64_v2_stages,
     round_up,
 )
-from fairy2i.spec import Fairy2IMetadata, write_metadata
+from fairy2i.spec import (
+    WEIGHT_LAYOUT_BUNDLE_V1,
+    WEIGHT_LAYOUT_TILE64_V2,
+    Fairy2IMetadata,
+    write_metadata,
+)
 
 
 QWEN2_PRETOKENIZER_HASHES = {
@@ -258,6 +264,12 @@ def main(argv: list[str] | None = None) -> None:
         default="tile64_v2",
         help="Quantization/export variant. tile64_v2 matches the training-side QAT kernel.",
     )
+    parser.add_argument(
+        "--weight-layout",
+        choices=[WEIGHT_LAYOUT_BUNDLE_V1, WEIGHT_LAYOUT_TILE64_V2],
+        default=WEIGHT_LAYOUT_BUNDLE_V1,
+        help="Fairy2i weight storage layout (default: bundle_v1)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
     args = parser.parse_args(argv)
 
@@ -297,6 +309,8 @@ def main(argv: list[str] | None = None) -> None:
     reader = TensorReader(model_dir, weight_map)
 
     writer = gguf.GGUFWriter(str(output_file), arch="fairy2i")
+    if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+        writer.add_custom_alignment(64)
     writer.add_name(config.get("_name_or_path", "Fairy2i-Qwen2"))
     writer.add_context_length(int(config["max_position_embeddings"]))
     writer.add_embedding_length(hidden_complex)
@@ -306,7 +320,11 @@ def main(argv: list[str] | None = None) -> None:
     writer.add_head_count_kv(n_head_kv)
     writer.add_layer_norm_rms_eps(float(config["rms_norm_eps"]))
     writer.add_rope_freq_base(rope_theta)
-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2)
+    writer.add_file_type(
+        gguf.LlamaFileType.MOSTLY_FAIRY2I_BUNDLE_V1
+        if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1
+        else gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2
+    )
     writer.add_vocab_size(int(config["vocab_size"]))
     write_metadata(
         writer,
@@ -318,6 +336,7 @@ def main(argv: list[str] | None = None) -> None:
             tokenizer_profile="qwen2",
             quant_variant=quant_variant,
             residual_steps=args.residual_steps,
+            weight_layout=args.weight_layout,
         ),
     )
 
@@ -342,14 +361,26 @@ def main(argv: list[str] | None = None) -> None:
             print("adding output projection (wide-linear fairy2i)")
         output_out_c = output_w.shape[0] // 2
         output_in_c = output_w.shape[1] // 2
-        output_packed = quantize_linear_to_fairy2i_tile64_v2_stages(output_w, output_out_c, output_in_c)
-        for stage_name, stage_data in output_packed.items():
-            writer.add_tensor(
-                f"output.{stage_name}",
-                stage_data,
-                raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+        if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+            output_codes, output_scales = quantize_linear_to_fairy2i_bundle_v1_stages(
+                output_w, output_out_c, output_in_c
             )
-        del output_packed
+            writer.add_tensor(
+                "output.bundle.codes",
+                output_codes,
+                raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_BUNDLE_CODES,
+            )
+            writer.add_tensor("output.bundle.scales", output_scales)
+            del output_codes, output_scales
+        else:
+            output_packed = quantize_linear_to_fairy2i_tile64_v2_stages(output_w, output_out_c, output_in_c)
+            for stage_name, stage_data in output_packed.items():
+                writer.add_tensor(
+                    f"output.{stage_name}",
+                    stage_data,
+                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+                )
+            del output_packed
 
     if output_layer_mode in ("dense", "both"):
         if verbose:
@@ -402,15 +433,26 @@ def main(argv: list[str] | None = None) -> None:
             out_target = ff_complex_padded if out_c == ff_complex else out_c
             in_target = ff_complex_padded if in_c == ff_complex else in_c
 
-            packed = quantize_linear_to_fairy2i_tile64_v2_stages(w, out_target, in_target)
-            for stage_name, stage_data in packed.items():
+            if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+                codes, scales = quantize_linear_to_fairy2i_bundle_v1_stages(w, out_target, in_target)
                 writer.add_tensor(
-                    f"blk.{il}.{gguf_base}.{stage_name}",
-                    stage_data,
-                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+                    f"blk.{il}.{gguf_base}.bundle.codes",
+                    codes,
+                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_BUNDLE_CODES,
                 )
+                writer.add_tensor(f"blk.{il}.{gguf_base}.bundle.scales", scales)
+                del codes, scales
+            else:
+                packed = quantize_linear_to_fairy2i_tile64_v2_stages(w, out_target, in_target)
+                for stage_name, stage_data in packed.items():
+                    writer.add_tensor(
+                        f"blk.{il}.{gguf_base}.{stage_name}",
+                        stage_data,
+                        raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+                    )
+                del packed
 
-            del w, packed
+            del w
             gc.collect()
 
         if export_attn_bias:

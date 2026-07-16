@@ -4,6 +4,7 @@ import pytest
 
 from fairy2i.spec import (
     QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE,
+    WEIGHT_LAYOUT_TILE64_V2,
     Fairy2IMetadata,
     SCALE_SOURCE_LEARNED,
     write_metadata,
@@ -38,7 +39,7 @@ def test_write_tile64_v2_metadata() -> None:
         ),
     )
 
-    assert writer.values["fairy2i.schema_version"] == 1
+    assert writer.values["fairy2i.schema_version"] == 2
     assert writer.values["fairy2i.base_arch"] == "llama"
     assert writer.values["fairy2i.quant.format"] == "fairy2i_tile64_v2"
     assert writer.values["fairy2i.quant.variant"] == "tile64_v2"
@@ -46,6 +47,26 @@ def test_write_tile64_v2_metadata() -> None:
     assert writer.values["fairy2i.attn.layout"] == "llama_real"
     assert writer.values["fairy2i.tokenizer.profile"] == "llama_bpe"
     assert writer.values["fairy2i.vocab.padding_multiple"] == 128
+    assert writer.values["fairy2i.weight.layout"] == "bundle_m64k64_v1"
+    assert writer.values["fairy2i.weight.scale_scope"] == "m64_k64"
+    assert writer.values["fairy2i.weight.code_order"] == "m16_q4_branch_lane"
+    assert writer.values["fairy2i.weight.branch_order"] == "U0,U1,W0,W1"
+
+
+def test_write_legacy_tile64_v2_layout_metadata() -> None:
+    writer = RecordingWriter()
+    write_metadata(
+        writer,  # type: ignore[arg-type]
+        Fairy2IMetadata(
+            base_arch="llama",
+            attn_layout="llama_real",
+            tokenizer_profile="llama_bpe",
+            weight_layout=WEIGHT_LAYOUT_TILE64_V2,
+        ),
+    )
+
+    assert writer.values["fairy2i.schema_version"] == 1
+    assert "fairy2i.weight.layout" not in writer.values
 
 
 def test_rejects_non_fairy2i_quant_schema() -> None:
@@ -99,6 +120,7 @@ def test_write_tile64_v2_w1_learned_scale_metadata() -> None:
     assert writer.values["fairy2i.quant.scale_source"] == "learned"
     assert writer.values["fairy2i.quant.tile_size"] == 64
     assert "fairy2i.quant.scale_stat" not in writer.values
+    assert writer.values["fairy2i.weight.branch_order"] == "U0,W0"
 
 
 def test_rejects_wrong_w1_residual_steps() -> None:

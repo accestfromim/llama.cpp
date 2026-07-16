@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .arch.registry import detect_arch_info, get_arch_info
 from .spec import QUANT_VARIANT_TILE64_V2, QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE
+from .spec import WEIGHT_LAYOUT_BUNDLE_V1, WEIGHT_LAYOUT_TILE64_V2
 
 
 def _dispatch_args(args: argparse.Namespace, base_arch: str) -> list[str]:
@@ -21,6 +22,7 @@ def _dispatch_args(args: argparse.Namespace, base_arch: str) -> list[str]:
         script_args.append("--qk-permute")
     if args.residual_steps is not None:
         script_args.extend(["--residual-steps", str(args.residual_steps)])
+    script_args.extend(["--weight-layout", args.weight_layout])
 
     if base_arch == "qwen2":
         if args.output_file is None:
@@ -45,6 +47,11 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
     )
     parser.add_argument("--residual-steps", type=int)
+    parser.add_argument(
+        "--weight-layout",
+        choices=[WEIGHT_LAYOUT_BUNDLE_V1, WEIGHT_LAYOUT_TILE64_V2],
+        default=WEIGHT_LAYOUT_BUNDLE_V1,
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs without writing GGUF")
     parser.add_argument("--qk-permute", action="store_true", help="Enable Llama q/k undo-permute when supported")
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
