@@ -19,6 +19,97 @@ and `fairy2i.attn.layout=qwen3_real`. It contains Qwen3 `attn_q_norm` and
 `attn_k_norm` tensors, so the current complete graph is slower than an older
 incomplete path that did not account for those nodes.
 
+## 2026-07-16 W2 W64-scale expansion sweep
+
+This sweep migrated the W1 32-row expansion strategy to the four-weight W2
+prefill path. Measurements used the W2 7B model with Metal source compilation,
+`-ngl 99 -t 8 -p 256 -n 0`, and the W64-scale path enabled. The original W2
+W64-scale `8x16/K8` implementation measured `82.00 +/- 0.10 tok/s`.
+
+### Output-row tile sweep
+
+The first sweep only enlarged the output-row tile. Weight codes were still
+loaded repeatedly while constructing each 8-wide coefficient tile.
+
+| row x column tile | K tile | pp256 tok/s |
+|---:|---:|---:|
+| `16x16` | 8 | `94.50 +/- 0.02` |
+| `32x16` | 8 | `99.57 +/- 0.12` |
+| `64x16` | 8 | `95.94 +/- 0.22` |
+
+The 32-row tile was the best balance. The 64-row tile increased thread count,
+threadgroup storage, and live state enough to lose performance.
+
+### Packed weight-code preload
+
+Each thread now loads its assigned bytes from `U.s0`, `U.s1`, `W.s0`, and
+`W.s1` once per W64 block. Two `uint4` values retain the codes for the two
+output rows owned by that thread; shifts extract successive 2-bit K positions.
+The four coefficient matrices remain FP32 while being formed and are converted
+to FP16 only when staged for the hardware MMA operation.
+
+| row x column tile | K tile | pp256 tok/s |
+|---:|---:|---:|
+| `16x16` | 8 | `138.79 +/- 0.69` |
+| `32x16` | 8 | `150.08 +/- 0.33` |
+| `64x16` | 8 | `142.92 +/- 0.25` |
+
+This is the main gain: the selected `32x16/K8` path is about 83% faster than
+the original `8x16/K8` W64-scale path.
+
+### K tile and layout sweep
+
+An initial generic implementation stored coefficient matrices with a
+`k_tile` stride. It regressed K8/K16/K32 to `124.18`, `125.00`, and
+`123.47 tok/s`. Storing every 8x8 MMA coefficient block contiguously restored
+performance.
+
+| row x column tile | K tile | pp256 tok/s | decision |
+|---:|---:|---:|---|
+| `32x16` | 8 | `148.57 +/- 1.92`; repeat `150.09 +/- 0.22` | keep |
+| `32x16` | 16 | `151.82 +/- 0.53`; reverse-order repeat `149.89 +/- 2.33` | no stable gain |
+| `32x16` | 32 | `149.00 +/- 1.35` | remove |
+| `32x16` | 64 | `119.74 +/- 0.13` | remove |
+
+K64 expands coefficient staging to 16 KiB and keeps eight MMA substeps in one
+unrolled live range. Its register/instruction-window cost dominates the saved
+barriers. K16 did not reproduce a gain over K8, so the smaller and more stable
+K8 tile is retained.
+
+### Negative variants
+
+| variant | pp256 tok/s | conclusion |
+|---|---:|---|
+| FP16 coefficient construction, `16x16/K8` | `128.58 +/- 5.76` | slower |
+| FP16 coefficient construction, `32x16/K8` | `134.53 +/- 0.79` | slower |
+| FP16 coefficient construction, `64x16/K8` | `127.86 +/- 0.14` | slower |
+| SIMD-local activation copies, `32x16/K8` | `107.21 +/- 0.09` | remove |
+
+The SIMD-local variant removed threadgroup-wide barriers by giving each of the
+four SIMD groups a private activation tile. It was compared with the ordinary
+path at about `125.53 tok/s` in the same thermally throttled period and was
+still roughly 15% slower. Re-reading activation four times costs more than the
+barriers saved, so activation remains cooperatively loaded and shared.
+
+Sustained later runs thermally throttled the M4 from about 150 to 125 tok/s.
+Those absolute hot-state values are not mixed into the cold tile ranking above.
+Temporary K/SIMD-local dispatch variables and losing shader instances were
+removed after the sweep. The retained W2 W64-scale default is `32x16/K8`.
+For direct comparison, `GGML_METAL_FAIRY2I_W2_PREFILL_ROWS=8|16|32` selects
+the W2 row tile; unset or invalid values use 32. This switch does not affect W1.
+An adjacent hot-state rerun after retaining the selector measured `83.61 +/-
+0.06`, `118.14 +/- 0.37`, and `124.91 +/- 0.09 tok/s` respectively. The
+absolute values were thermally limited, but the ordering remained clear.
+
+The final Shader Profiler capture is
+`/private/tmp/fairy-prefill-w2-row32-k8-final-20260716.trace`. In the hot-state
+capture, the main prefill frame contained 165 compute intervals with
+`1967.929 ms` union time and a `1981.409 ms` span. Shader Profiler identified
+165 dispatches of
+`kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16`; it was the dominant
+sampled shader. This trace is for structural inspection rather than cold-state
+throughput comparison.
+
 ## Prefill kernels
 
 ### W2 prefill
