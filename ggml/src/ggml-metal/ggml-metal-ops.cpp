@@ -79,7 +79,7 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_bundle_w1_decode_fc
                                                                                  int32_t              blocks,
                                                                                  int32_t              x_nb0,
                                                                                  int32_t              dst_nb0) {
-    const char * base = "kernel_fairy2i_bundle_w1_bf16_tile8x1_w8_full_nobias_fc_simd";
+    const char * base = "kernel_fairy2i_bundle_w1_bf16_tile8x1_sg2_full_nobias_fc";
     char         name[256];
 
     snprintf(name, sizeof(name), "%s_blocks=%d_xnb0=%d_dstnb0=%d", base, blocks, x_nb0, dst_nb0);
@@ -1949,8 +1949,10 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
         }
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 0);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 1);
+        if (!is_bundle || !use_fc_decode) {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 0);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 1);
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, (m + rows_per_tile - 1) / rows_per_tile, 1, 1, nth, 1, 1);
         return 1;
     }
