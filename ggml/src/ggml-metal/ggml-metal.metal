@@ -5299,10 +5299,17 @@ kernel void kernel_mul_mv_f16_f16_4_k4096_r1_nsg8(
     device const half4 * xb4 = x4 + vector_index;
     device const half4 * yb4 = y4 + vector_index;
 
-    float sumf[1] = { 0.0f };
+    half4 yl4[nf4];
     FOR_UNROLL (short i = 0; i < nf4; ++i) {
-        sumf[0] += dot(float4(xb4[i]), float4(yb4[i]));
+        yl4[i] = yb4[i];
     }
+
+    float sumf[1] = { 0.0f };
+    float sumq = 0.0f;
+    FOR_UNROLL (short i = 0; i < nf4; ++i) {
+        sumq += dot(float4(xb4[i]), float4(yl4[i]));
+    }
+    sumf[0] += sumq;
 
     device float * dst_f32 =
         (device float *) dst + (uint64_t) im * args.ne0 * args.ne1 + (uint64_t) r1 * args.ne0;
