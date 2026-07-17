@@ -17,6 +17,7 @@ Environment:
   FLASH_ATTN       Flash Attention 0/1 (default: 1)
   MMAP             mmap 0/1 (default: 1)
   XCTRACE_TEMPLATE optional xctrace template name/path; records PREFIX.trace
+  XCTRACE_WINDOW   optional trailing trace window, for example 1s
   COOLDOWN_SECONDS minimum interval after the preceding test (default/minimum: 60)
   COOLDOWN_STATE   shared cooldown state directory
 
@@ -46,6 +47,7 @@ n_gpu_layers=${N_GPU_LAYERS:-99}
 flash_attn=${FLASH_ATTN:-1}
 use_mmap=${MMAP:-1}
 profile_template=${XCTRACE_TEMPLATE:-}
+profile_window=${XCTRACE_WINDOW:-}
 cooldown_seconds=${COOLDOWN_SECONDS:-60}
 state_dir=${COOLDOWN_STATE:-/tmp/fairy2i-metal-bench-cooldown}
 
@@ -139,6 +141,7 @@ start_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf 'flash_attn=%s\n' "$flash_attn"
     printf 'mmap=%s\n' "$use_mmap"
     printf 'xctrace_template=%s\n' "$profile_template"
+    printf 'xctrace_window=%s\n' "$profile_window"
     printf 'cooldown_seconds=%s\n' "$cooldown_seconds"
     printf 'start_epoch=%s\n' "$start_epoch"
     printf 'start_utc=%s\n' "$start_iso"
@@ -152,12 +155,15 @@ echo "benchmark: mode=$mode repetitions=$repetitions tag=$tag" >&2
 echo "artifacts: $prefix.{json,stderr.log,meta}" >&2
 if [[ -n $profile_template ]]; then
     echo "profile: template=$profile_template trace=$prefix.trace" >&2
-    xcrun xctrace record \
+    xctrace_command=(xcrun xctrace record \
         --template "$profile_template" \
         --output "$prefix.trace" \
-        --no-prompt \
-        --target-stdout "$prefix.json" \
-        --launch -- "${command[@]}" \
+        --no-prompt)
+    if [[ -n $profile_window ]]; then
+        xctrace_command+=(--window "$profile_window")
+    fi
+    xctrace_command+=(--target-stdout "$prefix.json" --launch -- "${command[@]}")
+    "${xctrace_command[@]}" \
         > >(tee "$prefix.xctrace.log") \
         2> >(tee "$prefix.stderr.log" >&2)
 else
