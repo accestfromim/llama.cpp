@@ -34,6 +34,16 @@ static bool llama_fairy2i_fused_wide_linear_w2_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
+static bool llama_backend_dev_is_metal(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+    const char *       reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    return reg_name && strcmp(reg_name, "Metal") == 0;
+}
+
 enum llama_fairy2i_env_policy {
     LLAMA_FAIRY2I_ENV_POLICY_AUTO,
     LLAMA_FAIRY2I_ENV_POLICY_DISABLED,
@@ -4864,10 +4874,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (fairy2i_is_bundle) {
                             const ggml_backend_dev_t target_dev =
                                 bid >= 0 ? pimpl->dev_layer.at(bid).dev : pimpl->dev_output.dev;
-                            if (!target_dev || ggml_backend_dev_type(target_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            const bool target_dev_is_cpu =
+                                target_dev && ggml_backend_dev_type(target_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                            const bool target_dev_is_metal = llama_backend_dev_is_metal(target_dev);
+                            if (!target_dev_is_cpu && !(fairy2i_is_w1 && target_dev_is_metal)) {
                                 throw std::runtime_error(
-                                    format("FAIRY2I bundle_v1 tensor %s is CPU-LUT-only; disable layer offload",
-                                           (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str()));
+                                    format("FAIRY2I bundle_v1 tensor %s requires CPU-LUT or W1 Metal, got %s",
+                                           (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str(),
+                                           target_dev ? ggml_backend_dev_name(target_dev) : "no device"));
                             }
 
                             reject_fairy2i_tensor(tensor, "U.s0", bid, "bundle_v1");
@@ -14437,6 +14451,7 @@ struct llm_build_fairy2i : public llm_graph_context {
             ggml_backend_dev_t target_dev = il >= 0 ? model.dev_layer(il) : model.dev_output();
             const bool         target_dev_is_cpu =
                 target_dev && ggml_backend_dev_type(target_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            const bool target_dev_is_metal = llama_backend_dev_is_metal(target_dev);
 
             if (linear.bundle_codes || linear.bundle_scales) {
                 GGML_ASSERT(linear.bundle_codes && linear.bundle_scales);
@@ -14444,11 +14459,12 @@ struct llm_build_fairy2i : public llm_graph_context {
                 if (!loras->empty()) {
                     throw std::runtime_error("FAIRY2I bundle_v1 does not support LoRA adapters");
                 }
-                if (!target_dev_is_cpu) {
-                    throw std::runtime_error("FAIRY2I bundle_v1 is CPU-LUT-only; disable layer offload");
+                const bool is_w1 = linear.branch_count == 2;
+                if (!target_dev_is_cpu && !(is_w1 && target_dev_is_metal)) {
+                    throw std::runtime_error(format("FAIRY2I bundle_v1 requires CPU-LUT or W1 Metal, got %s",
+                                                    target_dev ? ggml_backend_dev_name(target_dev) : "no device"));
                 }
 
-                const bool   is_w1 = linear.branch_count == 2;
                 const char * env_name =
                     is_w1 ? "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1" : "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2";
                 if (llama_fairy2i_env_policy_from_env(env_name) == LLAMA_FAIRY2I_ENV_POLICY_DISABLED) {

@@ -200,6 +200,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                     res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
                 }
             } break;
+        case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
             {
                 res += ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(tensor);

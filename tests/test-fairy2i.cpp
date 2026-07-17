@@ -2009,10 +2009,16 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
                                       const std::vector<block_fairy2i_tile64_v2> * u_s1_data,
                                       const std::vector<block_fairy2i_tile64_v2> & w_s0_data,
                                       const std::vector<block_fairy2i_tile64_v2> * w_s1_data,
-                                      const std::vector<float> &                   bias_data) {
-    const bool is_w1 = u_s1_data == nullptr && w_s1_data == nullptr;
+                                      const std::vector<float> &                   bias_data,
+                                      const fairy2i_bundle_data *                  bundle_data = nullptr) {
+    const bool is_w1     = u_s1_data == nullptr && w_s1_data == nullptr;
+    const bool is_bundle = bundle_data != nullptr;
     if (!is_w1 && (!u_s1_data || !w_s1_data)) {
         fprintf(stderr, "invalid Fairy2i Metal test weight set\n");
+        return false;
+    }
+    if (is_bundle && !is_w1) {
+        fprintf(stderr, "invalid Fairy2i Metal bundle test weight set\n");
         return false;
     }
 
@@ -2034,14 +2040,25 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
         return false;
     }
 
-    ggml_tensor * x    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tc.K, tc.N);
-    ggml_tensor * u_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
-    ggml_tensor * u_s1 = is_w1 ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
-    ggml_tensor * w_s0 = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
-    ggml_tensor * w_s1 = is_w1 ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    const int64_t physical_tiles = (tc.M / 64) * (tc.K / 64);
+    ggml_tensor * x              = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * codes = is_bundle ? ggml_new_tensor_4d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, bundle_data->branches,
+                                                         64, physical_tiles) :
+                                      nullptr;
+    ggml_tensor * scales =
+        is_bundle ? ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, bundle_data->branches, physical_tiles) : nullptr;
+    ggml_tensor * u_s0 = is_bundle ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * u_s1 =
+        is_bundle || is_w1 ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s0 = is_bundle ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s1 =
+        is_bundle || is_w1 ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
     ggml_tensor * bias = tc.bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tc.M) : nullptr;
-    ggml_tensor * y    = ggml_fairy2i_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
-    ggml_set_name(y, is_w1 ? "fairy2i_metal_wide_linear_w1" : "fairy2i_metal_wide_linear_w2");
+    ggml_tensor * y    = is_bundle ? ggml_fairy2i_wide_linear_w1_bundle(ctx, x, codes, scales, bias, tc.M, tc.K) :
+                                     ggml_fairy2i_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
+    ggml_set_name(y, is_bundle ? "fairy2i_metal_bundle_w1" :
+                     is_w1     ? "fairy2i_metal_wide_linear_w1" :
+                                 "fairy2i_metal_wide_linear_w2");
 
     if (!ggml_backend_supports_op(backend, y)) {
         fprintf(stderr, "Metal does not support Fairy2i W%d M=%lld N=%lld K=%lld\n", is_w1 ? 1 : 2, (long long) tc.M,
@@ -2063,9 +2080,15 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
     }
 
     ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
-    ggml_backend_tensor_set(u_s0, u_s0_data.data(), 0, u_s0_data.size() * sizeof(block_fairy2i_tile64_v2));
-    ggml_backend_tensor_set(w_s0, w_s0_data.data(), 0, w_s0_data.size() * sizeof(block_fairy2i_tile64_v2));
-    if (!is_w1) {
+    if (is_bundle) {
+        ggml_backend_tensor_set(codes, bundle_data->codes.data(), 0, bundle_data->codes.size());
+        ggml_backend_tensor_set(scales, bundle_data->scales.data(), 0,
+                                bundle_data->scales.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(u_s0, u_s0_data.data(), 0, u_s0_data.size() * sizeof(block_fairy2i_tile64_v2));
+        ggml_backend_tensor_set(w_s0, w_s0_data.data(), 0, w_s0_data.size() * sizeof(block_fairy2i_tile64_v2));
+    }
+    if (!is_bundle && !is_w1) {
         ggml_backend_tensor_set(u_s1, u_s1_data->data(), 0, u_s1_data->size() * sizeof(block_fairy2i_tile64_v2));
         ggml_backend_tensor_set(w_s1, w_s1_data->data(), 0, w_s1_data->size() * sizeof(block_fairy2i_tile64_v2));
     }
@@ -2073,7 +2096,8 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
         ggml_backend_tensor_set(bias, bias_data.data(), 0, bias_data.size() * sizeof(float));
     }
 
-    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    const bool        direct_bundle = !is_bundle || (codes->extra == nullptr && scales->extra == nullptr);
+    const ggml_status status        = ggml_backend_graph_compute(backend, gf);
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "Fairy2i Metal W%d graph compute failed: %s\n", is_w1 ? 1 : 2, ggml_status_to_string(status));
         ggml_backend_buffer_free(buf);
@@ -2082,6 +2106,13 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
         return false;
     }
     ggml_backend_synchronize(backend);
+    if (!direct_bundle || (is_bundle && (codes->extra != nullptr || scales->extra != nullptr))) {
+        fprintf(stderr, "Fairy2i Metal bundle unexpectedly allocated a repacked weight copy\n");
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
 
     std::vector<float> out_f32((size_t) tc.M * (size_t) tc.N);
     ggml_backend_tensor_get(y, out_f32.data(), 0, out_f32.size() * sizeof(float));
@@ -2134,6 +2165,26 @@ static bool test_fairy2i_metal_wide_linear() {
         std::vector<uint32_t> metal;
         if (!run_fairy2i_metal_backend(metal, dev, tc, data.x, data.u_s0, nullptr, data.w_s0, nullptr, data.bias) ||
             !compare_packed_complex("Fairy2i Metal W1", metal, ref, 1e-2f)) {
+            return false;
+        }
+    }
+
+    const std::vector<fairy2i_w2_case> bundle_w1_cases = {
+        { 128, 1,  256, false },
+        { 64,  1,  128, true  },
+        { 64,  17, 128, true  },
+    };
+    for (const fairy2i_w2_case & tc : bundle_w1_cases) {
+        fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+        make_fairy2i_weights_bundle_compatible(data.u_s0, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(data.w_s0, tc.M, tc.K);
+        const fairy2i_bundle_data   bundle = pack_fairy2i_bundle({ &data.u_s0, &data.w_s0 }, tc.M, tc.K);
+        const std::vector<uint32_t> ref    = fairy2i_w1_scalar_reference(tc, data);
+
+        std::vector<uint32_t> metal;
+        if (!run_fairy2i_metal_backend(metal, dev, tc, data.x, data.u_s0, nullptr, data.w_s0, nullptr, data.bias,
+                                       &bundle) ||
+            !compare_packed_complex("Fairy2i Metal bundle W1", metal, ref, 1e-2f)) {
             return false;
         }
     }
