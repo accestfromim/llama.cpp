@@ -13,6 +13,8 @@ Environment:
   THREADS          host threads (default: 8)
   BATCH            logical batch size (default: 2048)
   UBATCH           physical batch size (default: 512)
+  N_PROMPT         pp prompt tokens (default: 512)
+  N_GEN            tg generated tokens (default: 128)
   N_GPU_LAYERS     GPU layers (default: 99)
   FLASH_ATTN       Flash Attention 0/1 (default: 1)
   MMAP             mmap 0/1 (default: 1)
@@ -43,6 +45,8 @@ repetitions=${REPS:-5}
 threads=${THREADS:-8}
 batch=${BATCH:-2048}
 ubatch=${UBATCH:-512}
+n_prompt=${N_PROMPT:-512}
+n_gen=${N_GEN:-128}
 n_gpu_layers=${N_GPU_LAYERS:-99}
 flash_attn=${FLASH_ATTN:-1}
 use_mmap=${MMAP:-1}
@@ -105,9 +109,9 @@ if [[ -f $last_end_file ]]; then
     fi
 fi
 
-workload=(--n-prompt 512 --n-gen 0)
+workload=(--n-prompt "$n_prompt" --n-gen 0)
 if [[ $mode == tg ]]; then
-    workload=(--n-prompt 0 --n-gen 128)
+    workload=(--n-prompt 0 --n-gen "$n_gen")
 fi
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -137,6 +141,8 @@ start_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     printf 'threads=%s\n' "$threads"
     printf 'batch=%s\n' "$batch"
     printf 'ubatch=%s\n' "$ubatch"
+    printf 'n_prompt=%s\n' "$n_prompt"
+    printf 'n_gen=%s\n' "$n_gen"
     printf 'n_gpu_layers=%s\n' "$n_gpu_layers"
     printf 'flash_attn=%s\n' "$flash_attn"
     printf 'mmap=%s\n' "$use_mmap"
