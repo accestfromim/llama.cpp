@@ -25,6 +25,13 @@ BRANCH_SUFFIXES_BY_ORDER = {
 }
 
 
+def v2_bases_for_bundle(base: str) -> tuple[str, ...]:
+    if base.endswith(".attn_qkv"):
+        prefix = base[: -len("attn_qkv")]
+        return (prefix + "attn_q", prefix + "attn_k", prefix + "attn_v")
+    return (base,)
+
+
 def field_value(reader: gguf.GGUFReader, name: str) -> object:
     field = reader.fields.get(name)
     if field is None:
@@ -158,54 +165,68 @@ def validate_layout(v2_path: Path, bundle_path: Path) -> dict[str, object]:
         if scales.tensor_type != gguf.GGMLQuantizationType.F16:
             raise ValueError(f"invalid bundle scale type: {base}")
 
-        branch_tensors = []
-        for suffix in branch_suffixes:
-            tensor = v2_tensors.get(base + suffix)
-            if tensor is None or tensor.tensor_type != gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2:
-                raise ValueError(f"missing V2 branch: {base}{suffix}")
-            branch_tensors.append(tensor)
+        components: list[tuple[str, list[gguf.ReaderTensor], int, int]] = []
+        logical_k = 0
+        for source_base in v2_bases_for_bundle(base):
+            branch_tensors = []
+            for suffix in branch_suffixes:
+                tensor = v2_tensors.get(source_base + suffix)
+                if tensor is None or tensor.tensor_type != gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2:
+                    raise ValueError(f"missing V2 branch: {source_base}{suffix}")
+                branch_tensors.append(tensor)
 
-        logical_k, logical_m = (int(value) for value in branch_tensors[0].shape)
-        if logical_m % 64 != 0 or logical_k % 64 != 0:
-            raise ValueError(f"invalid V2 logical shape for {base}: M={logical_m}, K={logical_k}")
-        if any(
-            tuple(int(value) for value in tensor.shape) != (logical_k, logical_m) for tensor in branch_tensors
-        ):
-            raise ValueError(f"V2 branch shape mismatch: {base}")
+            component_k, component_m = (int(value) for value in branch_tensors[0].shape)
+            if component_m % 64 != 0 or component_k % 64 != 0:
+                raise ValueError(
+                    f"invalid V2 logical shape for {source_base}: M={component_m}, K={component_k}"
+                )
+            if any(
+                tuple(int(value) for value in tensor.shape) != (component_k, component_m)
+                for tensor in branch_tensors
+            ):
+                raise ValueError(f"V2 branch shape mismatch: {source_base}")
+            if logical_k and component_k != logical_k:
+                raise ValueError(f"merged bundle K mismatch: {base} has {logical_k} and {component_k}")
+            logical_k = component_k
+            components.append((source_base, branch_tensors, component_m, component_k))
 
         k_blocks = logical_k // 64
-        physical_tiles = (logical_m // 64) * k_blocks
+        physical_tiles = sum((component_m // 64) * k_blocks for _, _, component_m, _ in components)
         if tuple(int(value) for value in codes.shape) != (16, branch_count, 64, physical_tiles):
             raise ValueError(f"invalid bundle code shape: {base} {tuple(codes.shape)}")
         if tuple(int(value) for value in scales.shape) != (2, branch_count, physical_tiles):
             raise ValueError(f"invalid bundle scale shape: {base} {tuple(scales.shape)}")
 
         canonical_hash.update(base.encode("utf-8"))
-        for mb in range(logical_m // 64):
-            tile_slice = slice(mb * k_blocks, (mb + 1) * k_blocks)
-            for branch, (suffix, v2_tensor) in enumerate(zip(branch_suffixes, branch_tensors)):
-                stage = np.asarray(v2_tensor.data).reshape(logical_m, k_blocks, 20)[
-                    mb * 64 : (mb + 1) * 64
-                ]
-                expected_codes = v2_strip_to_bundle_codes(stage)
-                actual_codes = np.asarray(codes.data[tile_slice, :, branch, :])
-                if not np.array_equal(expected_codes, actual_codes):
-                    raise ValueError(f"canonical code mismatch: {base}{suffix} M64 tile {mb}")
+        tile_offset = 0
+        for source_base, branch_tensors, component_m, _ in components:
+            for mb in range(component_m // 64):
+                tile_slice = slice(tile_offset, tile_offset + k_blocks)
+                for branch, (suffix, v2_tensor) in enumerate(zip(branch_suffixes, branch_tensors)):
+                    stage = np.asarray(v2_tensor.data).reshape(component_m, k_blocks, 20)[
+                        mb * 64 : (mb + 1) * 64
+                    ]
+                    expected_codes = v2_strip_to_bundle_codes(stage)
+                    actual_codes = np.asarray(codes.data[tile_slice, :, branch, :])
+                    if not np.array_equal(expected_codes, actual_codes):
+                        raise ValueError(f"canonical code mismatch: {source_base}{suffix} M64 tile {mb}")
 
-                expected_scales = v2_strip_scales(stage, base, suffix, mb)
-                actual_scales = np.asarray(scales.data[tile_slice, branch, :])
-                if not np.array_equal(expected_scales.view(np.uint16), actual_scales.view(np.uint16)):
-                    raise ValueError(f"canonical scale mismatch: {base}{suffix} M64 tile {mb}")
+                    expected_scales = v2_strip_scales(stage, source_base, suffix, mb)
+                    actual_scales = np.asarray(scales.data[tile_slice, branch, :])
+                    if not np.array_equal(expected_scales.view(np.uint16), actual_scales.view(np.uint16)):
+                        raise ValueError(f"canonical scale mismatch: {source_base}{suffix} M64 tile {mb}")
 
-                canonical_hash.update(expected_codes)
-                canonical_hash.update(expected_scales.view(np.uint8))
+                    canonical_hash.update(expected_codes)
+                    canonical_hash.update(expected_scales.view(np.uint8))
+                tile_offset += k_blocks
 
-        v2_weight_bytes += sum(tensor.n_bytes for tensor in branch_tensors)
+        v2_weight_bytes += sum(tensor.n_bytes for _, tensors, _, _ in components for tensor in tensors)
         bundle_weight_bytes += codes.n_bytes + scales.n_bytes
 
     expected_v2_layout = {
-        base + suffix
+        source_base + suffix
         for base in bundle_bases
+        for source_base in v2_bases_for_bundle(base)
         for suffix in branch_suffixes
     }
     actual_v2_layout = {name for name in v2_tensors if name.endswith(branch_suffixes)}

@@ -5006,11 +5006,36 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
                         layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), { n_embd_gqa }, TENSOR_NOT_REQUIRED);
                         layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), { n_embd_gqa }, TENSOR_NOT_REQUIRED);
+                        layer.bqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", i), { 2 * (n_embd + n_embd_gqa) },
+                                                   TENSOR_NOT_REQUIRED);
                         layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
 
-                        create_fairy2i_linear(layer.wq_fairy2i, LLM_TENSOR_ATTN_Q, i, n_embd, n_embd, 0);
-                        create_fairy2i_linear(layer.wk_fairy2i, LLM_TENSOR_ATTN_K, i, n_embd, n_embd_gqa / 2, 0);
-                        create_fairy2i_linear(layer.wv_fairy2i, LLM_TENSOR_ATTN_V, i, n_embd, n_embd_gqa / 2, 0);
+                        if (fairy2i_is_bundle && fairy2i_is_w1 && fairy2i_is_qwen3) {
+                            create_fairy2i_linear(layer.wqkv_fairy2i, LLM_TENSOR_ATTN_QKV, i, n_embd,
+                                                  n_embd + n_embd_gqa, TENSOR_NOT_REQUIRED);
+                        }
+
+                        const bool has_merged_qkv = fairy2i_linear_complete(layer.wqkv_fairy2i);
+                        if (has_merged_qkv) {
+                            if (layer.bq || layer.bk || layer.bv) {
+                                throw std::runtime_error(
+                                    format("FAIRY2I merged QKV layer %d cannot contain separate Q/K/V biases", i));
+                            }
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_Q, "bundle.codes", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_Q, "bundle.scales", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_K, "bundle.codes", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_K, "bundle.scales", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_V, "bundle.codes", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_V, "bundle.scales", i, "merged QKV");
+                        } else {
+                            if (layer.bqkv) {
+                                throw std::runtime_error(
+                                    format("FAIRY2I layer %d has an attn_qkv bias without merged QKV weights", i));
+                            }
+                            create_fairy2i_linear(layer.wq_fairy2i, LLM_TENSOR_ATTN_Q, i, n_embd, n_embd, 0);
+                            create_fairy2i_linear(layer.wk_fairy2i, LLM_TENSOR_ATTN_K, i, n_embd, n_embd_gqa / 2, 0);
+                            create_fairy2i_linear(layer.wv_fairy2i, LLM_TENSOR_ATTN_V, i, n_embd, n_embd_gqa / 2, 0);
+                        }
                         create_fairy2i_linear(layer.wo_fairy2i, LLM_TENSOR_ATTN_OUT, i, n_embd, n_embd, 0);
                         create_fairy2i_linear(layer.ffn_gate_fairy2i, LLM_TENSOR_FFN_GATE, i, n_embd, n_ff, 0);
                         create_fairy2i_linear(layer.ffn_up_fairy2i, LLM_TENSOR_FFN_UP, i, n_embd, n_ff, 0);
@@ -14537,9 +14562,28 @@ struct llm_build_fairy2i : public llm_graph_context {
 
             ggml_tensor * cur_conj = build_complex_conj(cur, il, "attn_norm_conj");
 
-            ggml_tensor * Qcur = build_wide_linear(model.layers[il].wq_fairy2i, cur, cur_conj, model.layers[il].bq, il, "Qcur");
-            ggml_tensor * Kcur = build_wide_linear(model.layers[il].wk_fairy2i, cur, cur_conj, model.layers[il].bk, il, "Kcur");
-            ggml_tensor * Vcur = build_wide_linear(model.layers[il].wv_fairy2i, cur, cur_conj, model.layers[il].bv, il, "Vcur");
+            ggml_tensor * Qcur;
+            ggml_tensor * Kcur;
+            ggml_tensor * Vcur;
+            if (model.layers[il].wqkv_fairy2i.bundle_codes) {
+                ggml_tensor * qkv  = build_wide_linear(model.layers[il].wqkv_fairy2i, cur, cur_conj,
+                                                       model.layers[il].bqkv, il, "QKVcur");
+                const int64_t q_m  = hparams.n_embd;
+                const int64_t kv_m = hparams.n_embd_v_gqa(il) / 2;
+                GGML_ASSERT(qkv->ne[0] == q_m + 2 * kv_m);
+                GGML_ASSERT(qkv->ne[1] == n_tokens && qkv->ne[2] == 1 && qkv->ne[3] == 1);
+
+                Qcur = ggml_view_2d(ctx0, qkv, q_m, n_tokens, qkv->nb[1], 0);
+                Kcur = ggml_view_2d(ctx0, qkv, kv_m, n_tokens, qkv->nb[1], q_m * qkv->nb[0]);
+                Vcur = ggml_view_2d(ctx0, qkv, kv_m, n_tokens, qkv->nb[1], (q_m + kv_m) * qkv->nb[0]);
+                cb(Qcur, "Qcur_view", il);
+                cb(Kcur, "Kcur_view", il);
+                cb(Vcur, "Vcur_view", il);
+            } else {
+                Qcur = build_wide_linear(model.layers[il].wq_fairy2i, cur, cur_conj, model.layers[il].bq, il, "Qcur");
+                Kcur = build_wide_linear(model.layers[il].wk_fairy2i, cur, cur_conj, model.layers[il].bk, il, "Kcur");
+                Vcur = build_wide_linear(model.layers[il].wv_fairy2i, cur, cur_conj, model.layers[il].bv, il, "Vcur");
+            }
 
             if (use_real_attn) {
                 Qcur = ggml_complex_split(ctx0, Qcur);

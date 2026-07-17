@@ -17,6 +17,7 @@ enum class fairy2i_loader_case {
     mixed_w1_w2,
     incomplete_w1,
     valid_bundle_w1,
+    valid_bundle_w1_qkv,
     valid_bundle_w2,
     incomplete_bundle,
     mixed_bundle,
@@ -26,9 +27,10 @@ enum class fairy2i_loader_case {
 };
 
 static bool is_bundle_case(fairy2i_loader_case tc) {
-    return tc == fairy2i_loader_case::valid_bundle_w1 || tc == fairy2i_loader_case::valid_bundle_w2 ||
-           tc == fairy2i_loader_case::incomplete_bundle || tc == fairy2i_loader_case::mixed_bundle ||
-           tc == fairy2i_loader_case::invalid_bundle_shape || tc == fairy2i_loader_case::invalid_bundle_alignment ||
+    return tc == fairy2i_loader_case::valid_bundle_w1 || tc == fairy2i_loader_case::valid_bundle_w1_qkv ||
+           tc == fairy2i_loader_case::valid_bundle_w2 || tc == fairy2i_loader_case::incomplete_bundle ||
+           tc == fairy2i_loader_case::mixed_bundle || tc == fairy2i_loader_case::invalid_bundle_shape ||
+           tc == fairy2i_loader_case::invalid_bundle_alignment ||
            tc == fairy2i_loader_case::invalid_bundle_branch_order;
 }
 
@@ -159,12 +161,14 @@ static void add_tiny_fairy2i_bundle(tiny_fairy2i_writer & writer,
                                     int                   branches,
                                     bool                  skip_scales,
                                     bool                  add_old_stage,
-                                    bool                  wrong_shape) {
+                                    bool                  wrong_shape,
+                                    int64_t               physical_tiles = 1) {
     const std::string codes  = std::string(base) + ".bundle.codes";
     const std::string scales = std::string(base) + ".bundle.scales";
-    writer.add_bundle_tensor(codes.c_str(), GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, branches, 64, wrong_shape ? 2 : 1);
+    writer.add_bundle_tensor(codes.c_str(), GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, branches, 64,
+                             wrong_shape ? physical_tiles + 1 : physical_tiles);
     if (!skip_scales) {
-        writer.add_bundle_tensor(scales.c_str(), GGML_TYPE_F16, 2, branches, 1, 1);
+        writer.add_bundle_tensor(scales.c_str(), GGML_TYPE_F16, 2, branches, physical_tiles, 1);
     }
     if (add_old_stage) {
         const std::string u0 = std::string(base) + ".U.s0";
@@ -177,6 +181,7 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
                               tc == fairy2i_loader_case::mixed_w1_w2              ? "mixed" :
                               tc == fairy2i_loader_case::incomplete_w1            ? "incomplete" :
                               tc == fairy2i_loader_case::valid_bundle_w1          ? "bundle-w1" :
+                              tc == fairy2i_loader_case::valid_bundle_w1_qkv      ? "bundle-w1-qkv" :
                               tc == fairy2i_loader_case::valid_bundle_w2          ? "bundle-w2" :
                               tc == fairy2i_loader_case::incomplete_bundle        ? "bundle-incomplete" :
                               tc == fairy2i_loader_case::mixed_bundle             ? "bundle-mixed" :
@@ -208,7 +213,14 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
 
     const char * linear_names[] = { "blk.0.attn_q",   "blk.0.attn_k", "blk.0.attn_v",  "blk.0.attn_output",
                                     "blk.0.ffn_gate", "blk.0.ffn_up", "blk.0.ffn_down" };
+    const bool   merged_qkv     = tc == fairy2i_loader_case::valid_bundle_w1_qkv;
+    if (merged_qkv) {
+        add_tiny_fairy2i_bundle(writer, "blk.0.attn_qkv", 2, false, false, false, 3);
+    }
     for (size_t i = 0; i < sizeof(linear_names) / sizeof(linear_names[0]); ++i) {
+        if (merged_qkv && i < 3) {
+            continue;
+        }
         if (bundle) {
             add_tiny_fairy2i_bundle(writer, linear_names[i], w1 ? 2 : 4,
                                     tc == fairy2i_loader_case::incomplete_bundle && i == 0,
@@ -266,6 +278,8 @@ int main() {
     ok = load_model_expect("Fairy2i W1 rejects mixed s1 tensor", fairy2i_loader_case::mixed_w1_w2, false) && ok;
     ok = load_model_expect("Fairy2i W1 rejects incomplete tensor set", fairy2i_loader_case::incomplete_w1, false) && ok;
     ok = load_model_expect("Fairy2i bundle W1 complete tensor set", fairy2i_loader_case::valid_bundle_w1, true) && ok;
+    ok = load_model_expect("Fairy2i bundle W1 merged QKV tensor set", fairy2i_loader_case::valid_bundle_w1_qkv, true) &&
+         ok;
     ok = load_model_expect("Fairy2i bundle W2 complete tensor set", fairy2i_loader_case::valid_bundle_w2, true) && ok;
     ok = load_model_expect("Fairy2i bundle rejects incomplete tensor set", fairy2i_loader_case::incomplete_bundle,
                            false) &&

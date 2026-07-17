@@ -4,8 +4,9 @@
 Convert a Qwen3-based Fairy2i learned-scale W1 Hugging Face checkpoint to GGUF.
 
 Qwen3 Fairy2i W1 checkpoints store one learned 64x64 scale tensor per QAT
-linear layer. The converter exports only U.s0/W.s0 tensors and relies on the
-runtime's generic wide-linear path for U * conj(x) + W * x.
+linear layer. In the default bundle_v1 layout, the converter concatenates the
+Q/K/V M64 tile streams into one attn_qkv bundle; tile64_v2 remains available
+with separate U.s0/W.s0 tensors.
 """
 
 import argparse
@@ -25,6 +26,7 @@ from convert_fairy2i_qwen2 import (
 )
 from fairy2i.quant.tile64_v2 import (
     FAIRY2I_TILE64,
+    merge_fairy2i_bundle_v1_m,
     quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale,
     quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale,
     round_up,
@@ -48,6 +50,8 @@ LINEAR_SPECS = [
     ("mlp.up_proj.weight", "ffn_up"),
     ("mlp.down_proj.weight", "ffn_down"),
 ]
+
+QKV_LINEAR_SPECS = LINEAR_SPECS[:3]
 
 
 def add_tensor_f32(writer: gguf.GGUFWriter, name: str, tensor: torch.Tensor) -> None:
@@ -178,6 +182,7 @@ def main(argv: list[str] | None = None) -> None:
         print(f"ff_complex={ff_complex}, ff_complex_padded={ff_complex_padded}")
         print(f"n_layer={n_layer}, n_head={n_head}, n_head_kv={n_head_kv}")
         print(f"quant_variant={args.quant_variant}, residual_steps={args.residual_steps}")
+        print(f"weight_layout={args.weight_layout}")
         print("output_layer=dense")
 
     if args.dry_run:
@@ -246,7 +251,50 @@ def main(argv: list[str] | None = None) -> None:
         add_tensor_f32(writer, f"blk.{il}.attn_q_norm", reader.get(f"model.layers.{il}.self_attn.q_norm.weight"))
         add_tensor_f32(writer, f"blk.{il}.attn_k_norm", reader.get(f"model.layers.{il}.self_attn.k_norm.weight"))
 
-        for hf_suffix, gguf_base in LINEAR_SPECS:
+        linear_specs = LINEAR_SPECS
+        if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+            qkv_bias_keys = [
+                f"model.layers.{il}.{suffix.replace('.weight', '.bias')}" for suffix, _ in QKV_LINEAR_SPECS
+            ]
+            present_qkv_biases = [key for key in qkv_bias_keys if key in weight_map]
+            if present_qkv_biases:
+                if len(present_qkv_biases) != len(qkv_bias_keys):
+                    raise ValueError(f"layer {il} has an incomplete QKV bias set: {present_qkv_biases}")
+                qkv_biases = [reader.get(key) for key in qkv_bias_keys]
+                if any(bias.ndim != 1 or bias.numel() % 2 != 0 for bias in qkv_biases):
+                    raise ValueError(f"layer {il} QKV biases must be even-sized vectors")
+                halves = [bias.numel() // 2 for bias in qkv_biases]
+                merged_bias = torch.cat(
+                    [bias[:half] for bias, half in zip(qkv_biases, halves)]
+                    + [bias[half:] for bias, half in zip(qkv_biases, halves)]
+                )
+                add_tensor_f32(writer, f"blk.{il}.attn_qkv.bias", merged_bias)
+                del qkv_biases, merged_bias
+
+            qkv_bundles: list[tuple[np.ndarray, np.ndarray]] = []
+            for hf_suffix, _ in QKV_LINEAR_SPECS:
+                hf_key = f"model.layers.{il}.{hf_suffix}"
+                w = reader.get(hf_key)
+                scale = reader.get(quant_scale_key(hf_key))
+                out_c = w.shape[0] // 2
+                in_c = w.shape[1] // 2
+                qkv_bundles.append(
+                    quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(w, scale, out_c, in_c)
+                )
+                del w, scale
+                gc.collect()
+
+            qkv_codes, qkv_scales = merge_fairy2i_bundle_v1_m(qkv_bundles)
+            writer.add_tensor(
+                f"blk.{il}.attn_qkv.bundle.codes",
+                qkv_codes,
+                raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_BUNDLE_CODES,
+            )
+            writer.add_tensor(f"blk.{il}.attn_qkv.bundle.scales", qkv_scales)
+            del qkv_bundles, qkv_codes, qkv_scales
+            linear_specs = LINEAR_SPECS[len(QKV_LINEAR_SPECS) :]
+
+        for hf_suffix, gguf_base in linear_specs:
             hf_key = f"model.layers.{il}.{hf_suffix}"
             w = reader.get(hf_key)
             scale = reader.get(quant_scale_key(hf_key))
