@@ -16,6 +16,15 @@ import numpy as np
 
 import gguf
 
+from fairy2i.quant.tile64_v3_metal import canonicalize_fairy2i_metal_codes, extract_fairy2i_metal_scales
+from fairy2i.spec import (
+    BUNDLE_CODE_ORDER,
+    BUNDLE_CODE_ORDER_M16_JOINT,
+    BUNDLE_CODE_ORDER_NATIVE_BRANCH_INLINE16,
+    BUNDLE_CODE_ORDER_ROW_JOINT,
+    BUNDLE_CODE_ORDERS,
+)
+
 
 BUNDLE_SUFFIX = ".bundle.codes"
 BRANCH_SUFFIXES = (".U.s0", ".W.s0")
@@ -103,18 +112,28 @@ def validate_layout(v2_path: Path, bundle_path: Path) -> dict[str, object]:
     bundle_reader = gguf.GGUFReader(bundle_path, "r")
     v2_tensors = tensor_map(v2_reader)
     bundle_tensors = tensor_map(bundle_reader)
+    code_order = str(field_value(bundle_reader, "fairy2i.weight.code_order"))
+    if code_order not in BUNDLE_CODE_ORDERS:
+        raise ValueError(f"unsupported bundle code order: {code_order}")
+    expected_m_subtile = 64 if code_order == BUNDLE_CODE_ORDER_ROW_JOINT else (
+        16 if code_order in (BUNDLE_CODE_ORDER, BUNDLE_CODE_ORDER_M16_JOINT) else 8
+    )
 
     expected_fields = {
         "general.file_type": 42,
         "general.alignment": 64,
         "fairy2i.schema_version": 2,
         "fairy2i.weight.layout": "bundle_m64k64_v1",
-        "fairy2i.weight.scale_scope": "m64_k64",
-        "fairy2i.weight.code_order": "m16_q4_branch_lane",
+        "fairy2i.weight.scale_scope": (
+            "inline_m64_k64_header16"
+            if code_order == BUNDLE_CODE_ORDER_NATIVE_BRANCH_INLINE16
+            else "m64_k64"
+        ),
+        "fairy2i.weight.code_order": code_order,
         "fairy2i.weight.branch_order": "U0,W0",
         "fairy2i.weight.m_block": 64,
         "fairy2i.weight.k_block": 64,
-        "fairy2i.weight.m_subtile": 16,
+        "fairy2i.weight.m_subtile": expected_m_subtile,
     }
     for name, expected in expected_fields.items():
         actual = field_value(bundle_reader, name)
@@ -163,10 +182,20 @@ def validate_layout(v2_path: Path, bundle_path: Path) -> dict[str, object]:
 
         k_blocks = logical_k // 64
         physical_tiles = (logical_m // 64) * k_blocks
-        if tuple(int(value) for value in codes.shape) != (16, 2, 64, physical_tiles):
+        expected_code_shape = (
+            (2064, physical_tiles)
+            if code_order == BUNDLE_CODE_ORDER_NATIVE_BRANCH_INLINE16
+            else (16, 2, 64, physical_tiles)
+        )
+        expected_scale_shape = (
+            (1,) if code_order == BUNDLE_CODE_ORDER_NATIVE_BRANCH_INLINE16 else (2, 2, physical_tiles)
+        )
+        if tuple(int(value) for value in codes.shape) != expected_code_shape:
             raise ValueError(f"invalid bundle code shape: {base} {tuple(codes.shape)}")
-        if tuple(int(value) for value in scales.shape) != (2, 2, physical_tiles):
+        if tuple(int(value) for value in scales.shape) != expected_scale_shape:
             raise ValueError(f"invalid bundle scale shape: {base} {tuple(scales.shape)}")
+        canonical_codes = canonicalize_fairy2i_metal_codes(np.asarray(codes.data), code_order)
+        canonical_scales = extract_fairy2i_metal_scales(np.asarray(codes.data), np.asarray(scales.data), code_order)
 
         canonical_hash.update(base.encode("utf-8"))
         for mb in range(logical_m // 64):
@@ -176,12 +205,12 @@ def validate_layout(v2_path: Path, bundle_path: Path) -> dict[str, object]:
                     mb * 64 : (mb + 1) * 64
                 ]
                 expected_codes = v2_strip_to_bundle_codes(stage)
-                actual_codes = np.asarray(codes.data[tile_slice, :, branch, :])
+                actual_codes = np.asarray(canonical_codes[tile_slice, :, branch, :])
                 if not np.array_equal(expected_codes, actual_codes):
                     raise ValueError(f"canonical code mismatch: {base}{suffix} M64 tile {mb}")
 
                 expected_scales = v2_strip_scales(stage, base, suffix, mb)
-                actual_scales = np.asarray(scales.data[tile_slice, branch, :])
+                actual_scales = np.asarray(canonical_scales[tile_slice, branch, :])
                 if not np.array_equal(expected_scales.view(np.uint16), actual_scales.view(np.uint16)):
                     raise ValueError(f"canonical scale mismatch: {base}{suffix} M64 tile {mb}")
 
@@ -211,6 +240,7 @@ def validate_layout(v2_path: Path, bundle_path: Path) -> dict[str, object]:
         "v2_file_bytes": v2_path.stat().st_size,
         "bundle_file_bytes": bundle_path.stat().st_size,
         "canonical_sha256": canonical_hash.hexdigest(),
+        "code_order": code_order,
     }
 
 

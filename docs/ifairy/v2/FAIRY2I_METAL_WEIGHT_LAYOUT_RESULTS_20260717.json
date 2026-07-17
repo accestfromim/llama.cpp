@@ -1,0 +1,123 @@
+{
+  "date": "2026-07-17",
+  "host": {
+    "cpu_gpu": "Apple M4",
+    "memory_bytes": 25769803776,
+    "logical_cpus": 10,
+    "os": "macOS 26.3 (25D125)"
+  },
+  "source": {
+    "branch": "codex/metal",
+    "winner_runtime_commit": "aa2eebf2d1503ca4b9c73d20180416b503f07dac",
+    "canonical_sha256": "ae4e8890c419d637e3fd7b339ba7f730e401f14de00e5a2e89ba002cbb449709"
+  },
+  "command": "./build-rel-metal/bin/llama-bench -m MODEL -ngl 99 -t 8 -fa 1 -p 512 -n 128 -r 5 -o json",
+  "winner": {
+    "layout": "m16_q4_branch_lane",
+    "model_bytes": 3368144832,
+    "model_sha256": "9f46dc9a82384b8ada003c79f8be635446b4fee28e9a0c4b5ee30908b23f5de5",
+    "clean_runtime_processes": [
+      { "pp512": 191.485105, "tg128": 25.132388 },
+      { "pp512": 192.061569, "tg128": 25.270927 },
+      { "pp512": 191.849906, "tg128": 25.076739 }
+    ],
+    "process_mean": { "pp512": 191.798860, "tg128": 25.160018 }
+  },
+  "r5_sweep": [
+    {
+      "layout": "m16_q4_branch_lane",
+      "role": "control_a",
+      "pp512": 192.306438,
+      "tg128": 25.183430,
+      "pp512_samples": [192.270, 192.165, 192.793, 192.013, 192.291],
+      "tg128_samples": [25.8045, 25.1128, 25.0050, 25.0006, 24.9943]
+    },
+    {
+      "layout": "m16_q4_lane_joint",
+      "model_sha256": "35a3735f740b7134f04ac764aed2abf5a3390c02e25d3c1abf167a103f26d977",
+      "model_bytes": 3368144832,
+      "pp512": 192.212934,
+      "tg128": 25.034298,
+      "pp512_samples": [192.188, 192.371, 192.272, 192.571, 191.662],
+      "tg128_samples": [25.0737, 24.9988, 25.0501, 25.0481, 25.0008]
+    },
+    {
+      "layout": "m8_q4_lane_joint",
+      "model_sha256": "95302607c0bcbd326c26de4229007648d77a827ff7ea974c89fbfdbfaaaaec02",
+      "model_bytes": 3368144832,
+      "pp512": 190.697260,
+      "tg128": 25.162811,
+      "pp512_samples": [190.861, 190.907, 190.478, 190.830, 190.410],
+      "tg128_samples": [25.7150, 25.0981, 24.9983, 25.0002, 25.0024]
+    },
+    {
+      "layout": "m32_k16_m8_q4_branch_lane",
+      "model_sha256": "8e531bfe01ead0d08fbea7886b2cc519183e93975b9ed2eafdf523b573fedb56",
+      "model_bytes": 3368144832,
+      "pp512": 187.776067,
+      "tg128": 25.144369,
+      "pp512_samples": [187.953, 187.613, 187.774, 187.880, 187.661],
+      "tg128_samples": [25.7260, 25.0013, 24.9868, 25.0074, 25.0003]
+    },
+    {
+      "layout": "m32_k16_m8_q4_lane_joint",
+      "model_sha256": "e0c8c16843192c0f45d7e1576779bb96cd9aa8b991c45082d11117aff98db7bc",
+      "model_bytes": 3368144832,
+      "pp512": 188.800456,
+      "tg128": 25.264858,
+      "pp512_samples": [188.547, 189.046, 189.024, 189.118, 188.268],
+      "tg128_samples": [26.1758, 25.1017, 25.0494, 25.0002, 24.9972]
+    },
+    {
+      "layout": "m8_q4_branch_bitplane",
+      "model_sha256": "f89d40f8303e8b580cfa1d24c2a5eb0a04edecc2a88ff2eb7378f8a2bc7e473f",
+      "model_bytes": 3368144832,
+      "pp512": 186.321203,
+      "tg128": 25.099431,
+      "pp512_samples": [186.365, 186.365, 185.588, 186.543, 186.745],
+      "tg128_samples": [25.0359, 24.9562, 24.9561, 25.2988, 25.2502]
+    },
+    {
+      "layout": "m64_row_q4_lane_joint",
+      "model_sha256": "090a3e979ca192358590f07ea520290492b4b3c72cd8b7fe0c031d7d7e036fb0",
+      "model_bytes": 3368144832,
+      "pp512": 193.857360,
+      "tg128": 24.875000,
+      "pp512_samples": [193.986, 193.803, 194.223, 194.122, 193.152],
+      "tg128_samples": [24.9041, 24.8526, 24.9035, 24.8473, 24.8676]
+    },
+    {
+      "layout": "m32_k16_m8_q4_branch_lane_inline16",
+      "model_sha256": "6889ec2ef1a61c6ad373420bf7888fbde09c780d2ec3de2df6920923e61b36f7",
+      "model_bytes": 3371544384,
+      "pp512": 187.910485,
+      "tg128": 25.110641,
+      "pp512_samples": [187.885, 188.083, 187.690, 187.901, 187.993],
+      "tg128_samples": [25.5522, 25.0132, 24.9870, 25.0064, 24.9944]
+    },
+    {
+      "layout": "m16_q4_branch_lane",
+      "role": "control_b",
+      "pp512": 194.664063,
+      "tg128": 25.592985,
+      "pp512_samples": [191.595, 195.650, 195.914, 195.327, 194.834],
+      "tg128_samples": [26.4301, 26.3869, 25.0983, 24.9999, 25.0496]
+    }
+  ],
+  "abba_row_joint": {
+    "sequence": ["control", "row_joint", "row_joint", "control"],
+    "control_process_mean": { "pp512": 193.259972, "tg128": 25.434164 },
+    "row_joint_process_mean": { "pp512": 193.757309, "tg128": 24.806222 },
+    "row_joint_delta_percent": { "pp512": 0.257, "tg128": -2.469 }
+  },
+  "screen_r3": [
+    { "layout": "m16_q4_branch_lane", "pp512": 192.182320, "tg128": 25.000658 },
+    { "layout": "m16_q4_lane_joint", "pp512": 192.727297, "tg128": 25.836102 },
+    { "layout": "m8_q4_lane_joint", "pp512": 201.032509, "tg128": 27.792255 },
+    { "layout": "m32_k16_m8_q4_branch_lane", "pp512": 198.637186, "tg128": 26.607540 },
+    { "layout": "m32_k16_m8_q4_lane_joint", "pp512": 189.641013, "tg128": 25.100045 },
+    { "layout": "m8_q4_branch_bitplane", "pp512": 187.329487, "tg128": 25.280384 },
+    { "layout": "m64_row_q4_lane_joint", "pp512": 194.148766, "tg128": 25.045889 }
+  ],
+  "raw_artifact_root": "tmp/fairy2i-layout-metal"
+}

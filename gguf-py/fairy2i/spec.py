@@ -20,6 +20,23 @@ WEIGHT_LAYOUT_BUNDLE_V1 = "bundle_v1"
 BUNDLE_LAYOUT_NAME = "bundle_m64k64_v1"
 BUNDLE_SCALE_SCOPE = "m64_k64"
 BUNDLE_CODE_ORDER = "m16_q4_branch_lane"
+BUNDLE_CODE_ORDER_M16_JOINT = "m16_q4_lane_joint"
+BUNDLE_CODE_ORDER_M8_JOINT = "m8_q4_lane_joint"
+BUNDLE_CODE_ORDER_NATIVE_BRANCH = "m32_k16_m8_q4_branch_lane"
+BUNDLE_CODE_ORDER_NATIVE_BRANCH_INLINE16 = "m32_k16_m8_q4_branch_lane_inline16"
+BUNDLE_CODE_ORDER_NATIVE_JOINT = "m32_k16_m8_q4_lane_joint"
+BUNDLE_CODE_ORDER_M8_BITPLANE = "m8_q4_branch_bitplane"
+BUNDLE_CODE_ORDER_ROW_JOINT = "m64_row_q4_lane_joint"
+BUNDLE_CODE_ORDERS = (
+    BUNDLE_CODE_ORDER,
+    BUNDLE_CODE_ORDER_M16_JOINT,
+    BUNDLE_CODE_ORDER_M8_JOINT,
+    BUNDLE_CODE_ORDER_NATIVE_BRANCH,
+    BUNDLE_CODE_ORDER_NATIVE_BRANCH_INLINE16,
+    BUNDLE_CODE_ORDER_NATIVE_JOINT,
+    BUNDLE_CODE_ORDER_M8_BITPLANE,
+    BUNDLE_CODE_ORDER_ROW_JOINT,
+)
 BUNDLE_W1_BRANCH_ORDER = "U0,W0"
 BUNDLE_W2_BRANCH_ORDER = "U0,U1,W0,W1"
 
@@ -36,6 +53,7 @@ class Fairy2IMetadata:
     base_architecture: str | None = None
     scale_source: str | None = None
     weight_layout: str = WEIGHT_LAYOUT_BUNDLE_V1
+    bundle_code_order: str = BUNDLE_CODE_ORDER
     vocab_original_size: int | None = None
     vocab_padded_size: int | None = None
     vocab_padding_multiple: int | None = None
@@ -93,18 +111,28 @@ def write_metadata(writer: gguf.GGUFWriter, metadata: Fairy2IMetadata) -> None:
         writer.add_string("fairy2i.quant.scale_source", scale_source)
 
     if metadata.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+        if metadata.bundle_code_order not in BUNDLE_CODE_ORDERS:
+            raise ValueError(f"unsupported Fairy2i bundle code order: {metadata.bundle_code_order}")
         branch_order = (
             BUNDLE_W1_BRANCH_ORDER
             if metadata.quant_variant == QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE
             else BUNDLE_W2_BRANCH_ORDER
         )
         writer.add_string("fairy2i.weight.layout", BUNDLE_LAYOUT_NAME)
-        writer.add_string("fairy2i.weight.scale_scope", BUNDLE_SCALE_SCOPE)
-        writer.add_string("fairy2i.weight.code_order", BUNDLE_CODE_ORDER)
+        scale_scope = (
+            "inline_m64_k64_header16"
+            if metadata.bundle_code_order == BUNDLE_CODE_ORDER_NATIVE_BRANCH_INLINE16
+            else BUNDLE_SCALE_SCOPE
+        )
+        writer.add_string("fairy2i.weight.scale_scope", scale_scope)
+        writer.add_string("fairy2i.weight.code_order", metadata.bundle_code_order)
         writer.add_string("fairy2i.weight.branch_order", branch_order)
         writer.add_uint32("fairy2i.weight.m_block", 64)
         writer.add_uint32("fairy2i.weight.k_block", 64)
-        writer.add_uint32("fairy2i.weight.m_subtile", 16)
+        m_subtile = 64 if metadata.bundle_code_order == BUNDLE_CODE_ORDER_ROW_JOINT else (
+            16 if metadata.bundle_code_order in (BUNDLE_CODE_ORDER, BUNDLE_CODE_ORDER_M16_JOINT) else 8
+        )
+        writer.add_uint32("fairy2i.weight.m_subtile", m_subtile)
 
     if metadata.vocab_original_size is not None:
         writer.add_uint32("fairy2i.vocab.original_size", metadata.vocab_original_size)
