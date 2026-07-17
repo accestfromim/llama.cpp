@@ -807,7 +807,7 @@ kernel void kernel_fairy2i_bundle_w1_bf16_tile8x1_w8_full_nobias_fc_simd(
     }
 }
 
-kernel void kernel_fairy2i_bundle_w1_bf16_tile8x1_sg2_full_nobias_fc(
+kernel void kernel_fairy2i_bundle_w1_bf16_tile8x1_sg4_full_nobias_fc(
         constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
         device const uchar * codes                              [[buffer(1)]],
         device const half * scales                              [[buffer(2)]],
@@ -815,7 +815,7 @@ kernel void kernel_fairy2i_bundle_w1_bf16_tile8x1_sg2_full_nobias_fc(
         device char * dst                                       [[buffer(4)]],
         uint2 tgpig                                             [[threadgroup_position_in_grid]],
         uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
-    constexpr int rows_per_simdgroup = 2;
+    constexpr int rows_per_simdgroup = 4;
     constexpr int block_slots = 2;
 
     const uint lid = tiitg.x;
