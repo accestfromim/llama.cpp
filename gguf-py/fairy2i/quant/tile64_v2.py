@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+from collections.abc import Mapping, Sequence
+from typing import Tuple
 
 import numpy as np
 
@@ -12,6 +14,13 @@ except ModuleNotFoundError:  # pragma: no cover - converter-only dependency
 
 FAIRY2I_TILE64 = 64
 TILE64 = FAIRY2I_TILE64
+
+FAIRY2I_BUNDLE_M = 64
+FAIRY2I_BUNDLE_K = 64
+FAIRY2I_BUNDLE_M_SUBTILE = 16
+FAIRY2I_BUNDLE_Q4 = 16
+
+Fairy2IBranch = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
 def round_up(x: int, base: int) -> int:
@@ -213,6 +222,127 @@ def encode_stage_codes(stage_real: np.ndarray, stage_imag: np.ndarray) -> np.nda
     return packed.reshape(rows, n_blocks * 16)
 
 
+def encode_stage_codes_bundle_v1(stage_real: np.ndarray, stage_imag: np.ndarray) -> np.ndarray:
+    """Pack four consecutive K codes per byte for the LUT-oriented bundle layout."""
+
+    if stage_real.shape != stage_imag.shape:
+        raise ValueError(f"shape mismatch: {stage_real.shape} vs {stage_imag.shape}")
+    rows, cols = stage_real.shape
+    if rows % FAIRY2I_BUNDLE_M != 0 or cols % FAIRY2I_BUNDLE_K != 0:
+        raise ValueError(f"bundle_v1 packing requires dims divisible by {TILE64}, got {stage_real.shape}")
+
+    abs_real = np.abs(stage_real)
+    abs_imag = np.abs(stage_imag)
+    choose_real = abs_real > abs_imag
+
+    codes = np.empty(stage_real.shape, dtype=np.uint8)
+    codes[choose_real] = np.where(stage_real[choose_real] >= 0.0, 1, 0)
+    codes[~choose_real] = np.where(stage_imag[~choose_real] >= 0.0, 3, 2)
+
+    codes = codes.reshape(rows, cols // FAIRY2I_BUNDLE_K, FAIRY2I_BUNDLE_Q4, 4)
+    return (
+        codes[..., 0]
+        | (codes[..., 1] << 2)
+        | (codes[..., 2] << 4)
+        | (codes[..., 3] << 6)
+    ).astype(np.uint8)
+
+
+def pack_fairy2i_bundle_v1(
+    branches: Mapping[str, Fairy2IBranch], branch_order: Sequence[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pack branch codes/scales as [physical_tile, slot, branch, lane]."""
+
+    if not branch_order:
+        raise ValueError("bundle_v1 requires at least one branch")
+    if set(branches) != set(branch_order) or len(branches) != len(branch_order):
+        raise ValueError(f"branch mismatch: expected {tuple(branch_order)}, got {tuple(branches)}")
+
+    first = branches[branch_order[0]]
+    rows, cols = first[0].shape
+    if rows % FAIRY2I_BUNDLE_M != 0 or cols % FAIRY2I_BUNDLE_K != 0:
+        raise ValueError(f"bundle_v1 packing requires dims divisible by {TILE64}, got {(rows, cols)}")
+
+    mb_count = rows // FAIRY2I_BUNDLE_M
+    kb_count = cols // FAIRY2I_BUNDLE_K
+    code_planes: list[np.ndarray] = []
+    scale_planes: list[np.ndarray] = []
+
+    for name in branch_order:
+        stage_real, stage_imag, scale_real, scale_imag = branches[name]
+        if stage_real.shape != (rows, cols) or stage_imag.shape != (rows, cols):
+            raise ValueError(f"branch {name} shape mismatch: {stage_real.shape}, {stage_imag.shape}")
+        if scale_real.shape != (mb_count, kb_count) or scale_imag.shape != (mb_count, kb_count):
+            raise ValueError(
+                f"branch {name} scale shape mismatch: expected {(mb_count, kb_count)}, "
+                f"got {scale_real.shape} and {scale_imag.shape}"
+            )
+
+        packed = encode_stage_codes_bundle_v1(stage_real, stage_imag)
+        packed = packed.reshape(mb_count, 4, FAIRY2I_BUNDLE_M_SUBTILE, kb_count, FAIRY2I_BUNDLE_Q4)
+        code_planes.append(packed.transpose(0, 3, 1, 4, 2))
+        scale_planes.append(
+            np.stack(
+                (
+                    np.ascontiguousarray(scale_real, dtype=np.float16),
+                    np.ascontiguousarray(scale_imag, dtype=np.float16),
+                ),
+                axis=-1,
+            )
+        )
+
+    codes = np.stack(code_planes, axis=-2)
+    codes = np.ascontiguousarray(codes.reshape(mb_count * kb_count, 64, len(branch_order), 16))
+    scales = np.stack(scale_planes, axis=-2)
+    scales = np.ascontiguousarray(scales.reshape(mb_count * kb_count, len(branch_order), 2))
+    return codes, scales
+
+
+def unpack_fairy2i_bundle_v1(
+    codes: np.ndarray,
+    scales: np.ndarray,
+    rows: int,
+    cols: int,
+    branch_order: Sequence[str],
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Decode bundle bytes for converter round-trip tests and diagnostics."""
+
+    if rows % FAIRY2I_BUNDLE_M != 0 or cols % FAIRY2I_BUNDLE_K != 0:
+        raise ValueError(f"bundle_v1 unpack requires dims divisible by {TILE64}, got {(rows, cols)}")
+    mb_count = rows // FAIRY2I_BUNDLE_M
+    kb_count = cols // FAIRY2I_BUNDLE_K
+    branch_count = len(branch_order)
+    expected_codes = (mb_count * kb_count, 64, branch_count, 16)
+    expected_scales = (mb_count * kb_count, branch_count, 2)
+    if codes.shape != expected_codes or codes.dtype != np.uint8:
+        raise ValueError(
+            f"bundle code shape/type mismatch: expected {expected_codes}/uint8, got {codes.shape}/{codes.dtype}"
+        )
+    if scales.shape != expected_scales or scales.dtype != np.float16:
+        raise ValueError(
+            f"bundle scale shape/type mismatch: expected {expected_scales}/float16, got {scales.shape}/{scales.dtype}"
+        )
+
+    tiled_codes = codes.reshape(mb_count, kb_count, 4, 16, branch_count, 16)
+    tiled_scales = scales.reshape(mb_count, kb_count, branch_count, 2)
+    result: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for branch, name in enumerate(branch_order):
+        packed = tiled_codes[..., branch, :].transpose(0, 2, 4, 1, 3)
+        packed = packed.reshape(rows, kb_count, FAIRY2I_BUNDLE_Q4)
+        decoded = np.empty((rows, kb_count, FAIRY2I_BUNDLE_K), dtype=np.uint8)
+        decoded[..., 0::4] = packed & 0x03
+        decoded[..., 1::4] = (packed >> 2) & 0x03
+        decoded[..., 2::4] = (packed >> 4) & 0x03
+        decoded[..., 3::4] = (packed >> 6) & 0x03
+        branch_scales = tiled_scales[:, :, branch, :]
+        result[name] = (
+            decoded.reshape(rows, cols),
+            np.ascontiguousarray(branch_scales[..., 0]),
+            np.ascontiguousarray(branch_scales[..., 1]),
+        )
+    return result
+
+
 def pack_fairy2i_tile64_v2_stage(
     stage_real: np.ndarray,
     stage_imag: np.ndarray,
@@ -249,9 +379,9 @@ def _require_torch() -> None:
         raise ModuleNotFoundError("torch is required for Fairy2i tensor conversion")
 
 
-def quantize_linear_to_fairy2i_tile64_v2_stages(
+def quantize_linear_to_fairy2i_tile64_v2_branch_data(
     weight: "torch.Tensor", out_target: int, in_target: int
-) -> dict[str, np.ndarray]:
+) -> dict[str, Fairy2IBranch]:
     u_real, u_imag, w_real, w_imag, _, _ = split_wide_linear_components(weight, out_target, in_target)
 
     (u0_real, u0_imag, u0_s_real, u0_s_imag), (u1_real, u1_imag, u1_s_real, u1_s_imag) = quantize_matrix_tile64_v2(
@@ -261,24 +391,39 @@ def quantize_linear_to_fairy2i_tile64_v2_stages(
         w_real, w_imag
     )
 
-    out = {
-        "U.s0": pack_fairy2i_tile64_v2_stage(u0_real, u0_imag, u0_s_real, u0_s_imag),
-        "U.s1": pack_fairy2i_tile64_v2_stage(u1_real, u1_imag, u1_s_real, u1_s_imag),
-        "W.s0": pack_fairy2i_tile64_v2_stage(w0_real, w0_imag, w0_s_real, w0_s_imag),
-        "W.s1": pack_fairy2i_tile64_v2_stage(w1_real, w1_imag, w1_s_real, w1_s_imag),
+    out: dict[str, Fairy2IBranch] = {
+        "U.s0": (u0_real, u0_imag, u0_s_real, u0_s_imag),
+        "U.s1": (u1_real, u1_imag, u1_s_real, u1_s_imag),
+        "W.s0": (w0_real, w0_imag, w0_s_real, w0_s_imag),
+        "W.s1": (w1_real, w1_imag, w1_s_real, w1_s_imag),
     }
 
     del u_real, u_imag, w_real, w_imag
-    del u0_real, u0_imag, u1_real, u1_imag
-    del w0_real, w0_imag, w1_real, w1_imag
     gc.collect()
 
     return out
 
 
-def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(
-    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+def quantize_linear_to_fairy2i_tile64_v2_stages(
+    weight: "torch.Tensor", out_target: int, in_target: int
 ) -> dict[str, np.ndarray]:
+    branches = quantize_linear_to_fairy2i_tile64_v2_branch_data(weight, out_target, in_target)
+    return {
+        name: pack_fairy2i_tile64_v2_stage(*branch)
+        for name, branch in branches.items()
+    }
+
+
+def quantize_linear_to_fairy2i_bundle_v1_stages(
+    weight: "torch.Tensor", out_target: int, in_target: int
+) -> tuple[np.ndarray, np.ndarray]:
+    branches = quantize_linear_to_fairy2i_tile64_v2_branch_data(weight, out_target, in_target)
+    return pack_fairy2i_bundle_v1(branches, ("U.s0", "U.s1", "W.s0", "W.s1"))
+
+
+def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
+    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+) -> dict[str, Fairy2IBranch]:
     _require_torch()
 
     u_real, u_imag, w_real, w_imag, out_c, in_c = split_wide_linear_components(weight, out_target, in_target)
@@ -296,13 +441,33 @@ def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(
     w_s_real = pad_scale_matrix(scale[2], out_target, in_target)
     w_s_imag = pad_scale_matrix(scale[3], out_target, in_target)
 
-    out = {
-        "U.s0": pack_fairy2i_tile64_v2_stage(u_real, u_imag, u_s_real, u_s_imag),
-        "W.s0": pack_fairy2i_tile64_v2_stage(w_real, w_imag, w_s_real, w_s_imag),
+    out: dict[str, Fairy2IBranch] = {
+        "U.s0": (u_real, u_imag, u_s_real, u_s_imag),
+        "W.s0": (w_real, w_imag, w_s_real, w_s_imag),
     }
 
-    del u_real, u_imag, w_real, w_imag
-    del scale, u_s_real, u_s_imag, w_s_real, w_s_imag
+    del scale
     gc.collect()
 
     return out
+
+
+def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(
+    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+) -> dict[str, np.ndarray]:
+    branches = quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
+        weight, quant_scale, out_target, in_target
+    )
+    return {
+        name: pack_fairy2i_tile64_v2_stage(*branch)
+        for name, branch in branches.items()
+    }
+
+
+def quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+) -> tuple[np.ndarray, np.ndarray]:
+    branches = quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
+        weight, quant_scale, out_target, in_target
+    )
+    return pack_fairy2i_bundle_v1(branches, ("U.s0", "W.s0"))

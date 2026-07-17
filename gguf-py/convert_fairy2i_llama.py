@@ -25,11 +25,17 @@ from fairy2i.io.tensor_reader import TensorReader, add_optional_vector_tensor, l
 from fairy2i.quant.tile64_v2 import (
     FAIRY2I_TILE64,
     TILE64,
+    quantize_linear_to_fairy2i_bundle_v1_stages,
     quantize_linear_to_fairy2i_tile64_v2_stages,
     round_up,
 )
 from fairy2i.quant.widely_linear import undo_llama_permute
-from fairy2i.spec import Fairy2IMetadata, write_metadata
+from fairy2i.spec import (
+    WEIGHT_LAYOUT_BUNDLE_V1,
+    WEIGHT_LAYOUT_TILE64_V2,
+    Fairy2IMetadata,
+    write_metadata,
+)
 from fairy2i.tokenizer.chat_template import load_fairy2i_chat_template
 
 
@@ -332,6 +338,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Residual quantization steps (only 2 is supported)",
     )
     parser.add_argument("--qk-permute", action="store_true", help="Enable Llama q/k undo-permute during conversion")
+    parser.add_argument(
+        "--weight-layout",
+        choices=[WEIGHT_LAYOUT_BUNDLE_V1, WEIGHT_LAYOUT_TILE64_V2],
+        default=WEIGHT_LAYOUT_BUNDLE_V1,
+        help="Fairy2i weight storage layout (default: bundle_v1)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
     args = parser.parse_args(argv)
 
@@ -377,6 +389,8 @@ def main(argv: list[str] | None = None) -> None:
     assert output_file is not None
 
     writer = gguf.GGUFWriter(str(output_file), arch="fairy2i")
+    if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+        writer.add_custom_alignment(64)
     writer.add_name(config.get("_name_or_path", model_dir.name))
     writer.add_context_length(int(config["max_position_embeddings"]))
     writer.add_embedding_length(hidden_complex)
@@ -386,7 +400,11 @@ def main(argv: list[str] | None = None) -> None:
     writer.add_head_count_kv(n_head_kv)
     writer.add_layer_norm_rms_eps(float(config["rms_norm_eps"]))
     add_rope_metadata(config, writer)
-    writer.add_file_type(gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2)
+    writer.add_file_type(
+        gguf.LlamaFileType.MOSTLY_FAIRY2I_BUNDLE_V1
+        if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1
+        else gguf.LlamaFileType.MOSTLY_FAIRY2I_TILE64_V2
+    )
     writer.add_vocab_size(vocab_padded)
     write_metadata(
         writer,
@@ -397,6 +415,7 @@ def main(argv: list[str] | None = None) -> None:
             attn_layout="llama_real",
             tokenizer_profile="llama_bpe",
             residual_steps=args.residual_steps,
+            weight_layout=args.weight_layout,
             vocab_original_size=vocab_original,
             vocab_padded_size=vocab_padded,
             vocab_padding_multiple=FAIRY2I_VOCAB_PADDING_MULTIPLE,
@@ -477,15 +496,26 @@ def main(argv: list[str] | None = None) -> None:
             out_target = ff_complex_padded if out_c == ff_complex else out_c
             in_target = ff_complex_padded if in_c == ff_complex else in_c
 
-            packed = quantize_linear_to_fairy2i_tile64_v2_stages(w, out_target, in_target)
-            for stage_name, stage_data in packed.items():
+            if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
+                codes, scales = quantize_linear_to_fairy2i_bundle_v1_stages(w, out_target, in_target)
                 writer.add_tensor(
-                    f"blk.{il}.{gguf_base}.{stage_name}",
-                    stage_data,
-                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+                    f"blk.{il}.{gguf_base}.bundle.codes",
+                    codes,
+                    raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_BUNDLE_CODES,
                 )
+                writer.add_tensor(f"blk.{il}.{gguf_base}.bundle.scales", scales)
+                del codes, scales
+            else:
+                packed = quantize_linear_to_fairy2i_tile64_v2_stages(w, out_target, in_target)
+                for stage_name, stage_data in packed.items():
+                    writer.add_tensor(
+                        f"blk.{il}.{gguf_base}.{stage_name}",
+                        stage_data,
+                        raw_dtype=gguf.GGMLQuantizationType.FAIRY2I_TILE64_V2,
+                    )
+                del packed
 
-            del w, packed
+            del w
             gc.collect()
 
         for hf_suffix, gguf_name in bias_specs:

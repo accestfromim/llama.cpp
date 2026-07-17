@@ -2935,6 +2935,7 @@ class GGMLQuantizationType(IntEnum):
     IFAIRY64_Q16 = 43
     FAIRY2I_TILE64_V2 = 44
     FAIRY2I_ACT_Q16_64 = 45
+    FAIRY2I_BUNDLE_CODES = 46
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -2988,6 +2989,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ2_0         = 37  # except 1d tensors
     MOSTLY_IFAIRY        = 40
     MOSTLY_FAIRY2I_TILE64_V2 = 41
+    MOSTLY_FAIRY2I_BUNDLE_V1 = 42
 
 
     GUESSED              = 1024  # not specified in the model file
@@ -3091,6 +3093,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.IFAIRY64_Q16:(QK_IFAIRY64, 4 + QK_IFAIRY64 * 2),
     GGMLQuantizationType.FAIRY2I_TILE64_V2:(QK_FAIRY2I_TILE64, 4 + QK_FAIRY2I_TILE64 // 4),
     GGMLQuantizationType.FAIRY2I_ACT_Q16_64:(QK_FAIRY2I_ACT_Q16_64, 4 + QK_FAIRY2I_ACT_Q16_64 * 2),
+    GGMLQuantizationType.FAIRY2I_BUNDLE_CODES:(1, 1),
 }
 
 

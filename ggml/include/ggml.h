@@ -375,53 +375,54 @@ extern "C" {
 
     // NOTE: always add types at the end of the enum to keep backward compatibility
     enum ggml_type {
-        GGML_TYPE_F32        = 0,
-        GGML_TYPE_F16        = 1,
-        GGML_TYPE_Q4_0       = 2,
-        GGML_TYPE_Q4_1       = 3,
+        GGML_TYPE_F32                  = 0,
+        GGML_TYPE_F16                  = 1,
+        GGML_TYPE_Q4_0                 = 2,
+        GGML_TYPE_Q4_1                 = 3,
         // GGML_TYPE_Q4_2 = 4, support has been removed
         // GGML_TYPE_Q4_3 = 5, support has been removed
-        GGML_TYPE_Q5_0       = 6,
-        GGML_TYPE_Q5_1       = 7,
-        GGML_TYPE_Q8_0       = 8,
-        GGML_TYPE_Q8_1       = 9,
-        GGML_TYPE_Q2_K       = 10,
-        GGML_TYPE_Q3_K       = 11,
-        GGML_TYPE_Q4_K       = 12,
-        GGML_TYPE_Q5_K       = 13,
-        GGML_TYPE_Q6_K       = 14,
-        GGML_TYPE_Q8_K       = 15,
-        GGML_TYPE_IQ2_XXS    = 16,
-        GGML_TYPE_IQ2_XS     = 17,
-        GGML_TYPE_IQ3_XXS    = 18,
-        GGML_TYPE_IQ1_S      = 19,
-        GGML_TYPE_IQ4_NL     = 20,
-        GGML_TYPE_IQ3_S      = 21,
-        GGML_TYPE_IQ2_S      = 22,
-        GGML_TYPE_IQ4_XS     = 23,
-        GGML_TYPE_I8         = 24,
-        GGML_TYPE_I16        = 25,
-        GGML_TYPE_I32        = 26,
-        GGML_TYPE_I64        = 27,
-        GGML_TYPE_F64        = 28,
-        GGML_TYPE_IQ1_M      = 29,
-        GGML_TYPE_BF16       = 30,
+        GGML_TYPE_Q5_0                 = 6,
+        GGML_TYPE_Q5_1                 = 7,
+        GGML_TYPE_Q8_0                 = 8,
+        GGML_TYPE_Q8_1                 = 9,
+        GGML_TYPE_Q2_K                 = 10,
+        GGML_TYPE_Q3_K                 = 11,
+        GGML_TYPE_Q4_K                 = 12,
+        GGML_TYPE_Q5_K                 = 13,
+        GGML_TYPE_Q6_K                 = 14,
+        GGML_TYPE_Q8_K                 = 15,
+        GGML_TYPE_IQ2_XXS              = 16,
+        GGML_TYPE_IQ2_XS               = 17,
+        GGML_TYPE_IQ3_XXS              = 18,
+        GGML_TYPE_IQ1_S                = 19,
+        GGML_TYPE_IQ4_NL               = 20,
+        GGML_TYPE_IQ3_S                = 21,
+        GGML_TYPE_IQ2_S                = 22,
+        GGML_TYPE_IQ4_XS               = 23,
+        GGML_TYPE_I8                   = 24,
+        GGML_TYPE_I16                  = 25,
+        GGML_TYPE_I32                  = 26,
+        GGML_TYPE_I64                  = 27,
+        GGML_TYPE_F64                  = 28,
+        GGML_TYPE_IQ1_M                = 29,
+        GGML_TYPE_BF16                 = 30,
         // GGML_TYPE_Q4_0_4_4 = 31, support has been removed from gguf files
         // GGML_TYPE_Q4_0_4_8 = 32,
         // GGML_TYPE_Q4_0_8_8 = 33,
-        GGML_TYPE_TQ1_0      = 34,
-        GGML_TYPE_TQ2_0      = 35,
+        GGML_TYPE_TQ1_0                = 34,
+        GGML_TYPE_TQ2_0                = 35,
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
-        GGML_TYPE_MXFP4      = 39,  // MXFP4 (1 block)
-        GGML_TYPE_IFAIRY     = 40,  // complex type used for the ifairy model weight
-        GGML_TYPE_IFAIRY_Q16 = 41,  // complex type used for the ifairy model in activation
-        GGML_TYPE_IFAIRY64   = 42,  // legacy complex tile64 weights
-        GGML_TYPE_IFAIRY64_Q16 = 43,  // legacy 64-value complex activation block
-        GGML_TYPE_FAIRY2I_TILE64_V2 = 44,  // Fairy2i tile64_v2 weights
-        GGML_TYPE_FAIRY2I_ACT_Q16_64 = 45, // Fairy2i 64-value complex activation block
-        GGML_TYPE_COUNT      = 46,
+        GGML_TYPE_MXFP4                = 39,  // MXFP4 (1 block)
+        GGML_TYPE_IFAIRY               = 40,  // complex type used for the ifairy model weight
+        GGML_TYPE_IFAIRY_Q16           = 41,  // complex type used for the ifairy model in activation
+        GGML_TYPE_IFAIRY64             = 42,  // legacy complex tile64 weights
+        GGML_TYPE_IFAIRY64_Q16         = 43,  // legacy 64-value complex activation block
+        GGML_TYPE_FAIRY2I_TILE64_V2    = 44,  // Fairy2i tile64_v2 weights
+        GGML_TYPE_FAIRY2I_ACT_Q16_64   = 45,  // Fairy2i 64-value complex activation block
+        GGML_TYPE_FAIRY2I_BUNDLE_CODES = 46,  // opaque Fairy2i M64xK64 bundle code plane
+        GGML_TYPE_COUNT                = 47,
     };
 
     // precision
@@ -1712,6 +1713,22 @@ extern "C" {
                                                               struct ggml_tensor *  u_s0,
                                                               struct ggml_tensor *  w_s0,
                                                               struct ggml_tensor *  bias);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_wide_linear_w1_bundle(struct ggml_context * ctx,
+                                                                     struct ggml_tensor *  x,
+                                                                     struct ggml_tensor *  codes,
+                                                                     struct ggml_tensor *  scales,
+                                                                     struct ggml_tensor *  bias,
+                                                                     int64_t               logical_m,
+                                                                     int64_t               logical_k);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_wide_linear_w2_bundle(struct ggml_context * ctx,
+                                                                     struct ggml_tensor *  x,
+                                                                     struct ggml_tensor *  codes,
+                                                                     struct ggml_tensor *  scales,
+                                                                     struct ggml_tensor *  bias,
+                                                                     int64_t               logical_m,
+                                                                     int64_t               logical_k);
 
     GGML_API struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps);
 

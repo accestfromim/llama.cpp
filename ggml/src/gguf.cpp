@@ -994,6 +994,10 @@ void gguf_set_val_u32(struct gguf_context * ctx, const char * key, uint32_t val)
     gguf_check_reserved_keys(key, val);
     gguf_remove_key(ctx, key);
     ctx->kv.emplace_back(key, val);
+    if (strcmp(key, GGUF_KEY_GENERAL_ALIGNMENT) == 0) {
+        GGML_ASSERT(ctx->info.empty() && "general.alignment must be set before adding tensors");
+        ctx->alignment = val;
+    }
 }
 
 void gguf_set_val_i32(struct gguf_context * ctx, const char * key, int32_t val) {

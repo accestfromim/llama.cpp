@@ -1747,6 +1747,59 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         format("unsupported FAIRY2I quant variant: %s", quant_variant.c_str()));
                 }
 
+                uint32_t    schema_version = 1;
+                std::string weight_layout  = "tile64_v2";
+                ml.get_key("fairy2i.schema_version", schema_version, false);
+                const bool has_weight_layout = ml.get_key("fairy2i.weight.layout", weight_layout, false);
+                if (!has_weight_layout && schema_version >= 2) {
+                    throw std::runtime_error("FAIRY2I schema v2 requires fairy2i.weight.layout");
+                }
+                if (weight_layout == "tile64_v2") {
+                    if (schema_version > 1) {
+                        throw std::runtime_error(
+                            format("unsupported FAIRY2I tile64_v2 schema version: %u", schema_version));
+                    }
+                    fairy2i_weight_layout = LLAMA_FAIRY2I_WEIGHT_LAYOUT_TILE64_V2;
+                } else if (weight_layout == "bundle_m64k64_v1") {
+                    fairy2i_weight_layout = LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1;
+                    if (fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_LEGACY) {
+                        throw std::runtime_error("FAIRY2I bundle_v1 does not support the legacy quant variant");
+                    }
+
+                    uint32_t alignment = 32;
+                    uint32_t m_block   = 0;
+                    uint32_t k_block   = 0;
+                    uint32_t m_subtile = 0;
+                    ml.get_key(LLM_KV_GENERAL_ALIGNMENT, alignment, false);
+                    ml.get_key("fairy2i.weight.m_block", m_block);
+                    ml.get_key("fairy2i.weight.k_block", k_block);
+                    ml.get_key("fairy2i.weight.m_subtile", m_subtile);
+                    if (schema_version != 2 || alignment < 64 || m_block != 64 || k_block != 64 || m_subtile != 16) {
+                        throw std::runtime_error(format(
+                            "invalid FAIRY2I bundle_v1 descriptor: schema=%u alignment=%u M=%u K=%u M_subtile=%u",
+                            schema_version, alignment, m_block, k_block, m_subtile));
+                    }
+
+                    std::string scale_scope;
+                    std::string code_order;
+                    std::string branch_order;
+                    ml.get_key("fairy2i.weight.scale_scope", scale_scope);
+                    ml.get_key("fairy2i.weight.code_order", code_order);
+                    ml.get_key("fairy2i.weight.branch_order", branch_order);
+                    const char * expected_branches =
+                        fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE ? "U0,W0" :
+                                                                                                          "U0,U1,W0,W1";
+                    if (scale_scope != "m64_k64" || code_order != "m16_q4_branch_lane" ||
+                        branch_order != expected_branches) {
+                        throw std::runtime_error(
+                            format("invalid FAIRY2I bundle_v1 layout: scale_scope=%s code_order=%s branch_order=%s "
+                                   "(expected %s)",
+                                   scale_scope.c_str(), code_order.c_str(), branch_order.c_str(), expected_branches));
+                    }
+                } else {
+                    throw std::runtime_error(format("unsupported FAIRY2I weight layout: %s", weight_layout.c_str()));
+                }
+
                 std::string attn_layout =
                     fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2                  ? "qwen2_real" :
                     fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE ? "qwen3_real" :
@@ -4761,6 +4814,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE;
                     const bool fairy2i_is_w1 =
                         fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE;
+                    const bool fairy2i_is_bundle = fairy2i_weight_layout == LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1;
                     const bool fairy2i_is_qwen3 = fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL;
 
                     auto create_fairy2i_stage = [&](ggml_tensor * & stage, llm_tensor tensor, const char * suffix, int bid,
@@ -4789,6 +4843,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     };
 
+                    auto reject_fairy2i_tensor = [&](llm_tensor tensor, const char * suffix, int bid,
+                                                     const char * layout) {
+                        const auto tensor_name = bid >= 0 ? tn(tensor, suffix, bid) : tn(tensor, suffix);
+                        if (ml.get_tensor_meta(tensor_name.str().c_str())) {
+                            throw std::runtime_error(format("invalid FAIRY2I %s tensor set: %s is not allowed", layout,
+                                                            tensor_name.str().c_str()));
+                        }
+                    };
+
                     auto create_fairy2i_linear = [&](llama_widely_linear_ifairy & linear, llm_tensor tensor, int bid,
                                                      int64_t in_dim, int64_t out_dim, int flags) {
                         if (fairy2i_is_tile64 && (in_dim % 64 != 0 || out_dim % 64 != 0)) {
@@ -4797,6 +4860,58 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 format("invalid FAIRY2I tile64_v2 dims for %s: in=%lld out=%lld, expected multiples of 64",
                                        tensor_name.c_str(), (long long) in_dim, (long long) out_dim));
                         }
+
+                        if (fairy2i_is_bundle) {
+                            const ggml_backend_dev_t target_dev =
+                                bid >= 0 ? pimpl->dev_layer.at(bid).dev : pimpl->dev_output.dev;
+                            if (!target_dev || ggml_backend_dev_type(target_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                throw std::runtime_error(
+                                    format("FAIRY2I bundle_v1 tensor %s is CPU-LUT-only; disable layer offload",
+                                           (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str()));
+                            }
+
+                            reject_fairy2i_tensor(tensor, "U.s0", bid, "bundle_v1");
+                            reject_fairy2i_tensor(tensor, "W.s0", bid, "bundle_v1");
+                            reject_fairy2i_tensor(tensor, "U.s1", bid, "bundle_v1");
+                            reject_fairy2i_tensor(tensor, "W.s1", bid, "bundle_v1");
+
+                            const int64_t branch_count   = fairy2i_is_w1 ? 2 : 4;
+                            const int64_t physical_tiles = (out_dim / 64) * (in_dim / 64);
+                            const auto    codes_name =
+                                bid >= 0 ? tn(tensor, "bundle.codes", bid) : tn(tensor, "bundle.codes");
+                            const auto scales_name =
+                                bid >= 0 ? tn(tensor, "bundle.scales", bid) : tn(tensor, "bundle.scales");
+                            const ggml_tensor * codes_meta  = ml.get_tensor_meta(codes_name.str().c_str());
+                            const ggml_tensor * scales_meta = ml.get_tensor_meta(scales_name.str().c_str());
+                            if (!codes_meta && !scales_meta && (flags & TENSOR_NOT_REQUIRED)) {
+                                return;
+                            }
+                            if (!codes_meta || !scales_meta) {
+                                throw std::runtime_error(
+                                    format("incomplete FAIRY2I bundle_v1 tensor set for %s: expected %s and %s",
+                                           (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str(),
+                                           codes_name.str().c_str(), scales_name.str().c_str()));
+                            }
+                            if (codes_meta->type != GGML_TYPE_FAIRY2I_BUNDLE_CODES ||
+                                scales_meta->type != GGML_TYPE_F16) {
+                                throw std::runtime_error(
+                                    format("invalid FAIRY2I bundle_v1 types for %s: codes=%s scales=%s",
+                                           (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str(),
+                                           ggml_type_name(codes_meta->type), ggml_type_name(scales_meta->type)));
+                            }
+
+                            linear.bundle_codes =
+                                create_tensor(codes_name, { 16, branch_count, 64, physical_tiles }, flags);
+                            linear.bundle_scales =
+                                create_tensor(scales_name, { 2, branch_count, physical_tiles }, flags);
+                            linear.logical_m    = out_dim;
+                            linear.logical_k    = in_dim;
+                            linear.branch_count = (int) branch_count;
+                            return;
+                        }
+
+                        reject_fairy2i_tensor(tensor, "bundle.codes", bid, "tile64_v2");
+                        reject_fairy2i_tensor(tensor, "bundle.scales", bid, "tile64_v2");
 
                         create_fairy2i_stage(linear.U[0], tensor, "U.s0", bid, { in_dim, out_dim }, flags);
                         create_fairy2i_stage(linear.W[0], tensor, "W.s0", bid, { in_dim, out_dim }, flags);
@@ -4810,12 +4925,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     };
 
                     auto fairy2i_linear_complete = [&](const llama_widely_linear_ifairy & linear) {
-                        return fairy2i_is_w1 ? (linear.U[0] && linear.W[0]) :
-                                               (linear.U[0] && linear.U[1] && linear.W[0] && linear.W[1]);
+                        if (fairy2i_is_bundle) {
+                            return linear.bundle_codes && linear.bundle_scales;
+                        }
+                        return fairy2i_is_w1 ? (linear.U[0] && linear.W[0])
+                                             : (linear.U[0] && linear.U[1] && linear.W[0] && linear.W[1]);
                     };
 
                     auto fairy2i_linear_any = [&](const llama_widely_linear_ifairy & linear) {
-                        return linear.U[0] || linear.U[1] || linear.W[0] || linear.W[1];
+                        return linear.bundle_codes || linear.bundle_scales || linear.U[0] || linear.U[1] ||
+                               linear.W[0] || linear.W[1];
                     };
 
                     if (n_vocab % 2 != 0) {
@@ -4829,13 +4948,17 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     const bool has_output_fairy2i_any = fairy2i_linear_any(output_fairy2i);
                     if (has_output_fairy2i_any && !has_output_fairy2i) {
                         throw std::runtime_error(
-                            fairy2i_is_w1 ? "incomplete FAIRY2I W1 output tensor set: expected output.{U,W}.s0" :
-                                            "incomplete FAIRY2I output tensor set: expected output.{U,W}.s{0,1}");
+                            fairy2i_is_bundle ? "incomplete FAIRY2I bundle output tensor set: expected "
+                                                "output.bundle.{codes,scales}" :
+                            fairy2i_is_w1     ? "incomplete FAIRY2I W1 output tensor set: expected output.{U,W}.s0" :
+                                                "incomplete FAIRY2I output tensor set: expected output.{U,W}.s{0,1}");
                     }
                     if (!has_output_fairy2i && !output) {
                         throw std::runtime_error(
-                            fairy2i_is_w1 ? "FAIRY2I W1 requires either output.{U,W}.s0 or dense output tensor" :
-                                            "FAIRY2I requires either output.{U,W}.s{0,1} or dense output tensor");
+                            fairy2i_is_bundle ? "FAIRY2I bundle_v1 requires either output.bundle.{codes,scales} "
+                                                "or a dense output tensor" :
+                            fairy2i_is_w1     ? "FAIRY2I W1 requires either output.{U,W}.s0 or dense output tensor" :
+                                                "FAIRY2I requires either output.{U,W}.s{0,1} or dense output tensor");
                     }
 
                     const char * force_dense_output_env = getenv("LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT");
@@ -14311,16 +14434,43 @@ struct llm_build_fairy2i : public llm_graph_context {
 
         auto build_wide_linear = [&](const llama_widely_linear_ifairy & linear, ggml_tensor * x, ggml_tensor * x_conj,
                                      ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
-            GGML_ASSERT(linear.U[0] && linear.W[0]);
-
-            const bool         has_stage1      = linear.U[1] && linear.W[1];
-            const bool         can_fuse_tile64 = loras->empty() && linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                                 linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                                 (!has_stage1 || (linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                                                  linear.W[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2));
-            ggml_backend_dev_t target_dev      = il >= 0 ? model.dev_layer(il) : model.dev_output();
+            ggml_backend_dev_t target_dev = il >= 0 ? model.dev_layer(il) : model.dev_output();
             const bool         target_dev_is_cpu =
                 target_dev && ggml_backend_dev_type(target_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+
+            if (linear.bundle_codes || linear.bundle_scales) {
+                GGML_ASSERT(linear.bundle_codes && linear.bundle_scales);
+                GGML_ASSERT(linear.logical_k == x->ne[0]);
+                if (!loras->empty()) {
+                    throw std::runtime_error("FAIRY2I bundle_v1 does not support LoRA adapters");
+                }
+                if (!target_dev_is_cpu) {
+                    throw std::runtime_error("FAIRY2I bundle_v1 is CPU-LUT-only; disable layer offload");
+                }
+
+                const bool   is_w1 = linear.branch_count == 2;
+                const char * env_name =
+                    is_w1 ? "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1" : "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2";
+                if (llama_fairy2i_env_policy_from_env(env_name) == LLAMA_FAIRY2I_ENV_POLICY_DISABLED) {
+                    throw std::runtime_error(format("FAIRY2I bundle_v1 requires %s", env_name));
+                }
+
+                ggml_tensor * y =
+                    is_w1 ? ggml_fairy2i_wide_linear_w1_bundle(ctx0, x, linear.bundle_codes, linear.bundle_scales, bias,
+                                                               linear.logical_m, linear.logical_k) :
+                            ggml_fairy2i_wide_linear_w2_bundle(ctx0, x, linear.bundle_codes, linear.bundle_scales, bias,
+                                                               linear.logical_m, linear.logical_k);
+                cb(y, name, il);
+                return y;
+            }
+
+            GGML_ASSERT(linear.U[0] && linear.W[0]);
+
+            const bool has_stage1      = linear.U[1] && linear.W[1];
+            const bool can_fuse_tile64 = loras->empty() && linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                         linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                         (!has_stage1 || (linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                                          linear.W[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2));
 
             const bool can_fuse_w1 =
                 model.fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE &&
@@ -14472,6 +14622,8 @@ struct llm_build_fairy2i : public llm_graph_context {
         res->t_embd       = cur;
 
         const bool has_output_fairy2i =
+            model.fairy2i_weight_layout == LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1 ?
+                (model.output_fairy2i.bundle_codes && model.output_fairy2i.bundle_scales) :
             model.fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE ?
                 (model.output_fairy2i.U[0] && model.output_fairy2i.W[0]) :
                 (model.output_fairy2i.U[0] && model.output_fairy2i.U[1] && model.output_fairy2i.W[0] &&

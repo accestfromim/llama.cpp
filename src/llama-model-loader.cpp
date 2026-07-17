@@ -64,6 +64,8 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
             return "IFairy";
         case LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2:
             return "Fairy2i tile64_v2";
+        case LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1:
+            return "Fairy2i bundle_v1";
 
         default: return "unknown, may not work";
     }
@@ -670,6 +672,9 @@ llama_model_loader::llama_model_loader(
                 break;
             case GGML_TYPE_FAIRY2I_TILE64_V2:
                 ftype = LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2;
+                break;
+            case GGML_TYPE_FAIRY2I_BUNDLE_CODES:
+                ftype = LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1;
                 break;
             default:
                 {

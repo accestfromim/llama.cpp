@@ -5976,6 +5976,9 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 VALIDATE_ROW_DATA_D_F16_IMPL_IFAIRY(block_fairy2i_tile64_v2, data, nb);
             }
             break;
+        case GGML_TYPE_FAIRY2I_BUNDLE_CODES:
+            // Every 2-bit pattern is valid; structural validation belongs to the bundle op.
+            break;
         case GGML_TYPE_IQ1_S:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq1_s, data, nb);
