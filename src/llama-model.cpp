@@ -4877,9 +4877,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             const bool target_dev_is_cpu =
                                 target_dev && ggml_backend_dev_type(target_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
                             const bool target_dev_is_metal = llama_backend_dev_is_metal(target_dev);
-                            if (!target_dev_is_cpu && !(fairy2i_is_w1 && target_dev_is_metal)) {
+                            if (!target_dev_is_cpu && !target_dev_is_metal) {
                                 throw std::runtime_error(
-                                    format("FAIRY2I bundle_v1 tensor %s requires CPU-LUT or W1 Metal, got %s",
+                                    format("FAIRY2I bundle_v1 tensor %s requires CPU-LUT or Metal, got %s",
                                            (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str(),
                                            target_dev ? ggml_backend_dev_name(target_dev) : "no device"));
                             }
@@ -14460,8 +14460,8 @@ struct llm_build_fairy2i : public llm_graph_context {
                     throw std::runtime_error("FAIRY2I bundle_v1 does not support LoRA adapters");
                 }
                 const bool is_w1 = linear.branch_count == 2;
-                if (!target_dev_is_cpu && !(is_w1 && target_dev_is_metal)) {
-                    throw std::runtime_error(format("FAIRY2I bundle_v1 requires CPU-LUT or W1 Metal, got %s",
+                if (!target_dev_is_cpu && !target_dev_is_metal) {
+                    throw std::runtime_error(format("FAIRY2I bundle_v1 requires CPU-LUT or Metal, got %s",
                                                     target_dev ? ggml_backend_dev_name(target_dev) : "no device"));
                 }
 

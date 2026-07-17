@@ -609,7 +609,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
-    if (op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 && op->src[1] &&
+    if ((op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2) && op->src[1] &&
         op->src[1]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES) {
         const struct ggml_tensor * x      = op->src[0];
         const struct ggml_tensor * codes  = op->src[1];
@@ -621,9 +621,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         const int32_t k        = ggml_get_op_params_i32(op, 2);
         const int32_t branches = ggml_get_op_params_i32(op, 3);
         const int64_t tiles    = m > 0 && k > 0 ? (int64_t) (m / 64) * (k / 64) : 0;
+        const int32_t expected_branches = op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ? 2 : 4;
 
         return has_simdgroup_mm && has_simdgroup_reduction && x && scales && layout == 1 && m > 0 && k > 0 &&
-               m % 64 == 0 && k % 64 == 0 && branches == 2 && op->type == GGML_TYPE_F32 &&
+               m % 64 == 0 && k % 64 == 0 && branches == expected_branches && op->type == GGML_TYPE_F32 &&
                x->type == GGML_TYPE_F32 && scales->type == GGML_TYPE_F16 && (!bias || bias->type == GGML_TYPE_F32) &&
                x->ne[0] == k && op->ne[0] == m && codes->ne[0] == 16 && codes->ne[1] == branches &&
                codes->ne[2] == 64 && codes->ne[3] == tiles && scales->ne[0] == 2 && scales->ne[1] == branches &&

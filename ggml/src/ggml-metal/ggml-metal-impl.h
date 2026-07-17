@@ -79,6 +79,7 @@
 #define FC_FAIRY2I_W2_DECODE           500
 #define FC_FAIRY2I_W1_DECODE           600
 #define FC_FAIRY2I_BUNDLE_W1_DECODE    700
+#define FC_FAIRY2I_BUNDLE_W2_DECODE    800
 
 // kernel argument structs
 //

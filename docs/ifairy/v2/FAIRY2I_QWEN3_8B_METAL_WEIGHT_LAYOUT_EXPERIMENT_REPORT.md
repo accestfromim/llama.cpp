@@ -334,39 +334,13 @@ inline 的 end-to-end 差异不足 0.2%，最终保留 side。
 5. 若未来设计完全不同的 fused complex GEMM，可重新定义 packet；届时应从 kernel 消费顺序反推文件布局，
    而不是继续围绕当前 kernel 枚举排列。
 
-## 13. 保留的复现代码
+## 13. 实验代码清理
 
-为避免把失败布局留在生产 runtime，本轮只保留离线转换/回解能力：
+布局结论确定后，仓库不再保留失败候选的 packer、转换入口、命令行选项和 round-trip 测试。生产转换器、
+格式声明及校验器均只接受最终 S0（`m16_q4_branch_lane`），避免未采用的格式演变成长期兼容负担。
 
-- `gguf-py/fairy2i/quant/tile64_v3_metal.py`：全部候选 pack/canonicalize/unpack；
-- `gguf-py/experimental/convert_fairy2i_qwen3_metal_layout.py`：完整 checkpoint → 候选 GGUF；
-- `gguf-py/validate_fairy2i_bundle_v1.py`：候选与 V2 的逐 tensor 位级校验；
-- `gguf-py/tests/fairy2i/test_tile64_v3_metal.py`：不同 shape、全部 code order round-trip；
-- `FAIRY2I_METAL_WEIGHT_LAYOUT_RESULTS_20260717.json`：原始 R5 样本、模型哈希和 ABBA 汇总。
-
-实验转换示例：
-
-```bash
-cd gguf-py
-../.venv/bin/python experimental/convert_fairy2i_qwen3_metal_layout.py \
-  /Users/a1806/llama/qwen_1bit_scale/checkpoint-5639 \
-  /tmp/qwen3-w1-m8-joint.gguf \
-  --weight-layout bundle_v1 \
-  --bundle-code-order m8_q4_lane_joint \
-  --verbose
-```
-
-校验示例：
-
-```bash
-cd gguf-py
-../.venv/bin/python validate_fairy2i_bundle_v1.py \
-  /Users/a1806/llama/qwen_1bit_scale/qwen3-fairy2i-w1-learned-scale.gguf \
-  /tmp/qwen3-w1-m8-joint.gguf
-```
-
-非默认候选是离线实验产物，清理后的生产 runtime 会按设计拒绝它们。若要重新测 Metal，需要按 packer
-中的 offset 重新接入临时 experimental reader；生产用户只应转换/使用默认 S0。
+本报告和 `FAIRY2I_METAL_WEIGHT_LAYOUT_RESULTS_20260717.json` 继续作为历史实验记录保留；非默认候选 GGUF
+也已删除。若未来重启布局研究，应从独立实验分支重新实现，不在生产路径中暴露实验格式。
 
 ## 14. 最终推荐命令
 

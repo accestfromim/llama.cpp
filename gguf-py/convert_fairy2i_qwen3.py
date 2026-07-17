@@ -29,10 +29,7 @@ from fairy2i.quant.tile64_v2 import (
     quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale,
     round_up,
 )
-from fairy2i.quant.tile64_v3_metal import quantize_linear_to_fairy2i_metal_layout_w1_learned_scale
 from fairy2i.spec import (
-    BUNDLE_CODE_ORDER,
-    BUNDLE_CODE_ORDERS,
     QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE,
     WEIGHT_LAYOUT_BUNDLE_V1,
     WEIGHT_LAYOUT_TILE64_V2,
@@ -119,7 +116,7 @@ def validate_checkpoint(config: dict, weight_map: dict[str, str]) -> None:
         raise ValueError(f"missing required Qwen3 Fairy2i tensor(s): {preview}{suffix}")
 
 
-def main(argv: list[str] | None = None, *, experimental_metal_layouts: bool = False) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Convert Qwen3 Fairy2i W1 learned-scale weights to GGUF")
     parser.add_argument("model_dir", type=Path, help="Path to Qwen3 Fairy2i model directory")
     parser.add_argument("output_file", type=Path, nargs="?", help="Output GGUF file path")
@@ -147,24 +144,14 @@ def main(argv: list[str] | None = None, *, experimental_metal_layouts: bool = Fa
         default=WEIGHT_LAYOUT_BUNDLE_V1,
         help="Fairy2i weight storage layout (default: bundle_v1)",
     )
-    if experimental_metal_layouts:
-        parser.add_argument(
-            "--bundle-code-order",
-            choices=BUNDLE_CODE_ORDERS,
-            default=BUNDLE_CODE_ORDER,
-            help="Physical code order for offline bundle_v1 Metal layout experiments.",
-        )
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs without writing GGUF")
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
     args = parser.parse_args(argv)
-    bundle_code_order = getattr(args, "bundle_code_order", BUNDLE_CODE_ORDER)
 
     if args.residual_steps != 1:
         raise ValueError("Qwen3 learned-scale Fairy2i conversion supports only --residual-steps 1")
     if args.qk_permute:
         raise ValueError("--qk-permute is not supported for learned-scale Qwen3 Fairy2i checkpoints")
-    if args.weight_layout != WEIGHT_LAYOUT_BUNDLE_V1 and bundle_code_order != BUNDLE_CODE_ORDER:
-        raise ValueError("--bundle-code-order requires --weight-layout bundle_v1")
     if args.output_file is None and not args.dry_run:
         raise ValueError("output_file is required unless --dry-run is set")
 
@@ -230,7 +217,6 @@ def main(argv: list[str] | None = None, *, experimental_metal_layouts: bool = Fa
             residual_steps=args.residual_steps,
             scale_source=SCALE_SOURCE_LEARNED,
             weight_layout=args.weight_layout,
-            bundle_code_order=bundle_code_order,
         ),
     )
 
@@ -271,14 +257,9 @@ def main(argv: list[str] | None = None, *, experimental_metal_layouts: bool = Fa
             in_target = ff_complex_padded if in_c == ff_complex else in_c
 
             if args.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
-                if experimental_metal_layouts:
-                    codes, scales = quantize_linear_to_fairy2i_metal_layout_w1_learned_scale(
-                        w, scale, out_target, in_target, bundle_code_order
-                    )
-                else:
-                    codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
-                        w, scale, out_target, in_target
-                    )
+                codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+                    w, scale, out_target, in_target
+                )
                 writer.add_tensor(
                     f"blk.{il}.{gguf_base}.bundle.codes",
                     codes,
