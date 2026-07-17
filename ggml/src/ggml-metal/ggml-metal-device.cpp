@@ -481,12 +481,12 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
             {
-                if (tsrc0 == GGML_TYPE_F16 && tsrc1 == GGML_TYPE_F16 && ne00 == 4096 && ne01 >= 200000) {
+                if (tsrc0 == GGML_TYPE_F16 && tsrc1 == GGML_TYPE_F16 && ne00 == 4096 && ne01 >= 100000) {
                     nsg = 8;
                     nr0 = 1;
                     nr1 = 1;
                     smem = 32*sizeof(float);
-                    suffix = "_4_k4096_r1_nsg8";
+                    suffix = "";
                 } else if (ne00 == 4) {
                     nsg = 1;
                     nr0 = 32;
