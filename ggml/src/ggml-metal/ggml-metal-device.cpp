@@ -486,7 +486,7 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_
                     nr0 = 1;
                     nr1 = 1;
                     smem = 32*sizeof(float);
-                    suffix = "";
+                    suffix = "_4_r1";
                 } else if (ne00 == 4) {
                     nsg = 1;
                     nr0 = 32;
@@ -643,6 +643,7 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_
 
     return res;
 }
+
 
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
     char base[256];

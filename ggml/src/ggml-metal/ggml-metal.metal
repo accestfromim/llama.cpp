@@ -5263,58 +5263,11 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4, N_R0_F>) mul_mv_t
 template [[host_name("kernel_mul_mv_f32_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4, N_R0_F>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4, N_R0_F>;
 template [[host_name("kernel_mul_mv_f16_f16_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  half,  half4,  N_R0_F>;
+template [[host_name("kernel_mul_mv_f16_f16_4_r1")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  half,  half4,  1>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float,  float4,  N_R0_F>;
 template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, bfloat, bfloat4, N_R0_F>;
 #endif
-
-kernel void kernel_mul_mv_f16_f16_4_k4096_r1_nsg8(
-        constant ggml_metal_kargs_mul_mv & args,
-        device const char * src0,
-        device const char * src1,
-        device char * dst,
-        threadgroup char * shmem [[threadgroup(0)]],
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    constexpr short nw = N_SIMDWIDTH;
-    constexpr short nf = 16;
-    constexpr short nf4 = nf / 4;
-
-    const int r0 = tgpig.x;
-    const int r1 = tgpig.y;
-    const int im = tgpig.z;
-    const uint i12 = im % args.ne12;
-    const uint i13 = im / args.ne12;
-    const uint64_t offset0 = (uint64_t) r0 * args.nb01 + (i12 / args.r2) * args.nb02 +
-                             (i13 / args.r3) * args.nb03;
-    const uint64_t offset1 = (uint64_t) r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
-    device const half4 * x4 = (device const half4 *) (src0 + offset0);
-    device const half4 * y4 = (device const half4 *) (src1 + offset1);
-
-    const short ix = tiisg / (nw / nf);
-    const short il = tiisg % (nw / nf);
-    const int ib = sgitg * nf + ix;
-    const int vector_index = (ib * 32 + il * nf) / 4;
-    device const half4 * xb4 = x4 + vector_index;
-    device const half4 * yb4 = y4 + vector_index;
-
-    half4 yl4[nf4];
-    FOR_UNROLL (short i = 0; i < nf4; ++i) {
-        yl4[i] = yb4[i];
-    }
-
-    float sumf[1] = { 0.0f };
-    float sumq = 0.0f;
-    FOR_UNROLL (short i = 0; i < nf4; ++i) {
-        sumq += dot(float4(xb4[i]), float4(yl4[i]));
-    }
-    sumf[0] += sumq;
-
-    device float * dst_f32 =
-        (device float *) dst + (uint64_t) im * args.ne0 * args.ne1 + (uint64_t) r1 * args.ne0;
-    helper_mv_reduce_and_write<1>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
-}
 
 #define N_MV_T_T 4
 
