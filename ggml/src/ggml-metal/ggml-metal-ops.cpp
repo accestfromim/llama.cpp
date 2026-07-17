@@ -79,7 +79,7 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_bundle_w1_decode_fc
                                                                                  int32_t              blocks,
                                                                                  int32_t              x_nb0,
                                                                                  int32_t              dst_nb0) {
-    const char * base = "kernel_fairy2i_bundle_w1_bf16_tile8x1_sg4_full_nobias_fc";
+    const char * base = "kernel_fairy2i_bundle_w1_bf16_tile8x1_w8_full_nobias_fc_simd";
     char         name[256];
 
     snprintf(name, sizeof(name), "%s_blocks=%d_xnb0=%d_dstnb0=%d", base, blocks, x_nb0, dst_nb0);
@@ -1905,12 +1905,12 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     if (is_w1) {
         const int  rows_per_tile = 8;
         const int  block_slots   = is_bundle && !bias ? 8 : 16;
+        const int  nth           = block_slots * 16;
         const bool full_rows     = (m % rows_per_tile) == 0;
         const int  blocks        = k / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
         const bool use_fc_decode = full_rows && !bias && x->nb[0] == sizeof(uint32_t) &&
                                    op->nb[0] == sizeof(uint32_t) &&
                                    (k % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2)) == 0;
-        const int nth = is_bundle && use_fc_decode ? 64 : block_slots * 16;
 
         ggml_metal_pipeline_t pipeline = nullptr;
         if (is_bundle && use_fc_decode) {
@@ -1949,10 +1949,8 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
         }
-        if (!is_bundle || !use_fc_decode) {
-            ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 0);
-            ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 1);
-        }
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 0);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 1);
         ggml_metal_encoder_dispatch_threadgroups(enc, (m + rows_per_tile - 1) / rows_per_tile, 1, 1, nth, 1, 1);
         return 1;
     }
