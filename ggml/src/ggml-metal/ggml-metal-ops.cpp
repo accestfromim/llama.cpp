@@ -2025,6 +2025,10 @@ size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const ggml_tensor * op) 
     const ggml_tensor * x = op->src[0];
 
     const int64_t act_rows = ggml_nrows(x);
+    if (act_rows == 1) {
+        return 0;
+    }
+
     const int64_t blocks   = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
 
     const size_t pad = GGML_PAD(ggml_nbytes(op), 32) - ggml_nbytes(op);
@@ -2032,29 +2036,7 @@ size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const ggml_tensor * op) 
         (size_t) act_rows * (size_t) blocks * 2u * (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64);
     const size_t half_stage_size = q8_size * sizeof(ggml_fp16_t);
 
-    return pad + (act_rows != 1 ? half_stage_size : q8_size);
-}
-
-size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_d(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
-
-    const ggml_tensor * x = op->src[0];
-
-    const int64_t act_rows = ggml_nrows(x);
-    if (act_rows != 1) {
-        return 0;
-    }
-
-    const int64_t blocks = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
-
-    return (size_t) act_rows * (size_t) blocks * 2u * sizeof(ggml_fp16_t);
-}
-
-size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_partial(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
-    GGML_UNUSED(op);
-
-    return 0;
+    return pad + half_stage_size;
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {

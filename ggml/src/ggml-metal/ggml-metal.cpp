@@ -204,8 +204,6 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
             {
                 res += ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(tensor);
-                res += ggml_metal_op_fairy2i_wide_linear_w2_extra_act_d(tensor);
-                res += ggml_metal_op_fairy2i_wide_linear_w2_extra_partial(tensor);
             }
             break;
         default:
