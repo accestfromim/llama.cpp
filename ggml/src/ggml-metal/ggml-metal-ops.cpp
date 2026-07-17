@@ -1793,6 +1793,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         GGML_ASSERT((u_s1 == nullptr) == (w_s1 == nullptr));
     }
     const bool is_w1 = is_bundle ? op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 : u_s1 == nullptr;
+    const bool use_native_bf16 = is_bundle && is_w1 && ggml_metal_device_get_props(ctx->dev)->has_bfloat;
 
     const int32_t                           k        = (int32_t) x->ne[0];
     const int32_t                           m        = (int32_t) op->ne[0];
@@ -1829,7 +1830,8 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     act_q.offs += ggml_nbytes(op) + op_act_q_pad;
 
     if (act_rows != 1) {
-        const char *          pipeline_name = "kernel_fairy2i_act_half_64_stage_bf16";
+        const char * pipeline_name = use_native_bf16 ? "kernel_fairy2i_act_bf16_64_stage_bf16" :
+                                                       "kernel_fairy2i_act_half_64_stage_bf16";
         ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
@@ -1850,10 +1852,12 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     }
 
     if (act_rows != 1) {
-        const char *          pipeline_name = is_bundle ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
-                                                                   "kernel_fairy2i_bundle_w2_half_mma32x16") :
-                                              is_w1     ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
-                                                          "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
+        const char * pipeline_name =
+            use_native_bf16 ? "kernel_fairy2i_bundle_w1_bf16_mma32x16_k16" :
+            is_bundle       ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
+                                       "kernel_fairy2i_bundle_w2_half_mma32x16") :
+            is_w1 ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
+                    "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
         ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
