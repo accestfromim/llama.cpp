@@ -1851,7 +1851,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
 
     if (act_rows != 1) {
         const bool use_bundle_w1_mn = is_bundle && is_w1;
-        const char * pipeline_name = use_bundle_w1_mn ? "kernel_fairy2i_bundle_w1_half_mma8x64_k16" :
+        const char * pipeline_name = use_bundle_w1_mn ? "kernel_fairy2i_bundle_w1_half_mma64x8_k16" :
                                       is_bundle       ? "kernel_fairy2i_bundle_w2_half_mma32x16" :
                                       is_w1 ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
                                               "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
@@ -1860,8 +1860,8 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
         }
 
-        const int row_tile = use_bundle_w1_mn ? 8 : 32;
-        const int col_tile = use_bundle_w1_mn ? 64 : 16;
+        const int row_tile = use_bundle_w1_mn ? 64 : 32;
+        const int col_tile = use_bundle_w1_mn ? 8 : 16;
         const int k_tile   = is_w1 ? 16 : 8;
         const int nth      = 128;
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
