@@ -127,6 +127,28 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_bundle_w2_decode_fc
     return pipeline;
 }
 
+static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(ggml_metal_library_t lib,
+                                                                                  const char *         base,
+                                                                                  int32_t              act_rows) {
+    char name[256];
+
+    snprintf(name, sizeof(name), "%s_actrows=%d", base, act_rows);
+
+    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
+    if (pipeline) {
+        return pipeline;
+    }
+
+    ggml_metal_cv_t cv = ggml_metal_cv_init();
+    ggml_metal_cv_set_int32(cv, act_rows, FC_FAIRY2I_BUNDLE_W1_PREFILL + 0);
+
+    pipeline = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+    ggml_metal_cv_free(cv);
+
+    return pipeline;
+}
+
 struct ggml_metal_op {
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
@@ -1832,9 +1854,14 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     if (act_rows != 1) {
         const char * pipeline_name = use_bundle_w1_direct_act ? "kernel_fairy2i_act_half_64_stage_bf16_kmajor" :
                                                                "kernel_fairy2i_act_half_64_stage_bf16";
-        ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
-        if (!pipeline) {
-            pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+        ggml_metal_pipeline_t pipeline = nullptr;
+        if (use_bundle_w1_direct_act) {
+            pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, act_rows);
+        } else {
+            pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
+            if (!pipeline) {
+                pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+            }
         }
 
         const int nth = ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
@@ -1858,9 +1885,14 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
                                  "kernel_fairy2i_bundle_w2_half_mma32x16") :
             is_w1 ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
                     "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
-        ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
-        if (!pipeline) {
-            pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+        ggml_metal_pipeline_t pipeline = nullptr;
+        if (use_bundle_w1_direct_act) {
+            pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, act_rows);
+        } else {
+            pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
+            if (!pipeline) {
+                pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+            }
         }
 
         const int row_tile = 32;

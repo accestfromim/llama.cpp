@@ -78,6 +78,8 @@ static inline ushort fairy2i_f32_to_bf16(float x) {
     return (ushort) ((bits + (0x7fffU + ((bits >> 16) & 1U))) >> 16);
 }
 
+constant int FC_fairy2i_bundle_w1_prefill_act_rows [[function_constant(FC_FAIRY2I_BUNDLE_W1_PREFILL + 0)]];
+
 static inline uint fairy2i_pack_bf16_pair(float real, float imag) {
     return ((uint) fairy2i_f32_to_bf16(real)) | (((uint) fairy2i_f32_to_bf16(imag)) << 16);
 }
@@ -123,9 +125,9 @@ kernel void kernel_fairy2i_act_half_64_stage_bf16_kmajor(
 
     const uint pair = *((device const uint *) (x + (ulong) i1 * args.x_nb1 + (ulong) i2 * args.x_nb2 +
                                                (ulong) i3 * args.x_nb3 + (ulong) k_idx * args.x_nb0));
-    const ulong plane_size = (ulong) QK_FAIRY2I_ACT_Q16_64 * (ulong) args.act_rows;
+    const ulong plane_size = (ulong) QK_FAIRY2I_ACT_Q16_64 * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows;
     const ulong block_base = (ulong) block * 2 * plane_size;
-    const ulong kmajor_index = (ulong) j * (ulong) args.act_rows + (ulong) act_row;
+    const ulong kmajor_index = (ulong) j * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows + (ulong) act_row;
 
     act_h[block_base + kmajor_index] = (half) fairy2i_bf16_to_f32((ushort) (pair & 0xffffU));
     act_h[block_base + plane_size + kmajor_index] = (half) fairy2i_bf16_to_f32((ushort) (pair >> 16));
@@ -1390,7 +1392,8 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act(
     const int row_in_m64 = (row_base + coeff_row) & 63;
     const int m16 = row_in_m64 >> 4;
     const int row_lane = row_in_m64 & 15;
-    const ulong act_plane_size = (ulong) QK_FAIRY2I_ACT_Q16_64 * (ulong) args.act_rows;
+    const ulong act_plane_size =
+        (ulong) QK_FAIRY2I_ACT_Q16_64 * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows;
 
     simdgroup_half8x8 a_rr;
     simdgroup_half8x8 a_ri;
@@ -1433,7 +1436,8 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act(
 
             for (int ik = 0; ik < 2; ++ik) {
                 const ulong act_real_base = act_block_base +
-                                            (ulong) (k_chunk + ik * 8) * (ulong) args.act_rows +
+                                            (ulong) (k_chunk + ik * 8) *
+                                                (ulong) FC_fairy2i_bundle_w1_prefill_act_rows +
                                             (ulong) col_base;
                 const ulong act_imag_base = act_real_base + act_plane_size;
 
@@ -1441,10 +1445,10 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act(
                 simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + ik * 8, 16);
                 simdgroup_load(a_ir, coeff_imag_from_real + coeff_base + ik * 8, 16);
                 simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base + ik * 8, 16);
-                simdgroup_load(b_r0, act_h + act_real_base, args.act_rows);
-                simdgroup_load(b_i0, act_h + act_imag_base, args.act_rows);
-                simdgroup_load(b_r1, act_h + act_real_base + 8, args.act_rows);
-                simdgroup_load(b_i1, act_h + act_imag_base + 8, args.act_rows);
+                simdgroup_load(b_r0, act_h + act_real_base, FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(b_i0, act_h + act_imag_base, FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(b_r1, act_h + act_real_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(b_i1, act_h + act_imag_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
 
                 simdgroup_barrier(mem_flags::mem_none);
                 simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
