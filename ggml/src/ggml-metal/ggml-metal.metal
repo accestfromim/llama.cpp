@@ -1414,14 +1414,13 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act(
         const half2 wr = half2(scales[scale_base + 0], scales[scale_base + 2]);
         const half2 wi = half2(scales[scale_base + 1], scales[scale_base + 3]);
         const ulong act_block_base = (ulong) wb * 2 * act_plane_size;
+        device const uchar * code_ptr =
+            codes + (ulong) physical_tile * 64 * 2 * 16 +
+            (ulong) (m16 * 16 + q4_local) * 2 * 16 + (ulong) row_lane;
 
         for (int k_chunk = 0; k_chunk < QK_FAIRY2I_TILE64; k_chunk += 16) {
-            const int q4 = (k_chunk >> 2) + q4_local;
-            const int slot = m16 * 16 + q4;
-            const ulong code_base =
-                ((((ulong) physical_tile * 64 + (ulong) slot) * 2) * 16) + (ulong) row_lane;
-            const uint u_codes = (uint) codes[code_base];
-            const uint w_codes = (uint) codes[code_base + 16];
+            const uint u_codes = (uint) code_ptr[0];
+            const uint w_codes = (uint) code_ptr[16];
 
             FOR_UNROLL (int part = 0; part < 4; ++part) {
                 const uint2 code = uint2((u_codes >> (2 * part)) & 3, (w_codes >> (2 * part)) & 3);
@@ -1461,6 +1460,7 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act(
                 simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
+            code_ptr += 4 * 2 * 16;
         }
     }
 
