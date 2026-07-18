@@ -1205,7 +1205,8 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
     const int physical_m_tile = row_base / QK_FAIRY2I_TILE64;
     const int coeff_base = (int) sgitg * 8 * 16;
 
-    simdgroup_half8x8 a;
+    simdgroup_half8x8 a0;
+    simdgroup_half8x8 a1;
     simdgroup_half8x8 b_r0;
     simdgroup_half8x8 b_i0;
     simdgroup_half8x8 b_r1;
@@ -1275,21 +1276,19 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
                 simdgroup_load(b_i1, act_imag_tile1 + ik * 64);
 
                 simdgroup_barrier(mem_flags::mem_none);
-                simdgroup_load(a, coeff_real_from_real + coeff_base + ik * 8, 16);
-                simdgroup_multiply_accumulate(c_r0, a, b_r0, c_r0);
-                simdgroup_multiply_accumulate(c_r1, a, b_r1, c_r1);
+                simdgroup_load(a0, coeff_real_from_real + coeff_base + ik * 8, 16);
+                simdgroup_load(a1, coeff_real_from_imag + coeff_base + ik * 8, 16);
+                simdgroup_multiply_accumulate(c_r0, a0, b_r0, c_r0);
+                simdgroup_multiply_accumulate(c_r0, a1, b_i0, c_r0);
+                simdgroup_multiply_accumulate(c_r1, a0, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a1, b_i1, c_r1);
 
-                simdgroup_load(a, coeff_real_from_imag + coeff_base + ik * 8, 16);
-                simdgroup_multiply_accumulate(c_r0, a, b_i0, c_r0);
-                simdgroup_multiply_accumulate(c_r1, a, b_i1, c_r1);
-
-                simdgroup_load(a, coeff_imag_from_real + coeff_base + ik * 8, 16);
-                simdgroup_multiply_accumulate(c_i0, a, b_r0, c_i0);
-                simdgroup_multiply_accumulate(c_i1, a, b_r1, c_i1);
-
-                simdgroup_load(a, coeff_imag_from_imag + coeff_base + ik * 8, 16);
-                simdgroup_multiply_accumulate(c_i0, a, b_i0, c_i0);
-                simdgroup_multiply_accumulate(c_i1, a, b_i1, c_i1);
+                simdgroup_load(a0, coeff_imag_from_real + coeff_base + ik * 8, 16);
+                simdgroup_load(a1, coeff_imag_from_imag + coeff_base + ik * 8, 16);
+                simdgroup_multiply_accumulate(c_i0, a0, b_r0, c_i0);
+                simdgroup_multiply_accumulate(c_i0, a1, b_i0, c_i0);
+                simdgroup_multiply_accumulate(c_i1, a0, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a1, b_i1, c_i1);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
