@@ -1279,15 +1279,15 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
                 simdgroup_load(a0, coeff_real_from_real + coeff_base + ik * 8, 16);
                 simdgroup_load(a1, coeff_real_from_imag + coeff_base + ik * 8, 16);
                 simdgroup_multiply_accumulate(c_r0, a0, b_r0, c_r0);
-                simdgroup_multiply_accumulate(c_r1, a0, b_r1, c_r1);
                 simdgroup_multiply_accumulate(c_r0, a1, b_i0, c_r0);
+                simdgroup_multiply_accumulate(c_r1, a0, b_r1, c_r1);
                 simdgroup_multiply_accumulate(c_r1, a1, b_i1, c_r1);
 
                 simdgroup_load(a0, coeff_imag_from_real + coeff_base + ik * 8, 16);
                 simdgroup_load(a1, coeff_imag_from_imag + coeff_base + ik * 8, 16);
                 simdgroup_multiply_accumulate(c_i0, a0, b_r0, c_i0);
-                simdgroup_multiply_accumulate(c_i1, a0, b_r1, c_i1);
                 simdgroup_multiply_accumulate(c_i0, a1, b_i0, c_i0);
+                simdgroup_multiply_accumulate(c_i1, a0, b_r1, c_i1);
                 simdgroup_multiply_accumulate(c_i1, a1, b_i1, c_i1);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
