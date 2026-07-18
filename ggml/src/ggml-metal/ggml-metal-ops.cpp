@@ -1816,11 +1816,11 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     }
     const bool is_w1 = is_bundle ? op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 : u_s1 == nullptr;
 
-    const int32_t                           k        = (int32_t) x->ne[0];
-    const int32_t                           m        = (int32_t) op->ne[0];
-    const int32_t                           act_rows = (int32_t) ggml_nrows(x);
-    const bool use_bundle_w1_direct_act = is_bundle && is_w1 && act_rows % 16 == 0;
-    ggml_metal_kargs_fairy2i_wide_linear_w2 args     = {
+    const int32_t                           k                        = (int32_t) x->ne[0];
+    const int32_t                           m                        = (int32_t) op->ne[0];
+    const int32_t                           act_rows                 = (int32_t) ggml_nrows(x);
+    const bool                              use_bundle_w1_direct_act = is_bundle && is_w1 && act_rows % 16 == 0;
+    ggml_metal_kargs_fairy2i_wide_linear_w2 args                     = {
         /*.k         =*/k,
         /*.m         =*/m,
         /*.act_rows  =*/act_rows,
@@ -1852,8 +1852,8 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     act_q.offs += ggml_nbytes(op) + op_act_q_pad;
 
     if (act_rows != 1) {
-        const char * pipeline_name = use_bundle_w1_direct_act ? "kernel_fairy2i_act_half_64_stage_bf16_kmajor" :
-                                                               "kernel_fairy2i_act_half_64_stage_bf16";
+        const char * pipeline_name     = use_bundle_w1_direct_act ? "kernel_fairy2i_act_half_64_stage_bf16_kmajor" :
+                                                                    "kernel_fairy2i_act_half_64_stage_bf16";
         ggml_metal_pipeline_t pipeline = nullptr;
         if (use_bundle_w1_direct_act) {
             pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, act_rows);
@@ -1879,13 +1879,13 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     }
 
     if (act_rows != 1) {
-        const char * pipeline_name =
-            use_bundle_w1_direct_act ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act" :
-            is_bundle ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
-                                 "kernel_fairy2i_bundle_w2_half_mma32x16") :
-            is_w1 ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
-                    "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
-        ggml_metal_pipeline_t pipeline = nullptr;
+        const char *          pipeline_name = use_bundle_w1_direct_act ?
+                                                  "kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act" :
+                                              is_bundle ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
+                                                                   "kernel_fairy2i_bundle_w2_half_mma32x16") :
+                                              is_w1     ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
+                                                          "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
+        ggml_metal_pipeline_t pipeline      = nullptr;
         if (use_bundle_w1_direct_act) {
             pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, act_rows);
         } else {
