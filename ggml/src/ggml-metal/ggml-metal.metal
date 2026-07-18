@@ -1354,7 +1354,9 @@ kernel void kernel_fairy2i_bundle_w1_half_mma_mn_k16(
         uint2 tgpig                                             [[threadgroup_position_in_grid]],
         uint tiitg                                              [[thread_index_in_threadgroup]],
         uint sgitg                                              [[simdgroup_index_in_threadgroup]]) {
-    static_assert(row_tile == 16 && col_tile == 32, "unsupported Fairy2i W1 M/N tile");
+    static_assert(row_tile * col_tile == 512, "Fairy2i W1 M/N candidates keep a fixed output area");
+    static_assert(row_tile == 64 || row_tile == 32 || row_tile == 16 || row_tile == 8,
+                  "unsupported Fairy2i W1 row tile");
 
     constexpr int n_threads = 128;
     constexpr int row_blocks = row_tile / 8;
@@ -1365,13 +1367,21 @@ kernel void kernel_fairy2i_bundle_w1_half_mma_mn_k16(
     const int blocks = args.k / QK_FAIRY2I_TILE64;
     const int physical_m_tile = row_base / QK_FAIRY2I_TILE64;
 
-    const int row_block = (int) sgitg % row_blocks;
-    const int col_block0 = ((int) sgitg / row_blocks) * 2;
-    const int col_block1 = col_block0 + 1;
-    const int coeff_base = row_block * 8 * 16;
+    const int row_block0 = row_tile == 64 ? (int) sgitg * 2 : (int) sgitg % row_blocks;
+    const int row_block1 = row_tile == 64 ? row_block0 + 1 : row_block0;
+    const int col_block0 = row_tile == 64 ? 0 : ((int) sgitg / row_blocks) * 2;
+    const int col_block1 = row_tile == 64 ? 0 : col_block0 + 1;
+    const int coeff_base0 = row_block0 * 8 * 16;
+    const int coeff_base1 = row_block1 * 8 * 16;
 
-    simdgroup_half8x8 a0;
-    simdgroup_half8x8 a1;
+    simdgroup_half8x8 a_rr0;
+    simdgroup_half8x8 a_ri0;
+    simdgroup_half8x8 a_ir0;
+    simdgroup_half8x8 a_ii0;
+    simdgroup_half8x8 a_rr1;
+    simdgroup_half8x8 a_ri1;
+    simdgroup_half8x8 a_ir1;
+    simdgroup_half8x8 a_ii1;
     simdgroup_half8x8 b_r0;
     simdgroup_half8x8 b_i0;
     simdgroup_half8x8 b_r1;
@@ -1429,34 +1439,48 @@ kernel void kernel_fairy2i_bundle_w1_half_mma_mn_k16(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             for (int ik = 0; ik < 2; ++ik) {
+                simdgroup_load(a_rr0, coeff_real_from_real + coeff_base0 + ik * 8, 16);
+                simdgroup_load(a_ri0, coeff_real_from_imag + coeff_base0 + ik * 8, 16);
+                simdgroup_load(a_ir0, coeff_imag_from_real + coeff_base0 + ik * 8, 16);
+                simdgroup_load(a_ii0, coeff_imag_from_imag + coeff_base0 + ik * 8, 16);
                 simdgroup_load(b_r0, act_real + ik * 8 * col_tile + col_block0 * 8, col_tile);
                 simdgroup_load(b_i0, act_imag + ik * 8 * col_tile + col_block0 * 8, col_tile);
-                simdgroup_load(b_r1, act_real + ik * 8 * col_tile + col_block1 * 8, col_tile);
-                simdgroup_load(b_i1, act_imag + ik * 8 * col_tile + col_block1 * 8, col_tile);
+
+                if (row_tile == 64) {
+                    simdgroup_load(a_rr1, coeff_real_from_real + coeff_base1 + ik * 8, 16);
+                    simdgroup_load(a_ri1, coeff_real_from_imag + coeff_base1 + ik * 8, 16);
+                    simdgroup_load(a_ir1, coeff_imag_from_real + coeff_base1 + ik * 8, 16);
+                    simdgroup_load(a_ii1, coeff_imag_from_imag + coeff_base1 + ik * 8, 16);
+                } else {
+                    simdgroup_load(b_r1, act_real + ik * 8 * col_tile + col_block1 * 8, col_tile);
+                    simdgroup_load(b_i1, act_imag + ik * 8 * col_tile + col_block1 * 8, col_tile);
+                }
 
                 simdgroup_barrier(mem_flags::mem_none);
-                simdgroup_load(a0, coeff_real_from_real + coeff_base + ik * 8, 16);
-                simdgroup_load(a1, coeff_real_from_imag + coeff_base + ik * 8, 16);
-                simdgroup_multiply_accumulate(c_r0, a0, b_r0, c_r0);
-                simdgroup_multiply_accumulate(c_r0, a1, b_i0, c_r0);
-                simdgroup_multiply_accumulate(c_r1, a0, b_r1, c_r1);
-                simdgroup_multiply_accumulate(c_r1, a1, b_i1, c_r1);
-
-                simdgroup_load(a0, coeff_imag_from_real + coeff_base + ik * 8, 16);
-                simdgroup_load(a1, coeff_imag_from_imag + coeff_base + ik * 8, 16);
-                simdgroup_multiply_accumulate(c_i0, a0, b_r0, c_i0);
-                simdgroup_multiply_accumulate(c_i0, a1, b_i0, c_i0);
-                simdgroup_multiply_accumulate(c_i1, a0, b_r1, c_i1);
-                simdgroup_multiply_accumulate(c_i1, a1, b_i1, c_i1);
+                simdgroup_multiply_accumulate(c_r0, a_rr0, b_r0, c_r0);
+                simdgroup_multiply_accumulate(c_r0, a_ri0, b_i0, c_r0);
+                simdgroup_multiply_accumulate(c_i0, a_ir0, b_r0, c_i0);
+                simdgroup_multiply_accumulate(c_i0, a_ii0, b_i0, c_i0);
+                if (row_tile == 64) {
+                    simdgroup_multiply_accumulate(c_r1, a_rr1, b_r0, c_r1);
+                    simdgroup_multiply_accumulate(c_r1, a_ri1, b_i0, c_r1);
+                    simdgroup_multiply_accumulate(c_i1, a_ir1, b_r0, c_i1);
+                    simdgroup_multiply_accumulate(c_i1, a_ii1, b_i0, c_i1);
+                } else {
+                    simdgroup_multiply_accumulate(c_r1, a_rr0, b_r1, c_r1);
+                    simdgroup_multiply_accumulate(c_r1, a_ri0, b_i1, c_r1);
+                    simdgroup_multiply_accumulate(c_i1, a_ir0, b_r1, c_i1);
+                    simdgroup_multiply_accumulate(c_i1, a_ii0, b_i1, c_i1);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 
-    simdgroup_store(c_r0, out_tile + row_block * 8 * col_tile + col_block0 * 8, col_tile);
-    simdgroup_store(c_i0, out_tile + out_elements + row_block * 8 * col_tile + col_block0 * 8, col_tile);
-    simdgroup_store(c_r1, out_tile + row_block * 8 * col_tile + col_block1 * 8, col_tile);
-    simdgroup_store(c_i1, out_tile + out_elements + row_block * 8 * col_tile + col_block1 * 8, col_tile);
+    simdgroup_store(c_r0, out_tile + row_block0 * 8 * col_tile + col_block0 * 8, col_tile);
+    simdgroup_store(c_i0, out_tile + out_elements + row_block0 * 8 * col_tile + col_block0 * 8, col_tile);
+    simdgroup_store(c_r1, out_tile + row_block1 * 8 * col_tile + col_block1 * 8, col_tile);
+    simdgroup_store(c_i1, out_tile + out_elements + row_block1 * 8 * col_tile + col_block1 * 8, col_tile);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint idx = tiitg; idx < out_elements; idx += n_threads) {
@@ -1491,8 +1515,12 @@ kernel void kernel_fairy2i_bundle_w1_half_mma_mn_k16(
 
 typedef decltype(kernel_fairy2i_bundle_w1_half_mma_mn_k16<16, 32>) fairy2i_bundle_w1_half_mma_mn_k16_t;
 
+template [[host_name("kernel_fairy2i_bundle_w1_half_mma64x8_k16")]]
+kernel fairy2i_bundle_w1_half_mma_mn_k16_t kernel_fairy2i_bundle_w1_half_mma_mn_k16<64, 8>;
 template [[host_name("kernel_fairy2i_bundle_w1_half_mma16x32_k16")]]
 kernel fairy2i_bundle_w1_half_mma_mn_k16_t kernel_fairy2i_bundle_w1_half_mma_mn_k16<16, 32>;
+template [[host_name("kernel_fairy2i_bundle_w1_half_mma8x64_k16")]]
+kernel fairy2i_bundle_w1_half_mma_mn_k16_t kernel_fairy2i_bundle_w1_half_mma_mn_k16<8, 64>;
 
 kernel void kernel_fairy2i_bundle_w2_half_mma32x16(
         constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
