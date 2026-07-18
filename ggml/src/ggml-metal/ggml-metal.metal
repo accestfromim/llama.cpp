@@ -1293,11 +1293,15 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
         }
     }
 
+    threadgroup float * out_real_tile0 = (threadgroup float *) coeff_real_from_real;
+    threadgroup float * out_imag_tile0 = (threadgroup float *) coeff_real_from_imag;
+    threadgroup float * out_real_tile1 = (threadgroup float *) coeff_imag_from_real;
+    threadgroup float * out_imag_tile1 = (threadgroup float *) coeff_imag_from_imag;
     const int simdgroup_out_base = (int) sgitg * 64;
-    simdgroup_store(c_r0, (threadgroup float *) coeff_real_from_real + simdgroup_out_base, 8);
-    simdgroup_store(c_i0, (threadgroup float *) coeff_real_from_imag + simdgroup_out_base, 8);
-    simdgroup_store(c_r1, (threadgroup float *) coeff_imag_from_real + simdgroup_out_base, 8);
-    simdgroup_store(c_i1, (threadgroup float *) coeff_imag_from_imag + simdgroup_out_base, 8);
+    simdgroup_store(c_r0, out_real_tile0 + simdgroup_out_base, 8);
+    simdgroup_store(c_i0, out_imag_tile0 + simdgroup_out_base, 8);
+    simdgroup_store(c_r1, out_real_tile1 + simdgroup_out_base, 8);
+    simdgroup_store(c_i1, out_imag_tile1 + simdgroup_out_base, 8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
@@ -1314,10 +1318,8 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
             const int row_group = row_lane >> 3;
             const int row_in_group = row_lane & 7;
             const int out_index = row_group * 64 + row_in_group * 8 + col_lane;
-            float out_real = tile == 0 ? ((threadgroup float *) coeff_real_from_real)[out_index] :
-                                         ((threadgroup float *) coeff_imag_from_real)[out_index];
-            float out_imag = tile == 0 ? ((threadgroup float *) coeff_real_from_imag)[out_index] :
-                                         ((threadgroup float *) coeff_imag_from_imag)[out_index];
+            float out_real = tile == 0 ? out_real_tile0[out_index] : out_real_tile1[out_index];
+            float out_imag = tile == 0 ? out_imag_tile0[out_index] : out_imag_tile1[out_index];
 
             if (args.has_bias) {
                 const int b0r = row % args.bias_ne0;
