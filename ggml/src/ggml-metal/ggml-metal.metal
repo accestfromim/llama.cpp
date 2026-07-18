@@ -1534,6 +1534,11 @@ kernel void kernel_fairy2i_bundle_w2_half_mma32x16(
     const int blocks = args.k / QK_FAIRY2I_TILE64;
     const int physical_m_tile = row_base / QK_FAIRY2I_TILE64;
     const int coeff_base = (int) sgitg * 64;
+    const int coeff_row = (int) tiitg & 31;
+    const int q4_local = (int) tiitg >> 5;
+    const int row_in_m64 = (row_base + coeff_row) & 63;
+    const int m16 = row_in_m64 >> 4;
+    const int row_lane = row_in_m64 & 15;
 
     simdgroup_half8x8 a_rr;
     simdgroup_half8x8 a_ri;
@@ -1550,25 +1555,19 @@ kernel void kernel_fairy2i_bundle_w2_half_mma32x16(
 
     for (int wb = 0; wb < blocks; ++wb) {
         const int physical_tile = physical_m_tile * blocks + wb;
+        device const uchar * code_ptr =
+            codes + (ulong) physical_tile * 64 * 4 * 16 +
+            (ulong) (m16 * 16 + q4_local) * 4 * 16 + (ulong) row_lane;
 
         for (int k_chunk = 0; k_chunk < QK_FAIRY2I_TILE64; k_chunk += k_tile) {
             // One bundle byte supplies four consecutive K codes. Only 64 threads are needed to expand
             // the complete 32x8 coefficient tile; all 128 threads remain active for staging and MMA.
             if (tiitg < 64) {
-                const int coeff_row = (int) tiitg & 31;
-                const int q4_local = (int) tiitg >> 5;
-                const int row_in_m64 = (row_base + coeff_row) & 63;
-                const int m16 = row_in_m64 >> 4;
-                const int row_lane = row_in_m64 & 15;
-                const int q4 = (k_chunk >> 2) + q4_local;
-                const int slot = m16 * 16 + q4;
-                const ulong code_base =
-                    ((((ulong) physical_tile * 64 + (ulong) slot) * 4) * 16) + (ulong) row_lane;
                 const uint4 packed_codes = uint4(
-                    (uint) codes[code_base],
-                    (uint) codes[code_base + 16],
-                    (uint) codes[code_base + 32],
-                    (uint) codes[code_base + 48]);
+                    (uint) code_ptr[0],
+                    (uint) code_ptr[16],
+                    (uint) code_ptr[32],
+                    (uint) code_ptr[48]);
 
                 const int scale_base = physical_tile * 8;
                 const half4 scale01 = *((device const half4 *) (scales + scale_base));
@@ -1585,6 +1584,7 @@ kernel void kernel_fairy2i_bundle_w2_half_mma32x16(
                     coeff_imag_from_real[coeff_index] = (half) coeff.z;
                     coeff_imag_from_imag[coeff_index] = (half) coeff.w;
                 }
+                code_ptr += 2 * 4 * 16;
             }
 
             for (uint idx = tiitg; idx < 16 * k_tile; idx += n_threads) {

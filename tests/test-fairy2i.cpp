@@ -2195,6 +2195,7 @@ static bool test_fairy2i_metal_wide_linear() {
     const std::vector<fairy2i_w2_case> bundle_w2_cases = {
         { 128, 1,  256, false },
         { 64,  1,  128, true  },
+        { 64,  16, 128, true  },
         { 64,  17, 128, true  },
     };
     for (const fairy2i_w2_case & tc : bundle_w2_cases) {
