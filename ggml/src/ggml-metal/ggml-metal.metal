@@ -1418,7 +1418,7 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act(
             codes + (ulong) physical_tile * 64 * 2 * 16 +
             (ulong) (m16 * 16 + q4_local) * 2 * 16 + (ulong) row_lane;
 
-        for (int k_chunk = 0; k_chunk < QK_FAIRY2I_TILE64; k_chunk += 16) {
+        FOR_UNROLL (int k_chunk = 0; k_chunk < QK_FAIRY2I_TILE64; k_chunk += 16) {
             const uint u_codes = (uint) code_ptr[0];
             const uint w_codes = (uint) code_ptr[16];
 
