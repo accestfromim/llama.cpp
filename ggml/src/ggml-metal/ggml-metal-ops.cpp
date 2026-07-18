@@ -1861,7 +1861,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
 
         const int row_tile = 32;
         const int k_tile   = is_w1 ? 16 : 8;
-        const int nth      = row_tile * (is_bundle && is_w1 ? 8 : 4);
+        const int nth      = row_tile * 4;
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
