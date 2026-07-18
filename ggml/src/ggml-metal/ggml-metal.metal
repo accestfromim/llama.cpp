@@ -1275,7 +1275,6 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
                 simdgroup_load(b_r1, act_real_tile1 + ik * 64);
                 simdgroup_load(b_i1, act_imag_tile1 + ik * 64);
 
-                simdgroup_barrier(mem_flags::mem_none);
                 simdgroup_load(a0, coeff_real_from_real + coeff_base + ik * 8, 16);
                 simdgroup_load(a1, coeff_real_from_imag + coeff_base + ik * 8, 16);
                 simdgroup_multiply_accumulate(c_r0, a0, b_r0, c_r0);
