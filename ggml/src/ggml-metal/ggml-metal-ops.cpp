@@ -1797,6 +1797,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     const int32_t                           k        = (int32_t) x->ne[0];
     const int32_t                           m        = (int32_t) op->ne[0];
     const int32_t                           act_rows = (int32_t) ggml_nrows(x);
+    const bool use_bundle_w1_direct_act = is_bundle && is_w1 && act_rows % 16 == 0;
     ggml_metal_kargs_fairy2i_wide_linear_w2 args     = {
         /*.k         =*/k,
         /*.m         =*/m,
@@ -1829,7 +1830,8 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     act_q.offs += ggml_nbytes(op) + op_act_q_pad;
 
     if (act_rows != 1) {
-        const char *          pipeline_name = "kernel_fairy2i_act_half_64_stage_bf16";
+        const char * pipeline_name = use_bundle_w1_direct_act ? "kernel_fairy2i_act_half_64_stage_bf16_kmajor" :
+                                                               "kernel_fairy2i_act_half_64_stage_bf16";
         ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
@@ -1850,10 +1852,12 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     }
 
     if (act_rows != 1) {
-        const char *          pipeline_name = is_bundle ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
-                                                                   "kernel_fairy2i_bundle_w2_half_mma32x16") :
-                                              is_w1     ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
-                                                          "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
+        const char * pipeline_name =
+            use_bundle_w1_direct_act ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act" :
+            is_bundle ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
+                                 "kernel_fairy2i_bundle_w2_half_mma32x16") :
+            is_w1 ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
+                    "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
         ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
@@ -1891,11 +1895,15 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * sizeof(ggml_fp16_t), 1);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * sizeof(ggml_fp16_t), 2);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * sizeof(ggml_fp16_t), 3);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 4);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 5);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 6);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 7);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 8);
+        if (use_bundle_w1_direct_act) {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 4);
+        } else {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 4);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 5);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 6);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 7);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 8);
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, (m + row_tile - 1) / row_tile, (act_rows + 15) / 16, 1, nth, 1,
                                                  1);
 
