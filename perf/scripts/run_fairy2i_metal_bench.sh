@@ -20,7 +20,7 @@ Environment:
   MMAP             mmap 0/1 (default: 1)
   XCTRACE_TEMPLATE optional xctrace template name/path; records PREFIX.trace
   XCTRACE_WINDOW   optional trailing trace window, for example 1s
-  COOLDOWN_SECONDS minimum interval after the preceding test (default/minimum: 60)
+  COOLDOWN_SECONDS minimum interval after the preceding test (default/minimum: 15)
   COOLDOWN_STATE   shared cooldown state directory
 
 The script refuses concurrent runs and records the end timestamp even when the
@@ -52,11 +52,11 @@ flash_attn=${FLASH_ATTN:-1}
 use_mmap=${MMAP:-1}
 profile_template=${XCTRACE_TEMPLATE:-}
 profile_window=${XCTRACE_WINDOW:-}
-cooldown_seconds=${COOLDOWN_SECONDS:-60}
+cooldown_seconds=${COOLDOWN_SECONDS:-15}
 state_dir=${COOLDOWN_STATE:-/tmp/fairy2i-metal-bench-cooldown}
 
-if (( cooldown_seconds < 60 )); then
-    echo "COOLDOWN_SECONDS must be at least 60" >&2
+if (( cooldown_seconds < 15 )); then
+    echo "COOLDOWN_SECONDS must be at least 15" >&2
     exit 2
 fi
 if [[ ! -x $binary ]]; then
