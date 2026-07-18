@@ -1859,9 +1859,11 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
         }
 
-        const int row_tile = 32;
-        const int k_tile   = is_w1 ? 16 : 8;
-        const int nth      = row_tile * 4;
+        const bool is_bundle_w1 = is_bundle && is_w1;
+        const int  row_tile     = 32;
+        const int  col_tile     = is_bundle_w1 ? 8 : 16;
+        const int  k_tile       = is_w1 ? 16 : 8;
+        const int  nth          = row_tile * 4;
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -1893,11 +1895,15 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * sizeof(ggml_fp16_t), 3);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 4);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 5);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 6);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 7);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 8);
-        ggml_metal_encoder_dispatch_threadgroups(enc, (m + row_tile - 1) / row_tile, (act_rows + 15) / 16, 1, nth, 1,
-                                                 1);
+        if (is_bundle_w1) {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * col_tile * 2 * sizeof(float), 6);
+        } else {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 6);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 7);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * col_tile * 2 * sizeof(float), 8);
+        }
+        ggml_metal_encoder_dispatch_threadgroups(enc, (m + row_tile - 1) / row_tile,
+                                                 (act_rows + col_tile - 1) / col_tile, 1, nth, 1, 1);
 
         return 1;
     }
