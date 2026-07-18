@@ -2685,6 +2685,16 @@ static bool test_fairy2i_bundle_lut() {
                                     true, "1", "lut16", false, 8, "0")) {
         return false;
     }
+    std::vector<uint32_t> dynamic_w1_default;
+    ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+    if (!run_fairy2i_bundle_backend(dynamic_w1_default, dynamic_tc, dynamic_w1.x, dynamic_w1.bias, dynamic_w1_bundle,
+                                    true, "1", "lut16", false, 8)) {
+        return false;
+    }
+    ok = check_fairy2i_w1_dynamic_tiles_hit("W1 bundle dynamic default", true) && ok;
+    ok = check_fairy2i_w1_dynamic_tiles_last_batch("W1 bundle dynamic default", 4) && ok;
+    ok = compare_exact("W1 bundle dynamic default/static", dynamic_w1_default, dynamic_w1_static) && ok;
+    ++cases_run;
     for (const char * batch : { "1", "2", "4" }) {
         std::vector<uint32_t> output;
         if (!run_fairy2i_bundle_backend(output, dynamic_tc, dynamic_w1.x, dynamic_w1.bias, dynamic_w1_bundle, true, "1",

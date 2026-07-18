@@ -36,12 +36,12 @@ Primary integration points:
   `GGML_FAIRY2I_LUT_IMPL=auto|lut16|lut_c`
 - Fairy2i W2 LUT16 dynamic tile claiming is enabled by default:
   `GGML_FAIRY2I_W2_DYNAMIC_TILES=0` disables it; it only affects W2 LUT with `N==1`;
-  `GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size. Unset uses `2`, invalid values use `1`.
-  Current M4 tg128 evidence prefers `batch=1` for low thread counts (`nth<=4`); consider `batch=2`
-  only for higher-thread tg after path-validated measurement. Do not present `batch=2` as generally safe.
-- Fairy2i W1 LUT16 dynamic tile claiming is an opt-in experiment:
-  `GGML_FAIRY2I_W1_DYNAMIC_TILES=1` enables it only for W1 LUT with `N==1`; `N>1` keeps the static split.
-  `GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size. Unset uses `2`, invalid values use `1`.
+  `GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size. Unset uses `4` for bundle_v1 and `2`
+  for older layouts; invalid values use `1`. Current M4 bundle_v1 tg128 evidence at `nth=8` prefers `batch=4`.
+- Fairy2i W1 LUT16 dynamic tile claiming is enabled by default only for bundle_v1 with `N==1`; older layouts remain
+  opt-in. `GGML_FAIRY2I_W1_DYNAMIC_TILES=0|1` overrides the default, and `N>1` always keeps the static split.
+  `GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size. Unset uses `4` for bundle_v1 and `2`
+  for older layouts; invalid values use `1`. Current M4 bundle_v1 tg128 evidence at `nth=8` prefers `batch=4`.
 - Legacy iFairy: `GGML_IFAIRY_LUT=0/1`, `GGML_IFAIRY_LUT_DEBUG=0/1`,
   `GGML_IFAIRY_LUT_IMPL=auto|lut16|lut_c`
 - Legacy tensor-scale vecdot policy remains under `GGML_IFAIRY_VEC_DOT_ACT_TENSOR`, but the route is
