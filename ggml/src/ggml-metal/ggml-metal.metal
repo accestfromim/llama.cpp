@@ -1192,7 +1192,6 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
         threadgroup half * act_imag_tile0                       [[threadgroup(5)]],
         threadgroup half * act_real_tile1                       [[threadgroup(6)]],
         threadgroup half * act_imag_tile1                       [[threadgroup(7)]],
-        threadgroup float * out_tile                            [[threadgroup(8)]],
         uint2 tgpig                                             [[threadgroup_position_in_grid]],
         uint tiitg                                              [[thread_index_in_threadgroup]],
         uint sgitg                                              [[simdgroup_index_in_threadgroup]]) {
@@ -1294,11 +1293,15 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
         }
     }
 
-    const int simdgroup_out_base = (int) sgitg * 256;
-    simdgroup_store(c_r0, out_tile + simdgroup_out_base, 8);
-    simdgroup_store(c_i0, out_tile + simdgroup_out_base + 64, 8);
-    simdgroup_store(c_r1, out_tile + simdgroup_out_base + 128, 8);
-    simdgroup_store(c_i1, out_tile + simdgroup_out_base + 192, 8);
+    threadgroup float * out_real_tile0 = (threadgroup float *) coeff_real_from_real;
+    threadgroup float * out_imag_tile0 = (threadgroup float *) coeff_real_from_imag;
+    threadgroup float * out_real_tile1 = (threadgroup float *) coeff_imag_from_real;
+    threadgroup float * out_imag_tile1 = (threadgroup float *) coeff_imag_from_imag;
+    const int simdgroup_out_base = (int) sgitg * 64;
+    simdgroup_store(c_r0, out_real_tile0 + simdgroup_out_base, 8);
+    simdgroup_store(c_i0, out_imag_tile0 + simdgroup_out_base, 8);
+    simdgroup_store(c_r1, out_real_tile1 + simdgroup_out_base, 8);
+    simdgroup_store(c_i1, out_imag_tile1 + simdgroup_out_base, 8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
@@ -1314,9 +1317,9 @@ kernel void kernel_fairy2i_bundle_w1_half_mma32x16_k16(
             const int i3 = col / (args.x_ne1 * args.x_ne2);
             const int row_group = row_lane >> 3;
             const int row_in_group = row_lane & 7;
-            const int out_base = row_group * 256 + tile * 128;
-            float out_real = out_tile[out_base + row_in_group * 8 + col_lane];
-            float out_imag = out_tile[out_base + 64 + row_in_group * 8 + col_lane];
+            const int out_index = row_group * 64 + row_in_group * 8 + col_lane;
+            float out_real = tile == 0 ? out_real_tile0[out_index] : out_real_tile1[out_index];
+            float out_imag = tile == 0 ? out_imag_tile0[out_index] : out_imag_tile1[out_index];
 
             if (args.has_bias) {
                 const int b0r = row % args.bias_ne0;

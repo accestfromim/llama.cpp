@@ -1895,7 +1895,9 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 5);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 6);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * sizeof(ggml_fp16_t), 7);
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 8);
+        if (!is_bundle || !is_w1) {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 8);
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, (m + row_tile - 1) / row_tile, (act_rows + 15) / 16, 1, nth, 1,
                                                  1);
 
