@@ -4942,8 +4942,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (fairy2i_is_bundle) {
                             return linear.bundle_codes && linear.bundle_scales;
                         }
-                        return fairy2i_is_w1 ? (linear.U[0] && linear.W[0])
-                                             : (linear.U[0] && linear.U[1] && linear.W[0] && linear.W[1]);
+                        return fairy2i_is_w1 ? (linear.U[0] && linear.W[0]) :
+                                               (linear.U[0] && linear.U[1] && linear.W[0] && linear.W[1]);
                     };
 
                     auto fairy2i_linear_any = [&](const llama_widely_linear_ifairy & linear) {
