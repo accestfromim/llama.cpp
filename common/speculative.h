@@ -24,10 +24,27 @@ struct common_speculative_params {
     float p_min = 0.75f; // min probability required to accept a token in the draft
 };
 
+struct common_speculative_draft_params {
+    bool drafting = false;
+
+    // overrides the configured max draft length when >= 0
+    int32_t n_max = -1;
+
+    llama_pos   n_past  = 0;
+    llama_token id_last = LLAMA_TOKEN_NULL;
+
+    const llama_tokens * prompt = nullptr;
+    llama_tokens       * result = nullptr;
+};
+
 struct common_speculative * common_speculative_init(
         struct llama_context * ctx_tgt,
         struct llama_context * ctx_dft
 );
+
+struct common_speculative * common_speculative_init(
+        struct common_params_speculative & params,
+        uint32_t n_seq);
 
 void common_speculative_free(struct common_speculative * spec);
 
@@ -38,6 +55,22 @@ bool common_speculative_are_compatible(
 void common_speculative_add_replacement_tgt_dft(
         struct common_speculative * spec,
         const char *source, const char *dest);
+
+void common_speculative_begin(
+        struct common_speculative * spec,
+        llama_seq_id seq_id,
+        const llama_tokens & prompt);
+
+common_speculative_draft_params & common_speculative_get_draft_params(
+        struct common_speculative * spec,
+        llama_seq_id seq_id);
+
+void common_speculative_draft(struct common_speculative * spec);
+
+void common_speculative_accept(
+        struct common_speculative * spec,
+        llama_seq_id seq_id,
+        uint16_t n_accepted);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_gen_draft(
