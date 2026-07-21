@@ -5,6 +5,18 @@
 
 struct common_speculative;
 
+// comma separated list of all supported speculative decoding types
+const char * common_speculative_all_types_str();
+
+// parse user provided types
+std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names);
+
+// convert string to type
+enum common_speculative_type common_speculative_type_from_name(const std::string & name);
+
+// convert type to string
+std::string common_speculative_type_to_str(enum common_speculative_type type);
+
 struct common_speculative_params {
     int n_draft = 16;  // max drafted tokens
     int n_reuse = 256;

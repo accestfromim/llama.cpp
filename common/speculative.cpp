@@ -8,10 +8,56 @@
 
 #include <cstring>
 #include <algorithm>
+#include <array>
 #include <map>
+#include <stdexcept>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+static const std::array<std::pair<const char *, common_speculative_type>, COMMON_SPECULATIVE_TYPE_COUNT> SPECULATIVE_TYPE_NAMES = {{
+    { "none",          COMMON_SPECULATIVE_TYPE_NONE },
+    { "draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE },
+    { "ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE },
+    { "ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K },
+    { "ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V },
+    { "ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD },
+}};
+
+const char * common_speculative_all_types_str() {
+    return "none,draft-simple,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod";
+}
+
+std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {
+    std::vector<enum common_speculative_type> types;
+    types.reserve(names.size());
+
+    for (const auto & name : names) {
+        types.push_back(common_speculative_type_from_name(name));
+    }
+
+    return types;
+}
+
+enum common_speculative_type common_speculative_type_from_name(const std::string & name) {
+    for (const auto & entry : SPECULATIVE_TYPE_NAMES) {
+        if (name == entry.first) {
+            return entry.second;
+        }
+    }
+
+    throw std::invalid_argument(string_format("unknown speculative type: %s", name.c_str()));
+}
+
+std::string common_speculative_type_to_str(enum common_speculative_type type) {
+    for (const auto & entry : SPECULATIVE_TYPE_NAMES) {
+        if (type == entry.second) {
+            return entry.first;
+        }
+    }
+
+    return "unknown";
+}
 
 struct common_speculative {
     struct llama_context * ctx_tgt; // only used for retokenizing from ctx_dft

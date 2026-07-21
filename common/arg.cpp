@@ -6,6 +6,7 @@
 #include "json-schema-to-grammar.h"
 #include "log.h"
 #include "sampling.h"
+#include "speculative.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -3494,6 +3495,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--spec-type"}, "TYPE",
+        string_format("comma-separated list of types of speculative decoding to use: %s (default: none)",
+            common_speculative_all_types_str()),
+        [](common_params & params, const std::string & value) {
+            params.speculative.types = common_speculative_types_from_names(string_split<std::string>(value, ','));
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(common_arg(
         {"--draft-max", "--draft", "--draft-n"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
         [](common_params & params, int value) {
@@ -3521,6 +3530,126 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.p_min = std::stof(value);
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-ngram-simple-size-n"}, "N",
+        string_format("ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_simple.size_n),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_simple.size_n = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-simple-size-m"}, "N",
+        string_format("ngram size M for ngram-simple speculative decoding, length of draft m-gram (default: %d)", params.speculative.ngram_simple.size_m),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size M must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_simple.size_m = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-simple-min-hits"}, "N",
+        string_format("minimum hits for ngram-simple speculative decoding (default: %d)", params.speculative.ngram_simple.min_hits),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 65535) {
+                throw std::invalid_argument("ngram min hits must be between 1 and 65535 inclusive");
+            }
+            params.speculative.ngram_simple.min_hits = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k-size-n"}, "N",
+        string_format("ngram size N for ngram-map-k speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_map_k.size_n),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k.size_n = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k-size-m"}, "N",
+        string_format("ngram size M for ngram-map-k speculative decoding, length of draft m-gram (default: %d)", params.speculative.ngram_map_k.size_m),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size M must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k.size_m = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k-min-hits"}, "N",
+        string_format("minimum hits for ngram-map-k speculative decoding (default: %d)", params.speculative.ngram_map_k.min_hits),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 65535) {
+                throw std::invalid_argument("ngram min hits must be between 1 and 65535 inclusive");
+            }
+            params.speculative.ngram_map_k.min_hits = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k4v-size-n"}, "N",
+        string_format("ngram size N for ngram-map-k4v speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_map_k4v.size_n),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k4v.size_n = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k4v-size-m"}, "N",
+        string_format("ngram size M for ngram-map-k4v speculative decoding, length of draft m-gram (default: %d)", params.speculative.ngram_map_k4v.size_m),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size M must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k4v.size_m = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k4v-min-hits"}, "N",
+        string_format("minimum hits for ngram-map-k4v speculative decoding (default: %d)", params.speculative.ngram_map_k4v.min_hits),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 65535) {
+                throw std::invalid_argument("ngram min hits must be between 1 and 65535 inclusive");
+            }
+            params.speculative.ngram_map_k4v.min_hits = (uint16_t) value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-n-match"}, "N",
+        string_format("ngram-mod lookup length (default: %d)", params.speculative.ngram_mod.n_match),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.n_match = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-n-min"}, "N",
+        string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram n-min must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.n_min = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-n-max"}, "N",
+        string_format("maximum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_max),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram n-max must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.n_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cd", "--ctx-size-draft"}, "N",
         string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.n_ctx),
