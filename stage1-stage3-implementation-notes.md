@@ -1,8 +1,8 @@
-# Stage 1-3 Implementation Notes
+# Stage 1-4 Implementation Notes
 
 本文档记录 fariy2i 的 `llama.cpp` fork 当前已经完成的 speculative n-gram 迁移工作。
 
-目标范围仍然只覆盖 `common` 层和后续 `examples/speculative-simple` 接入所需的基础框架；本阶段没有修改 `tools/server`。
+目标范围仍然只覆盖 `common` 层和 `examples/speculative-simple`；本阶段没有修改 `tools/server`。
 
 ## 当前提交范围
 
@@ -12,15 +12,16 @@
 阶段 1: common: add speculative type parameters
 阶段 2: common: add ngram speculative helpers
 阶段 3: common: introduce type-based speculative framework
+阶段 4: examples: use speculative framework in speculative-simple
 ```
 
 尚未完成：
 
 ```text
-阶段 4: examples: use speculative framework in speculative-simple
+tools/server speculative 迁移
 ```
 
-阶段 4 的目标是让 `llama-speculative-simple` 真正改用新接口，并根据 `--spec-type` 选择 `draft-simple` 或 n-gram 类型。
+阶段 4 已经让 `llama-speculative-simple` 改用新接口，并根据 `--spec-type` 选择 `draft-simple` 或 n-gram 类型。
 
 ## 阶段 1: 参数层
 
@@ -351,24 +352,91 @@ common_speculative_accept(spec, 0, n_accepted);
 common_speculative_free(spec);
 ```
 
-## 阶段 4 接入建议
+## 阶段 4: speculative-simple 接入
 
-`examples/speculative-simple` 后续应该做这些改动：
+阶段 4 的目标是让 `examples/speculative-simple` 真正消费阶段 1-3 引入的新框架。
+
+修改文件：
 
 ```text
-1. 不再强制要求 --model-draft。
-2. 如果用户没有传 --spec-type:
-   - 有 draft model: 默认 draft-simple
-   - 无 draft model: 默认 ngram-simple
-3. 如果 type 包含 draft-simple，则加载 draft model，并设置 ctx_tgt / ctx_dft。
-4. 如果只有 n-gram type，则不加载 draft model。
-5. 用 common_speculative_init(params.speculative, 1) 创建 spec。
-6. 每轮采样后设置 common_speculative_draft_params。
-7. 调 common_speculative_draft(spec) 生成 draft。
-8. target 校验后调 common_speculative_accept(spec, 0, n_accepted)。
+examples/speculative-simple/speculative-simple.cpp
 ```
 
-阶段 4 完成后，下面命令应该可以作为最小验证目标：
+完成的改动：
+
+```text
+1. 不再无条件要求 --model-draft。
+2. 如果用户没有传 --spec-type，则自动选择默认 type:
+   - 有 draft model: 默认 draft-simple
+   - 无 draft model: 默认 ngram-simple
+3. 如果用户显式传 --spec-type none，则保留 none，不自动改成 ngram-simple。
+4. 只有 type 包含 draft-simple 时才加载 draft model。
+5. 纯 n-gram type 不再初始化 ctx_dft。
+6. 设置 params.speculative.ctx_tgt / ctx_dft。
+7. 用 common_speculative_init(params.speculative, 1) 创建 spec。
+8. 用 common_speculative_begin(spec, 0, prompt_tgt) 初始化 sequence。
+9. 每轮采样前设置 common_speculative_draft_params。
+10. 调 common_speculative_draft(spec) 生成 draft。
+11. target 校验后调 common_speculative_accept(spec, 0, n_accepted)。
+12. 无 draft model 时跳过 llama_perf_context_print(ctx_dft)。
+13. accept 百分比输出避免 n_drafted == 0 时除零。
+```
+
+默认 type 选择逻辑：
+
+```cpp
+if (!has_user_spec_type && speculative_types_are_default(params.speculative.types)) {
+    params.speculative.types = {
+        params.speculative.model.path.empty()
+            ? COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE
+            : COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE
+    };
+}
+```
+
+draft model 加载条件：
+
+```cpp
+const bool has_draft_simple = speculative_has_type(params.speculative.types, COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
+
+if (has_draft_simple && params.speculative.model.path.empty()) {
+    LOG_ERR("%s: --model-draft is required for --spec-type draft-simple\n", __func__);
+    return 1;
+}
+```
+
+新 speculative 初始化方式：
+
+```cpp
+params.speculative.ctx_tgt = ctx_tgt;
+params.speculative.ctx_dft = ctx_dft;
+
+common_speculative * spec = common_speculative_init(params.speculative, 1);
+common_speculative_begin(spec, 0, prompt_tgt);
+```
+
+每轮 draft 生成方式：
+
+```cpp
+llama_tokens draft;
+common_speculative_get_draft_params(spec, 0) = {
+    /* .drafting = */ true,
+    /* .n_max    = */ n_draft,
+    /* .n_past   = */ n_past,
+    /* .id_last  = */ id_last,
+    /* .prompt   = */ &prompt_tgt,
+    /* .result   = */ &draft,
+};
+common_speculative_draft(spec);
+```
+
+target 接受 draft 后通知 framework：
+
+```cpp
+common_speculative_accept(spec, 0, ids.size() - 1);
+```
+
+阶段 4 完成后，下面命令可以作为最小验证目标：
 
 ```bash
 llama-speculative-simple -m target.gguf --spec-type ngram-simple -p "..."
@@ -404,14 +472,22 @@ git diff --check
 
 ## 当前边界
 
-第三阶段只引入 common framework，不改变 example 行为。
+阶段 4 已经把 `llama-speculative-simple` 切到新 common framework。
 
-也就是说，当前代码已经具备：
+当前代码已经具备：
 
 ```text
 common 层按 type 初始化 impl
 common 层按 sequence 生成 draft
 common 层通知 impl 接受数量
+speculative-simple 按 --spec-type 选择 draft-simple / n-gram
+speculative-simple 在无 draft model 时默认 ngram-simple
 ```
 
-但 `llama-speculative-simple` 还没有切换到这些新接口，所以 n-gram 跑通要等阶段 4。
+当前仍未处理：
+
+```text
+tools/server speculative 迁移
+server slot / multi-sequence speculative 生命周期
+KV cache checkpoint / partial sequence removal
+```
