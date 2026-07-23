@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -79,6 +80,50 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
+    auto       chat_templates    = common_chat_templates_init(model_tgt, params.chat_template);
+    const bool has_chat_template = common_chat_templates_was_explicit(chat_templates.get());
+
+    if (params.conversation_mode == COMMON_CONVERSATION_MODE_AUTO) {
+        if (has_chat_template) {
+            LOG_INF("%s: chat template is available, enabling conversation mode (disable it with -no-cnv)\n", __func__);
+            params.conversation_mode = COMMON_CONVERSATION_MODE_ENABLED;
+        } else {
+            params.conversation_mode = COMMON_CONVERSATION_MODE_DISABLED;
+        }
+    }
+
+    std::string prompt = params.prompt;
+
+    if (params.conversation_mode == COMMON_CONVERSATION_MODE_ENABLED && params.enable_chat_template) {
+        if (!has_chat_template) {
+            LOG_WRN("%s: chat template is not available; using the default chat template\n", __func__);
+        }
+
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja             = params.use_jinja;
+        inputs.add_generation_prompt = !params.prompt.empty();
+        inputs.reasoning_format      = params.reasoning_format;
+        inputs.enable_thinking       = params.reasoning_budget != 0;
+        inputs.chat_template_kwargs  = params.default_template_kwargs;
+
+        if (!params.system_prompt.empty()) {
+            common_chat_msg message;
+            message.role    = "system";
+            message.content = params.system_prompt;
+            inputs.messages.push_back(std::move(message));
+        }
+
+        if (!params.prompt.empty()) {
+            common_chat_msg message;
+            message.role    = "user";
+            message.content = params.prompt;
+            inputs.messages.push_back(std::move(message));
+        }
+
+        prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+        LOG_INF("%s: applied chat template to the prompt\n", __func__);
+    }
+
     common_init_result llama_init_dft;
 
     if (has_draft_simple) {
@@ -112,7 +157,7 @@ int main(int argc, char ** argv) {
 
     // Tokenize the prompt
     std::vector<llama_token> inp;
-    inp = common_tokenize(ctx_tgt, params.prompt, true, true);
+    inp = common_tokenize(ctx_tgt, prompt, true, true);
 
     if (llama_n_ctx(ctx_tgt) < (uint32_t) inp.size()) {
         LOG_ERR("%s: the prompt exceeds the context size (%d tokens, ctx %d)\n", __func__, (int) inp.size(), llama_n_ctx(ctx_tgt));
@@ -177,7 +222,13 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
 
-    while (true) {
+    while (params.n_predict < 0 || n_predict < params.n_predict) {
+        int n_draft_step = n_draft;
+        if (params.n_predict >= 0) {
+            n_draft_step = std::min(n_draft_step, params.n_predict - n_predict - 1);
+            n_draft_step = std::max(n_draft_step, 0);
+        }
+
         // optionally, generate draft tokens that can be appended to the target batch
         //
         // this is the most important part of the speculation. the more probable tokens that are provided here
@@ -188,7 +239,7 @@ int main(int argc, char ** argv) {
         llama_tokens draft;
         common_speculative_get_draft_params(spec, 0) = {
             /* .drafting = */ true,
-            /* .n_max    = */ n_draft,
+            /* .n_max    = */ n_draft_step,
             /* .n_past   = */ n_past,
             /* .id_last  = */ id_last,
             /* .prompt   = */ &prompt_tgt,
@@ -270,7 +321,7 @@ int main(int argc, char ** argv) {
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
         }
 
-        if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
+        if ((params.n_predict >= 0 && n_predict >= params.n_predict) || has_eos) {
             break;
         }
     }
