@@ -1,11 +1,16 @@
 #import "ggml-metal-device.h"
 
+#define GGML_COMMON_DECL_C
+#include "ggml-common.h"
+
 #import "ggml-impl.h"
 #import "ggml-threading.h"
 
 #include <Foundation/Foundation.h>
 
 #include <Metal/Metal.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -175,8 +180,9 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
         NSBundle * bundle = [NSBundle bundleForClass:[GGMLMetalClass class]];
 #endif
 
-        NSString * path_lib = [bundle pathForResource:@"default" ofType:@"metallib"];
-        if (path_lib == nil) {
+        const bool force_source = getenv("GGML_METAL_FORCE_SOURCE") != NULL;
+        NSString * path_lib     = force_source ? nil : [bundle pathForResource:@"default" ofType:@"metallib"];
+        if (path_lib == nil && !force_source) {
             // Try to find the resource in the directory where the current binary located.
             NSString * bin_cur = [[NSProcessInfo processInfo] arguments][0];
             NSString * bin_dir = [bin_cur stringByDeletingLastPathComponent];
@@ -440,6 +446,9 @@ struct ggml_metal_device {
     ggml_metal_library_t library;
 
     struct ggml_metal_device_props props;
+
+    ggml_metal_buffer_t scratch;
+    size_t scratch_size;
 };
 
 ggml_metal_device_t ggml_metal_device_init(void) {
@@ -551,6 +560,12 @@ ggml_metal_device_t ggml_metal_device_init(void) {
 void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
+    if (dev->scratch) {
+        ggml_metal_buffer_free(dev->scratch);
+        dev->scratch = NULL;
+        dev->scratch_size = 0;
+    }
+
     ggml_metal_library_free(dev->library);
     dev->library = NULL;
 
@@ -594,9 +609,65 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
-    // custom complex types are CPU-only for now
-    if (op->type == GGML_TYPE_IFAIRY || op->type == GGML_TYPE_IFAIRY_Q16 || op->type == GGML_TYPE_IFAIRY64 ||
-        op->type == GGML_TYPE_FAIRY2I_TILE64_V2 || op->type == GGML_TYPE_FAIRY2I_ACT_Q16_64) {
+    if ((op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2) && op->src[1] &&
+        op->src[1]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES) {
+        const struct ggml_tensor * x      = op->src[0];
+        const struct ggml_tensor * codes  = op->src[1];
+        const struct ggml_tensor * scales = op->src[2];
+        const struct ggml_tensor * bias   = op->src[3];
+
+        const int32_t layout   = ggml_get_op_params_i32(op, 0);
+        const int32_t m        = ggml_get_op_params_i32(op, 1);
+        const int32_t k        = ggml_get_op_params_i32(op, 2);
+        const int32_t branches = ggml_get_op_params_i32(op, 3);
+        const int64_t tiles    = m > 0 && k > 0 ? (int64_t) (m / 64) * (k / 64) : 0;
+        const int32_t expected_branches = op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ? 2 : 4;
+
+        return has_simdgroup_mm && has_simdgroup_reduction && x && scales && layout == 1 && m > 0 && k > 0 &&
+               m % 64 == 0 && k % 64 == 0 && branches == expected_branches && op->type == GGML_TYPE_F32 &&
+               x->type == GGML_TYPE_F32 && scales->type == GGML_TYPE_F16 && (!bias || bias->type == GGML_TYPE_F32) &&
+               x->ne[0] == k && op->ne[0] == m && codes->ne[0] == 16 && codes->ne[1] == branches &&
+               codes->ne[2] == 64 && codes->ne[3] == tiles && scales->ne[0] == 2 && scales->ne[1] == branches &&
+               scales->ne[2] == tiles && scales->ne[3] == 1 && ggml_is_contiguous(x) && ggml_is_contiguous(op) &&
+               ggml_is_contiguous(codes) && ggml_is_contiguous(scales);
+    }
+
+    if (op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2 &&
+        (!op->src[1] || op->src[1]->type != GGML_TYPE_FAIRY2I_BUNDLE_CODES)) {
+        const struct ggml_tensor * x    = op->src[0];
+        const struct ggml_tensor * u_s0 = op->src[1];
+        const struct ggml_tensor * u_s1 = op->src[2];
+        const struct ggml_tensor * w_s0 = op->src[3];
+        const struct ggml_tensor * w_s1 = op->src[4];
+        const struct ggml_tensor * bias = op->src[5];
+
+        if (!x || !u_s0 || !w_s0 || (u_s1 == NULL) != (w_s1 == NULL)) {
+            return false;
+        }
+
+        const bool has_stage1 = u_s1 != NULL;
+
+        return op->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
+               u_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2 && w_s0->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+               (!has_stage1 ||
+                (u_s1->type == GGML_TYPE_FAIRY2I_TILE64_V2 && w_s1->type == GGML_TYPE_FAIRY2I_TILE64_V2)) &&
+               (!bias || bias->type == GGML_TYPE_F32) && ggml_is_contiguous(x) && ggml_is_contiguous(op) &&
+               ggml_is_contiguous(u_s0) && ggml_is_contiguous(w_s0) &&
+               (!has_stage1 || (ggml_is_contiguous(u_s1) && ggml_is_contiguous(w_s1))) &&
+               x->ne[0] % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2) == 0 && op->ne[0] == u_s0->ne[1] &&
+               u_s0->ne[0] == x->ne[0] && w_s0->ne[0] == x->ne[0] && w_s0->ne[1] == op->ne[0] &&
+               (!has_stage1 ||
+                (u_s1->ne[0] == x->ne[0] && w_s1->ne[0] == x->ne[0] && u_s1->ne[1] == op->ne[0] &&
+                 w_s1->ne[1] == op->ne[0])) &&
+               u_s0->ne[2] == 1 && u_s0->ne[3] == 1 && w_s0->ne[2] == 1 && w_s0->ne[3] == 1 &&
+               (!has_stage1 ||
+                (u_s1->ne[2] == 1 && u_s1->ne[3] == 1 && w_s1->ne[2] == 1 && w_s1->ne[3] == 1));
+    }
+
+    // custom complex types are CPU-only for compute ops, except when they are stored as leaf tensors for fused kernels.
+    if (op->op != GGML_OP_NONE &&
+        (op->type == GGML_TYPE_IFAIRY || op->type == GGML_TYPE_IFAIRY_Q16 || op->type == GGML_TYPE_IFAIRY64 ||
+         op->type == GGML_TYPE_FAIRY2I_TILE64_V2 || op->type == GGML_TYPE_FAIRY2I_ACT_Q16_64)) {
         return false;
     }
     for (size_t i = 0, n = 3; i < n; ++i) {
@@ -661,6 +732,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_PERMUTE:
         case GGML_OP_CONCAT:
             return true;
+        case GGML_OP_COMPLEX_SPLIT:
+        case GGML_OP_COMPLEX_MERGE:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op);
+        case GGML_OP_COMPLEX_ADD:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                   ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous_rows(op);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -1157,6 +1236,11 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
 
+size_t ggml_metal_fairy2i_packed_weight_extra(const struct ggml_tensor * tensor) {
+    GGML_UNUSED(tensor);
+    return 0;
+}
+
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     if (buf->is_shared) {
         memset((char *)tensor->data + offset, value, size);
@@ -1324,4 +1408,29 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
 
     return res;
+}
+
+struct ggml_metal_buffer_id ggml_metal_device_get_scratch(ggml_metal_device_t dev, size_t size) {
+    const size_t size_page = sysconf(_SC_PAGESIZE);
+    size_t size_aligned = size;
+    if ((size_aligned % size_page) != 0) {
+        size_aligned += size_page - (size_aligned % size_page);
+    }
+
+    if (dev->scratch_size < size_aligned) {
+        ggml_metal_buffer_t scratch = ggml_metal_buffer_init(dev, size_aligned, false);
+        if (scratch == NULL) {
+            GGML_LOG_ERROR("%s: error: failed to allocate scratch buffer, size = %8.2f MiB\n", __func__,
+                           size_aligned / 1024.0 / 1024.0);
+            return (struct ggml_metal_buffer_id) { nil, 0 };
+        }
+
+        if (dev->scratch) {
+            ggml_metal_buffer_free(dev->scratch);
+        }
+        dev->scratch      = scratch;
+        dev->scratch_size = size_aligned;
+    }
+
+    return (struct ggml_metal_buffer_id) { dev->scratch->buffers[0].metal, 0 };
 }

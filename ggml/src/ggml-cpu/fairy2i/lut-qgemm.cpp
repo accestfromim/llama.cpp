@@ -709,19 +709,18 @@ static inline float32x4_t ggml_fairy2i_tile64_lut_load_scale4_arm(const ggml_hal
     return vcvt_f32_f16(vreinterpret_f16_u16(v));
 }
 
-static inline void ggml_fairy2i_tile64_lut_accumulate_codes_arm(const uint8_t *     codes,
-                                                                const int8x16x4_t & ilut_0,
-                                                                const int8x16x4_t & ilut_1,
-                                                                const uint8x16_t    mask_4bit,
-                                                                int16x8_t &         sum_ac_0,
-                                                                int16x8_t &         sum_ac_1,
-                                                                int16x8_t &         sum_bc_0,
-                                                                int16x8_t &         sum_bc_1,
-                                                                int16x8_t &         sum_ad_0,
-                                                                int16x8_t &         sum_ad_1,
-                                                                int16x8_t &         sum_bd_0,
-                                                                int16x8_t &         sum_bd_1) {
-    const uint8x16_t packed = vld1q_u8(codes);
+static inline void ggml_fairy2i_tile64_lut_accumulate_packed_arm(const uint8x16_t    packed,
+                                                                 const int8x16x4_t & ilut_0,
+                                                                 const int8x16x4_t & ilut_1,
+                                                                 const uint8x16_t    mask_4bit,
+                                                                 int16x8_t &         sum_ac_0,
+                                                                 int16x8_t &         sum_ac_1,
+                                                                 int16x8_t &         sum_bc_0,
+                                                                 int16x8_t &         sum_bc_1,
+                                                                 int16x8_t &         sum_ad_0,
+                                                                 int16x8_t &         sum_ad_1,
+                                                                 int16x8_t &         sum_bd_0,
+                                                                 int16x8_t &         sum_bd_1) {
     const uint8x16_t idx_lo = vandq_u8(packed, mask_4bit);
     const uint8x16_t idx_hi = vandq_u8(vshrq_n_u8(packed, 4), mask_4bit);
 
@@ -735,25 +734,33 @@ static inline void ggml_fairy2i_tile64_lut_accumulate_codes_arm(const uint8_t * 
     const int8x16_t v_bc_1 = vqtbl1q_s8(ilut_1.val[2], idx_hi);
     const int8x16_t v_ad_1 = vqtbl1q_s8(ilut_1.val[3], idx_hi);
 
-    sum_ac_0 = vaddw_s8(sum_ac_0, vget_low_s8(v_ac_0));
-    sum_ac_1 = vaddw_s8(sum_ac_1, vget_high_s8(v_ac_0));
-    sum_ac_0 = vaddw_s8(sum_ac_0, vget_low_s8(v_ac_1));
-    sum_ac_1 = vaddw_s8(sum_ac_1, vget_high_s8(v_ac_1));
+    sum_ac_0 = vaddq_s16(sum_ac_0, vaddl_s8(vget_low_s8(v_ac_0), vget_low_s8(v_ac_1)));
+    sum_ac_1 = vaddq_s16(sum_ac_1, vaddl_high_s8(v_ac_0, v_ac_1));
 
-    sum_bc_0 = vaddw_s8(sum_bc_0, vget_low_s8(v_bc_0));
-    sum_bc_1 = vaddw_s8(sum_bc_1, vget_high_s8(v_bc_0));
-    sum_bc_0 = vaddw_s8(sum_bc_0, vget_low_s8(v_bc_1));
-    sum_bc_1 = vaddw_s8(sum_bc_1, vget_high_s8(v_bc_1));
+    sum_bc_0 = vaddq_s16(sum_bc_0, vaddl_s8(vget_low_s8(v_bc_0), vget_low_s8(v_bc_1)));
+    sum_bc_1 = vaddq_s16(sum_bc_1, vaddl_high_s8(v_bc_0, v_bc_1));
 
-    sum_ad_0 = vaddw_s8(sum_ad_0, vget_low_s8(v_ad_0));
-    sum_ad_1 = vaddw_s8(sum_ad_1, vget_high_s8(v_ad_0));
-    sum_ad_0 = vaddw_s8(sum_ad_0, vget_low_s8(v_ad_1));
-    sum_ad_1 = vaddw_s8(sum_ad_1, vget_high_s8(v_ad_1));
+    sum_ad_0 = vaddq_s16(sum_ad_0, vaddl_s8(vget_low_s8(v_ad_0), vget_low_s8(v_ad_1)));
+    sum_ad_1 = vaddq_s16(sum_ad_1, vaddl_high_s8(v_ad_0, v_ad_1));
 
-    sum_bd_0 = vaddw_s8(sum_bd_0, vget_low_s8(v_bd_0));
-    sum_bd_1 = vaddw_s8(sum_bd_1, vget_high_s8(v_bd_0));
-    sum_bd_0 = vaddw_s8(sum_bd_0, vget_low_s8(v_bd_1));
-    sum_bd_1 = vaddw_s8(sum_bd_1, vget_high_s8(v_bd_1));
+    sum_bd_0 = vaddq_s16(sum_bd_0, vaddl_s8(vget_low_s8(v_bd_0), vget_low_s8(v_bd_1)));
+    sum_bd_1 = vaddq_s16(sum_bd_1, vaddl_high_s8(v_bd_0, v_bd_1));
+}
+
+static inline void ggml_fairy2i_tile64_lut_accumulate_codes_arm(const uint8_t *     codes,
+                                                                const int8x16x4_t & ilut_0,
+                                                                const int8x16x4_t & ilut_1,
+                                                                const uint8x16_t    mask_4bit,
+                                                                int16x8_t &         sum_ac_0,
+                                                                int16x8_t &         sum_ac_1,
+                                                                int16x8_t &         sum_bc_0,
+                                                                int16x8_t &         sum_bc_1,
+                                                                int16x8_t &         sum_ad_0,
+                                                                int16x8_t &         sum_ad_1,
+                                                                int16x8_t &         sum_bd_0,
+                                                                int16x8_t &         sum_bd_1) {
+    ggml_fairy2i_tile64_lut_accumulate_packed_arm(vld1q_u8(codes), ilut_0, ilut_1, mask_4bit, sum_ac_0, sum_ac_1,
+                                                  sum_bc_0, sum_bc_1, sum_ad_0, sum_ad_1, sum_bd_0, sum_bd_1);
 }
 
 static inline void ggml_fairy2i_tile64_lut_accumulate_wtile_arm(const fairy2i_tile64_lut_wtile_16 * wt,
@@ -866,6 +873,36 @@ static inline void ggml_fairy2i_bundle_lut_apply_sums4_arm(float32x4_t   v_lr,
     acc_i                   = vmlaq_f32(acc_i, ggml_fairy2i_tile64_lut_s16x4_to_f32(sum_ad), li_wr);
 }
 
+static inline void ggml_fairy2i_bundle_lut_apply_sums_scaled_arm(float32x4_t   wr,
+                                                                 float32x4_t   wi,
+                                                                 float32x4_t   v_lr,
+                                                                 float32x4_t   v_li,
+                                                                 int16x8_t     sum_ac_0,
+                                                                 int16x8_t     sum_ac_1,
+                                                                 int16x8_t     sum_bc_0,
+                                                                 int16x8_t     sum_bc_1,
+                                                                 int16x8_t     sum_ad_0,
+                                                                 int16x8_t     sum_ad_1,
+                                                                 int16x8_t     sum_bd_0,
+                                                                 int16x8_t     sum_bd_1,
+                                                                 float32x4_t & acc_r0,
+                                                                 float32x4_t & acc_r1,
+                                                                 float32x4_t & acc_r2,
+                                                                 float32x4_t & acc_r3,
+                                                                 float32x4_t & acc_i0,
+                                                                 float32x4_t & acc_i1,
+                                                                 float32x4_t & acc_i2,
+                                                                 float32x4_t & acc_i3) {
+    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_low_s16(sum_ac_0), vget_low_s16(sum_bc_0),
+                                            vget_low_s16(sum_ad_0), vget_low_s16(sum_bd_0), acc_r0, acc_i0);
+    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_high_s16(sum_ac_0), vget_high_s16(sum_bc_0),
+                                            vget_high_s16(sum_ad_0), vget_high_s16(sum_bd_0), acc_r1, acc_i1);
+    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_low_s16(sum_ac_1), vget_low_s16(sum_bc_1),
+                                            vget_low_s16(sum_ad_1), vget_low_s16(sum_bd_1), acc_r2, acc_i2);
+    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_high_s16(sum_ac_1), vget_high_s16(sum_bc_1),
+                                            vget_high_s16(sum_ad_1), vget_high_s16(sum_bd_1), acc_r3, acc_i3);
+}
+
 static inline void ggml_fairy2i_bundle_lut_apply_sums_arm(const ggml_half scales[2],
                                                           float32x4_t     v_lr,
                                                           float32x4_t     v_li,
@@ -887,17 +924,17 @@ static inline void ggml_fairy2i_bundle_lut_apply_sums_arm(const ggml_half scales
                                                           float32x4_t &   acc_i3) {
     const float32x4_t wr = vdupq_n_f32(GGML_FP16_TO_FP32(scales[0]));
     const float32x4_t wi = vdupq_n_f32(GGML_FP16_TO_FP32(scales[1]));
-    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_low_s16(sum_ac_0), vget_low_s16(sum_bc_0),
-                                            vget_low_s16(sum_ad_0), vget_low_s16(sum_bd_0), acc_r0, acc_i0);
-    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_high_s16(sum_ac_0), vget_high_s16(sum_bc_0),
-                                            vget_high_s16(sum_ad_0), vget_high_s16(sum_bd_0), acc_r1, acc_i1);
-    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_low_s16(sum_ac_1), vget_low_s16(sum_bc_1),
-                                            vget_low_s16(sum_ad_1), vget_low_s16(sum_bd_1), acc_r2, acc_i2);
-    ggml_fairy2i_bundle_lut_apply_sums4_arm(v_lr, v_li, wr, wi, vget_high_s16(sum_ac_1), vget_high_s16(sum_bc_1),
-                                            vget_high_s16(sum_ad_1), vget_high_s16(sum_bd_1), acc_r3, acc_i3);
+    ggml_fairy2i_bundle_lut_apply_sums_scaled_arm(wr, wi, v_lr, v_li, sum_ac_0, sum_ac_1, sum_bc_0, sum_bc_1, sum_ad_0,
+                                                  sum_ad_1, sum_bd_0, sum_bd_1, acc_r0, acc_r1, acc_r2, acc_r3, acc_i0,
+                                                  acc_i1, acc_i2, acc_i3);
 }
 
-static inline void ggml_fairy2i_tile64_lut_store4_f32_arm(float * out, float32x4_t acc_r, float32x4_t acc_i) {
+static inline void ggml_fairy2i_tile64_lut_store4_f32_arm(float * out, bool add, float32x4_t acc_r, float32x4_t acc_i) {
+    if (add) {
+        const float32x4x2_t previous = vld2q_f32(out);
+        acc_r                        = vaddq_f32(acc_r, previous.val[0]);
+        acc_i                        = vaddq_f32(acc_i, previous.val[1]);
+    }
     const float32x4x2_t value = {
         { acc_r, acc_i }
     };
@@ -909,6 +946,7 @@ static inline void ggml_fairy2i_tile64_lut_store_tile_arm(int         tile,
                                                           uint8_t *   dst_col,
                                                           size_t      dst_row_stride,
                                                           bool        pack_bf16,
+                                                          bool        add,
                                                           float32x4_t acc_r0,
                                                           float32x4_t acc_r1,
                                                           float32x4_t acc_r2,
@@ -920,10 +958,10 @@ static inline void ggml_fairy2i_tile64_lut_store_tile_arm(int         tile,
     const int row0 = tile << 4;
     if (!pack_bf16 && dst_row_stride == 2u * sizeof(float) && row0 + 16 <= m) {
         float * out = (float *) (dst_col + (size_t) row0 * dst_row_stride);
-        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 0, acc_r0, acc_i0);
-        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 8, acc_r1, acc_i1);
-        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 16, acc_r2, acc_i2);
-        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 24, acc_r3, acc_i3);
+        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 0, add, acc_r0, acc_i0);
+        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 8, add, acc_r1, acc_i1);
+        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 16, add, acc_r2, acc_i2);
+        ggml_fairy2i_tile64_lut_store4_f32_arm(out + 24, add, acc_r3, acc_i3);
         return;
     }
 
@@ -942,9 +980,17 @@ static inline void ggml_fairy2i_tile64_lut_store_tile_arm(int         tile,
     for (int lane = 0; lane < rows_in_tile; ++lane) {
         uint8_t * out = dst_col + (size_t) (row0 + lane) * dst_row_stride;
         if (pack_bf16) {
-            ((ggml_bf16_t *) out)[0] = ggml_fp32_to_bf16(out_r[lane]);
-            ((ggml_bf16_t *) out)[1] = ggml_fp32_to_bf16(out_i[lane]);
+            if (add) {
+                out_r[lane] += GGML_BF16_TO_FP32(((const ggml_bf16_t *) out)[0]);
+                out_i[lane] += GGML_BF16_TO_FP32(((const ggml_bf16_t *) out)[1]);
+            }
+            ((ggml_bf16_t *) out)[0] = GGML_FP32_TO_BF16(out_r[lane]);
+            ((ggml_bf16_t *) out)[1] = GGML_FP32_TO_BF16(out_i[lane]);
         } else {
+            if (add) {
+                out_r[lane] += ((const float *) out)[0];
+                out_i[lane] += ((const float *) out)[1];
+            }
             ((float *) out)[0] = out_r[lane];
             ((float *) out)[1] = out_i[lane];
         }
@@ -1033,28 +1079,32 @@ static GGML_FAIRY2I_NOINLINE void ggml_fairy2i_tile64_lut_qgemm_w1_pair_neon(int
                                                        acc_r2, acc_r3, acc_i0, acc_i1, acc_i2, acc_i3);
             }
 
-            ggml_fairy2i_tile64_lut_store_tile_arm(tile, m, dst_col, dst_row_stride, pack_bf16, acc_r0, acc_r1, acc_r2,
-                                                   acc_r3, acc_i0, acc_i1, acc_i2, acc_i3);
+            ggml_fairy2i_tile64_lut_store_tile_arm(tile, m, dst_col, dst_row_stride, pack_bf16, /*add=*/false, acc_r0,
+                                                   acc_r1, acc_r2, acc_r3, acc_i0, acc_i1, acc_i2, acc_i3);
         }
     }
 }
 
-static GGML_FAIRY2I_NOINLINE void ggml_fairy2i_bundle_lut_qgemm_w1_neon(int                                     m,
-                                                                        int                                     k,
-                                                                        int                                     n,
-                                                                        const struct ggml_fairy2i_bundle_desc * bundle,
-                                                                        int64_t      global_m16_offset,
-                                                                        const void * lut,
-                                                                        const void * lut_scales,
-                                                                        float *      dst,
-                                                                        size_t       dst_col_stride,
-                                                                        size_t       dst_row_stride,
-                                                                        bool         pack_bf16) {
+template <int branch0, bool negate_imag0, bool negate_imag1, bool add>
+static GGML_FAIRY2I_NOINLINE void ggml_fairy2i_bundle_lut_qgemm_pair_neon(
+    int                                     m,
+    int                                     k,
+    int                                     n,
+    const struct ggml_fairy2i_bundle_desc * bundle,
+    int64_t                                 global_m16_offset,
+    const void *                            lut,
+    const void *                            lut_scales,
+    float *                                 dst,
+    size_t                                  dst_col_stride,
+    size_t                                  dst_row_stride,
+    bool                                    pack_bf16) {
     const int64_t    blocks           = k / QK_FAIRY2I_TILE64;
     const int64_t    groups_per_block = QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
     const int64_t    groups           = blocks * groups_per_block;
     const int        tiles            = (m + 15) / 16;
     const size_t     code_stride      = (size_t) bundle->branches * 16u;
+    const size_t     code_block_bytes = 64u * (size_t) bundle->branches * 16u;
+    const size_t     scale_block_size = (size_t) bundle->branches * 2u;
     const uint8x16_t mask_4bit        = vdupq_n_u8(0x0f);
 
     for (int col = 0; col < n; ++col) {
@@ -1063,22 +1113,28 @@ static GGML_FAIRY2I_NOINLINE void ggml_fairy2i_bundle_lut_qgemm_w1_neon(int     
         uint8_t *      dst_col = (uint8_t *) dst + (size_t) col * dst_col_stride;
 
         for (int tile = 0; tile < tiles; ++tile) {
-            const int64_t global_m16 = global_m16_offset + tile;
-            float32x4_t   acc_r0     = vdupq_n_f32(0.0f);
-            float32x4_t   acc_r1     = vdupq_n_f32(0.0f);
-            float32x4_t   acc_r2     = vdupq_n_f32(0.0f);
-            float32x4_t   acc_r3     = vdupq_n_f32(0.0f);
-            float32x4_t   acc_i0     = vdupq_n_f32(0.0f);
-            float32x4_t   acc_i1     = vdupq_n_f32(0.0f);
-            float32x4_t   acc_i2     = vdupq_n_f32(0.0f);
-            float32x4_t   acc_i3     = vdupq_n_f32(0.0f);
+            const int64_t   global_m16     = global_m16_offset + tile;
+            const int64_t   physical_tile0 = (global_m16 / 4) * bundle->k_blocks;
+            const int64_t   slot_base      = (global_m16 % 4) * 16;
+            const uint8_t * code_block =
+                bundle->codes + (((physical_tile0 * 64 + slot_base) * bundle->branches + branch0) * 16);
+            const ggml_half * weight_scales = bundle->scales + (physical_tile0 * bundle->branches + branch0) * 2;
+            float32x4_t       acc_r0        = vdupq_n_f32(0.0f);
+            float32x4_t       acc_r1        = vdupq_n_f32(0.0f);
+            float32x4_t       acc_r2        = vdupq_n_f32(0.0f);
+            float32x4_t       acc_r3        = vdupq_n_f32(0.0f);
+            float32x4_t       acc_i0        = vdupq_n_f32(0.0f);
+            float32x4_t       acc_i1        = vdupq_n_f32(0.0f);
+            float32x4_t       acc_i2        = vdupq_n_f32(0.0f);
+            float32x4_t       acc_i3        = vdupq_n_f32(0.0f);
 
-            for (int64_t blk = 0; blk < blocks; ++blk) {
-                const uint8_t *   codes_u  = ggml_fairy2i_bundle_codes_at(bundle, global_m16, blk, 0);
-                const uint8_t *   codes_w  = ggml_fairy2i_bundle_codes_at(bundle, global_m16, blk, 1);
-                const ggml_half * scales_u = ggml_fairy2i_bundle_scales_at(bundle, global_m16, blk, 0);
-                const ggml_half * scales_w = ggml_fairy2i_bundle_scales_at(bundle, global_m16, blk, 1);
+            for (int64_t blk = 0; blk < blocks;
+                 ++blk, code_block += code_block_bytes, weight_scales += scale_block_size) {
+                const ggml_half * scales0 = weight_scales;
                 const int8_t * lut_ptr = lut_col + (size_t) blk * (size_t) groups_per_block * k_fairy2i_lut_group_bytes;
+                if (blk + 1 < blocks) {
+                    __builtin_prefetch(code_block + code_block_bytes, 0, 3);
+                }
 
 #    define GGML_FAIRY2I_BUNDLE_NEON_SUMS(prefix) \
         int16x8_t prefix##_ac_0 = vdupq_n_s16(0); \
@@ -1089,35 +1145,41 @@ static GGML_FAIRY2I_NOINLINE void ggml_fairy2i_bundle_lut_qgemm_w1_neon(int     
         int16x8_t prefix##_ad_1 = vdupq_n_s16(0); \
         int16x8_t prefix##_bd_0 = vdupq_n_s16(0); \
         int16x8_t prefix##_bd_1 = vdupq_n_s16(0)
-                GGML_FAIRY2I_BUNDLE_NEON_SUMS(sum_u);
-                GGML_FAIRY2I_BUNDLE_NEON_SUMS(sum_w);
+                GGML_FAIRY2I_BUNDLE_NEON_SUMS(sum0);
+                GGML_FAIRY2I_BUNDLE_NEON_SUMS(sum1);
 #    undef GGML_FAIRY2I_BUNDLE_NEON_SUMS
 
                 for (int q4 = 0; q4 < groups_per_block / 2; ++q4) {
-                    const int8x16x4_t ilut_0 = vld1q_s8_x4(lut_ptr + 0);
-                    const int8x16x4_t ilut_1 = vld1q_s8_x4(lut_ptr + 64);
+                    const int8x16x4_t  ilut_0 = vld1q_s8_x4(lut_ptr + 0);
+                    const int8x16x4_t  ilut_1 = vld1q_s8_x4(lut_ptr + 64);
+                    const uint8x16x2_t packed = vld1q_u8_x2(code_block + (size_t) q4 * code_stride);
                     lut_ptr += 128;
-                    ggml_fairy2i_tile64_lut_accumulate_codes_arm(
-                        codes_u + (size_t) q4 * code_stride, ilut_0, ilut_1, mask_4bit, sum_u_ac_0, sum_u_ac_1,
-                        sum_u_bc_0, sum_u_bc_1, sum_u_ad_0, sum_u_ad_1, sum_u_bd_0, sum_u_bd_1);
-                    ggml_fairy2i_tile64_lut_accumulate_codes_arm(
-                        codes_w + (size_t) q4 * code_stride, ilut_0, ilut_1, mask_4bit, sum_w_ac_0, sum_w_ac_1,
-                        sum_w_bc_0, sum_w_bc_1, sum_w_ad_0, sum_w_ad_1, sum_w_bd_0, sum_w_bd_1);
+                    ggml_fairy2i_tile64_lut_accumulate_packed_arm(packed.val[0], ilut_0, ilut_1, mask_4bit, sum0_ac_0,
+                                                                  sum0_ac_1, sum0_bc_0, sum0_bc_1, sum0_ad_0, sum0_ad_1,
+                                                                  sum0_bd_0, sum0_bd_1);
+                    ggml_fairy2i_tile64_lut_accumulate_packed_arm(packed.val[1], ilut_0, ilut_1, mask_4bit, sum1_ac_0,
+                                                                  sum1_ac_1, sum1_bc_0, sum1_bc_1, sum1_ad_0, sum1_ad_1,
+                                                                  sum1_bd_0, sum1_bd_1);
                 }
 
-                const float32x4_t v_lr   = vdupq_n_f32(scales[blk * 2 + 0]);
-                const float32x4_t v_li_w = vdupq_n_f32(scales[blk * 2 + 1]);
-                const float32x4_t v_li_u = vnegq_f32(v_li_w);
-                ggml_fairy2i_bundle_lut_apply_sums_arm(scales_u, v_lr, v_li_u, sum_u_ac_0, sum_u_ac_1, sum_u_bc_0,
-                                                       sum_u_bc_1, sum_u_ad_0, sum_u_ad_1, sum_u_bd_0, sum_u_bd_1,
-                                                       acc_r0, acc_r1, acc_r2, acc_r3, acc_i0, acc_i1, acc_i2, acc_i3);
-                ggml_fairy2i_bundle_lut_apply_sums_arm(scales_w, v_lr, v_li_w, sum_w_ac_0, sum_w_ac_1, sum_w_bc_0,
-                                                       sum_w_bc_1, sum_w_ad_0, sum_w_ad_1, sum_w_bd_0, sum_w_bd_1,
-                                                       acc_r0, acc_r1, acc_r2, acc_r3, acc_i0, acc_i1, acc_i2, acc_i3);
+                const float32x4_t v_lr  = vdupq_n_f32(scales[blk * 2 + 0]);
+                const float32x4_t v_li  = vdupq_n_f32(scales[blk * 2 + 1]);
+                const float32x4_t v_li0 = negate_imag0 ? vnegq_f32(v_li) : v_li;
+                const float32x4_t v_li1 = negate_imag1 ? vnegq_f32(v_li) : v_li;
+                const float32x4_t pair_scales =
+                    vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16((const uint16_t *) scales0)));
+                ggml_fairy2i_bundle_lut_apply_sums_scaled_arm(
+                    vdupq_laneq_f32(pair_scales, 0), vdupq_laneq_f32(pair_scales, 1), v_lr, v_li0, sum0_ac_0, sum0_ac_1,
+                    sum0_bc_0, sum0_bc_1, sum0_ad_0, sum0_ad_1, sum0_bd_0, sum0_bd_1, acc_r0, acc_r1, acc_r2, acc_r3,
+                    acc_i0, acc_i1, acc_i2, acc_i3);
+                ggml_fairy2i_bundle_lut_apply_sums_scaled_arm(
+                    vdupq_laneq_f32(pair_scales, 2), vdupq_laneq_f32(pair_scales, 3), v_lr, v_li1, sum1_ac_0, sum1_ac_1,
+                    sum1_bc_0, sum1_bc_1, sum1_ad_0, sum1_ad_1, sum1_bd_0, sum1_bd_1, acc_r0, acc_r1, acc_r2, acc_r3,
+                    acc_i0, acc_i1, acc_i2, acc_i3);
             }
 
-            ggml_fairy2i_tile64_lut_store_tile_arm(tile, m, dst_col, dst_row_stride, pack_bf16, acc_r0, acc_r1, acc_r2,
-                                                   acc_r3, acc_i0, acc_i1, acc_i2, acc_i3);
+            ggml_fairy2i_tile64_lut_store_tile_arm(tile, m, dst_col, dst_row_stride, pack_bf16, add, acc_r0, acc_r1,
+                                                   acc_r2, acc_r3, acc_i0, acc_i1, acc_i2, acc_i3);
         }
     }
 }
@@ -1360,8 +1422,8 @@ bool ggml_fairy2i_bundle_lut_qgemm_two_cpu(int                                  
     }
 #elif defined(__ARM_NEON) && defined(__aarch64__)
     if (!ggml_fairy2i_bundle_lut_force_scalar_for_test()) {
-        ggml_fairy2i_bundle_lut_qgemm_w1_neon(m, k, n, bundle, global_m16_offset, lut, lut_scales, dst, dst_col_stride,
-                                              dst_row_stride, pack_bf16);
+        ggml_fairy2i_bundle_lut_qgemm_pair_neon<0, true, false, false>(
+            m, k, n, bundle, global_m16_offset, lut, lut_scales, dst, dst_col_stride, dst_row_stride, pack_bf16);
         return true;
     }
 #endif
@@ -1405,6 +1467,14 @@ bool ggml_fairy2i_bundle_lut_qgemm_four_cpu(int                                 
                                                     /*negate_imag1=*/false, lut, lut_scales, dst, dst_col_stride,
                                                     dst_row_stride, pack_bf16, /*add=*/true);
         }
+        return true;
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    if (!ggml_fairy2i_bundle_lut_force_scalar_for_test()) {
+        ggml_fairy2i_bundle_lut_qgemm_pair_neon<0, true, true, false>(
+            m, k, n, bundle, global_m16_offset, lut, lut_scales, dst, dst_col_stride, dst_row_stride, pack_bf16);
+        ggml_fairy2i_bundle_lut_qgemm_pair_neon<2, false, false, true>(
+            m, k, n, bundle, global_m16_offset, lut, lut_scales, dst, dst_col_stride, dst_row_stride, pack_bf16);
         return true;
     }
 #endif

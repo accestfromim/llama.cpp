@@ -110,6 +110,7 @@ the Llama undo-permute transform.
 | `--dry-run` | off | Validate inputs and print the conversion plan without writing GGUF. |
 | `--residual-steps` | `2` | Residual quantization steps. Any value other than `2` errors. |
 | `--qk-permute` | off | Enable Llama q/k undo-permute during conversion. |
+| `--weight-layout` | `bundle_v1` | Use `bundle_v1` (default) or the compatibility `tile64_v2` layout. |
 | `--verbose` | off | Print conversion progress. |
 
 Llama output projection is always exported as a dense padded output tensor:

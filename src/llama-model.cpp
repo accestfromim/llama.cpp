@@ -29,6 +29,21 @@ static bool llama_fairy2i_merged_output_enabled() {
     return env != nullptr && strcmp(env, "0") != 0;
 }
 
+static bool llama_fairy2i_fused_wide_linear_w2_enabled() {
+    const char * env = getenv("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2");
+    return env != nullptr && strcmp(env, "0") != 0;
+}
+
+static bool llama_backend_dev_is_metal(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+    const char *       reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    return reg_name && strcmp(reg_name, "Metal") == 0;
+}
+
 enum llama_fairy2i_env_policy {
     LLAMA_FAIRY2I_ENV_POLICY_AUTO,
     LLAMA_FAIRY2I_ENV_POLICY_DISABLED,
@@ -57,14 +72,14 @@ static void llama_fairy2i_fused_wide_linear_warn_unsupported_once(const char * e
     *warned = true;
 
     LLAMA_LOG_WARN("%s: %s was requested, but the CPU backend does not support %s; falling back to the unfused graph\n",
-            __func__, env_name, op_name);
+                   __func__, env_name, op_name);
 }
 
-static bool llama_fairy2i_should_use_fused_wide_linear(const char *         env_name,
-                                                       const char *         op_name,
-                                                       bool                 auto_target_cpu,
-                                                       ggml_backend_t       backend_cpu,
-                                                       const ggml_tensor *  op) {
+static bool llama_fairy2i_should_use_fused_wide_linear(const char *        env_name,
+                                                       const char *        op_name,
+                                                       bool                auto_target_cpu,
+                                                       ggml_backend_t      backend_cpu,
+                                                       const ggml_tensor * op) {
     const llama_fairy2i_env_policy policy = llama_fairy2i_env_policy_from_env(env_name);
     if (policy == LLAMA_FAIRY2I_ENV_POLICY_DISABLED) {
         return false;
@@ -79,6 +94,11 @@ static bool llama_fairy2i_should_use_fused_wide_linear(const char *         env_
         llama_fairy2i_fused_wide_linear_warn_unsupported_once(env_name, op_name);
     }
     return false;
+}
+
+static bool llama_fairy2i_output_neon_enabled() {
+    const char * env = getenv("LLAMA_FAIRY2I_OUTPUT_NEON");
+    return env != nullptr && strcmp(env, "0") != 0;
 }
 
 const char * llm_type_name(llm_type type) {
@@ -349,6 +369,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
+
+static bool buft_list_has_non_cpu_dev(const buft_list_t & buft_list) {
+    for (const auto & cur : buft_list) {
+        if (cur.first && ggml_backend_dev_type(cur.first) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list) {
@@ -1719,9 +1748,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     std::string scale_source;
                     ml.get_key("fairy2i.quant.scale_source", scale_source);
                     if (scale_source != "learned") {
-                        throw std::runtime_error(format(
-                            "invalid FAIRY2I tile64_v2_w1_learned_scale scale source: %s, expected learned",
-                            scale_source.c_str()));
+                        throw std::runtime_error(
+                            format("invalid FAIRY2I tile64_v2_w1_learned_scale scale source: %s, expected learned",
+                                   scale_source.c_str()));
                     }
                 } else {
                     throw std::runtime_error(
@@ -1782,11 +1811,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 }
 
                 std::string attn_layout =
-                    fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2
-                        ? "qwen2_real"
-                        : fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE
-                              ? "qwen3_real"
-                              : "legacy_complex";
+                    fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2                  ? "qwen2_real" :
+                    fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE ? "qwen3_real" :
+                                                                                                      "legacy_complex";
                 ml.get_key("fairy2i.attn.layout", attn_layout, false);
 
                 if (attn_layout == "legacy_complex") {
@@ -2261,10 +2288,15 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & tensor_split = params.tensor_split;
 
     const int n_layer = hparams.n_layer;
+    const bool fairy2i_output_neon = arch == LLM_ARCH_FAIRY2I && llama_fairy2i_output_neon_enabled();
 
     const bool use_mmap_buffer = true;
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s)\n", __func__, ml.use_mmap ? "true" : "false");
+    if (fairy2i_output_neon) {
+        LLAMA_LOG_INFO("%s: LLAMA_FAIRY2I_OUTPUT_NEON=1, dense output matmul will use the CPU backend when available\n",
+                       __func__);
+    }
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts);
@@ -2441,6 +2473,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             } else {
                 op = info.op;
             }
+            const bool dense_fairy2i_output = fairy2i_output_neon && tn_tensor == LLM_TENSOR_OUTPUT && !bias &&
+                                              (tn.suffix == nullptr || strcmp(tn.suffix, "weight") == 0) &&
+                                              t_meta->type != GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                              t_meta->type != GGML_TYPE_IFAIRY;
 
             // sanity checks
             if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
@@ -2468,6 +2504,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
             }
+            if (dense_fairy2i_output) {
+                LLAMA_LOG_INFO("%s: placing dense output tensor %s on CPU backend for LLAMA_FAIRY2I_OUTPUT_NEON\n",
+                               __func__, tn.str().c_str());
+            }
 
             ggml_backend_buffer_type_t buft = nullptr;
 
@@ -2491,6 +2531,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         break;
                     }
                 }
+            }
+
+            if (dense_fairy2i_output) {
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+                if (!weight_buft_supported(hparams, t_meta, op, buft, cpu_dev)) {
+                    throw std::runtime_error(
+                        format("CPU backend does not support dense Fairy2i output tensor %s", tn.str().c_str()));
+                }
+            }
+
+            if (t_meta->type == GGML_TYPE_FAIRY2I_TILE64_V2 && llama_fairy2i_fused_wide_linear_w2_enabled() &&
+                buft_list_has_non_cpu_dev(*buft_list)) {
+                // These tensors are consumed by GGML_OP_FAIRY2I_WIDE_LINEAR_W2, not by a generic MUL_MAT.
+                // Keep them eligible for layer offload so the scheduler can place the fused op on the same device.
+                op = GGML_OP_NONE;
             }
 
             if (!buft) {
@@ -4819,10 +4874,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (fairy2i_is_bundle) {
                             const ggml_backend_dev_t target_dev =
                                 bid >= 0 ? pimpl->dev_layer.at(bid).dev : pimpl->dev_output.dev;
-                            if (!target_dev || ggml_backend_dev_type(target_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            const bool target_dev_is_cpu =
+                                target_dev && ggml_backend_dev_type(target_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                            const bool target_dev_is_metal = llama_backend_dev_is_metal(target_dev);
+                            if (!target_dev_is_cpu && !target_dev_is_metal) {
                                 throw std::runtime_error(
-                                    format("FAIRY2I bundle_v1 tensor %s is CPU-LUT-only; disable layer offload",
-                                           (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str()));
+                                    format("FAIRY2I bundle_v1 tensor %s requires CPU-LUT or Metal, got %s",
+                                           (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str(),
+                                           target_dev ? ggml_backend_dev_name(target_dev) : "no device"));
                             }
 
                             reject_fairy2i_tensor(tensor, "U.s0", bid, "bundle_v1");
@@ -4883,8 +4942,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (fairy2i_is_bundle) {
                             return linear.bundle_codes && linear.bundle_scales;
                         }
-                        return fairy2i_is_w1 ? (linear.U[0] && linear.W[0])
-                                             : (linear.U[0] && linear.U[1] && linear.W[0] && linear.W[1]);
+                        return fairy2i_is_w1 ? (linear.U[0] && linear.W[0]) :
+                                               (linear.U[0] && linear.U[1] && linear.W[0] && linear.W[1]);
                     };
 
                     auto fairy2i_linear_any = [&](const llama_widely_linear_ifairy & linear) {
@@ -4919,9 +4978,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     const char * force_dense_output_env = getenv("LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT");
                     const bool   force_dense_output =
                         force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0;
+                    const bool output_neon = llama_fairy2i_output_neon_enabled();
                     if (force_dense_output && !output && has_output_fairy2i) {
                         LLAMA_LOG_WARN(
                             "%s: LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT is set, but dense output tensor is missing; "
+                            "falling back to output.{U,W}.s{0,1}\n",
+                            __func__);
+                    }
+                    if (output_neon && !output && has_output_fairy2i) {
+                        LLAMA_LOG_WARN(
+                            "%s: LLAMA_FAIRY2I_OUTPUT_NEON is set, but dense output tensor is missing; "
                             "falling back to output.{U,W}.s{0,1}\n",
                             __func__);
                     }
@@ -4931,7 +4997,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, i), { n_embd * 2 }, 0);
                         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM, i), { n_embd * 2 }, 0);
-
                         if (fairy2i_is_qwen3) {
                             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, i), { n_embd_head_k }, 0);
                             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, i), { n_embd_head_k }, 0);
@@ -4941,11 +5006,36 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
                         layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), { n_embd_gqa }, TENSOR_NOT_REQUIRED);
                         layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), { n_embd_gqa }, TENSOR_NOT_REQUIRED);
+                        layer.bqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", i), { 2 * (n_embd + n_embd_gqa) },
+                                                   TENSOR_NOT_REQUIRED);
                         layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
 
-                        create_fairy2i_linear(layer.wq_fairy2i, LLM_TENSOR_ATTN_Q, i, n_embd, n_embd, 0);
-                        create_fairy2i_linear(layer.wk_fairy2i, LLM_TENSOR_ATTN_K, i, n_embd, n_embd_gqa / 2, 0);
-                        create_fairy2i_linear(layer.wv_fairy2i, LLM_TENSOR_ATTN_V, i, n_embd, n_embd_gqa / 2, 0);
+                        if (fairy2i_is_bundle && fairy2i_is_w1 && fairy2i_is_qwen3) {
+                            create_fairy2i_linear(layer.wqkv_fairy2i, LLM_TENSOR_ATTN_QKV, i, n_embd,
+                                                  n_embd + n_embd_gqa, TENSOR_NOT_REQUIRED);
+                        }
+
+                        const bool has_merged_qkv = fairy2i_linear_complete(layer.wqkv_fairy2i);
+                        if (has_merged_qkv) {
+                            if (layer.bq || layer.bk || layer.bv) {
+                                throw std::runtime_error(
+                                    format("FAIRY2I merged QKV layer %d cannot contain separate Q/K/V biases", i));
+                            }
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_Q, "bundle.codes", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_Q, "bundle.scales", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_K, "bundle.codes", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_K, "bundle.scales", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_V, "bundle.codes", i, "merged QKV");
+                            reject_fairy2i_tensor(LLM_TENSOR_ATTN_V, "bundle.scales", i, "merged QKV");
+                        } else {
+                            if (layer.bqkv) {
+                                throw std::runtime_error(
+                                    format("FAIRY2I layer %d has an attn_qkv bias without merged QKV weights", i));
+                            }
+                            create_fairy2i_linear(layer.wq_fairy2i, LLM_TENSOR_ATTN_Q, i, n_embd, n_embd, 0);
+                            create_fairy2i_linear(layer.wk_fairy2i, LLM_TENSOR_ATTN_K, i, n_embd, n_embd_gqa / 2, 0);
+                            create_fairy2i_linear(layer.wv_fairy2i, LLM_TENSOR_ATTN_V, i, n_embd, n_embd_gqa / 2, 0);
+                        }
                         create_fairy2i_linear(layer.wo_fairy2i, LLM_TENSOR_ATTN_OUT, i, n_embd, n_embd, 0);
                         create_fairy2i_linear(layer.ffn_gate_fairy2i, LLM_TENSOR_FFN_GATE, i, n_embd, n_ff, 0);
                         create_fairy2i_linear(layer.ffn_up_fairy2i, LLM_TENSOR_FFN_UP, i, n_embd, n_ff, 0);
@@ -14383,10 +14473,10 @@ struct llm_build_fairy2i : public llm_graph_context {
 
         auto build_wide_linear = [&](const llama_widely_linear_ifairy & linear, ggml_tensor * x, ggml_tensor * x_conj,
                                      ggml_tensor * bias, int il, const char * name) -> ggml_tensor * {
-            auto target_dev_is_cpu = [&]() {
-                ggml_backend_dev_t dev = il >= 0 ? model.dev_layer(il) : model.dev_output();
-                return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-            };
+            ggml_backend_dev_t target_dev = il >= 0 ? model.dev_layer(il) : model.dev_output();
+            const bool         target_dev_is_cpu =
+                target_dev && ggml_backend_dev_type(target_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            const bool target_dev_is_metal = llama_backend_dev_is_metal(target_dev);
 
             if (linear.bundle_codes || linear.bundle_scales) {
                 GGML_ASSERT(linear.bundle_codes && linear.bundle_scales);
@@ -14394,11 +14484,12 @@ struct llm_build_fairy2i : public llm_graph_context {
                 if (!loras->empty()) {
                     throw std::runtime_error("FAIRY2I bundle_v1 does not support LoRA adapters");
                 }
-                if (!target_dev_is_cpu()) {
-                    throw std::runtime_error("FAIRY2I bundle_v1 is CPU-LUT-only; disable layer offload");
+                const bool is_w1 = linear.branch_count == 2;
+                if (!target_dev_is_cpu && !target_dev_is_metal) {
+                    throw std::runtime_error(format("FAIRY2I bundle_v1 requires CPU-LUT or Metal, got %s",
+                                                    target_dev ? ggml_backend_dev_name(target_dev) : "no device"));
                 }
 
-                const bool   is_w1 = linear.branch_count == 2;
                 const char * env_name =
                     is_w1 ? "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1" : "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2";
                 if (llama_fairy2i_env_policy_from_env(env_name) == LLAMA_FAIRY2I_ENV_POLICY_DISABLED) {
@@ -14416,35 +14507,40 @@ struct llm_build_fairy2i : public llm_graph_context {
 
             GGML_ASSERT(linear.U[0] && linear.W[0]);
 
+            const bool has_stage1      = linear.U[1] && linear.W[1];
+            const bool can_fuse_tile64 = loras->empty() && linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                         linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                         (!has_stage1 || (linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
+                                                          linear.W[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2));
+
             const bool can_fuse_w1 =
                 model.fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE &&
-                loras->empty() && !linear.U[1] && !linear.W[1] &&
-                linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2;
-            if (can_fuse_w1) {
+                can_fuse_tile64 && !has_stage1;
+            if (target_dev_is_cpu && can_fuse_w1) {
                 ggml_tensor * y = ggml_fairy2i_wide_linear_w1(ctx0, x, linear.U[0], linear.W[0], bias);
-                if (llama_fairy2i_should_use_fused_wide_linear("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1",
-                                                               "GGML_OP_FAIRY2I_WIDE_LINEAR_W1", target_dev_is_cpu(),
-                                                               backend_cpu, y)) {
+                if (llama_fairy2i_should_use_fused_wide_linear(
+                        "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1", "GGML_OP_FAIRY2I_WIDE_LINEAR_W1", true, backend_cpu, y)) {
                     cb(y, name, il);
                     return y;
                 }
             }
 
-            const bool can_fuse_w2 = loras->empty() && linear.U[1] && linear.W[1] &&
-                                     linear.U[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                     linear.U[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                     linear.W[0]->type == GGML_TYPE_FAIRY2I_TILE64_V2 &&
-                                     linear.W[1]->type == GGML_TYPE_FAIRY2I_TILE64_V2;
-            if (can_fuse_w2) {
+            const bool can_fuse_w2 = can_fuse_tile64 && has_stage1;
+            if (target_dev_is_cpu && can_fuse_w2) {
                 ggml_tensor * y =
                     ggml_fairy2i_wide_linear_w2(ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
-                if (llama_fairy2i_should_use_fused_wide_linear("LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2",
-                                                               "GGML_OP_FAIRY2I_WIDE_LINEAR_W2", target_dev_is_cpu(),
-                                                               backend_cpu, y)) {
+                if (llama_fairy2i_should_use_fused_wide_linear(
+                        "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2", "GGML_OP_FAIRY2I_WIDE_LINEAR_W2", true, backend_cpu, y)) {
                     cb(y, name, il);
                     return y;
                 }
+            }
+
+            if (!target_dev_is_cpu && can_fuse_tile64 && llama_fairy2i_fused_wide_linear_w2_enabled()) {
+                ggml_tensor * y =
+                    ggml_fairy2i_wide_linear_w2(ctx0, x, linear.U[0], linear.U[1], linear.W[0], linear.W[1], bias);
+                cb(y, name, il);
+                return y;
             }
 
             ggml_tensor * u0 = build_lora_mm(linear.U[0], x_conj);
@@ -14466,9 +14562,28 @@ struct llm_build_fairy2i : public llm_graph_context {
 
             ggml_tensor * cur_conj = build_complex_conj(cur, il, "attn_norm_conj");
 
-            ggml_tensor * Qcur = build_wide_linear(model.layers[il].wq_fairy2i, cur, cur_conj, model.layers[il].bq, il, "Qcur");
-            ggml_tensor * Kcur = build_wide_linear(model.layers[il].wk_fairy2i, cur, cur_conj, model.layers[il].bk, il, "Kcur");
-            ggml_tensor * Vcur = build_wide_linear(model.layers[il].wv_fairy2i, cur, cur_conj, model.layers[il].bv, il, "Vcur");
+            ggml_tensor * Qcur;
+            ggml_tensor * Kcur;
+            ggml_tensor * Vcur;
+            if (model.layers[il].wqkv_fairy2i.bundle_codes) {
+                ggml_tensor * qkv  = build_wide_linear(model.layers[il].wqkv_fairy2i, cur, cur_conj,
+                                                       model.layers[il].bqkv, il, "QKVcur");
+                const int64_t q_m  = hparams.n_embd;
+                const int64_t kv_m = hparams.n_embd_v_gqa(il) / 2;
+                GGML_ASSERT(qkv->ne[0] == q_m + 2 * kv_m);
+                GGML_ASSERT(qkv->ne[1] == n_tokens && qkv->ne[2] == 1 && qkv->ne[3] == 1);
+
+                Qcur = ggml_view_2d(ctx0, qkv, q_m, n_tokens, qkv->nb[1], 0);
+                Kcur = ggml_view_2d(ctx0, qkv, kv_m, n_tokens, qkv->nb[1], q_m * qkv->nb[0]);
+                Vcur = ggml_view_2d(ctx0, qkv, kv_m, n_tokens, qkv->nb[1], (q_m + kv_m) * qkv->nb[0]);
+                cb(Qcur, "Qcur_view", il);
+                cb(Kcur, "Kcur_view", il);
+                cb(Vcur, "Vcur_view", il);
+            } else {
+                Qcur = build_wide_linear(model.layers[il].wq_fairy2i, cur, cur_conj, model.layers[il].bq, il, "Qcur");
+                Kcur = build_wide_linear(model.layers[il].wk_fairy2i, cur, cur_conj, model.layers[il].bk, il, "Kcur");
+                Vcur = build_wide_linear(model.layers[il].wv_fairy2i, cur, cur_conj, model.layers[il].bv, il, "Vcur");
+            }
 
             if (use_real_attn) {
                 Qcur = ggml_complex_split(ctx0, Qcur);
@@ -14575,7 +14690,9 @@ struct llm_build_fairy2i : public llm_graph_context {
                  model.output_fairy2i.W[1]);
         const bool has_output_fairy2i_merged = model.output_fairy2i_merged.U[0] && model.output_fairy2i_merged.W[0];
         const char * force_dense_output_env = getenv("LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT");
-        const bool   force_dense_output = force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0;
+        const bool   force_dense_output =
+            (force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0) ||
+            llama_fairy2i_output_neon_enabled();
 
         if (has_output_fairy2i_merged && (!force_dense_output || !model.output)) {
             ggml_tensor * cur_conj = build_complex_conj(cur, -1, "result_norm_conj");
@@ -14587,9 +14704,15 @@ struct llm_build_fairy2i : public llm_graph_context {
             cur                    = ggml_complex_split(ctx0, cur);
         } else if (model.output) {
             cur = ggml_complex_split(ctx0, cur);
+            cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+            cb(cur, "result_output_inp_f16", -1);
             cur = build_lora_mm(model.output, cur);
+            if (llama_fairy2i_output_neon_enabled() && backend_cpu != nullptr &&
+                ggml_backend_supports_op(backend_cpu, cur)) {
+                ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+            }
         } else {
-            throw std::runtime_error("FAIRY2I output layer requires dense output tensor or output.{U,W}.s{0,1}");
+            throw std::runtime_error("FAIRY2I output layer requires dense output tensor or output.{U,W}.s0/s{0,1}");
         }
 
         cb(cur, "result_output", -1);
@@ -20420,9 +20543,8 @@ int32_t llama_n_head(const llama_model * model) {
 }
 
 llama_rope_type llama_model_rope_type(const llama_model * model) {
-    if (model->arch == LLM_ARCH_FAIRY2I &&
-        (model->fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL ||
-         model->fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL)) {
+    if (model->arch == LLM_ARCH_FAIRY2I && (model->fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL ||
+                                            model->fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL)) {
         return LLAMA_ROPE_TYPE_NEOX;
     }
 

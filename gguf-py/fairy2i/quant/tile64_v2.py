@@ -298,6 +298,32 @@ def pack_fairy2i_bundle_v1(
     return codes, scales
 
 
+def merge_fairy2i_bundle_v1_m(
+    bundles: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Concatenate complete bundle tensors along the logical M-tile dimension."""
+
+    if not bundles:
+        raise ValueError("at least one bundle is required")
+
+    code_tail = bundles[0][0].shape[1:]
+    scale_tail = bundles[0][1].shape[1:]
+    for index, (codes, scales) in enumerate(bundles):
+        if codes.dtype != np.uint8 or codes.ndim != 4 or codes.shape[1:] != code_tail:
+            raise ValueError(f"bundle {index} code shape/type mismatch: {codes.shape}/{codes.dtype}")
+        if scales.dtype != np.float16 or scales.ndim != 3 or scales.shape[1:] != scale_tail:
+            raise ValueError(f"bundle {index} scale shape/type mismatch: {scales.shape}/{scales.dtype}")
+        if codes.shape[0] != scales.shape[0]:
+            raise ValueError(
+                f"bundle {index} code/scale tile count mismatch: {codes.shape[0]} vs {scales.shape[0]}"
+            )
+
+    return (
+        np.ascontiguousarray(np.concatenate([codes for codes, _ in bundles], axis=0)),
+        np.ascontiguousarray(np.concatenate([scales for _, scales in bundles], axis=0)),
+    )
+
+
 def unpack_fairy2i_bundle_v1(
     codes: np.ndarray,
     scales: np.ndarray,

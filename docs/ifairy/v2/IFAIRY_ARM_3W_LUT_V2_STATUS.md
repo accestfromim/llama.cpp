@@ -16,11 +16,29 @@ Status: Draft (2026-07-04)
 
 - Fairy2i W1/W2 graph fusion moves from env opt-in to auto default: model variant, LoRA state, tensor types, and CPU backend support must all match; `LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W{1,2}=0` keeps the unfused graph available.
 - Fairy2i CPU LUT builds default to LUT16. `GGML_FAIRY2I_LUT=0` forces the direct CPU path; `GGML_FAIRY2I_LUT_IMPL=lut_c` remains an explicit experimental override.
-- W1 LUT16 dynamic tile claiming is an opt-in experiment. `GGML_FAIRY2I_W1_DYNAMIC_TILES=1` enables it only for W1 LUT with `N==1`; `N>1` keeps the static split. `GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size; unset uses `2`, and invalid values use `1`.
-- W2 LUT16 dynamic tile claiming is enabled by default. `GGML_FAIRY2I_W2_DYNAMIC_TILES=0` disables it; it only applies to W2 LUT with `N==1` (tg path); `N>1` keeps the static split. `GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH=1|2|4` controls the claim batch size; unset uses `2`, and invalid values use `1`.
-  Current M4 tg128 evidence prefers `batch=1` for low thread counts (`nth<=4`); `batch=2` should only be considered for higher-thread tg after path-validated measurement, because it regressed tg4 in the focused sweep.
+- W1 LUT16 dynamic tile claiming is enabled by default only for bundle-v1 with `N==1`; older layouts remain opt-in and `N>1` keeps the static split. `GGML_FAIRY2I_W1_DYNAMIC_TILES=0|1` overrides the default. `GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH=1|2|4` controls claim batch size; unset uses `4` for bundle-v1 and `2` for older layouts, while invalid values use `1`.
+- W2 LUT16 dynamic tile claiming is enabled by default. `GGML_FAIRY2I_W2_DYNAMIC_TILES=0` disables it; it only applies to W2 LUT with `N==1` (tg path); `N>1` keeps the static split. `GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH=1|2|4` controls the claim batch size; unset uses `4` for bundle-v1 and `2` for older layouts, while invalid values use `1`.
+  Current Apple M4 bundle-v1 tg128 evidence at `nth=8` prefers `batch=4` for W1 and W2. Other devices/thread counts should keep the override available for path-validated ABBA measurement instead of adding CPU-specific defaults.
 - `GGML_FAIRY2I_CPU_LUT` remains a build-time capability gate and still defaults to OFF, so normal builds do not become CPU-only.
 - Regression coverage now includes default LUT, explicit LUT, and explicit direct paths in `test-fairy2i`.
+
+## 2026-07-18 — bundle-v1 AArch64 NEON optimization
+
+- Added a shared compile-time-specialized branch-pair NEON qgemm that directly consumes bundle-v1 codes/scales. W2 no longer falls back to the per-row scalar branch kernel on AArch64.
+- Coalesced adjacent branch code/scale loads, hoisted bundle address mapping, shortened int16 accumulation dependencies, vectorized add/store, and retained one-line next-block prefetch.
+- Enabled W1 bundle-v1 `N==1` dynamic tile claiming by default with batch 4; old layouts keep their previous opt-in policy.
+- Apple M4, CPU-only, 8 threads, `R=3`, ABBA with 15-second gaps:
+
+  | model | workload | baseline | current | delta |
+  |---|---:|---:|---:|---:|
+  | W1 Qwen3 bundle-v1 QKV | pp512 | 42.4810 | 43.5825 | +2.5928% |
+  | W1 Qwen3 bundle-v1 QKV | tg128 | 16.2074 | 20.4651 | +26.2706% |
+  | W2 Llama2 bundle-v1 | pp512 | 1.7411 | 23.1522 | +1229.7330% |
+  | W2 Llama2 bundle-v1 | tg128 | 1.4858 | 15.3419 | +932.5447% |
+
+- W1 CPU baseline/current WikiText-2 PPL is exactly `39.3324` on the same 8 chunks. W2 one-chunk PPL is `17.7752` scalar vs `17.7353` NEON; mean KL is `0.001928`, with `99.608%` same top probability.
+- Native and `GGML_NATIVE=OFF`, `GGML_CPU_ARM_ARCH=armv8-a`, no-dotprod/no-Accelerate Fairy2i test matrices pass. Legacy direct and LUT regression gates pass.
+- Full implementation, candidate matrix, commands, and raw artifact paths: `FAIRY2I_BUNDLE_V1_NEON_OPTIMIZATION_REPORT.md`.
 
 ## 2026-07-04 — Fairy2i ARM W1 build gate and real-GGUF baseline
 

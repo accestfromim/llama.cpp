@@ -255,6 +255,7 @@ struct llama_layer {
     llama_widely_linear_ifairy wq_fairy2i;
     llama_widely_linear_ifairy wk_fairy2i;
     llama_widely_linear_ifairy wv_fairy2i;
+    llama_widely_linear_ifairy wqkv_fairy2i;
     llama_widely_linear_ifairy wo_fairy2i;
     struct ggml_tensor * wq_enc    = nullptr;
     struct ggml_tensor * wk_enc    = nullptr;

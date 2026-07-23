@@ -54,15 +54,15 @@ static bool ggml_fairy2i_wide_linear_w2_have_packed_weights(const struct ggml_te
     return ggml_fairy2i_wide_linear_have_packed_weights(dst, 1, 4);
 }
 
-static bool ggml_fairy2i_wide_linear_w1_dynamic_tiles_enabled(void) {
+static bool ggml_fairy2i_wide_linear_w1_dynamic_tiles_enabled(const struct ggml_tensor * dst) {
     const char * env = getenv("GGML_FAIRY2I_W1_DYNAMIC_TILES");
-    return env && strcmp(env, "1") == 0;
+    return env ? strcmp(env, "1") == 0 : ggml_fairy2i_is_bundle_op(dst);
 }
 
-static int64_t ggml_fairy2i_wide_linear_w1_dynamic_tile_batch(void) {
+static int64_t ggml_fairy2i_wide_linear_w1_dynamic_tile_batch(const struct ggml_tensor * dst) {
     const char * batch = getenv("GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH");
     if (!batch) {
-        return 2;
+        return ggml_fairy2i_is_bundle_op(dst) ? 4 : 2;
     }
     if (strcmp(batch, "1") == 0) {
         return 1;
@@ -452,7 +452,7 @@ bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * 
     const void * packed_w0 =
         is_bundle ? nullptr : (const uint8_t *) extra_w0->packed_w + (size_t) tile0 * packed_tile_bytes;
 
-    if (N == 1 && ggml_fairy2i_wide_linear_w1_dynamic_tiles_enabled()) {
+    if (N == 1 && ggml_fairy2i_wide_linear_w1_dynamic_tiles_enabled(dst)) {
         GGML_ASSERT(((uintptr_t) q_x % alignof(std::atomic<int64_t>)) == 0);
         std::atomic<int64_t> * next_tile = reinterpret_cast<std::atomic<int64_t> *>(q_x);
         if (params->ith == 0) {
@@ -461,7 +461,7 @@ bool ggml_fairy2i_wide_linear_w1_compute_lut(const struct ggml_compute_params * 
         }
         ggml_barrier(params->threadpool);
 
-        const int64_t dynamic_tile_batch = ggml_fairy2i_wide_linear_w1_dynamic_tile_batch();
+        const int64_t dynamic_tile_batch = ggml_fairy2i_wide_linear_w1_dynamic_tile_batch(dst);
         if (params->ith == 0) {
             ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits.fetch_add(1, std::memory_order_acq_rel);
             ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch.store((int) dynamic_tile_batch,

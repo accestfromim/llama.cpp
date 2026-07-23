@@ -1369,4 +1369,3 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_timestep_embedding(ggml_me
 
     return res;
 }
-

@@ -98,6 +98,7 @@ static void ggml_fairy2i_cpu_debug_log_once(const struct ggml_compute_params *  
         PATH_UNKNOWN,
         PATH_COUNT,
     };
+
     static bool logged[2][PATH_COUNT] = {};
 
     const int op_idx   = dst && dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ? 0 : 1;
@@ -145,9 +146,8 @@ static void ggml_fairy2i_cpu_timing_log(const struct ggml_compute_params * param
     }
 
     const struct ggml_tensor * x = dst ? dst->src[0] : nullptr;
-    GGML_LOG_INFO("%s: timing path=%s us=%lld M=%lld N=%lld K=%lld nth=%d\n",
-                  ggml_fairy2i_cpu_op_log_name(dst), path ? path : "unknown",
-                  (long long) (ggml_time_us() - start_us), (long long) (dst ? dst->ne[0] : 0),
+    GGML_LOG_INFO("%s: timing path=%s us=%lld M=%lld N=%lld K=%lld nth=%d\n", ggml_fairy2i_cpu_op_log_name(dst),
+                  path ? path : "unknown", (long long) (ggml_time_us() - start_us), (long long) (dst ? dst->ne[0] : 0),
                   (long long) (x ? ggml_nrows(x) : 0), (long long) (x ? x->ne[0] : 0), params->nth);
 }
 
@@ -186,9 +186,8 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
     plan->lut_c                                 = policy.impl == GGML_FAIRY2I_LUT_IMPL_LUT_C;
     plan->impl                                  = policy.impl;
     if (plan->use_lut) {
-        plan->lut_bytes = dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ?
-                              ggml_fairy2i_wide_linear_w1_lut_wsize(dst) :
-                              ggml_fairy2i_wide_linear_w2_lut_wsize(dst);
+        plan->lut_bytes = dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ? ggml_fairy2i_wide_linear_w1_lut_wsize(dst) :
+                                                                      ggml_fairy2i_wide_linear_w2_lut_wsize(dst);
         if (plan->lut_bytes == 0) {
             plan->use_lut = false;
         } else if (plan->work_size < plan->lut_bytes) {
@@ -201,8 +200,7 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
 }
 
 bool ggml_fairy2i_cpu_supports_op(const struct ggml_tensor * dst) {
-    return dst != nullptr &&
-           (dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+    return dst != nullptr && (dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
 }
 
 int ggml_fairy2i_cpu_n_tasks(const struct ggml_tensor * dst, int n_threads) {
@@ -254,7 +252,8 @@ void ggml_fairy2i_cpu_free(void) {
 #endif
 }
 
-static bool ggml_fairy2i_cpu_compute_wide_linear_w1(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+static bool ggml_fairy2i_cpu_compute_wide_linear_w1(const struct ggml_compute_params * params,
+                                                    struct ggml_tensor *               dst) {
     struct ggml_fairy2i_cpu_plan plan;
     if (!ggml_fairy2i_cpu_build_plan(dst, params ? params->nth : 1, &plan)) {
         return false;

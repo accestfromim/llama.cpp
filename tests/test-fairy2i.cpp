@@ -310,6 +310,31 @@ static fairy2i_w1_data make_fairy2i_w1_data(const fairy2i_w2_case & tc) {
     return data;
 }
 
+static void share_fairy2i_w64_scales(std::vector<block_fairy2i_tile64_v2> & weights, int64_t M, int64_t K) {
+    const int64_t blocks = K / QK_FAIRY2I_TILE64;
+    for (int64_t row = 0; row < M; ++row) {
+        const int64_t scale_row = (row / QK_FAIRY2I_TILE64) * QK_FAIRY2I_TILE64;
+        for (int64_t ib = 0; ib < blocks; ++ib) {
+            block_fairy2i_tile64_v2 &       dst = weights[(size_t) row * (size_t) blocks + (size_t) ib];
+            const block_fairy2i_tile64_v2 & src = weights[(size_t) scale_row * (size_t) blocks + (size_t) ib];
+            dst.d_real                          = src.d_real;
+            dst.d_imag                          = src.d_imag;
+        }
+    }
+}
+
+static void share_fairy2i_w64_scales(fairy2i_w2_data & data, const fairy2i_w2_case & tc) {
+    share_fairy2i_w64_scales(data.u_s0, tc.M, tc.K);
+    share_fairy2i_w64_scales(data.u_s1, tc.M, tc.K);
+    share_fairy2i_w64_scales(data.w_s0, tc.M, tc.K);
+    share_fairy2i_w64_scales(data.w_s1, tc.M, tc.K);
+}
+
+static void share_fairy2i_w64_scales(fairy2i_w1_data & data, const fairy2i_w2_case & tc) {
+    share_fairy2i_w64_scales(data.u_s0, tc.M, tc.K);
+    share_fairy2i_w64_scales(data.w_s0, tc.M, tc.K);
+}
+
 static std::vector<float> make_fairy2i_lut_quantize_input(int salt) {
     static const float values[] = {
         0.0f,         1.0f,          -1.0f,          0.5f / 63.0f,    -0.5f / 63.0f,
@@ -1164,7 +1189,7 @@ static std::vector<uint32_t> fairy2i_w2_scalar_reference(const fairy2i_w2_case &
 }
 
 static std::vector<uint32_t> fairy2i_w1_scalar_reference(const fairy2i_w2_case & tc, const fairy2i_w1_data & data) {
-    const int64_t blocks = tc.K / QK_FAIRY2I_TILE64;
+    const int64_t                         blocks = tc.K / QK_FAIRY2I_TILE64;
     std::vector<block_fairy2i_act_q16_64> q_x;
     quantize_fairy2i_act_q16_64(q_x, data.x, tc.N, tc.K);
 
@@ -1174,9 +1199,8 @@ static std::vector<uint32_t> fairy2i_w1_scalar_reference(const fairy2i_w2_case &
             float real = 0.0f;
             float imag = 0.0f;
             for (int64_t ib = 0; ib < blocks; ++ib) {
-                const block_fairy2i_act_q16_64 & x =
-                    q_x[(size_t) n * (size_t) blocks + (size_t) ib];
-                const size_t w_idx = (size_t) row * (size_t) blocks + (size_t) ib;
+                const block_fairy2i_act_q16_64 & x     = q_x[(size_t) n * (size_t) blocks + (size_t) ib];
+                const size_t                     w_idx = (size_t) row * (size_t) blocks + (size_t) ib;
 
                 int32_t sums[2][4] = {};
                 fairy2i_accumulate_block_scalar(data.u_s0[w_idx], x, sums[0]);
@@ -1896,7 +1920,9 @@ static bool test_fairy2i_wide_linear_w2_lut_dynamic_tiles() {
 #endif
 }
 
-static bool compare_exact(const char * label, const std::vector<uint32_t> & actual, const std::vector<uint32_t> & expected) {
+static bool compare_exact(const char *                  label,
+                          const std::vector<uint32_t> & actual,
+                          const std::vector<uint32_t> & expected) {
     if (actual.size() != expected.size()) {
         fprintf(stderr, "%s size mismatch: %zu vs %zu\n", label, actual.size(), expected.size());
         return false;
@@ -1953,6 +1979,241 @@ static bool compare_packed_complex(
                 "%s max diff %.7g exceeds %.7g at index %zu channel=%s actual=(%.7g,%.7g) expected=(%.7g,%.7g)\n",
                 label, max_diff, max_error, max_idx, max_ch == 0 ? "real" : "imag", ar, ai, er, ei);
         return false;
+    }
+
+    return true;
+}
+
+static ggml_backend_dev_t find_metal_test_device() {
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev      = ggml_backend_dev_get(i);
+        const char *       name     = ggml_backend_dev_name(dev);
+        ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+        const char *       reg_name = ggml_backend_reg_name(reg);
+
+        if ((name && strcmp(name, "Metal") == 0) || (reg_name && strcmp(reg_name, "Metal") == 0)) {
+            return dev;
+        }
+    }
+
+    return nullptr;
+}
+
+static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                      out,
+                                      ggml_backend_dev_t                           dev,
+                                      const fairy2i_w2_case &                      tc,
+                                      const std::vector<float> &                   input,
+                                      const std::vector<block_fairy2i_tile64_v2> & u_s0_data,
+                                      const std::vector<block_fairy2i_tile64_v2> * u_s1_data,
+                                      const std::vector<block_fairy2i_tile64_v2> & w_s0_data,
+                                      const std::vector<block_fairy2i_tile64_v2> * w_s1_data,
+                                      const std::vector<float> &                   bias_data,
+                                      const fairy2i_bundle_data *                  bundle_data = nullptr) {
+    const bool is_bundle = bundle_data != nullptr;
+    const bool is_w1     = is_bundle ? bundle_data->branches == 2 : u_s1_data == nullptr && w_s1_data == nullptr;
+    if (!is_w1 && (!u_s1_data || !w_s1_data)) {
+        fprintf(stderr, "invalid Fairy2i Metal test weight set\n");
+        return false;
+    }
+    if (is_bundle && bundle_data->branches != 2 && bundle_data->branches != 4) {
+        fprintf(stderr, "invalid Fairy2i Metal bundle branch count\n");
+        return false;
+    }
+
+    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+    if (!backend) {
+        fprintf(stderr, "failed to initialize Metal backend\n");
+        return false;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/4 * 1024 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        ggml_backend_free(backend);
+        fprintf(stderr, "failed to initialize ggml context for Fairy2i Metal\n");
+        return false;
+    }
+
+    const int64_t physical_tiles = (tc.M / 64) * (tc.K / 64);
+    ggml_tensor * x              = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * codes = is_bundle ? ggml_new_tensor_4d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, bundle_data->branches,
+                                                         64, physical_tiles) :
+                                      nullptr;
+    ggml_tensor * scales =
+        is_bundle ? ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, bundle_data->branches, physical_tiles) : nullptr;
+    ggml_tensor * u_s0 = is_bundle ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * u_s1 =
+        is_bundle || is_w1 ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s0 = is_bundle ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w_s1 =
+        is_bundle || is_w1 ? nullptr : ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * bias = tc.bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tc.M) : nullptr;
+    ggml_tensor * y    = is_bundle ?
+                             (is_w1 ? ggml_fairy2i_wide_linear_w1_bundle(ctx, x, codes, scales, bias, tc.M, tc.K) :
+                                      ggml_fairy2i_wide_linear_w2_bundle(ctx, x, codes, scales, bias, tc.M, tc.K)) :
+                             ggml_fairy2i_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
+    ggml_set_name(y, is_bundle ? (is_w1 ? "fairy2i_metal_bundle_w1" : "fairy2i_metal_bundle_w2") :
+                     is_w1     ? "fairy2i_metal_wide_linear_w1" :
+                                 "fairy2i_metal_wide_linear_w2");
+
+    if (!ggml_backend_supports_op(backend, y)) {
+        fprintf(stderr, "Metal does not support Fairy2i W%d M=%lld N=%lld K=%lld\n", is_w1 ? 1 : 2, (long long) tc.M,
+                (long long) tc.N, (long long) tc.K);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "failed to allocate Metal backend buffer for Fairy2i W%d\n", is_w1 ? 1 : 2);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+    if (is_bundle) {
+        ggml_backend_tensor_set(codes, bundle_data->codes.data(), 0, bundle_data->codes.size());
+        ggml_backend_tensor_set(scales, bundle_data->scales.data(), 0,
+                                bundle_data->scales.size() * sizeof(ggml_fp16_t));
+    } else {
+        ggml_backend_tensor_set(u_s0, u_s0_data.data(), 0, u_s0_data.size() * sizeof(block_fairy2i_tile64_v2));
+        ggml_backend_tensor_set(w_s0, w_s0_data.data(), 0, w_s0_data.size() * sizeof(block_fairy2i_tile64_v2));
+    }
+    if (!is_bundle && !is_w1) {
+        ggml_backend_tensor_set(u_s1, u_s1_data->data(), 0, u_s1_data->size() * sizeof(block_fairy2i_tile64_v2));
+        ggml_backend_tensor_set(w_s1, w_s1_data->data(), 0, w_s1_data->size() * sizeof(block_fairy2i_tile64_v2));
+    }
+    if (bias) {
+        ggml_backend_tensor_set(bias, bias_data.data(), 0, bias_data.size() * sizeof(float));
+    }
+
+    const bool        direct_bundle = !is_bundle || (codes->extra == nullptr && scales->extra == nullptr);
+    const ggml_status status        = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "Fairy2i Metal W%d graph compute failed: %s\n", is_w1 ? 1 : 2, ggml_status_to_string(status));
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+    if (!direct_bundle || (is_bundle && (codes->extra != nullptr || scales->extra != nullptr))) {
+        fprintf(stderr, "Fairy2i Metal bundle unexpectedly allocated a repacked weight copy\n");
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return false;
+    }
+
+    std::vector<float> out_f32((size_t) tc.M * (size_t) tc.N);
+    ggml_backend_tensor_get(y, out_f32.data(), 0, out_f32.size() * sizeof(float));
+    out.resize(out_f32.size());
+    memcpy(out.data(), out_f32.data(), out_f32.size() * sizeof(float));
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return true;
+}
+
+static bool test_fairy2i_metal_wide_linear() {
+    printf("\n=== Fairy2i Metal W1/W2 tests ===\n");
+
+    ggml_backend_dev_t dev = find_metal_test_device();
+    if (!dev) {
+        printf("Metal backend not found; skipping Fairy2i Metal tests.\n");
+        return true;
+    }
+
+    printf("Metal device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+
+    const std::vector<fairy2i_w2_case> w2_cases = {
+        { 7,  3, 128, true },
+        { 17, 1, 256, true },
+    };
+    for (const fairy2i_w2_case & tc : w2_cases) {
+        fairy2i_w2_data data = make_fairy2i_w2_data(tc);
+        share_fairy2i_w64_scales(data, tc);
+        const std::vector<uint32_t> ref = fairy2i_w2_scalar_reference(tc, data);
+
+        std::vector<uint32_t> metal;
+        if (!run_fairy2i_metal_backend(metal, dev, tc, data.x, data.u_s0, &data.u_s1, data.w_s0, &data.w_s1,
+                                       data.bias) ||
+            !compare_packed_complex("Fairy2i Metal W2", metal, ref, 1e-2f)) {
+            return false;
+        }
+    }
+
+    const std::vector<fairy2i_w2_case> w1_cases = {
+        { 9,  3, 128, true  },
+        { 16, 1, 256, false },
+    };
+    for (const fairy2i_w2_case & tc : w1_cases) {
+        fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+        share_fairy2i_w64_scales(data, tc);
+        const std::vector<uint32_t> ref = fairy2i_w1_scalar_reference(tc, data);
+
+        std::vector<uint32_t> metal;
+        if (!run_fairy2i_metal_backend(metal, dev, tc, data.x, data.u_s0, nullptr, data.w_s0, nullptr, data.bias) ||
+            !compare_packed_complex("Fairy2i Metal W1", metal, ref, 1e-2f)) {
+            return false;
+        }
+    }
+
+    const std::vector<fairy2i_w2_case> bundle_w1_cases = {
+        { 128, 1,  256, false },
+        { 64,  1,  128, true  },
+        { 64,  16, 128, true  },
+        { 64,  17, 128, true  },
+    };
+    for (const fairy2i_w2_case & tc : bundle_w1_cases) {
+        fairy2i_w1_data data = make_fairy2i_w1_data(tc);
+        make_fairy2i_weights_bundle_compatible(data.u_s0, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(data.w_s0, tc.M, tc.K);
+        const fairy2i_bundle_data   bundle = pack_fairy2i_bundle({ &data.u_s0, &data.w_s0 }, tc.M, tc.K);
+        const std::vector<uint32_t> ref    = fairy2i_w1_scalar_reference(tc, data);
+
+        std::vector<uint32_t> metal;
+        if (!run_fairy2i_metal_backend(metal, dev, tc, data.x, data.u_s0, nullptr, data.w_s0, nullptr, data.bias,
+                                       &bundle) ||
+            !compare_packed_complex("Fairy2i Metal bundle W1", metal, ref, 1e-2f)) {
+            return false;
+        }
+    }
+
+    const std::vector<fairy2i_w2_case> bundle_w2_cases = {
+        { 128, 1,  256, false },
+        { 64,  1,  128, true  },
+        { 64,  16, 128, true  },
+        { 64,  17, 128, true  },
+    };
+    for (const fairy2i_w2_case & tc : bundle_w2_cases) {
+        fairy2i_w2_data data = make_fairy2i_w2_data(tc);
+        make_fairy2i_weights_bundle_compatible(data.u_s0, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(data.u_s1, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(data.w_s0, tc.M, tc.K);
+        make_fairy2i_weights_bundle_compatible(data.w_s1, tc.M, tc.K);
+        const fairy2i_bundle_data bundle =
+            pack_fairy2i_bundle({ &data.u_s0, &data.u_s1, &data.w_s0, &data.w_s1 }, tc.M, tc.K);
+        const std::vector<uint32_t> ref = fairy2i_w2_scalar_reference(tc, data);
+
+        std::vector<uint32_t> metal;
+        if (!run_fairy2i_metal_backend(metal, dev, tc, data.x, data.u_s0, &data.u_s1, data.w_s0, &data.w_s1, data.bias,
+                                       &bundle) ||
+            !compare_packed_complex("Fairy2i Metal bundle W2", metal, ref, 1e-2f)) {
+            return false;
+        }
     }
 
     return true;
@@ -2230,7 +2491,8 @@ static bool test_fairy2i_wide_linear_w2_variants() {
                     if (!run_fairy2i_w2_backend(direct, tc, data, "0", "lut16", false, false)) {
                         return false;
                     }
-                    if (compare_scalar_default && !run_fairy2i_w2_backend(direct_scalar, tc, data, "0", "lut16", false, true)) {
+                    if (compare_scalar_default &&
+                        !run_fairy2i_w2_backend(direct_scalar, tc, data, "0", "lut16", false, true)) {
                         return false;
                     }
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
@@ -2283,8 +2545,8 @@ static bool test_fairy2i_wide_linear_w1_variants() {
     const int64_t Ks[] = { 64, 128, 192, 256, 320, 1024 };
     const int64_t Ns[] = { 1, 2, 4, 8 };
 
-    int  cases_run = 0;
-    bool ok        = true;
+    int        cases_run = 0;
+    bool       ok        = true;
     const bool compare_scalar_default =
         ggml_cpu_has_avx2() != 0 || ggml_cpu_has_neon() != 0 || ggml_cpu_has_dotprod() != 0;
 
@@ -2292,9 +2554,9 @@ static bool test_fairy2i_wide_linear_w1_variants() {
         for (int64_t K : Ks) {
             for (int64_t N : Ns) {
                 for (bool with_bias : { false, true }) {
-                    const fairy2i_w2_case tc = { M, N, K, with_bias };
-                    const fairy2i_w1_data data = make_fairy2i_w1_data(tc);
-                    const std::vector<uint32_t> ref = fairy2i_w1_scalar_reference(tc, data);
+                    const fairy2i_w2_case       tc   = { M, N, K, with_bias };
+                    const fairy2i_w1_data       data = make_fairy2i_w1_data(tc);
+                    const std::vector<uint32_t> ref  = fairy2i_w1_scalar_reference(tc, data);
 
                     std::vector<uint32_t> direct;
                     std::vector<uint32_t> direct_scalar;
@@ -2303,7 +2565,8 @@ static bool test_fairy2i_wide_linear_w1_variants() {
                     if (!run_fairy2i_w1_backend(direct, tc, data, "0", "lut16", false, false)) {
                         return false;
                     }
-                    if (compare_scalar_default && !run_fairy2i_w1_backend(direct_scalar, tc, data, "0", "lut16", false, true)) {
+                    if (compare_scalar_default &&
+                        !run_fairy2i_w1_backend(direct_scalar, tc, data, "0", "lut16", false, true)) {
                         return false;
                     }
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
@@ -2316,8 +2579,8 @@ static bool test_fairy2i_wide_linear_w1_variants() {
 #endif
 
                     char label[160];
-                    snprintf(label, sizeof(label), "W1 reference vs direct M=%lld N=%lld K=%lld bias=%d",
-                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    snprintf(label, sizeof(label), "W1 reference vs direct M=%lld N=%lld K=%lld bias=%d", (long long) M,
+                             (long long) N, (long long) K, (int) with_bias);
                     ok = compare_exact(label, direct, ref) && ok;
 
                     if (compare_scalar_default) {
@@ -2327,8 +2590,8 @@ static bool test_fairy2i_wide_linear_w1_variants() {
                     }
 
 #if defined(GGML_USE_FAIRY2I_CPU_LUT)
-                    snprintf(label, sizeof(label), "W1 direct vs LUT M=%lld N=%lld K=%lld bias=%d",
-                             (long long) M, (long long) N, (long long) K, (int) with_bias);
+                    snprintf(label, sizeof(label), "W1 direct vs LUT M=%lld N=%lld K=%lld bias=%d", (long long) M,
+                             (long long) N, (long long) K, (int) with_bias);
                     ok = compare_packed_complex(label, lut, direct, 1e-2f) && ok;
 
                     snprintf(label, sizeof(label), "W1 explicit LUT vs default LUT M=%lld N=%lld K=%lld bias=%d",
@@ -2422,6 +2685,16 @@ static bool test_fairy2i_bundle_lut() {
                                     true, "1", "lut16", false, 8, "0")) {
         return false;
     }
+    std::vector<uint32_t> dynamic_w1_default;
+    ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+    if (!run_fairy2i_bundle_backend(dynamic_w1_default, dynamic_tc, dynamic_w1.x, dynamic_w1.bias, dynamic_w1_bundle,
+                                    true, "1", "lut16", false, 8)) {
+        return false;
+    }
+    ok = check_fairy2i_w1_dynamic_tiles_hit("W1 bundle dynamic default", true) && ok;
+    ok = check_fairy2i_w1_dynamic_tiles_last_batch("W1 bundle dynamic default", 4) && ok;
+    ok = compare_exact("W1 bundle dynamic default/static", dynamic_w1_default, dynamic_w1_static) && ok;
+    ++cases_run;
     for (const char * batch : { "1", "2", "4" }) {
         std::vector<uint32_t> output;
         if (!run_fairy2i_bundle_backend(output, dynamic_tc, dynamic_w1.x, dynamic_w1.bias, dynamic_w1_bundle, true, "1",
@@ -2504,6 +2777,10 @@ int main() {
     }
     if (!test_fairy2i_wide_linear_w2_lut_dynamic_tiles()) {
         fprintf(stderr, "Fairy2i W2 LUT dynamic tiles FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_metal_wide_linear()) {
+        fprintf(stderr, "Fairy2i Metal W1/W2 FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_bundle_lut()) {

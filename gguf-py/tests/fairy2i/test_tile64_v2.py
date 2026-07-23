@@ -6,6 +6,7 @@ import pytest
 from fairy2i.quant.tile64_v2 import (
     TILE64,
     encode_stage_codes,
+    merge_fairy2i_bundle_v1_m,
     pack_fairy2i_bundle_v1,
     pack_fairy2i_tile64_v2_stage,
     quantize_matrix_tile64_v2,
@@ -90,6 +91,26 @@ def test_bundle_v1_slot_order_is_m16_then_q4() -> None:
     assert codes[0, 0, 0, 0] == np.uint8(0b11100100)
     assert codes[0, 1, 0, 0] == np.uint8(0b11100100)
     assert codes[0, 16, 0, 0] == np.uint8(0b11100100)
+
+
+def test_bundle_v1_merge_m_preserves_component_tile_order() -> None:
+    branch_order = ("U.s0", "W.s0")
+    first_branches = {name: make_bundle_branch(seed)[:4] for seed, name in enumerate(branch_order)}
+    second_branches = {name: make_bundle_branch(seed + 2)[:4] for seed, name in enumerate(branch_order)}
+    first = pack_fairy2i_bundle_v1(first_branches, branch_order)
+    second = pack_fairy2i_bundle_v1(second_branches, branch_order)
+
+    codes, scales = merge_fairy2i_bundle_v1_m((first, second))
+
+    assert codes.shape == (2, 64, 2, 16)
+    assert scales.shape == (2, 2, 2)
+    decoded = unpack_fairy2i_bundle_v1(codes, scales, 2 * TILE64, TILE64, branch_order)
+    first_decoded = unpack_fairy2i_bundle_v1(*first, TILE64, TILE64, branch_order)
+    second_decoded = unpack_fairy2i_bundle_v1(*second, TILE64, TILE64, branch_order)
+    for name in branch_order:
+        for component in range(3):
+            expected = np.concatenate((first_decoded[name][component], second_decoded[name][component]), axis=0)
+            np.testing.assert_array_equal(decoded[name][component], expected)
 
 
 def test_quantize_matrix_tile64_requires_divisible_dims() -> None:

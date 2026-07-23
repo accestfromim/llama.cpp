@@ -17,6 +17,15 @@ Status: Draft (2026-04-23)
 
 按日期追加（YYYY-MM-DD）：
 
+### 2026-07-14 (working tree, Fairy2i dense output CPU/NEON routing)
+- 新增实验开关 `LLAMA_FAIRY2I_OUTPUT_NEON=1`。
+- 作用范围：
+  - 仅影响 Fairy2i dense `output` tensor，不移动 `output_norm` 或 `output.{U,W}.s{0,1}` 低比特权重。
+  - dense `output` 权重加载到 CPU buffer，最终 logits `MUL_MAT` 节点显式放到 CPU backend；在 Apple ARM 上该路径使用 CPU/NEON 的 F16 dot 实现。
+  - 当模型同时有 dense `output` 和 Fairy2i output 权重时，该开关会优先走 dense output 分支，便于对比 Metal output head 与 CPU/NEON output head。
+  - 如果 dense `output` 缺失，则打印 warning 并回退到原 Fairy2i output 路径。
+- 该开关默认关闭，主要用于 profiling/ablation；性能结论待单独记录。
+
 ### 2026-06-04 (working tree, Llama 7B Fairy2i conversion support)
 - Scope:
   - Supports the Llama-based Fairy2i 7B checkpoint with existing `fairy2i` architecture metadata and the existing `IFAIRY64` `tile64_v2` tensor format.
