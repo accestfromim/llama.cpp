@@ -20,8 +20,6 @@
 *.so
 *.swp
 *.tmp
-*.log
-*.gz
 # IDE / OS
 
 .cache/
