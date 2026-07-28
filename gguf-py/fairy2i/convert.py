@@ -20,13 +20,21 @@ def _dispatch_args(args: argparse.Namespace, base_arch: str) -> list[str]:
         script_args.append("--verbose")
     if args.qk_permute:
         script_args.append("--qk-permute")
+    if args.no_attn_bias:
+        if base_arch != "qwen2":
+            raise ValueError(f"--no-attn-bias is not supported for {base_arch} conversion")
+        script_args.append("--no-attn-bias")
     if args.residual_steps is not None:
         script_args.extend(["--residual-steps", str(args.residual_steps)])
     script_args.extend(["--weight-layout", args.weight_layout])
+    if args.output_layer is not None:
+        if base_arch not in ("qwen2", "qwen3"):
+            raise ValueError(f"--output-layer is not supported for {base_arch} conversion")
+        script_args.extend(["--output-layer", args.output_layer])
 
     if base_arch == "qwen2":
-        if args.output_file is None:
-            raise ValueError("output_file is required for qwen2 conversion")
+        if args.output_file is None and not args.dry_run:
+            raise ValueError("output_file is required for qwen2 conversion unless --dry-run is set")
         script_args.extend(["--quant-variant", args.quant_variant])
     if base_arch == "qwen3":
         if args.output_file is None and not args.dry_run:
@@ -54,11 +62,23 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs without writing GGUF")
     parser.add_argument("--qk-permute", action="store_true", help="Enable Llama q/k undo-permute when supported")
+    parser.add_argument(
+        "--no-attn-bias",
+        action="store_true",
+        help="Do not export Qwen2 attention bias tensors (rejected by the Fairy2i 32B preflight)",
+    )
+    parser.add_argument(
+        "--output-layer",
+        choices=["wide-linear", "dense", "both"],
+        help="Output projection storage mode when supported by the selected base architecture",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
     args = parser.parse_args(argv)
 
     config = json.loads((args.model_dir / "config.json").read_text(encoding="utf-8"))
     arch_info = detect_arch_info(config) if args.base_arch == "auto" else get_arch_info(args.base_arch)
+    if arch_info.name == "qwen2" and args.weight_layout != WEIGHT_LAYOUT_BUNDLE_V1:
+        raise ValueError("Qwen2 Fairy2i conversion requires --weight-layout bundle_v1")
 
     if args.quant_variant is None:
         args.quant_variant = (

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import gc
-from collections.abc import Mapping, Sequence
-from typing import Tuple
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import Any, Tuple
 
 import numpy as np
 
@@ -21,6 +21,9 @@ FAIRY2I_BUNDLE_M_SUBTILE = 16
 FAIRY2I_BUNDLE_Q4 = 16
 
 Fairy2IBranch = Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+Fairy2IWeightSliceSource = Callable[[slice, slice], Any]
+
+FAIRY2I_BUNDLE_W2_BRANCH_ORDER = ("U.s0", "U.s1", "W.s0", "W.s1")
 
 
 def round_up(x: int, base: int) -> int:
@@ -440,11 +443,266 @@ def quantize_linear_to_fairy2i_tile64_v2_stages(
     }
 
 
+def _resolve_weight_slice_source(
+    weight_or_source: Any,
+    weight_shape: tuple[int, int] | None,
+) -> tuple[Fairy2IWeightSliceSource, tuple[int, int]]:
+    if weight_shape is None:
+        inferred_shape = getattr(weight_or_source, "shape", None)
+        if inferred_shape is None:
+            raise ValueError("weight_shape is required when weight_or_source is a callback")
+        weight_shape = tuple(int(dim) for dim in inferred_shape)
+    elif len(weight_shape) != 2:
+        raise ValueError(f"weight_shape must have two dimensions, got {weight_shape}")
+    else:
+        weight_shape = tuple(int(dim) for dim in weight_shape)
+
+    if callable(weight_or_source):
+        source = weight_or_source
+    elif hasattr(weight_or_source, "__getitem__"):
+        source = lambda rows, cols: weight_or_source[rows, cols]
+    else:
+        raise TypeError("weight_or_source must be a tensor, array, sliceable object, or callback")
+
+    return source, weight_shape
+
+
+def _weight_slice_to_float32(
+    value: Any,
+    expected_shape: tuple[int, int],
+    row_slice: slice,
+    col_slice: slice,
+) -> np.ndarray:
+    if torch is not None and isinstance(value, torch.Tensor):
+        result = value.to(torch.float32).cpu().numpy()
+    else:
+        result = np.asarray(value, dtype=np.float32)
+
+    if result.shape != expected_shape:
+        raise ValueError(
+            f"weight source returned shape {result.shape} for [{row_slice}, {col_slice}], "
+            f"expected {expected_shape}"
+        )
+    return result
+
+
+def _bundle_v1_tile_codes(stage_real: np.ndarray, stage_imag: np.ndarray) -> np.ndarray:
+    packed = encode_stage_codes_bundle_v1(stage_real, stage_imag)
+    # rows = m16 * lane and the packed K dimension is q4. Bundle slots are
+    # flattened as slot = m16 * 16 + q4, with lane kept as the innermost axis.
+    return np.ascontiguousarray(
+        packed[:, 0, :]
+        .reshape(
+            FAIRY2I_BUNDLE_M // FAIRY2I_BUNDLE_M_SUBTILE,
+            FAIRY2I_BUNDLE_M_SUBTILE,
+            FAIRY2I_BUNDLE_Q4,
+        )
+        .transpose(0, 2, 1)
+        .reshape(FAIRY2I_BUNDLE_M, FAIRY2I_BUNDLE_M_SUBTILE)
+    )
+
+
+def _quantize_complex_tile_to_bundle_v1(
+    tile_real: np.ndarray,
+    tile_imag: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    stage0_real, stage0_imag, scale0_real, scale0_imag = quantize_tile64_once(tile_real, tile_imag)
+    residual_real = tile_real - stage0_real
+    residual_imag = tile_imag - stage0_imag
+    stage1_real, stage1_imag, scale1_real, scale1_imag = quantize_tile64_once(
+        residual_real, residual_imag
+    )
+
+    # The non-streaming path first stores scales in float32 tile matrices and
+    # only then casts them to float16 while packing. Preserve that intermediate
+    # rounding so streaming output remains byte-identical.
+    scale0 = np.asarray(
+        (np.float32(scale0_real), np.float32(scale0_imag)),
+        dtype=np.float16,
+    )
+    scale1 = np.asarray(
+        (np.float32(scale1_real), np.float32(scale1_imag)),
+        dtype=np.float16,
+    )
+    return (
+        _bundle_v1_tile_codes(stage0_real, stage0_imag),
+        _bundle_v1_tile_codes(stage1_real, stage1_imag),
+        scale0,
+        scale1,
+    )
+
+
+def iter_quantize_linear_to_fairy2i_bundle_v1_m64(
+    weight_or_source: Any,
+    out_target: int,
+    in_target: int,
+    *,
+    weight_shape: tuple[int, int] | None = None,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield one M64 strip of final Bundle v1 codes and scales at a time.
+
+    ``weight_or_source`` may be a torch tensor, a NumPy array, another 2-D
+    sliceable object, or a callback with the signature
+    ``source(row_slice, col_slice)``. Callbacks must provide ``weight_shape``.
+    Each yielded code strip has shape ``[K/64, 64, 4, 16]`` and each scale
+    strip has shape ``[K/64, 4, 2]`` in branch order U0, U1, W0, W1.
+
+    Only four source quadrant strips and one complex M64xK64 tile are live
+    while quantizing. In particular, no whole-matrix U/W, stage, or residual
+    arrays are constructed.
+    """
+
+    source, source_shape = _resolve_weight_slice_source(weight_or_source, weight_shape)
+    if len(source_shape) != 2:
+        raise ValueError(f"linear weight must be 2D, got shape {source_shape}")
+    out_real, in_real = source_shape
+    if out_real <= 0 or in_real <= 0 or out_real % 2 != 0 or in_real % 2 != 0:
+        raise ValueError(f"linear weight shape must be positive and even, got {source_shape}")
+
+    out_c = out_real // 2
+    in_c = in_real // 2
+    if out_target < out_c or in_target < in_c:
+        raise ValueError(f"cannot pad from {(out_c, in_c)} to {(out_target, in_target)}")
+    if out_target % FAIRY2I_BUNDLE_M != 0 or in_target % FAIRY2I_BUNDLE_K != 0:
+        raise ValueError(
+            f"bundle_v1 quantization requires target dims divisible by {TILE64}, "
+            f"got {(out_target, in_target)}"
+        )
+
+    mb_count = out_target // FAIRY2I_BUNDLE_M
+    kb_count = in_target // FAIRY2I_BUNDLE_K
+    for mb in range(mb_count):
+        row_start = mb * FAIRY2I_BUNDLE_M
+        source_rows = min(FAIRY2I_BUNDLE_M, max(0, out_c - row_start))
+        strip_codes = np.empty(
+            (
+                kb_count,
+                FAIRY2I_BUNDLE_M,
+                len(FAIRY2I_BUNDLE_W2_BRANCH_ORDER),
+                FAIRY2I_BUNDLE_M_SUBTILE,
+            ),
+            dtype=np.uint8,
+        )
+        strip_scales = np.empty(
+            (kb_count, len(FAIRY2I_BUNDLE_W2_BRANCH_ORDER), 2),
+            dtype=np.float16,
+        )
+
+        if source_rows > 0:
+            top_rows = slice(row_start, row_start + source_rows)
+            bottom_rows = slice(out_c + row_start, out_c + row_start + source_rows)
+            left_cols = slice(0, in_c)
+            right_cols = slice(in_c, 2 * in_c)
+            expected_strip_shape = (source_rows, in_c)
+            a11 = _weight_slice_to_float32(
+                source(top_rows, left_cols), expected_strip_shape, top_rows, left_cols
+            )
+            a12 = _weight_slice_to_float32(
+                source(top_rows, right_cols), expected_strip_shape, top_rows, right_cols
+            )
+            a21 = _weight_slice_to_float32(
+                source(bottom_rows, left_cols), expected_strip_shape, bottom_rows, left_cols
+            )
+            a22 = _weight_slice_to_float32(
+                source(bottom_rows, right_cols), expected_strip_shape, bottom_rows, right_cols
+            )
+
+        for kb in range(kb_count):
+            col_start = kb * FAIRY2I_BUNDLE_K
+            source_cols = min(FAIRY2I_BUNDLE_K, max(0, in_c - col_start))
+            physical_tile = kb
+
+            u_real = np.zeros((FAIRY2I_BUNDLE_M, FAIRY2I_BUNDLE_K), dtype=np.float32)
+            u_imag = np.zeros_like(u_real)
+            if source_rows > 0 and source_cols > 0:
+                cols = slice(col_start, col_start + source_cols)
+                tile = (slice(0, source_rows), slice(0, source_cols))
+                u_real[tile] = 0.5 * (a11[:, cols] + a22[:, cols])
+                u_imag[tile] = 0.5 * (a21[:, cols] - a12[:, cols])
+
+            u0_codes, u1_codes, u0_scales, u1_scales = _quantize_complex_tile_to_bundle_v1(
+                u_real, u_imag
+            )
+            strip_codes[physical_tile, :, 0, :] = u0_codes
+            strip_codes[physical_tile, :, 1, :] = u1_codes
+            strip_scales[physical_tile, 0, :] = u0_scales
+            strip_scales[physical_tile, 1, :] = u1_scales
+            del u_real, u_imag, u0_codes, u1_codes, u0_scales, u1_scales
+
+            w_real = np.zeros((FAIRY2I_BUNDLE_M, FAIRY2I_BUNDLE_K), dtype=np.float32)
+            w_imag = np.zeros_like(w_real)
+            if source_rows > 0 and source_cols > 0:
+                cols = slice(col_start, col_start + source_cols)
+                tile = (slice(0, source_rows), slice(0, source_cols))
+                w_real[tile] = 0.5 * (a11[:, cols] - a22[:, cols])
+                w_imag[tile] = 0.5 * (a12[:, cols] + a21[:, cols])
+
+            w0_codes, w1_codes, w0_scales, w1_scales = _quantize_complex_tile_to_bundle_v1(
+                w_real, w_imag
+            )
+            strip_codes[physical_tile, :, 2, :] = w0_codes
+            strip_codes[physical_tile, :, 3, :] = w1_codes
+            strip_scales[physical_tile, 2, :] = w0_scales
+            strip_scales[physical_tile, 3, :] = w1_scales
+            del w_real, w_imag, w0_codes, w1_codes, w0_scales, w1_scales
+
+        yield strip_codes, strip_scales
+
+
+def quantize_linear_to_fairy2i_bundle_v1_m64(
+    weight_or_source: Any,
+    out_target: int,
+    in_target: int,
+    *,
+    weight_shape: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize a linear weight directly to final Bundle v1 tensors."""
+
+    if out_target % FAIRY2I_BUNDLE_M != 0 or in_target % FAIRY2I_BUNDLE_K != 0:
+        raise ValueError(
+            f"bundle_v1 quantization requires target dims divisible by {TILE64}, "
+            f"got {(out_target, in_target)}"
+        )
+
+    mb_count = out_target // FAIRY2I_BUNDLE_M
+    kb_count = in_target // FAIRY2I_BUNDLE_K
+    codes = np.empty(
+        (
+            mb_count * kb_count,
+            FAIRY2I_BUNDLE_M,
+            len(FAIRY2I_BUNDLE_W2_BRANCH_ORDER),
+            FAIRY2I_BUNDLE_M_SUBTILE,
+        ),
+        dtype=np.uint8,
+    )
+    scales = np.empty(
+        (mb_count * kb_count, len(FAIRY2I_BUNDLE_W2_BRANCH_ORDER), 2),
+        dtype=np.float16,
+    )
+    strip_count = 0
+    for mb, (strip_codes, strip_scales) in enumerate(
+        iter_quantize_linear_to_fairy2i_bundle_v1_m64(
+            weight_or_source,
+            out_target,
+            in_target,
+            weight_shape=weight_shape,
+        )
+    ):
+        tile_start = mb * kb_count
+        tile_end = tile_start + kb_count
+        codes[tile_start:tile_end] = strip_codes
+        scales[tile_start:tile_end] = strip_scales
+        strip_count += 1
+
+    if strip_count != mb_count:
+        raise RuntimeError(f"expected {mb_count} M64 strips, got {strip_count}")
+    return codes, scales
+
+
 def quantize_linear_to_fairy2i_bundle_v1_stages(
     weight: "torch.Tensor", out_target: int, in_target: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    branches = quantize_linear_to_fairy2i_tile64_v2_branch_data(weight, out_target, in_target)
-    return pack_fairy2i_bundle_v1(branches, ("U.s0", "U.s1", "W.s0", "W.s1"))
+    return quantize_linear_to_fairy2i_bundle_v1_m64(weight, out_target, in_target)
 
 
 def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
