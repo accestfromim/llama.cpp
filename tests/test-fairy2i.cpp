@@ -2001,6 +2001,92 @@ static ggml_backend_dev_t find_metal_test_device() {
     return nullptr;
 }
 
+static bool test_fairy2i_bundle_generic_mul_mat_rejected() {
+    printf("\n=== Fairy2i Bundle generic MUL_MAT rejection ===\n");
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "failed to initialize context for Bundle generic MUL_MAT support tests\n");
+        return false;
+    }
+
+    ggml_tensor * codes = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, 64);
+    ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 16, 1);
+    ggml_tensor * mm    = ggml_mul_mat(ctx, codes, x);
+
+    ggml_tensor * expert_codes = ggml_new_tensor_3d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, 64, 2);
+    ggml_tensor * expert_x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 16, 1, 1);
+    ggml_tensor * expert_ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    ggml_tensor * mm_id        = ggml_mul_mat_id(ctx, expert_codes, expert_x, expert_ids);
+
+    ggml_tensor * bundle_codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, 4, 64, 2);
+    ggml_tensor * bundle_scales = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, 4, 2);
+    ggml_tensor * bundle_x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1);
+    ggml_tensor * bundle_w2 =
+        ggml_fairy2i_wide_linear_w2_bundle(ctx, bundle_x, bundle_codes, bundle_scales, nullptr, 64, 128);
+
+    bool               ok      = true;
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        fprintf(stderr, "CPU backend device not found for Bundle generic MUL_MAT support tests\n");
+        ok = false;
+    } else if (ggml_backend_dev_supports_op(cpu_dev, mm) || ggml_backend_dev_supports_op(cpu_dev, mm_id)) {
+        fprintf(stderr, "CPU backend must reject Bundle codes in generic MUL_MAT and MUL_MAT_ID\n");
+        ok = false;
+    }
+
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    if (cpu_dev) {
+        scoped_env_var lut_enabled("GGML_FAIRY2I_LUT");
+        scoped_env_var lut_impl("GGML_FAIRY2I_LUT_IMPL");
+        lut_enabled.set("0");
+        if (ggml_backend_dev_supports_op(cpu_dev, bundle_w2)) {
+            fprintf(stderr, "CPU backend must reject Bundle W2 when GGML_FAIRY2I_LUT=0\n");
+            ok = false;
+        }
+        lut_enabled.set("1");
+        lut_impl.set("lut16");
+        if (!ggml_backend_dev_supports_op(cpu_dev, bundle_w2)) {
+            fprintf(stderr, "CPU backend must support Bundle W2 with the LUT16 path enabled\n");
+            ok = false;
+        }
+        lut_impl.set("lut_c");
+        if (ggml_backend_dev_supports_op(cpu_dev, bundle_w2)) {
+            fprintf(stderr, "CPU backend must reject Bundle W2 with GGML_FAIRY2I_LUT_IMPL=lut_c\n");
+            ok = false;
+        }
+    }
+#else
+    if (cpu_dev && ggml_backend_dev_supports_op(cpu_dev, bundle_w2)) {
+        fprintf(stderr, "CPU backend without LUT16 must reject the dedicated Bundle W2 op\n");
+        ok = false;
+    }
+#endif
+
+    ggml_backend_dev_t metal_dev = find_metal_test_device();
+    if (metal_dev) {
+        if (ggml_backend_dev_supports_op(metal_dev, mm) || ggml_backend_dev_supports_op(metal_dev, mm_id)) {
+            fprintf(stderr, "Metal backend must reject Bundle codes in generic MUL_MAT and MUL_MAT_ID\n");
+            ok = false;
+        }
+        if (!ggml_backend_dev_supports_op(metal_dev, bundle_w2)) {
+            fprintf(stderr, "Metal backend must continue to support the dedicated Bundle W2 op\n");
+            ok = false;
+        }
+    } else {
+        printf("Metal backend not found; skipping Metal capability assertions.\n");
+    }
+
+    ggml_free(ctx);
+    printf("  Bundle generic matmul rejection: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                      out,
                                       ggml_backend_dev_t                           dev,
                                       const fairy2i_w2_case &                      tc,
@@ -2781,6 +2867,10 @@ int main() {
     }
     if (!test_fairy2i_metal_wide_linear()) {
         fprintf(stderr, "Fairy2i Metal W1/W2 FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_bundle_generic_mul_mat_rejected()) {
+        fprintf(stderr, "Fairy2i Bundle generic MUL_MAT rejection FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_bundle_lut()) {

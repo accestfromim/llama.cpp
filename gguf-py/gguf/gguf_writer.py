@@ -10,7 +10,7 @@ from enum import Enum, auto
 from math import prod
 from pathlib import Path
 from io import BufferedWriter
-from typing import IO, Any, Sequence, Mapping
+from typing import IO, Any, Iterable, Sequence, Mapping
 from string import ascii_letters, digits
 
 import numpy as np
@@ -395,31 +395,59 @@ class GGUFWriter:
             fp.write(bytes([0] * pad))
 
     def write_tensor_data(self, tensor: np.ndarray[Any, Any]) -> None:
+        self.write_tensor_data_stream((tensor,))
+
+    def write_tensor_data_stream(self, chunks: Iterable[np.ndarray[Any, Any]]) -> None:
+        """Write the next registered tensor from a bounded sequence of chunks."""
         if self.state is not WriterState.TI_DATA and self.state is not WriterState.WEIGHTS:
             raise ValueError(f'Expected output file to contain tensor info or weights, got {self.state}')
         assert self.fout is not None
 
-        if self.endianess == GGUFEndian.BIG:
-            tensor.byteswap(inplace=True)
-
-        file_id = -1
+        file_id = None
         for i, tensors in enumerate(self.tensors):
             if len(tensors) > 0:
                 file_id = i
                 break
 
+        if file_id is None:
+            raise ValueError("Expected tensor info for the next tensor, but none remains")
+
         fout = self.fout[file_id]
 
-        # pop the first tensor info
-        # TODO: cleaner way to get the first key
-        first_tensor_name = [name for name, _ in zip(self.tensors[file_id].keys(), range(1))][0]
-        ti = self.tensors[file_id].pop(first_tensor_name)
-        assert ti.nbytes == tensor.nbytes
+        first_tensor_name = next(iter(self.tensors[file_id]))
+        ti = self.tensors[file_id][first_tensor_name]
+        write_start = fout.tell()
+        nbytes_written = 0
 
-        self.write_padding(fout, fout.tell())
-        tensor.tofile(fout)
-        self.write_padding(fout, tensor.nbytes)
+        try:
+            self.write_padding(fout, write_start)
 
+            for chunk in chunks:
+                chunk_nbytes = chunk.nbytes
+                next_nbytes_written = nbytes_written + chunk_nbytes
+                if next_nbytes_written > ti.nbytes:
+                    raise ValueError(
+                        f"Tensor {first_tensor_name!r} overflow: expected {ti.nbytes} bytes, "
+                        f"got at least {next_nbytes_written}"
+                    )
+
+                output_chunk = chunk.byteswap(inplace=False) if self.endianess == GGUFEndian.BIG else chunk
+                output_chunk.tofile(fout)
+                nbytes_written = next_nbytes_written
+
+            if nbytes_written != ti.nbytes:
+                raise ValueError(
+                    f"Tensor {first_tensor_name!r} underflow: expected {ti.nbytes} bytes, "
+                    f"got {nbytes_written}"
+                )
+
+            self.write_padding(fout, nbytes_written)
+        except BaseException:
+            fout.seek(write_start)
+            fout.truncate()
+            raise
+
+        self.tensors[file_id].pop(first_tensor_name)
         self.state = WriterState.WEIGHTS
 
     def write_tensors_to_file(self, *, progress: bool = False) -> None:

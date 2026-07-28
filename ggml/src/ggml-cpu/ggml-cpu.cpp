@@ -411,6 +411,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && src0 &&
+        src0->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES) {
+        // Bundle codes are opaque storage for the dedicated Fairy2i wide-linear ops.
+        return false;
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
@@ -442,7 +448,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
 #ifdef GGML_USE_FAIRY2I_CPU
-            return true;
+            return ggml_fairy2i_cpu_supports_op(op);
 #else
             return false;
 #endif

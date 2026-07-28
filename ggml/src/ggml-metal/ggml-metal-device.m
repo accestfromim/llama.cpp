@@ -667,14 +667,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     // custom complex types are CPU-only for compute ops, except when they are stored as leaf tensors for fused kernels.
     if (op->op != GGML_OP_NONE &&
         (op->type == GGML_TYPE_IFAIRY || op->type == GGML_TYPE_IFAIRY_Q16 || op->type == GGML_TYPE_IFAIRY64 ||
-         op->type == GGML_TYPE_FAIRY2I_TILE64_V2 || op->type == GGML_TYPE_FAIRY2I_ACT_Q16_64)) {
+         op->type == GGML_TYPE_FAIRY2I_TILE64_V2 || op->type == GGML_TYPE_FAIRY2I_ACT_Q16_64 ||
+         op->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES)) {
         return false;
     }
     for (size_t i = 0, n = 3; i < n; ++i) {
         if (op->src[i] != NULL &&
             (op->src[i]->type == GGML_TYPE_IFAIRY || op->src[i]->type == GGML_TYPE_IFAIRY_Q16 ||
              op->src[i]->type == GGML_TYPE_IFAIRY64 || op->src[i]->type == GGML_TYPE_FAIRY2I_TILE64_V2 ||
-             op->src[i]->type == GGML_TYPE_FAIRY2I_ACT_Q16_64)) {
+             op->src[i]->type == GGML_TYPE_FAIRY2I_ACT_Q16_64 ||
+             op->src[i]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES)) {
             return false;
         }
     }

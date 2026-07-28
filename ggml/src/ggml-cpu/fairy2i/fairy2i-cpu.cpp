@@ -200,7 +200,21 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
 }
 
 bool ggml_fairy2i_cpu_supports_op(const struct ggml_tensor * dst) {
-    return dst != nullptr && (dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+    if (!dst || (dst->op != GGML_OP_FAIRY2I_WIDE_LINEAR_W1 && dst->op != GGML_OP_FAIRY2I_WIDE_LINEAR_W2)) {
+        return false;
+    }
+    if (!ggml_fairy2i_is_bundle_op(dst)) {
+        return true;
+    }
+
+#ifdef GGML_USE_FAIRY2I_CPU_LUT
+    const struct ggml_fairy2i_lut_policy policy = ggml_fairy2i_lut_policy_from_env();
+    struct ggml_fairy2i_bundle_desc      bundle;
+    return policy.lut_enabled && policy.impl == GGML_FAIRY2I_LUT_IMPL_LUT16 &&
+           ggml_fairy2i_bundle_desc_init(dst, &bundle, false);
+#else
+    return false;
+#endif
 }
 
 int ggml_fairy2i_cpu_n_tasks(const struct ggml_tensor * dst, int n_threads) {

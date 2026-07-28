@@ -2352,13 +2352,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+    // there is very little benefit to offloading the input layer in the general case
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+    }
+
+    // For a fully Metal-offloaded Bundle model, keep the embedding lookup on Metal as well
+    // so an otherwise unnecessary CPU split is not introduced at the start of the graph.
+    if (arch == LLM_ARCH_FAIRY2I && fairy2i_weight_layout == LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1 &&
+        n_gpu_layers > n_layer && !pimpl->dev_layer.empty() && llama_backend_dev_is_metal(pimpl->dev_layer[0].dev)) {
+        pimpl->dev_input = pimpl->dev_layer[0];
+        LLAMA_LOG_INFO("%s: preferring Metal for the Fairy2i bundle input layer\n", __func__);
     }
 
     // assign the output layer
@@ -2473,6 +2481,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             } else {
                 op = info.op;
             }
+            const bool fairy2i_bundle_codes = t_meta->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES;
+            if (fairy2i_bundle_codes) {
+                // Bundle codes are opaque inputs to the dedicated Fairy2i wide-linear ops.
+                op = GGML_OP_NONE;
+            }
             const bool dense_fairy2i_output = fairy2i_output_neon && tn_tensor == LLM_TENSOR_OUTPUT && !bias &&
                                               (tn.suffix == nullptr || strcmp(tn.suffix, "weight") == 0) &&
                                               t_meta->type != GGML_TYPE_FAIRY2I_TILE64_V2 &&
@@ -2491,15 +2504,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
             // select the buffer type for this tensor
             buft_list_t * buft_list;
+            ggml_backend_dev_t target_dev;
             switch (info.layer) {
                 case LLM_TENSOR_LAYER_INPUT:
                     buft_list = pimpl->dev_input.buft_list;
+                    target_dev = pimpl->dev_input.dev;
                     break;
                 case LLM_TENSOR_LAYER_OUTPUT:
                     buft_list = pimpl->dev_output.buft_list;
+                    target_dev = pimpl->dev_output.dev;
                     break;
                 case LLM_TENSOR_LAYER_REPEATING:
                     buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+                    target_dev = pimpl->dev_layer.at(tn.bid).dev;
                     break;
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
@@ -2530,6 +2547,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 ggml_backend_buft_name(buft));
                         break;
                     }
+                }
+            }
+
+            if (fairy2i_bundle_codes && !buft) {
+                if (!target_dev) {
+                    throw std::runtime_error(
+                        format("no target device selected for Fairy2i bundle tensor %s", tn.str().c_str()));
+                }
+                // Keep opaque codes on the same device as the layer/output that consumes them.
+                buft = ggml_backend_dev_buffer_type(target_dev);
+                if (!buft) {
+                    throw std::runtime_error(
+                        format("target device %s has no default buffer for Fairy2i bundle tensor %s",
+                               ggml_backend_dev_name(target_dev), tn.str().c_str()));
                 }
             }
 
@@ -14492,7 +14523,8 @@ struct llm_build_fairy2i : public llm_graph_context {
 
                 const char * env_name =
                     is_w1 ? "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W1" : "LLAMA_FAIRY2I_FUSED_WIDE_LINEAR_W2";
-                if (llama_fairy2i_env_policy_from_env(env_name) == LLAMA_FAIRY2I_ENV_POLICY_DISABLED) {
+                const llama_fairy2i_env_policy policy = llama_fairy2i_env_policy_from_env(env_name);
+                if (policy == LLAMA_FAIRY2I_ENV_POLICY_DISABLED) {
                     throw std::runtime_error(format("FAIRY2I bundle_v1 requires %s", env_name));
                 }
 
@@ -14501,6 +14533,13 @@ struct llm_build_fairy2i : public llm_graph_context {
                                                                linear.logical_m, linear.logical_k) :
                             ggml_fairy2i_wide_linear_w2_bundle(ctx0, x, linear.bundle_codes, linear.bundle_scales, bias,
                                                                linear.logical_m, linear.logical_k);
+                if (!target_dev || !ggml_backend_dev_supports_op(target_dev, y)) {
+                    throw std::runtime_error(
+                        format("FAIRY2I bundle_v1 target device %s does not support the dedicated Bundle W%d op "
+                               "(policy=%s)",
+                               target_dev ? ggml_backend_dev_name(target_dev) : "none", is_w1 ? 1 : 2,
+                               policy == LLAMA_FAIRY2I_ENV_POLICY_ENABLED ? env_name : "auto"));
+                }
                 cb(y, name, il);
                 return y;
             }
