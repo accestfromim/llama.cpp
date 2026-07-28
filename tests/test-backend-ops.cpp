@@ -60,7 +60,8 @@ static float make_ifairy_split_value(float x) {
 
 static bool is_ifairy_packed_pair_output(const ggml_tensor * t) {
     if (t->op == GGML_OP_COMPLEX_ADD || t->op == GGML_OP_COMPLEX_MUL || t->op == GGML_OP_COMPLEX_MERGE ||
-        t->op == GGML_OP_IFAIRY_ADD || t->op == GGML_OP_IFAIRY_MUL || t->op == GGML_OP_IFAIRY_MERGE) {
+        t->op == GGML_OP_IFAIRY_ADD || t->op == GGML_OP_IFAIRY_MUL || t->op == GGML_OP_IFAIRY_MERGE ||
+        t->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || t->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2) {
         return true;
     }
     return t->op == GGML_OP_UNARY &&
@@ -2991,6 +2992,120 @@ struct test_ifairy_rope : public test_case {
     double max_maa_err() override {
         return 1e-3;
     }
+};
+
+struct test_fairy2i_wide_linear_bundle : public test_case {
+    const bool    is_w1;
+    const int64_t M;
+    const int64_t N;
+    const int64_t K;
+    const bool    use_bias;
+
+    test_fairy2i_wide_linear_bundle(bool is_w1, int64_t M, int64_t N, int64_t K, bool use_bias) :
+        is_w1(is_w1),
+        M(M),
+        N(N),
+        K(K),
+        use_bias(use_bias) {}
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override { return VARS_TO_STR5(is_w1, M, N, K, use_bias); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t branches       = is_w1 ? 2 : 4;
+        const int64_t physical_tiles = (M / 64) * (K / 64);
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * codes = ggml_new_tensor_4d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, branches, 64, physical_tiles);
+        ggml_set_name(codes, "codes");
+
+        ggml_tensor * scales = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, branches, physical_tiles);
+        ggml_set_name(scales, "scales");
+
+        ggml_tensor * bias = use_bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * M) : nullptr;
+        if (bias) {
+            ggml_set_name(bias, "bias");
+        }
+
+        ggml_tensor * out = is_w1 ? ggml_fairy2i_wide_linear_w1_bundle(ctx, x, codes, scales, bias, M, K) :
+                                    ggml_fairy2i_wide_linear_w2_bundle(ctx, x, codes, scales, bias, M, K);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "x") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t n = 0; n < N; ++n) {
+                    for (int64_t k = 0; k < K; ++k) {
+                        const float real                           = 0.25f + (float) ((k + 7 * n) % 19) / 16.0f;
+                        const float imag                           = 0.125f + (float) ((2 * k + 5 * n) % 23) / 20.0f;
+                        data[(size_t) n * (size_t) K + (size_t) k] = pack_ifairy_bf16_pair(real, imag);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (strcmp(t->name, "codes") == 0) {
+                const int64_t        branches       = is_w1 ? 2 : 4;
+                const int64_t        physical_tiles = (M / 64) * (K / 64);
+                std::vector<uint8_t> data(ggml_nbytes(t));
+
+                // Bundle v1 order: [physical_tile][m16_q4 slot][branch][lane].
+                for (int64_t tile = 0; tile < physical_tiles; ++tile) {
+                    for (int64_t slot = 0; slot < 64; ++slot) {
+                        for (int64_t branch = 0; branch < branches; ++branch) {
+                            for (int64_t lane = 0; lane < 16; ++lane) {
+                                uint8_t packed = 0;
+                                for (int q = 0; q < 4; ++q) {
+                                    const int selector = (int) ((lane + 3 * slot + 5 * branch + 7 * tile + q) & 0x7);
+                                    const uint8_t code = (uint8_t) (selector == 0 ? 0 :
+                                                                    selector == 1 ? 2 :
+                                                                                    1 + 2 * (selector & 0x1));
+                                    packed |= (uint8_t) (code << (2 * q));
+                                }
+                                const size_t offset =
+                                    ((((size_t) tile * 64u + (size_t) slot) * (size_t) branches + (size_t) branch) *
+                                         16u +
+                                     (size_t) lane);
+                                data[offset] = packed;
+                            }
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else if (strcmp(t->name, "scales") == 0) {
+                const int64_t            branches       = is_w1 ? 2 : 4;
+                const int64_t            physical_tiles = (M / 64) * (K / 64);
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+
+                // One real/imag scale pair per branch and complete M64xK64 tile.
+                for (int64_t tile = 0; tile < physical_tiles; ++tile) {
+                    for (int64_t branch = 0; branch < branches; ++branch) {
+                        const size_t offset = ((size_t) tile * (size_t) branches + (size_t) branch) * 2u;
+                        data[offset + 0] =
+                            ggml_fp32_to_fp16(0.021f + 0.003f * (float) branch + 0.001f * (float) (tile % 5));
+                        data[offset + 1] =
+                            ggml_fp32_to_fp16(0.017f + 0.002f * (float) branch + 0.001f * (float) (tile % 3));
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "bias") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t row = 0; row < M; ++row) {
+                    data[(size_t) row]              = (float) (row - M / 2) / 32.0f;
+                    data[(size_t) row + (size_t) M] = (float) (M - 2 * row) / 40.0f;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override { return 1e-5; }
 };
 
 // GGML_OP_ADD_ID
@@ -6521,6 +6636,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ifairy_relu2({32, 5, 4, 3}));
     test_cases.emplace_back(new test_ifairy_rope({2, 1, 1, 1}, 4, 32));
     test_cases.emplace_back(new test_ifairy_rope({32, 5, 4, 3}, 64, 512));
+
+    for (bool is_w1 : { true, false }) {
+        test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(is_w1, 64, 1, 128, false));
+        test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(is_w1, 64, 16, 128, true));
+        test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(is_w1, 64, 17, 128, true));
+    }
 
     // single in-place tests, especially important for WebGPU backend since kernels for in-place vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
