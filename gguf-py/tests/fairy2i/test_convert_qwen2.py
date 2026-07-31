@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import struct
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -26,7 +27,12 @@ from convert_fairy2i_qwen2 import (
     TensorReader,
 )
 from fairy2i.convert import _dispatch_args
-from fairy2i.spec import QUANT_VARIANT_TILE64_V2, WEIGHT_LAYOUT_BUNDLE_V1
+from fairy2i.spec import (
+    NUMERIC_PROFILE_LEGACY_F16_V1,
+    NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+    QUANT_VARIANT_TILE64_V2,
+    WEIGHT_LAYOUT_BUNDLE_V1,
+)
 
 
 def _tiny_config(*, hidden_size: int = 128, vocab_size: int = 128) -> dict[str, object]:
@@ -92,6 +98,7 @@ def _write_checkpoint(
     missing_tensor: str | None = None,
     dtype_override: tuple[str, torch.dtype] | None = None,
     shape_override: tuple[str, tuple[int, ...]] | None = None,
+    randomize_matrix_weights: bool = False,
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     model_dir.mkdir()
     config = _tiny_config(hidden_size=hidden_size, vocab_size=vocab_size)
@@ -100,6 +107,15 @@ def _write_checkpoint(
         name: torch.zeros(shape, dtype=torch.bfloat16)
         for name, shape in expected_qwen2_tensor_shapes(dimensions).items()
     }
+    if randomize_matrix_weights:
+        generator = torch.Generator().manual_seed(20260729)
+        for name, tensor in tensors.items():
+            if name.endswith(".weight") and tensor.ndim == 2:
+                tensors[name] = torch.randn(
+                    tensor.shape,
+                    generator=generator,
+                    dtype=torch.float32,
+                ).to(torch.bfloat16)
     if missing_tensor is not None:
         tensors.pop(missing_tensor)
     if dtype_override is not None:
@@ -356,6 +372,12 @@ def test_qwen2_bundle_plan_and_streaming_writer_use_the_same_order(tmp_path: Pat
     assert tensor_names == [entry.name for entry in plan]
     assert gguf_reader.alignment == 64
     assert all(tensor.data_offset % 64 == 0 for tensor in gguf_reader.tensors)
+    assert gguf_reader.fields["fairy2i.schema_version"].contents() == 2
+    assert (
+        gguf_reader.fields["fairy2i.quant.numeric_profile"].contents()
+        == "legacy_f16_v1"
+    )
+    assert gguf_reader.fields["fairy2i.weight.scale_dtype"].contents() == "f16"
     tensor_map = {tensor.name: tensor for tensor in gguf_reader.tensors}
     assert tensor_map["output.bundle.codes"].tensor_type == gguf.GGMLQuantizationType.FAIRY2I_BUNDLE_CODES
     assert tensor_map["output.bundle.scales"].tensor_type == gguf.GGMLQuantizationType.F16
@@ -365,6 +387,110 @@ def test_qwen2_bundle_plan_and_streaming_writer_use_the_same_order(tmp_path: Pat
     assert "<｜end▁of▁sentence｜>" not in generation_tail
     assert output_file.stat().st_size >= sum(entry.nbytes for entry in plan)
     assert not output_file.with_name(f".{output_file.name}.tmp").exists()
+
+
+def test_qwen2_exact_profile_writes_schema3_and_f32_scales(tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir, randomize_matrix_weights=True)
+    output_file = tmp_path / "tiny-exact.gguf"
+
+    legacy_report = run_qwen2_preflight(
+        model_dir,
+        output_file=None,
+        output_layer="wide-linear",
+        weight_layout=WEIGHT_LAYOUT_BUNDLE_V1,
+        numeric_profile=NUMERIC_PROFILE_LEGACY_F16_V1,
+    )
+    exact_report = run_qwen2_preflight(
+        model_dir,
+        output_file=None,
+        output_layer="wide-linear",
+        weight_layout=WEIGHT_LAYOUT_BUNDLE_V1,
+        numeric_profile=NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+    )
+    assert exact_report.estimated_output_bytes == legacy_report.estimated_output_bytes
+
+    qwen2_main(
+        [
+            str(model_dir),
+            str(output_file),
+            "--numeric-profile",
+            NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+        ]
+    )
+
+    reader = gguf.GGUFReader(output_file)
+    assert reader.fields["general.file_type"].contents() == 42
+    assert reader.fields["fairy2i.schema_version"].contents() == 3
+    assert (
+        reader.fields["fairy2i.quant.numeric_profile"].contents()
+        == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+    )
+    assert reader.fields["fairy2i.weight.scale_dtype"].contents() == "bf16"
+    scales = [tensor for tensor in reader.tensors if tensor.name.endswith(".bundle.scales")]
+    assert len(scales) == 8
+    assert all(tensor.tensor_type == gguf.GGMLQuantizationType.BF16 for tensor in scales)
+    assert all(np.asarray(tensor.data).dtype == np.uint8 for tensor in scales)
+    assert all(
+        np.all(
+            (np.ascontiguousarray(tensor.data).view(np.uint16) & np.uint16(0x8000))
+            == 0
+        )
+        for tensor in scales
+    )
+    assert not any(tensor.name == "output" for tensor in reader.tensors)
+
+
+def test_qwen2_exact_profile_rejects_dense_output_fallback(tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    _write_checkpoint(model_dir)
+
+    with pytest.raises(ValueError, match="dense F16 output is forbidden"):
+        qwen2_main(
+            [
+                str(model_dir),
+                "--dry-run",
+                "--output-layer",
+                "both",
+                "--numeric-profile",
+                NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+            ]
+        )
+
+
+def test_qwen2_common_export_rejects_nonfinite_embedding() -> None:
+    embedding = torch.zeros((2, 4), dtype=torch.bfloat16)
+    embedding[1, 2] = float("nan")
+
+    with pytest.raises(
+        ValueError,
+        match=r"model\.embed_tokens\.weight contains a non-finite BF16 value",
+    ):
+        qwen2_converter.pack_token_embedding(embedding, hidden_complex=2)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("model.norm.weight", float("inf")),
+        ("model.layers.0.self_attn.q_proj.bias", float("nan")),
+    ],
+)
+def test_qwen2_common_export_rejects_nonfinite_f32_carrier(
+    key: str,
+    value: float,
+) -> None:
+    class Reader:
+        @staticmethod
+        def get(requested_key: str) -> torch.Tensor:
+            assert requested_key == key
+            return torch.tensor([1.0, value], dtype=torch.bfloat16)
+
+    with pytest.raises(
+        ValueError,
+        match="contains a non-finite BF16 value",
+    ):
+        list(qwen2_converter._iter_tensor_f32(Reader(), key))
 
 
 def test_qwen2_streaming_chunks_are_bounded_by_rows_and_m64(tmp_path: Path) -> None:
@@ -443,6 +569,7 @@ def test_unified_qwen2_dispatch_forwards_dry_run_and_output_layer() -> None:
         no_attn_bias=False,
         output_layer="both",
         verbose=True,
+        numeric_profile=NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
     )
 
     dispatched = _dispatch_args(args, "qwen2")
@@ -451,6 +578,10 @@ def test_unified_qwen2_dispatch_forwards_dry_run_and_output_layer() -> None:
     assert "--dry-run" in dispatched
     assert dispatched[dispatched.index("--output-layer") + 1] == "both"
     assert dispatched[dispatched.index("--weight-layout") + 1] == WEIGHT_LAYOUT_BUNDLE_V1
+    assert (
+        dispatched[dispatched.index("--numeric-profile") + 1]
+        == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+    )
 
 
 def test_qwen2_rejects_legacy_row_block_layout(tmp_path: Path) -> None:

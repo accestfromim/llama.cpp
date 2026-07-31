@@ -5,7 +5,12 @@ import json
 from pathlib import Path
 
 from .arch.registry import detect_arch_info, get_arch_info
-from .spec import QUANT_VARIANT_TILE64_V2, QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE
+from .spec import (
+    NUMERIC_PROFILE_LEGACY_F16_V1,
+    NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+    QUANT_VARIANT_TILE64_V2,
+    QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE,
+)
 from .spec import WEIGHT_LAYOUT_BUNDLE_V1, WEIGHT_LAYOUT_TILE64_V2
 
 
@@ -36,6 +41,12 @@ def _dispatch_args(args: argparse.Namespace, base_arch: str) -> list[str]:
         if args.output_file is None and not args.dry_run:
             raise ValueError("output_file is required for qwen2 conversion unless --dry-run is set")
         script_args.extend(["--quant-variant", args.quant_variant])
+        script_args.extend(
+            [
+                "--numeric-profile",
+                getattr(args, "numeric_profile", NUMERIC_PROFILE_LEGACY_F16_V1),
+            ]
+        )
     if base_arch == "qwen3":
         if args.output_file is None and not args.dry_run:
             raise ValueError("output_file is required for qwen3 conversion")
@@ -60,6 +71,15 @@ def main(argv: list[str] | None = None) -> None:
         choices=[WEIGHT_LAYOUT_BUNDLE_V1, WEIGHT_LAYOUT_TILE64_V2],
         default=WEIGHT_LAYOUT_BUNDLE_V1,
     )
+    parser.add_argument(
+        "--numeric-profile",
+        choices=[
+            NUMERIC_PROFILE_LEGACY_F16_V1,
+            NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+        ],
+        default=NUMERIC_PROFILE_LEGACY_F16_V1,
+        help="Qwen2 W2 numeric profile; other architectures support legacy_f16_v1 only",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs without writing GGUF")
     parser.add_argument("--qk-permute", action="store_true", help="Enable Llama q/k undo-permute when supported")
     parser.add_argument(
@@ -79,6 +99,13 @@ def main(argv: list[str] | None = None) -> None:
     arch_info = detect_arch_info(config) if args.base_arch == "auto" else get_arch_info(args.base_arch)
     if arch_info.name == "qwen2" and args.weight_layout != WEIGHT_LAYOUT_BUNDLE_V1:
         raise ValueError("Qwen2 Fairy2i conversion requires --weight-layout bundle_v1")
+    if (
+        arch_info.name != "qwen2"
+        and args.numeric_profile != NUMERIC_PROFILE_LEGACY_F16_V1
+    ):
+        raise ValueError(
+            f"--numeric-profile {args.numeric_profile} is supported only for Qwen2 Fairy2i"
+        )
 
     if args.quant_variant is None:
         args.quant_variant = (
