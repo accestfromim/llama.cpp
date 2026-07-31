@@ -13,6 +13,9 @@ void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * para
 
 void ggml_fairy2i_wide_linear_w1_compute(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 
+void ggml_fairy2i_wide_linear_w2_bundle_exact_compute(const struct ggml_compute_params * params,
+                                                      struct ggml_tensor *               dst);
+
 bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * params,
                                               struct ggml_tensor *                dst,
                                               bool                                lut_c);

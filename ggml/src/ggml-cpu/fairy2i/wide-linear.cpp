@@ -1,5 +1,6 @@
 #include "wide-linear.h"
 
+#include "fairy2i-bundle.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "quants.h"
@@ -17,6 +18,17 @@ struct ggml_fairy2i_complex_acc {
     float real;
     float imag;
 };
+
+static inline uint32_t ggml_fairy2i_load_packed_bf16_pair(const void * src) {
+    uint32_t bits;
+    memcpy(&bits, src, sizeof(bits));
+    return bits;
+}
+
+static inline void ggml_fairy2i_store_packed_bf16_pair(void * dst, ggml_bf16_t real, ggml_bf16_t imag) {
+    const uint32_t bits = (uint32_t) real.bits | ((uint32_t) imag.bits << 16);
+    memcpy(dst, &bits, sizeof(bits));
+}
 
 static inline void ggml_fairy2i_tile64_fuse_accumulate_block_scalar(const block_fairy2i_tile64_v2 *      w,
                                                                const block_fairy2i_act_q16_64 * x,
@@ -379,6 +391,131 @@ static inline float ggml_fairy2i_wide_linear_bias_at(const struct ggml_tensor * 
     return *(const float *) ptr;
 }
 
+struct ggml_fairy2i_exact_complex {
+    float real;
+    float imag;
+};
+
+static inline float ggml_fairy2i_exact_bf16_round(float value) {
+    return GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(value));
+}
+
+static inline uint8_t ggml_fairy2i_bundle_code_at(const struct ggml_fairy2i_bundle_desc * bundle,
+                                                  int64_t                                 row,
+                                                  int64_t                                 col,
+                                                  int                                     branch) {
+    const int64_t   global_m16 = row / 16;
+    const int64_t   k_block    = col / 64;
+    const int64_t   q4         = (col % 64) / 4;
+    const int       lane       = (int) (row % 16);
+    const int       q          = (int) (col % 4);
+    const uint8_t * codes      = ggml_fairy2i_bundle_codes_at(bundle, global_m16, k_block, branch);
+    const uint8_t   packed     = codes[q4 * bundle->branches * 16 + lane];
+    return (packed >> (2 * q)) & 0x3u;
+}
+
+static inline struct ggml_fairy2i_exact_complex ggml_fairy2i_bundle_exact_branch_at(
+    const struct ggml_fairy2i_bundle_desc * bundle,
+    int64_t                                 row,
+    int64_t                                 col,
+    int                                     branch) {
+    const int64_t       global_m16     = row / 16;
+    const int64_t       k_block        = col / 64;
+    const ggml_bf16_t * scales         = ggml_fairy2i_bundle_scales_bf16_at(bundle, global_m16, k_block, branch);
+    const uint8_t       code           = ggml_fairy2i_bundle_code_at(bundle, row, col, branch);
+    const uint16_t      magnitude_bits = scales[code < 2 ? 0 : 1].bits;
+    const uint16_t      signed_bits    = magnitude_bits ^ ((code & 1u) != 0 ? 0x0000u : 0x8000u);
+    const float         signed_scale   = GGML_BF16_TO_FP32({ signed_bits });
+
+    struct ggml_fairy2i_exact_complex value = { 0.0f, 0.0f };
+    if (code < 2) {
+        value.real = signed_scale;
+    } else {
+        value.imag = signed_scale;
+    }
+    return value;
+}
+
+static inline float ggml_fairy2i_exact_f32_add(float lhs, float rhs) {
+    return fmaf(1.0f, lhs, rhs);
+}
+
+static inline void ggml_fairy2i_bundle_exact_aij_at(const struct ggml_fairy2i_bundle_desc * bundle,
+                                                    int64_t                                 row,
+                                                    int64_t                                 col,
+                                                    float *                                 a11,
+                                                    float *                                 a12,
+                                                    float *                                 a21,
+                                                    float *                                 a22) {
+    const struct ggml_fairy2i_exact_complex u0 = ggml_fairy2i_bundle_exact_branch_at(bundle, row, col, 0);
+    const struct ggml_fairy2i_exact_complex u1 = ggml_fairy2i_bundle_exact_branch_at(bundle, row, col, 1);
+    const struct ggml_fairy2i_exact_complex w0 = ggml_fairy2i_bundle_exact_branch_at(bundle, row, col, 2);
+    const struct ggml_fairy2i_exact_complex w1 = ggml_fairy2i_bundle_exact_branch_at(bundle, row, col, 3);
+    const float u_real = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(u0.real, u1.real));
+    const float u_imag = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(u0.imag, u1.imag));
+    const float w_real = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(w0.real, w1.real));
+    const float w_imag = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(w0.imag, w1.imag));
+
+    *a11 = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(u_real, w_real));
+    *a12 = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(-u_imag, w_imag));
+    *a21 = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(u_imag, w_imag));
+    *a22 = ggml_fairy2i_exact_bf16_round(ggml_fairy2i_exact_f32_add(u_real, -w_real));
+}
+
+void ggml_fairy2i_wide_linear_w2_bundle_exact_compute(const struct ggml_compute_params * params,
+                                                      struct ggml_tensor *               dst) {
+    struct ggml_fairy2i_bundle_desc bundle;
+    GGML_ASSERT(params && dst && ggml_fairy2i_bundle_desc_init(dst, &bundle, true));
+    GGML_ASSERT(bundle.scale_type == GGML_TYPE_BF16 && bundle.branches == 4);
+
+    const struct ggml_tensor * x    = dst->src[0];
+    const struct ggml_tensor * bias = dst->src[3];
+    GGML_ASSERT(x && x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
+    GGML_ASSERT(!bias || bias->type == GGML_TYPE_F32);
+
+    const int64_t M        = dst->ne[0];
+    const int64_t K        = x->ne[0];
+    const int64_t act_rows = ggml_nrows(x);
+    const int64_t total    = M * act_rows;
+    const int64_t begin    = (total * params->ith) / params->nth;
+    const int64_t end      = (total * (params->ith + 1)) / params->nth;
+
+    for (int64_t index = begin; index < end; ++index) {
+        const int64_t row     = index % M;
+        const int64_t act_row = index / M;
+        const int64_t i1      = act_row % x->ne[1];
+        const int64_t i2      = (act_row / x->ne[1]) % x->ne[2];
+        const int64_t i3      = act_row / (x->ne[1] * x->ne[2]);
+        const char *  x_row   = (const char *) x->data + i1 * x->nb[1] + i2 * x->nb[2] + i3 * x->nb[3];
+
+        float acc_real = 0.0f;
+        float acc_imag = 0.0f;
+        for (int64_t col = 0; col < K; ++col) {
+            const uint32_t x_bits = ggml_fairy2i_load_packed_bf16_pair(x_row + col * x->nb[0]);
+            const float    x_real = GGML_BF16_TO_FP32({ (uint16_t) x_bits });
+            const float    x_imag = GGML_BF16_TO_FP32({ (uint16_t) (x_bits >> 16) });
+            float          a11;
+            float          a12;
+            float          a21;
+            float          a22;
+            ggml_fairy2i_bundle_exact_aij_at(&bundle, row, col, &a11, &a12, &a21, &a22);
+            acc_real = fmaf(a11, x_real, acc_real);
+            acc_real = fmaf(a12, x_imag, acc_real);
+            acc_imag = fmaf(a21, x_real, acc_imag);
+            acc_imag = fmaf(a22, x_imag, acc_imag);
+        }
+
+        if (bias) {
+            acc_real += ggml_fairy2i_wide_linear_bias_at(bias, row, i1, i2, i3);
+            acc_imag += ggml_fairy2i_wide_linear_bias_at(bias, row + M, i1, i2, i3);
+        }
+
+        void * out = (char *) dst->data + act_row * dst->nb[1] + row * dst->nb[0];
+        ggml_fairy2i_store_packed_bf16_pair(out, GGML_FP32_TO_BF16(acc_real), GGML_FP32_TO_BF16(acc_imag));
+    }
+}
+
 static inline bool ggml_fairy2i_wide_linear_weight_type(enum ggml_type type) {
     return type == GGML_TYPE_FAIRY2I_TILE64_V2;
 }
@@ -412,8 +549,9 @@ static void ggml_fairy2i_quantize_row_act_q16_64(const float * x, void * vy, int
         for (int j = 0; j < QK_FAIRY2I_ACT_Q16_64; ++j) {
             const float * x_com = x + j;
 
-            const ggml_bf16_t x_real_bf16 = ((const ggml_bf16_t *) (x_com))[0];
-            const ggml_bf16_t x_imag_bf16 = ((const ggml_bf16_t *) (x_com))[1];
+            const uint32_t    x_bits      = ggml_fairy2i_load_packed_bf16_pair(x_com);
+            const ggml_bf16_t x_real_bf16 = { (uint16_t) x_bits };
+            const ggml_bf16_t x_imag_bf16 = { (uint16_t) (x_bits >> 16) };
 
             const float x_real = GGML_BF16_TO_FP32(x_real_bf16);
             const float x_imag = GGML_BF16_TO_FP32(x_imag_bf16);
@@ -428,8 +566,9 @@ static void ggml_fairy2i_quantize_row_act_q16_64(const float * x, void * vy, int
         for (int j = 0; j < QK_FAIRY2I_ACT_Q16_64; ++j) {
             const float * x_com = x + j;
 
-            const ggml_bf16_t x_real_bf16 = ((const ggml_bf16_t *) (x_com))[0];
-            const ggml_bf16_t x_imag_bf16 = ((const ggml_bf16_t *) (x_com))[1];
+            const uint32_t    x_bits      = ggml_fairy2i_load_packed_bf16_pair(x_com);
+            const ggml_bf16_t x_real_bf16 = { (uint16_t) x_bits };
+            const ggml_bf16_t x_imag_bf16 = { (uint16_t) (x_bits >> 16) };
 
             const float x_real = GGML_BF16_TO_FP32(x_real_bf16);
             const float x_imag = GGML_BF16_TO_FP32(x_imag_bf16);
@@ -508,9 +647,8 @@ void ggml_fairy2i_wide_linear_w2_compute(const struct ggml_compute_params * para
             acc.imag += ggml_fairy2i_wide_linear_bias_at(bias, row + M, i1, i2, i3);
         }
 
-        ggml_bf16_t * out = (ggml_bf16_t *) ((char *) dst->data + act_row * dst->nb[1] + row * dst->nb[0]);
-        out[0]             = GGML_FP32_TO_BF16(acc.real);
-        out[1]             = GGML_FP32_TO_BF16(acc.imag);
+        void * out = (char *) dst->data + act_row * dst->nb[1] + row * dst->nb[0];
+        ggml_fairy2i_store_packed_bf16_pair(out, GGML_FP32_TO_BF16(acc.real), GGML_FP32_TO_BF16(acc.imag));
     }
 }
 
@@ -573,8 +711,7 @@ void ggml_fairy2i_wide_linear_w1_compute(const struct ggml_compute_params * para
             acc.imag += ggml_fairy2i_wide_linear_bias_at(bias, row + M, i1, i2, i3);
         }
 
-        ggml_bf16_t * out = (ggml_bf16_t *) ((char *) dst->data + act_row * dst->nb[1] + row * dst->nb[0]);
-        out[0]            = GGML_FP32_TO_BF16(acc.real);
-        out[1]            = GGML_FP32_TO_BF16(acc.imag);
+        void * out = (char *) dst->data + act_row * dst->nb[1] + row * dst->nb[0];
+        ggml_fairy2i_store_packed_bf16_pair(out, GGML_FP32_TO_BF16(acc.real), GGML_FP32_TO_BF16(acc.imag));
     }
 }

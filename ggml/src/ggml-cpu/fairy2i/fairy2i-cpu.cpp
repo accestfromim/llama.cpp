@@ -18,6 +18,7 @@ static constexpr size_t GGML_FAIRY2I_CPU_CACHE_LINE = 64;
 struct ggml_fairy2i_cpu_plan {
     bool                       use_lut;
     bool                       lut_c;
+    bool                       exact_bundle;
     size_t                     q_bytes;
     size_t                     lut_bytes;
     size_t                     work_size;
@@ -93,6 +94,7 @@ static void ggml_fairy2i_cpu_debug_log_once(const struct ggml_compute_params *  
         PATH_AVX512,
         PATH_NEON,
         PATH_DOTPROD,
+        PATH_BF16_EXACT,
         PATH_LUT16,
         PATH_LUT_C,
         PATH_UNKNOWN,
@@ -113,6 +115,8 @@ static void ggml_fairy2i_cpu_debug_log_once(const struct ggml_compute_params *  
         path_idx = PATH_NEON;
     } else if (path && strcmp(path, "direct_dotprod") == 0) {
         path_idx = PATH_DOTPROD;
+    } else if (path && strcmp(path, "direct_bf16_exact") == 0) {
+        path_idx = PATH_BF16_EXACT;
     } else if (path && strcmp(path, "lut16") == 0) {
         path_idx = PATH_LUT16;
     } else if (path && strcmp(path, "lut_c") == 0) {
@@ -170,6 +174,10 @@ static bool ggml_fairy2i_cpu_build_plan(const struct ggml_tensor * dst, int n_ta
         if (!ggml_fairy2i_bundle_desc_init(dst, &bundle, false)) {
             return false;
         }
+        plan->exact_bundle = bundle.scale_type == GGML_TYPE_BF16;
+        if (plan->exact_bundle) {
+            return true;
+        }
     }
 
     const struct ggml_tensor * x = dst->src[0];
@@ -207,11 +215,17 @@ bool ggml_fairy2i_cpu_supports_op(const struct ggml_tensor * dst) {
         return true;
     }
 
+    struct ggml_fairy2i_bundle_desc bundle;
+    if (!ggml_fairy2i_bundle_desc_init(dst, &bundle, false)) {
+        return false;
+    }
+    if (bundle.scale_type == GGML_TYPE_BF16) {
+        return dst->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2;
+    }
+
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
     const struct ggml_fairy2i_lut_policy policy = ggml_fairy2i_lut_policy_from_env();
-    struct ggml_fairy2i_bundle_desc      bundle;
-    return policy.lut_enabled && policy.impl == GGML_FAIRY2I_LUT_IMPL_LUT16 &&
-           ggml_fairy2i_bundle_desc_init(dst, &bundle, false);
+    return policy.lut_enabled && policy.impl == GGML_FAIRY2I_LUT_IMPL_LUT16;
 #else
     return false;
 #endif
@@ -312,6 +326,13 @@ static bool ggml_fairy2i_cpu_compute_wide_linear_w2(const struct ggml_compute_pa
     }
 
     const int64_t timing_start_us = ggml_fairy2i_cpu_timing_start_us(params);
+
+    if (plan.exact_bundle) {
+        ggml_fairy2i_wide_linear_w2_bundle_exact_compute(params, dst);
+        ggml_fairy2i_cpu_debug_log_once(params, dst, &plan, "direct_bf16_exact");
+        ggml_fairy2i_cpu_timing_log(params, dst, "direct_bf16_exact", timing_start_us);
+        return true;
+    }
 
 #ifdef GGML_USE_FAIRY2I_CPU_LUT
     if (plan.use_lut) {

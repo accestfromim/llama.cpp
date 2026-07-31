@@ -578,6 +578,12 @@ extern "C" {
         GGML_OP_COMPLEX_MUL,
         GGML_OP_FAIRY2I_WIDE_LINEAR_W1,
         GGML_OP_FAIRY2I_WIDE_LINEAR_W2,
+        GGML_OP_FAIRY2I_RMS_NORM_EXACT,
+        GGML_OP_FAIRY2I_ROPE_EXACT,
+        GGML_OP_FAIRY2I_SILU_EXACT,
+        GGML_OP_FAIRY2I_MUL_EXACT,
+        GGML_OP_FAIRY2I_PACK_BF16_EXACT,
+        GGML_OP_FAIRY2I_ATTN_EXACT_CPU,
 
         GGML_OP_COUNT,
     };
@@ -1732,6 +1738,26 @@ extern "C" {
 
     GGML_API struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps);
 
+    GGML_API struct ggml_tensor * ggml_fairy2i_rms_norm_exact(struct ggml_context * ctx,
+                                                              struct ggml_tensor *  a,
+                                                              struct ggml_tensor *  weight,
+                                                              float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_silu_exact(struct ggml_context * ctx, struct ggml_tensor * a);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_mul_exact(struct ggml_context * ctx,
+                                                         struct ggml_tensor *  a,
+                                                         struct ggml_tensor *  b);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_pack_bf16_exact(struct ggml_context * ctx, struct ggml_tensor * a);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_attn_exact_cpu(struct ggml_context * ctx,
+                                                              struct ggml_tensor *  q,
+                                                              struct ggml_tensor *  k,
+                                                              struct ggml_tensor *  v,
+                                                              struct ggml_tensor *  mask,
+                                                              float                 scale);
+
     GGML_API struct ggml_tensor * ggml_ifairy_split(struct ggml_context * ctx, struct ggml_tensor * a);
 
     GGML_API struct ggml_tensor * ggml_ifairy_merge(struct ggml_context * ctx, struct ggml_tensor * a);
@@ -1778,6 +1804,20 @@ extern "C" {
             float                 attn_factor,
             float                 beta_fast,
             float                 beta_slow);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_rope_ext_exact(struct ggml_context * ctx,
+                                                              struct ggml_tensor *  a,
+                                                              struct ggml_tensor *  b,
+                                                              struct ggml_tensor *  c,
+                                                              int                   n_dims,
+                                                              int                   mode,
+                                                              int                   n_ctx_orig,
+                                                              float                 freq_base,
+                                                              float                 freq_scale,
+                                                              float                 ext_factor,
+                                                              float                 attn_factor,
+                                                              float                 beta_fast,
+                                                              float                 beta_slow);
 
     GGML_API struct ggml_tensor * ggml_rope_multi(
             struct ggml_context * ctx,
@@ -2289,6 +2329,10 @@ extern "C" {
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    GGML_API void ggml_flash_attn_ext_set_fairy2i_exact(struct ggml_tensor * a, bool exact);
+
+    GGML_API bool ggml_flash_attn_ext_get_fairy2i_exact(const struct ggml_tensor * a);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

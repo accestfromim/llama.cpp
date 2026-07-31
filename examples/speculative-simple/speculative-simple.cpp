@@ -53,6 +53,8 @@ int main(int argc, char ** argv) {
     params.n_ctx        = params.speculative.n_ctx;
     params.n_batch      = params.speculative.n_ctx > 0 ? params.speculative.n_ctx : params.n_batch;
     params.n_gpu_layers = params.speculative.n_gpu_layers;
+    params.cache_type_k = params.speculative.cache_type_k;
+    params.cache_type_v = params.speculative.cache_type_v;
 
     if (params.speculative.cpuparams.n_threads > 0) {
         params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;

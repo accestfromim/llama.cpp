@@ -203,6 +203,11 @@ enum llama_fairy2i_weight_layout {
     LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1,
 };
 
+enum llama_fairy2i_numeric_profile {
+    LLAMA_FAIRY2I_NUMERIC_PROFILE_LEGACY_F16_V1 = 0,
+    LLAMA_FAIRY2I_NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+};
+
 struct llama_layer_nextn {
     struct ggml_tensor * eh_proj          = nullptr;
     struct ggml_tensor * embed_tokens     = nullptr;
@@ -430,6 +435,12 @@ struct llama_model {
     llama_fairy2i_quant_variant fairy2i_quant_variant = LLAMA_FAIRY2I_QUANT_VARIANT_LEGACY;
     llama_fairy2i_attn_layout   fairy2i_attn_layout   = LLAMA_FAIRY2I_ATTN_LAYOUT_LEGACY_COMPLEX;
     llama_fairy2i_weight_layout fairy2i_weight_layout = LLAMA_FAIRY2I_WEIGHT_LAYOUT_TILE64_V2;
+    llama_fairy2i_numeric_profile fairy2i_numeric_profile = LLAMA_FAIRY2I_NUMERIC_PROFILE_LEGACY_F16_V1;
+    uint32_t                      fairy2i_schema_version  = 1;
+
+    bool fairy2i_uses_exact_numeric_profile() const {
+        return fairy2i_numeric_profile == LLAMA_FAIRY2I_NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1;
+    }
 
     // for classifier models
     std::vector<std::string> classifier_labels;

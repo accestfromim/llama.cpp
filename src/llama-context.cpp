@@ -2279,36 +2279,36 @@ void llama_context::opt_epoch(
 
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
-        /*.n_ctx                       =*/ 512,
-        /*.n_batch                     =*/ 2048,
-        /*.n_ubatch                    =*/ 512,
-        /*.n_seq_max                   =*/ 1,
-        /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
-        /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
-        /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
-        /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,
-        /*.attention_type              =*/ LLAMA_ATTENTION_TYPE_UNSPECIFIED,
-        /*.flash_attn_type             =*/ LLAMA_FLASH_ATTN_TYPE_AUTO,
-        /*.rope_freq_base              =*/ 0.0f,
-        /*.rope_freq_scale             =*/ 0.0f,
-        /*.yarn_ext_factor             =*/ -1.0f,
-        /*.yarn_attn_factor            =*/ -1.0f,
-        /*.yarn_beta_fast              =*/ -1.0f,
-        /*.yarn_beta_slow              =*/ -1.0f,
-        /*.yarn_orig_ctx               =*/ 0,
-        /*.defrag_thold                =*/ -1.0f,
-        /*.cb_eval                     =*/ nullptr,
-        /*.cb_eval_user_data           =*/ nullptr,
-        /*.type_k                      =*/ GGML_TYPE_F16,
-        /*.type_v                      =*/ GGML_TYPE_F16,
-        /*.abort_callback              =*/ nullptr,
-        /*.abort_callback_data         =*/ nullptr,
-        /*.embeddings                  =*/ false,
-        /*.offload_kqv                 =*/ true,
-        /*.no_perf                     =*/ true,
-        /*.op_offload                  =*/ true,
-        /*.swa_full                    =*/ true,
-        /*.kv_unified                  =*/ false,
+        /*.n_ctx                       =*/512,
+        /*.n_batch                     =*/2048,
+        /*.n_ubatch                    =*/512,
+        /*.n_seq_max                   =*/1,
+        /*.n_threads                   =*/GGML_DEFAULT_N_THREADS,  // TODO: better default
+        /*.n_threads_batch             =*/GGML_DEFAULT_N_THREADS,
+        /*.rope_scaling_type           =*/LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
+        /*.pooling_type                =*/LLAMA_POOLING_TYPE_UNSPECIFIED,
+        /*.attention_type              =*/LLAMA_ATTENTION_TYPE_UNSPECIFIED,
+        /*.flash_attn_type             =*/LLAMA_FLASH_ATTN_TYPE_AUTO,
+        /*.rope_freq_base              =*/0.0f,
+        /*.rope_freq_scale             =*/0.0f,
+        /*.yarn_ext_factor             =*/-1.0f,
+        /*.yarn_attn_factor            =*/-1.0f,
+        /*.yarn_beta_fast              =*/-1.0f,
+        /*.yarn_beta_slow              =*/-1.0f,
+        /*.yarn_orig_ctx               =*/0,
+        /*.defrag_thold                =*/-1.0f,
+        /*.cb_eval                     =*/nullptr,
+        /*.cb_eval_user_data           =*/nullptr,
+        /*.type_k                      =*/GGML_TYPE_COUNT,
+        /*.type_v                      =*/GGML_TYPE_COUNT,
+        /*.abort_callback              =*/nullptr,
+        /*.abort_callback_data         =*/nullptr,
+        /*.embeddings                  =*/false,
+        /*.offload_kqv                 =*/true,
+        /*.no_perf                     =*/true,
+        /*.op_offload                  =*/true,
+        /*.swa_full                    =*/true,
+        /*.kv_unified                  =*/false,
     };
 
     return result;
@@ -2330,6 +2330,89 @@ llama_context * llama_init_from_model(
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
         return nullptr;
+    }
+
+    const bool      fairy2i_exact   = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_exact_numeric_profile();
+    const ggml_type default_kv_type = fairy2i_exact ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    if (params.type_k == GGML_TYPE_COUNT) {
+        params.type_k = default_kv_type;
+    }
+    if (params.type_v == GGML_TYPE_COUNT) {
+        params.type_v = default_kv_type;
+    }
+
+    if (fairy2i_exact && (params.type_k != GGML_TYPE_BF16 || params.type_v != GGML_TYPE_BF16)) {
+        LLAMA_LOG_ERROR(
+            "%s: FAIRY2I script_f32reduce_bf16scale_v1 requires BF16 K/V cache, got type_k=%s type_v=%s; "
+            "set both cache types to bf16\n",
+            __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (fairy2i_exact) {
+        if (model->has_tensor_overrides()) {
+            LLAMA_LOG_ERROR(
+                "%s: FAIRY2I script_f32reduce_bf16scale_v1 forbids tensor buffer overrides; "
+                "an override can create an unvalidated CPU/Metal route even when nominal layer placement is "
+                "all-CPU or all-Metal\n",
+                __func__);
+            return nullptr;
+        }
+
+        bool all_exact_devices_metal = true;
+        bool all_exact_devices_cpu   = true;
+        auto classify_exact_device   = [&](ggml_backend_dev_t dev) {
+            ggml_backend_reg_t reg      = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const bool         is_metal = reg && strcmp(ggml_backend_reg_name(reg), "Metal") == 0;
+            const bool         is_cpu   = dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            all_exact_devices_metal     = all_exact_devices_metal && is_metal;
+            all_exact_devices_cpu       = all_exact_devices_cpu && is_cpu;
+        };
+
+        for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+            classify_exact_device(model->dev_layer(il));
+        }
+        classify_exact_device(model->dev_output());
+
+        if (all_exact_devices_metal) {
+            if (!params.offload_kqv) {
+                LLAMA_LOG_ERROR(
+                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 full Metal placement requires offload_kqv=true; "
+                    "forcing K/Q/V nodes to CPU would create an unsupported mixed route\n",
+                    __func__);
+                return nullptr;
+            }
+            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+                LLAMA_LOG_ERROR(
+                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 with Metal offload requires the dedicated BF16 "
+                    "Flash Attention path; --flash-attn off is only valid with the all-CPU reference path\n",
+                    __func__);
+                return nullptr;
+            }
+        } else if (all_exact_devices_cpu) {
+            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+                LLAMA_LOG_ERROR(
+                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 Flash Attention requires every repeating and output "
+                    "layer "
+                    "on Metal; use --flash-attn off for the explicit all-CPU reference path\n",
+                    __func__);
+                return nullptr;
+            }
+            if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+                LLAMA_LOG_INFO(
+                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 is fully CPU-resident; "
+                    "disabling automatic Flash Attention and using the explicit reference graph\n",
+                    __func__);
+                params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            }
+        } else {
+            LLAMA_LOG_ERROR(
+                "%s: FAIRY2I script_f32reduce_bf16scale_v1 forbids mixed CPU/Metal placement; choose full Metal "
+                "offload "
+                "with Flash Attention or --gpu-layers 0 with --flash-attn off\n",
+                __func__);
+            return nullptr;
+        }
     }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {

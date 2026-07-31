@@ -22,6 +22,18 @@ static inline float op_div(float a, float b) {
     return a / b;
 }
 
+static inline uint32_t packed_bf16_pair_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static inline float packed_bf16_pair_carrier(uint32_t bits) {
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 /**
  * @brief 两个以 float 位模式存储的 BF16 复数相加
  * 
@@ -35,28 +47,28 @@ static inline float op_div(float a, float b) {
  *   Bits 16-31: imag (BF16)
  */
 static inline float op_complex_add(float a, float b) {
-    float r = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[0]);
-    float i = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[1]);
-    r       = r + GGML_BF16_TO_FP32(((ggml_bf16_t *) (&b))[0]);
-    i       = i + GGML_BF16_TO_FP32(((ggml_bf16_t *) (&b))[1]);
-    float ret;
-    ((ggml_bf16_t *) (&ret))[1] = GGML_FP32_TO_BF16(i);
-    ((ggml_bf16_t *) (&ret))[0] = GGML_FP32_TO_BF16(r);
-    return ret;
+    const uint32_t a_bits = packed_bf16_pair_bits(a);
+    const uint32_t b_bits = packed_bf16_pair_bits(b);
+    float          r      = GGML_BF16_TO_FP32({ (uint16_t) a_bits });
+    float          i      = GGML_BF16_TO_FP32({ (uint16_t) (a_bits >> 16) });
+    r += GGML_BF16_TO_FP32({ (uint16_t) b_bits });
+    i += GGML_BF16_TO_FP32({ (uint16_t) (b_bits >> 16) });
+    const uint32_t result_bits = (uint32_t) GGML_FP32_TO_BF16(r).bits | ((uint32_t) GGML_FP32_TO_BF16(i).bits << 16);
+    return packed_bf16_pair_carrier(result_bits);
 }
 
 static inline float op_complex_mul(float a, float b) {
-    float ra = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[0]);
-    float ia = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&a))[1]);
-    float rg = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&b))[0]);
-    float ig = GGML_BF16_TO_FP32(((ggml_bf16_t *) (&b))[1]);
+    const uint32_t a_bits      = packed_bf16_pair_bits(a);
+    const uint32_t b_bits      = packed_bf16_pair_bits(b);
+    const float    ra          = GGML_BF16_TO_FP32({ (uint16_t) a_bits });
+    const float    ia          = GGML_BF16_TO_FP32({ (uint16_t) (a_bits >> 16) });
+    const float    rg          = GGML_BF16_TO_FP32({ (uint16_t) b_bits });
+    const float    ig          = GGML_BF16_TO_FP32({ (uint16_t) (b_bits >> 16) });
     // (ra - i ia) * (rg + i ig) = (ra*rg + ia*ig) + i(ra*ig - ia*rg)
-    float r  = ra * rg + ia * ig;
-    float i  = ia * rg - ra * ig;
-    float ret;
-    ((ggml_bf16_t *) (&ret))[0] = GGML_FP32_TO_BF16(r);
-    ((ggml_bf16_t *) (&ret))[1] = GGML_FP32_TO_BF16(i);
-    return ret;
+    const float    r           = ra * rg + ia * ig;
+    const float    i           = ia * rg - ra * ig;
+    const uint32_t result_bits = (uint32_t) GGML_FP32_TO_BF16(r).bits | ((uint32_t) GGML_FP32_TO_BF16(i).bits << 16);
+    return packed_bf16_pair_carrier(result_bits);
 }
 
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>

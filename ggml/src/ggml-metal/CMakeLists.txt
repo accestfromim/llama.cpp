@@ -90,6 +90,47 @@ else()
         list   (APPEND XC_FLAGS -std=${GGML_METAL_STD})
     endif()
 
+    # Runtime source compilation enables BF16 kernels per device. Do the same for
+    # the precompiled library when the Metal compiler supports the required MSL.
+    # Pipeline selection remains guarded by the device's has_bfloat property.
+    set(_GGML_METAL_BF16_STD "${GGML_METAL_STD}")
+    if (NOT _GGML_METAL_BF16_STD)
+        set(_GGML_METAL_BF16_STD "metal3.1")
+    endif()
+
+    set(_GGML_METAL_BF16_PROBE_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/ggml-metal-bf16-probe.metal")
+    set(_GGML_METAL_BF16_PROBE_AIR    "${CMAKE_CURRENT_BINARY_DIR}/ggml-metal-bf16-probe.air")
+    file(WRITE "${_GGML_METAL_BF16_PROBE_SOURCE}"
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "kernel void ggml_bf16_probe(device bfloat * dst [[buffer(0)]]) { dst[0] = bfloat(0.0f); }\n")
+
+    set(_GGML_METAL_BF16_PROBE_FLAGS ${XC_FLAGS})
+    if (NOT GGML_METAL_STD)
+        list(APPEND _GGML_METAL_BF16_PROBE_FLAGS -std=${_GGML_METAL_BF16_STD})
+    endif()
+
+    execute_process(
+        COMMAND xcrun -sdk macosx metal ${_GGML_METAL_BF16_PROBE_FLAGS}
+                -c "${_GGML_METAL_BF16_PROBE_SOURCE}" -o "${_GGML_METAL_BF16_PROBE_AIR}"
+        RESULT_VARIABLE _GGML_METAL_BF16_PROBE_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+    file(REMOVE "${_GGML_METAL_BF16_PROBE_SOURCE}" "${_GGML_METAL_BF16_PROBE_AIR}")
+
+    if (_GGML_METAL_BF16_PROBE_RESULT EQUAL 0)
+        if (NOT GGML_METAL_STD)
+            message(STATUS "Adding  -std=${_GGML_METAL_BF16_STD} flag to Metal compilation for BF16 kernels")
+            list   (APPEND XC_FLAGS -std=${_GGML_METAL_BF16_STD})
+        endif()
+        message(STATUS "Enabling GGML_METAL_HAS_BF16 in precompiled Metal library")
+        list(APPEND XC_FLAGS -DGGML_METAL_HAS_BF16=1)
+        target_compile_definitions(ggml-metal PRIVATE GGML_METAL_HAS_BF16_LIBRARY)
+    else()
+        message(STATUS "Metal compiler does not support BF16 with -std=${_GGML_METAL_BF16_STD}; disabling BF16 kernels")
+    endif()
+
     add_custom_command(
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
         COMMAND xcrun -sdk macosx metal ${XC_FLAGS} -c ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal.metal -o - |

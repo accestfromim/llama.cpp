@@ -564,15 +564,15 @@ bool ggml_fairy2i_wide_linear_w2_compute_lut(const struct ggml_compute_params * 
         return false;
     }
 
-    const struct ggml_tensor * x      = dst->src[0];
-    const struct ggml_tensor * bias                = dst->src[is_bundle ? 3 : 5];
-    const int64_t K                   = x->ne[0];
-    const int64_t M                   = dst->ne[0];
-    const int64_t N                   = ggml_nrows(x);
-    const int64_t weight_blocks       = K / QK_FAIRY2I_TILE64;
-    const int64_t groups              = weight_blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
-    const size_t  q_bytes             = GGML_PAD((size_t) N * (size_t) weight_blocks * sizeof(block_fairy2i_act_q16_64), 64);
-    const size_t  lut_bytes           = (size_t) N * (size_t) groups * k_fairy2i_lut_group_bytes;
+    const struct ggml_tensor * x             = dst->src[0];
+    const struct ggml_tensor * bias          = is_bundle ? dst->src[3] : dst->src[5];
+    const int64_t              K             = x->ne[0];
+    const int64_t              M             = dst->ne[0];
+    const int64_t              N             = ggml_nrows(x);
+    const int64_t              weight_blocks = K / QK_FAIRY2I_TILE64;
+    const int64_t              groups        = weight_blocks * QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK;
+    const size_t  q_bytes   = GGML_PAD((size_t) N * (size_t) weight_blocks * sizeof(block_fairy2i_act_q16_64), 64);
+    const size_t  lut_bytes = (size_t) N * (size_t) groups * k_fairy2i_lut_group_bytes;
     const size_t  shared_bytes        =
         GGML_PAD(lut_bytes + (size_t) N * (size_t) weight_blocks * 2u * sizeof(float), 64);
     const size_t  need                = ggml_fairy2i_wide_linear_w2_lut_wsize(dst);
