@@ -23,6 +23,8 @@ enum class fairy2i_loader_case {
     incomplete_w1,
     valid_bundle_w1,
     valid_bundle_w1_qkv,
+    valid_bundle_w1_qat,
+    valid_bundle_w1_qat_qkv_bias,
     valid_bundle_w2,
     valid_bundle_w2_legacy_explicit,
     valid_bundle_w2_exact,
@@ -73,6 +75,18 @@ enum class fairy2i_loader_case {
     invalid_exact_output_bias_f16,
     invalid_exact_dense_f16,
     invalid_exact_dense_only,
+    invalid_qat_schema,
+    invalid_qat_base_arch,
+    invalid_qat_attn_layout,
+    invalid_qat_quant_variant,
+    invalid_qat_scale_dtype,
+    invalid_qat_numeric_profile,
+    invalid_qat_scales_f16,
+    invalid_qat_output_f16,
+    invalid_qat_missing_output,
+    invalid_qat_q_norm_f16,
+    invalid_qat_missing_q_norm,
+    invalid_qat_qkv_bias_f16,
 };
 
 static bool is_bundle_case(fairy2i_loader_case tc) {
@@ -164,6 +178,28 @@ static bool is_exact_case(fairy2i_loader_case tc) {
         case fairy2i_loader_case::invalid_exact_output_bias_f16:
         case fairy2i_loader_case::invalid_exact_dense_f16:
         case fairy2i_loader_case::invalid_exact_dense_only:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool is_qat_case(fairy2i_loader_case tc) {
+    switch (tc) {
+        case fairy2i_loader_case::valid_bundle_w1_qat:
+        case fairy2i_loader_case::valid_bundle_w1_qat_qkv_bias:
+        case fairy2i_loader_case::invalid_qat_schema:
+        case fairy2i_loader_case::invalid_qat_base_arch:
+        case fairy2i_loader_case::invalid_qat_attn_layout:
+        case fairy2i_loader_case::invalid_qat_quant_variant:
+        case fairy2i_loader_case::invalid_qat_scale_dtype:
+        case fairy2i_loader_case::invalid_qat_numeric_profile:
+        case fairy2i_loader_case::invalid_qat_scales_f16:
+        case fairy2i_loader_case::invalid_qat_output_f16:
+        case fairy2i_loader_case::invalid_qat_missing_output:
+        case fairy2i_loader_case::invalid_qat_q_norm_f16:
+        case fairy2i_loader_case::invalid_qat_missing_q_norm:
+        case fairy2i_loader_case::invalid_qat_qkv_bias_f16:
             return true;
         default:
             return false;
@@ -471,6 +507,10 @@ static const char * loader_case_label(fairy2i_loader_case tc) {
             return "bundle-w1";
         case fairy2i_loader_case::valid_bundle_w1_qkv:
             return "bundle-w1-qkv";
+        case fairy2i_loader_case::valid_bundle_w1_qat:
+            return "bundle-w1-qat";
+        case fairy2i_loader_case::valid_bundle_w1_qat_qkv_bias:
+            return "bundle-w1-qat-qkv-bias";
         case fairy2i_loader_case::valid_bundle_w2:
             return "bundle-w2";
         case fairy2i_loader_case::valid_bundle_w2_legacy_explicit:
@@ -571,6 +611,30 @@ static const char * loader_case_label(fairy2i_loader_case tc) {
             return "exact-dense-f16";
         case fairy2i_loader_case::invalid_exact_dense_only:
             return "exact-dense-only";
+        case fairy2i_loader_case::invalid_qat_schema:
+            return "qat-schema";
+        case fairy2i_loader_case::invalid_qat_base_arch:
+            return "qat-base-arch";
+        case fairy2i_loader_case::invalid_qat_attn_layout:
+            return "qat-attn-layout";
+        case fairy2i_loader_case::invalid_qat_quant_variant:
+            return "qat-quant-variant";
+        case fairy2i_loader_case::invalid_qat_scale_dtype:
+            return "qat-scale-dtype";
+        case fairy2i_loader_case::invalid_qat_numeric_profile:
+            return "qat-numeric-profile";
+        case fairy2i_loader_case::invalid_qat_scales_f16:
+            return "qat-scales-f16";
+        case fairy2i_loader_case::invalid_qat_output_f16:
+            return "qat-output-f16";
+        case fairy2i_loader_case::invalid_qat_missing_output:
+            return "qat-missing-output";
+        case fairy2i_loader_case::invalid_qat_q_norm_f16:
+            return "qat-q-norm-f16";
+        case fairy2i_loader_case::invalid_qat_missing_q_norm:
+            return "qat-missing-q-norm";
+        case fairy2i_loader_case::invalid_qat_qkv_bias_f16:
+            return "qat-qkv-bias-f16";
     }
     return "unknown";
 }
@@ -583,9 +647,10 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
     const bool               bundle    = is_bundle_case(tc);
     const bool               w1        = is_w1_case(tc);
     const bool               exact     = is_exact_case(tc);
+    const bool               qat       = is_qat_case(tc);
     const bool               exact_gqa = tc == fairy2i_loader_case::valid_bundle_w2_exact_gqa;
     const tiny_fairy2i_shape shape     = {
-        /*.n_embd   =*/exact_gqa ? 128 : 64,
+        /*.n_embd   =*/exact_gqa || qat ? 128 : 64,
         /*.n_ff     =*/64,
         /*.n_head   =*/exact_gqa ? 4 : 2,
         /*.n_head_kv=*/2,
@@ -593,6 +658,11 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
     };
     const int64_t n_embd_kv = shape.n_embd * shape.n_head_kv / shape.n_head;
     add_tiny_fairy2i_metadata(writer.gguf, bundle, w1, exact, is_qwen2_legacy_case(tc), shape);
+    if (qat) {
+        gguf_set_val_u32(writer.gguf, "fairy2i.schema_version", 4);
+        gguf_set_val_str(writer.gguf, "fairy2i.weight.scale_dtype", "bf16");
+        gguf_set_val_str(writer.gguf, "fairy2i.quant.numeric_profile", "qat_bf16_learned_scale_v1");
+    }
     if (tc == fairy2i_loader_case::invalid_bundle_alignment) {
         gguf_set_val_u32(writer.gguf, "general.alignment", 32);
     }
@@ -610,6 +680,27 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
     }
     if (tc == fairy2i_loader_case::invalid_bundle_variant) {
         gguf_set_val_str(writer.gguf, "fairy2i.quant.variant", "tile64_v1");
+    }
+    if (tc == fairy2i_loader_case::invalid_qat_schema) {
+        gguf_set_val_u32(writer.gguf, "fairy2i.schema_version", 3);
+    }
+    if (tc == fairy2i_loader_case::invalid_qat_base_arch) {
+        gguf_set_val_str(writer.gguf, "fairy2i.base_arch", "qwen2");
+    }
+    if (tc == fairy2i_loader_case::invalid_qat_attn_layout) {
+        gguf_set_val_str(writer.gguf, "fairy2i.attn.layout", "qwen2_real");
+    }
+    if (tc == fairy2i_loader_case::invalid_qat_quant_variant) {
+        gguf_set_val_str(writer.gguf, "fairy2i.quant.variant", "tile64_v2");
+        gguf_set_val_u32(writer.gguf, "fairy2i.quant.residual_steps", 2);
+        gguf_set_val_str(writer.gguf, "fairy2i.quant.scale_stat", "dominant_mean_abs");
+        gguf_set_val_str(writer.gguf, "fairy2i.weight.branch_order", "U0,U1,W0,W1");
+    }
+    if (tc == fairy2i_loader_case::invalid_qat_scale_dtype) {
+        gguf_set_val_str(writer.gguf, "fairy2i.weight.scale_dtype", "f16");
+    }
+    if (tc == fairy2i_loader_case::invalid_qat_numeric_profile) {
+        gguf_set_val_str(writer.gguf, "fairy2i.quant.numeric_profile", "legacy_f16_v1");
     }
     if (tc == fairy2i_loader_case::invalid_exact_missing_scale_dtype) {
         gguf_remove_key(writer.gguf, "fairy2i.weight.scale_dtype");
@@ -687,10 +778,14 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
     writer.add_tensor("output_norm",
                       tc == fairy2i_loader_case::invalid_exact_output_norm_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
                       2 * shape.n_embd, 1);
-    if (!exact || tc == fairy2i_loader_case::invalid_exact_dense_f16 ||
-        tc == fairy2i_loader_case::invalid_exact_dense_only) {
-        writer.add_tensor("output", tc == fairy2i_loader_case::invalid_exact_dense_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
-                          2 * shape.n_embd, shape.n_vocab);
+    if ((!exact || tc == fairy2i_loader_case::invalid_exact_dense_f16 ||
+         tc == fairy2i_loader_case::invalid_exact_dense_only) &&
+        tc != fairy2i_loader_case::invalid_qat_missing_output) {
+        const ggml_type output_type =
+            qat ? (tc == fairy2i_loader_case::invalid_qat_output_f16 ? GGML_TYPE_F16 : GGML_TYPE_BF16) :
+            tc == fairy2i_loader_case::invalid_exact_dense_f16 ? GGML_TYPE_F16 :
+                                                                 GGML_TYPE_F32;
+        writer.add_tensor("output", output_type, 2 * shape.n_embd, shape.n_vocab);
     }
     writer.add_tensor("blk.0.attn_norm",
                       tc == fairy2i_loader_case::invalid_exact_attn_norm_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
@@ -699,8 +794,12 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
                       tc == fairy2i_loader_case::invalid_exact_ffn_norm_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
                       2 * shape.n_embd, 1);
     if (w1) {
-        writer.add_tensor("blk.0.attn_q_norm", GGML_TYPE_F32, 64, 1);
-        writer.add_tensor("blk.0.attn_k_norm", GGML_TYPE_F32, 64, 1);
+        if (tc != fairy2i_loader_case::invalid_qat_missing_q_norm) {
+            writer.add_tensor("blk.0.attn_q_norm",
+                              tc == fairy2i_loader_case::invalid_qat_q_norm_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                              2 * shape.n_embd / shape.n_head, 1);
+        }
+        writer.add_tensor("blk.0.attn_k_norm", GGML_TYPE_F32, 2 * shape.n_embd / shape.n_head, 1);
     }
     if (exact) {
         if (tc != fairy2i_loader_case::invalid_exact_missing_q_bias) {
@@ -720,22 +819,30 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
 
     const char * linear_names[] = { "blk.0.attn_q",   "blk.0.attn_k", "blk.0.attn_v",  "blk.0.attn_output",
                                     "blk.0.ffn_gate", "blk.0.ffn_up", "blk.0.ffn_down" };
-    const bool   merged_qkv     = tc == fairy2i_loader_case::valid_bundle_w1_qkv;
+    const bool   merged_qkv     = tc == fairy2i_loader_case::valid_bundle_w1_qkv ||
+                                  tc == fairy2i_loader_case::valid_bundle_w1_qat_qkv_bias ||
+                                  tc == fairy2i_loader_case::invalid_qat_qkv_bias_f16;
     if (merged_qkv) {
+        const int64_t qkv_physical_tiles = (shape.n_embd / 64) * ((shape.n_embd + 2 * n_embd_kv) / 64);
         add_tiny_fairy2i_bundle(writer, "blk.0.attn_qkv", 2, 2, false, false, GGML_TYPE_FAIRY2I_BUNDLE_CODES,
-                                exact ? GGML_TYPE_BF16 : GGML_TYPE_F16, 3, 3);
+                                exact || qat ? GGML_TYPE_BF16 : GGML_TYPE_F16, qkv_physical_tiles, qkv_physical_tiles);
+        if (qat) {
+            writer.add_tensor("blk.0.attn_qkv.bias",
+                              tc == fairy2i_loader_case::invalid_qat_qkv_bias_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
+                              2 * (shape.n_embd + 2 * n_embd_kv), 1);
+        }
     }
     for (size_t i = 0; i < sizeof(linear_names) / sizeof(linear_names[0]); ++i) {
         if (merged_qkv && i < 3) {
             continue;
         }
         if (bundle) {
-            int       codes_branches        = w1 ? 2 : 4;
-            int       scales_branches       = codes_branches;
-            ggml_type codes_type            = GGML_TYPE_FAIRY2I_BUNDLE_CODES;
-            const bool use_exact_scales      = (exact && tc != fairy2i_loader_case::invalid_exact_legacy_contract) ||
-                                               tc == fairy2i_loader_case::invalid_legacy_exact_contract;
-            ggml_type  scales_type           = use_exact_scales ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+            int        codes_branches  = w1 ? 2 : 4;
+            int        scales_branches = codes_branches;
+            ggml_type  codes_type      = GGML_TYPE_FAIRY2I_BUNDLE_CODES;
+            const bool use_bf16_scales = (exact && tc != fairy2i_loader_case::invalid_exact_legacy_contract) || qat ||
+                                         tc == fairy2i_loader_case::invalid_legacy_exact_contract;
+            ggml_type  scales_type     = use_bf16_scales ? GGML_TYPE_BF16 : GGML_TYPE_F16;
             if (tc == fairy2i_loader_case::invalid_exact_obsolete_f32_contract) {
                 scales_type = GGML_TYPE_F32;
             }
@@ -756,6 +863,8 @@ static std::string write_tiny_fairy2i_model(fairy2i_loader_case tc) {
                 } else if (tc == fairy2i_loader_case::invalid_bundle_scales_bf16) {
                     scales_type = GGML_TYPE_BF16;
                 } else if (tc == fairy2i_loader_case::invalid_exact_scales_f16) {
+                    scales_type = GGML_TYPE_F16;
+                } else if (tc == fairy2i_loader_case::invalid_qat_scales_f16) {
                     scales_type = GGML_TYPE_F16;
                 } else if (tc == fairy2i_loader_case::invalid_bundle_scales_shape) {
                     scales_physical_tiles = 2;
@@ -814,14 +923,22 @@ static bool load_model_expect(const char * label, fairy2i_loader_case tc, bool e
         return false;
     }
     if (ok && expect_success && is_exact_case(tc) &&
-        (!model->fairy2i_uses_exact_numeric_profile() || model->fairy2i_schema_version != 3)) {
+        (!model->fairy2i_uses_qwen2_exact_numeric_profile() || model->fairy2i_schema_version != 3)) {
         fprintf(stderr, "%s: expected schema v3 script_f32reduce_bf16scale_v1 model state\n", label);
         llama_model_free(model);
         unlink(path.c_str());
         return false;
     }
-    if (ok && expect_success && !is_exact_case(tc) && is_bundle_case(tc) &&
-        (model->fairy2i_uses_exact_numeric_profile() || model->fairy2i_schema_version != 2)) {
+    if (ok && expect_success && is_qat_case(tc) &&
+        (!model->fairy2i_uses_qwen3_qat_numeric_profile() || !model->fairy2i_uses_bf16_runtime_profile() ||
+         model->fairy2i_schema_version != 4)) {
+        fprintf(stderr, "%s: expected schema v4 qat_bf16_learned_scale_v1 model state\n", label);
+        llama_model_free(model);
+        unlink(path.c_str());
+        return false;
+    }
+    if (ok && expect_success && !is_exact_case(tc) && !is_qat_case(tc) && is_bundle_case(tc) &&
+        (model->fairy2i_uses_bf16_runtime_profile() || model->fairy2i_schema_version != 2)) {
         fprintf(stderr, "%s: expected schema v2 legacy_f16_v1 model state\n", label);
         llama_model_free(model);
         unlink(path.c_str());
@@ -840,8 +957,8 @@ static bool load_model_expect(const char * label, fairy2i_loader_case tc, bool e
     return true;
 }
 
-static bool load_exact_model_with_env_expect_failure(const char * label, const char * env_name) {
-    const std::string path = write_tiny_fairy2i_model(fairy2i_loader_case::valid_bundle_w2_exact);
+static bool load_model_with_env_expect_failure(const char * label, fairy2i_loader_case tc, const char * env_name) {
+    const std::string path = write_tiny_fairy2i_model(tc);
 
     const char *      old_env   = getenv(env_name);
     const bool        had_env   = old_env != nullptr;
@@ -936,14 +1053,35 @@ static bool buffer_type_uses_backend(ggml_backend_buffer_type_t buft, const char
     return reg && strcmp(ggml_backend_reg_name(reg), backend_name) == 0;
 }
 
-static bool metal_device_available() {
+static ggml_backend_dev_t find_metal_device() {
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "Metal") == 0) {
-            return true;
+            return dev;
         }
     }
-    return false;
+    return nullptr;
+}
+
+static bool probe_metal_exact_w1_support(ggml_backend_dev_t dev, bool & supported) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/64 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "Fairy2i Qwen3 QAT: failed to initialize exact W1 Metal capability probe\n");
+        return false;
+    }
+
+    ggml_tensor * x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 1);
+    ggml_tensor * codes    = ggml_new_tensor_4d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, 2, 64, 1);
+    ggml_tensor * scales   = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, 2, 2, 1);
+    ggml_tensor * exact_w1 = ggml_fairy2i_wide_linear_w1_bundle(ctx, x, codes, scales, nullptr, 64, 64);
+    supported              = ggml_backend_dev_supports_op(dev, exact_w1);
+    ggml_free(ctx);
+    return true;
 }
 
 struct exact_decode_result {
@@ -1141,7 +1279,7 @@ static bool test_exact_full_graph_cpu() {
 }
 
 static bool test_exact_full_graph_cpu_metal() {
-    if (!metal_device_available()) {
+    if (!find_metal_device()) {
         printf("  Fairy2i exact full graph CPU/Metal logits: SKIP (Metal unavailable)\n");
         return true;
     }
@@ -1237,6 +1375,98 @@ static bool test_exact_full_graph_cpu_metal() {
     return ok;
 }
 
+struct qwen3_qat_graph_capture {
+    bool q_norm                            = false;
+    bool k_norm                            = false;
+    bool k_bf16                            = false;
+    bool v_bf16                            = false;
+    bool dense_output_input_bf16           = false;
+    bool dense_output_result_bf16_boundary = false;
+    bool valid                             = true;
+};
+
+static bool capture_qwen3_qat_graph(ggml_tensor * tensor, bool ask, void * user_data) {
+    qwen3_qat_graph_capture * capture                = (qwen3_qat_graph_capture *) user_data;
+    const bool                is_q_norm              = strcmp(tensor->name, "Qcur_normed-0") == 0;
+    const bool                is_k_norm              = strcmp(tensor->name, "Kcur_normed-0") == 0;
+    const bool                is_k_bf16              = strcmp(tensor->name, "Kcur_bf16_exact-0") == 0;
+    const bool                is_v_bf16              = strcmp(tensor->name, "Vcur_bf16_exact-0") == 0;
+    const bool                is_dense_output_input  = strcmp(tensor->name, "result_output_inp_bf16") == 0;
+    const bool                is_dense_output_result = strcmp(tensor->name, "result_output") == 0;
+    if (ask) {
+        return is_q_norm || is_k_norm || is_k_bf16 || is_v_bf16 || is_dense_output_input || is_dense_output_result;
+    }
+
+    if (is_q_norm || is_k_norm) {
+        const bool norm_valid = tensor->op == GGML_OP_FAIRY2I_RMS_NORM_EXACT && tensor->type == GGML_TYPE_F32 &&
+                                tensor->ne[0] == 128 && tensor->ne[1] == 2;
+        capture->valid        = capture->valid && norm_valid;
+        capture->q_norm       = capture->q_norm || is_q_norm;
+        capture->k_norm       = capture->k_norm || is_k_norm;
+    } else if (is_k_bf16 || is_v_bf16) {
+        capture->valid  = capture->valid && tensor->type == GGML_TYPE_BF16 && tensor->ne[0] == 128;
+        capture->k_bf16 = capture->k_bf16 || is_k_bf16;
+        capture->v_bf16 = capture->v_bf16 || is_v_bf16;
+    } else if (is_dense_output_input || is_dense_output_result) {
+        const bool boundary_valid = is_dense_output_input ?
+                                        tensor->type == GGML_TYPE_BF16 :
+                                        tensor->type == GGML_TYPE_F32 && tensor->op == GGML_OP_FAIRY2I_PACK_BF16_EXACT;
+        capture->valid            = capture->valid && boundary_valid;
+        capture->dense_output_input_bf16 = capture->dense_output_input_bf16 || is_dense_output_input;
+        capture->dense_output_result_bf16_boundary =
+            capture->dense_output_result_bf16_boundary || is_dense_output_result;
+    }
+    return true;
+}
+
+static bool test_qwen3_qat_full_graph_metal() {
+    const std::string path = write_tiny_fairy2i_model(fairy2i_loader_case::valid_bundle_w1_qat);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers       = 2;
+    model_params.use_mmap           = false;
+    model_params.check_tensors      = false;
+
+    llama_model * model = llama_model_load_from_file(path.c_str(), model_params);
+    if (!model) {
+        fprintf(stderr, "Fairy2i Qwen3 QAT graph: failed to load model\n");
+        unlink(path.c_str());
+        return false;
+    }
+
+    qwen3_qat_graph_capture capture;
+    llama_context_params    context_params = llama_context_default_params();
+    context_params.n_ctx                   = 8;
+    context_params.n_batch                 = 8;
+    context_params.n_ubatch                = 8;
+    context_params.flash_attn_type         = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    context_params.type_k                  = GGML_TYPE_COUNT;
+    context_params.type_v                  = GGML_TYPE_COUNT;
+    context_params.cb_eval                 = capture_qwen3_qat_graph;
+    context_params.cb_eval_user_data       = &capture;
+
+    llama_context * context = llama_init_from_model(model, context_params);
+    bool            ok      = context != nullptr;
+    if (ok) {
+        llama_token token = 1;
+        ok                = llama_decode(context, llama_batch_get_one(&token, 1)) == 0;
+    }
+    if (ok && (!capture.valid || !capture.q_norm || !capture.k_norm || !capture.k_bf16 || !capture.v_bf16 ||
+               !capture.dense_output_input_bf16 || !capture.dense_output_result_bf16_boundary)) {
+        fprintf(stderr,
+                "Fairy2i Qwen3 QAT graph: missing exact head-dim RMSNorm, BF16 K/V, or BF16 dense output boundary\n");
+        ok = false;
+    }
+
+    llama_free(context);
+    llama_model_free(model);
+    unlink(path.c_str());
+    if (ok) {
+        printf("  Fairy2i Qwen3 QAT exact head-dim RMSNorm/BF16 KV+dense output boundary: PASS\n");
+    }
+    return ok;
+}
+
 static bool check_bundle_input_placement(const char * label, int n_gpu_layers, bool expect_metal) {
     const std::string path = write_tiny_fairy2i_model(fairy2i_loader_case::valid_bundle_w2);
 
@@ -1278,6 +1508,12 @@ int main() {
     ok = load_model_expect("Fairy2i W1 rejects incomplete tensor set", fairy2i_loader_case::incomplete_w1, false) && ok;
     ok = load_model_expect("Fairy2i bundle W1 complete tensor set", fairy2i_loader_case::valid_bundle_w1, true) && ok;
     ok = load_model_expect("Fairy2i bundle W1 merged QKV tensor set", fairy2i_loader_case::valid_bundle_w1_qkv, true) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT schema v4 accepts optional QKV bias",
+                           fairy2i_loader_case::valid_bundle_w1_qat, true) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT schema v4 accepts merged BF16-runtime QKV bias",
+                           fairy2i_loader_case::valid_bundle_w1_qat_qkv_bias, true) &&
          ok;
     ok = load_model_expect("Fairy2i bundle W2 complete tensor set", fairy2i_loader_case::valid_bundle_w2, true) && ok;
     ok = load_model_expect("Fairy2i bundle W2 explicit legacy numeric profile",
@@ -1425,6 +1661,41 @@ int main() {
     ok = load_model_expect("Fairy2i exact schema rejects dense-only output fallback",
                            fairy2i_loader_case::invalid_exact_dense_only, false) &&
          ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects non-v4 schema", fairy2i_loader_case::invalid_qat_schema, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects non-Qwen3 base architecture",
+                           fairy2i_loader_case::invalid_qat_base_arch, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects non-Qwen3 attention layout",
+                           fairy2i_loader_case::invalid_qat_attn_layout, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects non-W1 quant variant",
+                           fairy2i_loader_case::invalid_qat_quant_variant, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects non-BF16 scale metadata",
+                           fairy2i_loader_case::invalid_qat_scale_dtype, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects wrong numeric profile",
+                           fairy2i_loader_case::invalid_qat_numeric_profile, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects F16 scale tensors", fairy2i_loader_case::invalid_qat_scales_f16,
+                           false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects F16 dense lm_head", fairy2i_loader_case::invalid_qat_output_f16,
+                           false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects missing dense lm_head",
+                           fairy2i_loader_case::invalid_qat_missing_output, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects F16 Q RMSNorm carrier",
+                           fairy2i_loader_case::invalid_qat_q_norm_f16, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects missing Q RMSNorm",
+                           fairy2i_loader_case::invalid_qat_missing_q_norm, false) &&
+         ok;
+    ok = load_model_expect("Fairy2i Qwen3 QAT rejects F16 merged QKV bias carrier",
+                           fairy2i_loader_case::invalid_qat_qkv_bias_f16, false) &&
+         ok;
     const llama_context_params default_context_params = llama_context_default_params();
     if (default_context_params.type_k != GGML_TYPE_COUNT || default_context_params.type_v != GGML_TYPE_COUNT) {
         fprintf(stderr, "Fairy2i KV AUTO default: expected GGML_TYPE_COUNT sentinels\n");
@@ -1432,11 +1703,15 @@ int main() {
     } else {
         printf("  Fairy2i KV AUTO default sentinels: PASS\n");
     }
-    ok = load_exact_model_with_env_expect_failure("Fairy2i exact schema rejects forced dense output",
-                                                  "LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT") &&
+    ok = load_model_with_env_expect_failure("Fairy2i exact schema rejects forced dense output",
+                                            fairy2i_loader_case::valid_bundle_w2_exact,
+                                            "LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT") &&
          ok;
-    ok = load_exact_model_with_env_expect_failure("Fairy2i exact schema rejects NEON dense output",
-                                                  "LLAMA_FAIRY2I_OUTPUT_NEON") &&
+    ok = load_model_with_env_expect_failure("Fairy2i exact schema rejects NEON dense output",
+                                            fairy2i_loader_case::valid_bundle_w2_exact, "LLAMA_FAIRY2I_OUTPUT_NEON") &&
+         ok;
+    ok = load_model_with_env_expect_failure("Fairy2i Qwen3 QAT schema rejects NEON dense output",
+                                            fairy2i_loader_case::valid_bundle_w1_qat, "LLAMA_FAIRY2I_OUTPUT_NEON") &&
          ok;
     ok = init_context_expect("Fairy2i exact context resolves AUTO KV cache to BF16",
                              fairy2i_loader_case::valid_bundle_w2_exact, GGML_TYPE_COUNT, GGML_TYPE_COUNT, true) &&
@@ -1458,6 +1733,13 @@ int main() {
     ok = init_context_expect("Fairy2i exact context rejects quantized K cache",
                              fairy2i_loader_case::valid_bundle_w2_exact, GGML_TYPE_Q8_0, GGML_TYPE_BF16, false) &&
          ok;
+    ok = init_context_expect("Fairy2i Qwen3 QAT context rejects explicit F16 KV cache",
+                             fairy2i_loader_case::valid_bundle_w1_qat, GGML_TYPE_F16, GGML_TYPE_F16, false) &&
+         ok;
+    ok = init_context_expect("Fairy2i Qwen3 QAT context rejects unsupported all-CPU BF16-scale W1 graph",
+                             fairy2i_loader_case::valid_bundle_w1_qat, GGML_TYPE_COUNT, GGML_TYPE_COUNT, false,
+                             LLAMA_FLASH_ATTN_TYPE_AUTO) &&
+         ok;
     const llama_model_tensor_buft_override exact_cpu_tensor_override[] = {
         { "blk\\.0\\.attn_norm", ggml_backend_cpu_buffer_type() },
         { nullptr,               nullptr                        },
@@ -1467,7 +1749,28 @@ int main() {
                              LLAMA_FLASH_ATTN_TYPE_DISABLED, 0, true, exact_cpu_tensor_override) &&
          ok;
     ok = test_exact_full_graph_cpu() && ok;
-    if (metal_device_available()) {
+    if (ggml_backend_dev_t metal_dev = find_metal_device()) {
+        bool       exact_w1_supported = false;
+        const bool capability_probed  = probe_metal_exact_w1_support(metal_dev, exact_w1_supported);
+        ok                            = capability_probed && ok;
+        if (capability_probed && exact_w1_supported) {
+            printf("  Fairy2i Qwen3 QAT exact W1 Metal capability: PASS\n");
+            ok = init_context_expect("Fairy2i Qwen3 QAT full Metal context resolves AUTO KV cache to BF16",
+                                     fairy2i_loader_case::valid_bundle_w1_qat, GGML_TYPE_COUNT, GGML_TYPE_COUNT, true,
+                                     LLAMA_FLASH_ATTN_TYPE_AUTO, 2) &&
+                 ok;
+            ok = init_context_expect("Fairy2i Qwen3 QAT full Metal context accepts explicit BF16 KV cache",
+                                     fairy2i_loader_case::valid_bundle_w1_qat, GGML_TYPE_BF16, GGML_TYPE_BF16, true,
+                                     LLAMA_FLASH_ATTN_TYPE_AUTO, 2) &&
+                 ok;
+            ok = test_qwen3_qat_full_graph_metal() && ok;
+        } else if (capability_probed) {
+            ok = init_context_expect("Fairy2i Qwen3 QAT context rejects Metal without exact W1 capability",
+                                     fairy2i_loader_case::valid_bundle_w1_qat, GGML_TYPE_COUNT, GGML_TYPE_COUNT, false,
+                                     LLAMA_FLASH_ATTN_TYPE_AUTO, 2) &&
+                 ok;
+            printf("  Fairy2i Qwen3 QAT full Metal graph: SKIP (exact W1 BF16-scale op unsupported)\n");
+        }
         ok = init_context_expect("Fairy2i exact full Metal context requires Flash Attention",
                                  fairy2i_loader_case::valid_bundle_w2_exact, GGML_TYPE_COUNT, GGML_TYPE_COUNT, false,
                                  LLAMA_FLASH_ATTN_TYPE_DISABLED, 2) &&
@@ -1492,6 +1795,7 @@ int main() {
         ok = check_bundle_input_placement("Fairy2i full Metal bundle keeps embedding in one split", 2, true) && ok;
         ok = check_bundle_input_placement("Fairy2i partial Metal bundle keeps embedding on CPU", 1, false) && ok;
     } else {
+        printf("  Fairy2i Qwen3 QAT full Metal context/graph: SKIP (Metal unavailable)\n");
         printf("  Fairy2i Metal bundle input placement: SKIP (Metal unavailable)\n");
     }
 

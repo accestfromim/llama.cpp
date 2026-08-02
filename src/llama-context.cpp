@@ -2332,8 +2332,11 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    const bool      fairy2i_exact   = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_exact_numeric_profile();
-    const ggml_type default_kv_type = fairy2i_exact ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    const bool   fairy2i_bf16_runtime = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_bf16_runtime_profile();
+    const bool   fairy2i_qwen3_qat = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_qwen3_qat_numeric_profile();
+    const char * fairy2i_numeric_profile =
+        model->arch == LLM_ARCH_FAIRY2I ? model->fairy2i_numeric_profile_name() : "n/a";
+    const ggml_type default_kv_type = fairy2i_bf16_runtime ? GGML_TYPE_BF16 : GGML_TYPE_F16;
     if (params.type_k == GGML_TYPE_COUNT) {
         params.type_k = default_kv_type;
     }
@@ -2341,76 +2344,88 @@ llama_context * llama_init_from_model(
         params.type_v = default_kv_type;
     }
 
-    if (fairy2i_exact && (params.type_k != GGML_TYPE_BF16 || params.type_v != GGML_TYPE_BF16)) {
+    if (fairy2i_bf16_runtime && (params.type_k != GGML_TYPE_BF16 || params.type_v != GGML_TYPE_BF16)) {
         LLAMA_LOG_ERROR(
-            "%s: FAIRY2I script_f32reduce_bf16scale_v1 requires BF16 K/V cache, got type_k=%s type_v=%s; "
+            "%s: FAIRY2I %s requires BF16 K/V cache, got type_k=%s type_v=%s; "
             "set both cache types to bf16\n",
-            __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+            __func__, fairy2i_numeric_profile, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
     }
 
-    if (fairy2i_exact) {
+    if (fairy2i_bf16_runtime) {
         if (model->has_tensor_overrides()) {
             LLAMA_LOG_ERROR(
-                "%s: FAIRY2I script_f32reduce_bf16scale_v1 forbids tensor buffer overrides; "
+                "%s: FAIRY2I %s forbids tensor buffer overrides; "
                 "an override can create an unvalidated CPU/Metal route even when nominal layer placement is "
                 "all-CPU or all-Metal\n",
-                __func__);
+                __func__, fairy2i_numeric_profile);
             return nullptr;
         }
 
-        bool all_exact_devices_metal = true;
-        bool all_exact_devices_cpu   = true;
-        auto classify_exact_device   = [&](ggml_backend_dev_t dev) {
+        bool all_bf16_devices_metal = true;
+        bool all_bf16_devices_cpu   = true;
+        auto classify_bf16_device   = [&](ggml_backend_dev_t dev) {
             ggml_backend_reg_t reg      = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             const bool         is_metal = reg && strcmp(ggml_backend_reg_name(reg), "Metal") == 0;
             const bool         is_cpu   = dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-            all_exact_devices_metal     = all_exact_devices_metal && is_metal;
-            all_exact_devices_cpu       = all_exact_devices_cpu && is_cpu;
+            all_bf16_devices_metal      = all_bf16_devices_metal && is_metal;
+            all_bf16_devices_cpu        = all_bf16_devices_cpu && is_cpu;
         };
 
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
-            classify_exact_device(model->dev_layer(il));
+            classify_bf16_device(model->dev_layer(il));
         }
-        classify_exact_device(model->dev_output());
+        classify_bf16_device(model->dev_output());
 
-        if (all_exact_devices_metal) {
+        if (all_bf16_devices_metal) {
             if (!params.offload_kqv) {
                 LLAMA_LOG_ERROR(
-                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 full Metal placement requires offload_kqv=true; "
+                    "%s: FAIRY2I %s full Metal placement requires offload_kqv=true; "
                     "forcing K/Q/V nodes to CPU would create an unsupported mixed route\n",
-                    __func__);
+                    __func__, fairy2i_numeric_profile);
                 return nullptr;
             }
             if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
                 LLAMA_LOG_ERROR(
-                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 with Metal offload requires the dedicated BF16 "
-                    "Flash Attention path; --flash-attn off is only valid with the all-CPU reference path\n",
-                    __func__);
+                    "%s: FAIRY2I %s with Metal offload requires the dedicated BF16 "
+                    "Flash Attention path; enable Flash Attention\n",
+                    __func__, fairy2i_numeric_profile);
                 return nullptr;
             }
-        } else if (all_exact_devices_cpu) {
+        } else if (all_bf16_devices_cpu) {
+            if (fairy2i_qwen3_qat) {
+                LLAMA_LOG_ERROR(
+                    "%s: FAIRY2I %s requires full Metal offload with Flash Attention; "
+                    "the CPU backend does not implement the schema v4 BF16-scale W1 graph\n",
+                    __func__, fairy2i_numeric_profile);
+                return nullptr;
+            }
             if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED) {
                 LLAMA_LOG_ERROR(
-                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 Flash Attention requires every repeating and output "
-                    "layer "
-                    "on Metal; use --flash-attn off for the explicit all-CPU reference path\n",
-                    __func__);
+                    "%s: FAIRY2I %s Flash Attention requires every repeating and output layer on Metal; "
+                    "use --flash-attn off for the explicit all-CPU reference path\n",
+                    __func__, fairy2i_numeric_profile);
                 return nullptr;
             }
             if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
                 LLAMA_LOG_INFO(
-                    "%s: FAIRY2I script_f32reduce_bf16scale_v1 is fully CPU-resident; "
+                    "%s: FAIRY2I %s is fully CPU-resident; "
                     "disabling automatic Flash Attention and using the explicit reference graph\n",
-                    __func__);
+                    __func__, fairy2i_numeric_profile);
                 params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
             }
         } else {
-            LLAMA_LOG_ERROR(
-                "%s: FAIRY2I script_f32reduce_bf16scale_v1 forbids mixed CPU/Metal placement; choose full Metal "
-                "offload "
-                "with Flash Attention or --gpu-layers 0 with --flash-attn off\n",
-                __func__);
+            if (fairy2i_qwen3_qat) {
+                LLAMA_LOG_ERROR(
+                    "%s: FAIRY2I %s forbids mixed CPU/Metal placement and requires full Metal offload with "
+                    "Flash Attention\n",
+                    __func__, fairy2i_numeric_profile);
+            } else {
+                LLAMA_LOG_ERROR(
+                    "%s: FAIRY2I %s forbids mixed CPU/Metal placement; choose full Metal offload with "
+                    "Flash Attention or --gpu-layers 0 with --flash-attn off\n",
+                    __func__, fairy2i_numeric_profile);
+            }
             return nullptr;
         }
     }

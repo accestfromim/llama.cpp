@@ -1702,6 +1702,10 @@ extern "C" {
                                                    struct ggml_tensor *  a,
                                                    struct ggml_tensor *  b);
 
+    GGML_API void ggml_complex_add_set_qat(struct ggml_tensor * a, bool qat);
+
+    GGML_API bool ggml_complex_add_get_qat(const struct ggml_tensor * a);
+
     GGML_API struct ggml_tensor * ggml_complex_mul(struct ggml_context * ctx,
                                                    struct ggml_tensor *  a,
                                                    struct ggml_tensor *  b);
@@ -1736,6 +1740,10 @@ extern "C" {
                                                                      int64_t               logical_m,
                                                                      int64_t               logical_k);
 
+    GGML_API void ggml_fairy2i_wide_linear_set_qat(struct ggml_tensor * a, bool qat);
+
+    GGML_API bool ggml_fairy2i_wide_linear_get_qat(const struct ggml_tensor * a);
+
     GGML_API struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps);
 
     GGML_API struct ggml_tensor * ggml_fairy2i_rms_norm_exact(struct ggml_context * ctx,
@@ -1749,7 +1757,16 @@ extern "C" {
                                                          struct ggml_tensor *  a,
                                                          struct ggml_tensor *  b);
 
+    // Selects the QAT execution variant for Fairy2i BF16 boundary ops. The QAT
+    // variant preserves BF16 inputs/outputs and F32 arithmetic without the
+    // exceptional-value software replay required by the schema-3 exact profile.
+    GGML_API void ggml_fairy2i_exact_set_qat(struct ggml_tensor * a, bool qat);
+
+    GGML_API bool ggml_fairy2i_exact_get_qat(const struct ggml_tensor * a);
+
     GGML_API struct ggml_tensor * ggml_fairy2i_pack_bf16_exact(struct ggml_context * ctx, struct ggml_tensor * a);
+
+    GGML_API struct ggml_tensor * ggml_fairy2i_round_bf16_exact(struct ggml_context * ctx, struct ggml_tensor * a);
 
     GGML_API struct ggml_tensor * ggml_fairy2i_attn_exact_cpu(struct ggml_context * ctx,
                                                               struct ggml_tensor *  q,
@@ -2333,6 +2350,10 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_fairy2i_exact(struct ggml_tensor * a, bool exact);
 
     GGML_API bool ggml_flash_attn_ext_get_fairy2i_exact(const struct ggml_tensor * a);
+
+    GGML_API void ggml_flash_attn_ext_set_fairy2i_flash3(struct ggml_tensor * a, bool flash3);
+
+    GGML_API bool ggml_flash_attn_ext_get_fairy2i_flash3(const struct ggml_tensor * a);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

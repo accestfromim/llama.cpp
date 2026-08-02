@@ -1300,7 +1300,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
                                                 ggml_tensor * v_mla,
                                                 float         kq_scale,
                                                 int           il,
-                                                bool          fairy2i_exact) const {
+                                                bool          fairy2i_exact,
+                                                bool          fairy2i_flash3) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1338,13 +1339,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
         return cur;
     }
 
-    if (fairy2i_exact && cparams.flash_attn && n_kv % 32 != 0) {
+    if (fairy2i_exact && cparams.flash_attn && !fairy2i_flash3 && n_kv % 32 != 0) {
         throw std::runtime_error(
             "FAIRY2I script_f32reduce_bf16scale_v1 Metal Flash Attention requires the KV length padded to 32");
     }
 
     // TODO: replace hardcoded padding with ggml-provided padding
-    if (cparams.flash_attn && ((fairy2i_exact && n_kv % 32 == 0) || (!fairy2i_exact && n_kv % 256 == 0)) &&
+    if (cparams.flash_attn &&
+        ((fairy2i_exact && !fairy2i_flash3 && n_kv % 32 == 0) ||
+         ((!fairy2i_exact || fairy2i_flash3) && n_kv % 256 == 0)) &&
         kq_b == nullptr) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -1369,11 +1372,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
                 "soft-capping, "
                 "or MLA");
         }
-        if (fairy2i_exact && (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_BF16 || v->type != GGML_TYPE_BF16 ||
-                              kq_mask == nullptr || kq_mask->type != GGML_TYPE_F32)) {
+        if (fairy2i_exact &&
+            (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_BF16 || v->type != GGML_TYPE_BF16 || kq_mask == nullptr ||
+             kq_mask->type != (fairy2i_flash3 ? GGML_TYPE_F16 : GGML_TYPE_F32))) {
             throw std::runtime_error(
-                "FAIRY2I script_f32reduce_bf16scale_v1 Flash Attention requires F32 BF16-valued Q, BF16 K/V, and an "
-                "F32 mask");
+                "FAIRY2I BF16 Flash Attention requires F32 BF16-valued Q, BF16 K/V, and the profile-specific mask "
+                "type");
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
@@ -1382,7 +1386,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
-        ggml_flash_attn_ext_set_fairy2i_exact(cur, fairy2i_exact);
+        if (fairy2i_flash3) {
+            ggml_flash_attn_ext_set_fairy2i_flash3(cur, true);
+        } else {
+            ggml_flash_attn_ext_set_fairy2i_exact(cur, fairy2i_exact);
+        }
 
         if (v_mla) {
 #if 0
@@ -1402,6 +1410,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
         }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        if (fairy2i_flash3) {
+            // The Fairy2i FlashAttention-3 Metal kernels write BF16-rounded values
+            // into the F32 carrier directly, avoiding two standalone cast kernels.
+            cb(cur, "fattn_bf16_output", il);
+        }
     } else {
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
@@ -1680,7 +1693,8 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
                                             ggml_tensor *             v_mla,
                                             float                     kq_scale,
                                             int                       il,
-                                            bool                      fairy2i_exact) const {
+                                            bool                      fairy2i_exact,
+                                            bool                      fairy2i_flash3) const {
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -1698,13 +1712,14 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask(fairy2i_exact);
+    const auto & kq_mask = inp->get_kq_mask(fairy2i_exact && !fairy2i_flash3);
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, fairy2i_exact);
+    ggml_tensor * cur =
+        build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, fairy2i_exact, fairy2i_flash3);
     cb(cur, "kqv_out", il);
 
     if (wo) {

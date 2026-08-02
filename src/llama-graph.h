@@ -712,7 +712,8 @@ struct llm_graph_context {
                                  ggml_tensor * v_mla,  // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                                  float         kq_scale,
                                  int           il,
-                                 bool          fairy2i_exact = false) const;
+                                 bool          fairy2i_exact  = false,
+                                 bool          fairy2i_flash3 = false) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -764,7 +765,8 @@ struct llm_graph_context {
                              ggml_tensor *             v_mla,  // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                              float                     kq_scale,
                              int                       il,
-                             bool                      fairy2i_exact = false) const;
+                             bool                      fairy2i_exact  = false,
+                             bool                      fairy2i_flash3 = false) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 

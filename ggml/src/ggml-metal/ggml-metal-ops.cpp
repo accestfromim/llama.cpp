@@ -8,6 +8,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,11 @@ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t) buffer->context;
 
     return ggml_metal_buffer_get_id(ctx, t);
+}
+
+static ggml_metal_buffer_t ggml_metal_get_buffer(const ggml_tensor * t) {
+    ggml_backend_buffer_t buffer = t->view_src ? t->view_src->buffer : t->buffer;
+    return (ggml_metal_buffer_t) buffer->context;
 }
 
 static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_w2_decode_fc(ggml_metal_library_t lib,
@@ -82,6 +88,34 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_bundle_w1_decode_fc
                                                                                  int32_t              x_nb0,
                                                                                  int32_t              dst_nb0) {
     const char * base = "kernel_fairy2i_bundle_w1_bf16_tile8x1_w8_full_nobias_fc_simd";
+    char         name[256];
+
+    snprintf(name, sizeof(name), "%s_blocks=%d_xnb0=%d_dstnb0=%d", base, blocks, x_nb0, dst_nb0);
+
+    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
+    if (pipeline) {
+        return pipeline;
+    }
+
+    ggml_metal_cv_t cv = ggml_metal_cv_init();
+    ggml_metal_cv_set_int32(cv, blocks, FC_FAIRY2I_BUNDLE_W1_DECODE + 0);
+    ggml_metal_cv_set_int32(cv, x_nb0, FC_FAIRY2I_BUNDLE_W1_DECODE + 1);
+    ggml_metal_cv_set_int32(cv, dst_nb0, FC_FAIRY2I_BUNDLE_W1_DECODE + 2);
+
+    pipeline = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+    ggml_metal_cv_free(cv);
+
+    return pipeline;
+}
+
+static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_bundle_w1_exact_decode_fc(ggml_metal_library_t lib,
+                                                                                       int32_t              blocks,
+                                                                                       int32_t              x_nb0,
+                                                                                       int32_t              dst_nb0,
+                                                                                       bool                 qat) {
+    const char * base = qat ? "kernel_fairy2i_bundle_w1_bf16_bf16scale_qat_tile8x1_w8_nobias_fc_simd" :
+                              "kernel_fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8_nobias_fc_simd";
     char         name[256];
 
     snprintf(name, sizeof(name), "%s_blocks=%d_xnb0=%d_dstnb0=%d", base, blocks, x_nb0, dst_nb0);
@@ -177,8 +211,8 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_f
     return pipeline;
 }
 
-static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ggml_metal_library_t lib) {
-    constexpr const char * name = "kernel_fairy2i_rms_norm_exact_f32";
+static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ggml_metal_library_t lib, bool qat) {
+    const char * name = qat ? "kernel_fairy2i_rms_norm_qat_f32" : "kernel_fairy2i_rms_norm_exact_f32";
 
     ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
     if (!pipeline) {
@@ -190,17 +224,18 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ggml
 }
 
 static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_elementwise_exact(ggml_metal_library_t lib,
-                                                                               enum ggml_op         op) {
+                                                                               enum ggml_op         op,
+                                                                               bool                 qat) {
     const char * name = nullptr;
     switch (op) {
         case GGML_OP_FAIRY2I_SILU_EXACT:
-            name = "kernel_fairy2i_silu_exact_f32";
+            name = qat ? "kernel_fairy2i_silu_qat_f32" : "kernel_fairy2i_silu_exact_f32";
             break;
         case GGML_OP_FAIRY2I_MUL_EXACT:
-            name = "kernel_fairy2i_mul_exact_f32";
+            name = qat ? "kernel_fairy2i_mul_qat_f32" : "kernel_fairy2i_mul_exact_f32";
             break;
         case GGML_OP_FAIRY2I_PACK_BF16_EXACT:
-            name = "kernel_fairy2i_pack_bf16_exact";
+            name = qat ? "kernel_fairy2i_round_bf16_f32" : "kernel_fairy2i_pack_bf16_exact";
             break;
         default:
             GGML_ABORT("invalid Fairy2i exact elementwise op");
@@ -222,8 +257,8 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_set_rows_bf16_raw(ggml_meta
     return pipeline;
 }
 
-static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_rope_exact(ggml_metal_library_t lib) {
-    constexpr const char * name = "kernel_fairy2i_rope_neox_exact_f32";
+static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_rope_exact(ggml_metal_library_t lib, bool qat) {
+    const char * name = qat ? "kernel_fairy2i_rope_neox_qat_f32" : "kernel_fairy2i_rope_neox_exact_f32";
 
     ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
     if (!pipeline) {
@@ -725,7 +760,7 @@ int ggml_metal_op_complex(ggml_metal_op_t ctx, int idx) {
             /*.o1   =*/{ 0 },
         };
 
-        const char *          pipeline_name = "kernel_complex_add";
+        const char * pipeline_name = ggml_complex_add_get_qat(op) ? "kernel_complex_add_qat" : "kernel_complex_add";
         ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
@@ -1936,9 +1971,21 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         GGML_ASSERT(op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2 && u_s0 && w_s0);
         GGML_ASSERT((u_s1 == nullptr) == (w_s1 == nullptr));
     }
-    const bool is_w1                        = is_bundle ? op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 : u_s1 == nullptr;
-    const bool is_exact_bundle_w2           = is_bundle && !is_w1 && scales->type == GGML_TYPE_BF16;
-    int32_t    strict_staged_reconstruction = is_exact_bundle_w2 ? 1 : 0;
+    const bool                 is_w1 = is_bundle ? op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 : u_s1 == nullptr;
+    const bool                 is_exact_bundle_w1 = is_bundle && is_w1 && scales->type == GGML_TYPE_BF16;
+    const bool                 is_exact_bundle_w2 = is_bundle && !is_w1 && scales->type == GGML_TYPE_BF16;
+    const bool                 is_exact_bundle    = is_exact_bundle_w1 || is_exact_bundle_w2;
+    const bool                 is_qat_bundle      = is_exact_bundle && ggml_fairy2i_wide_linear_get_qat(op);
+    const ggml_metal_buffer_id exact_w1_coeff_lut =
+        is_exact_bundle_w1 ? ggml_metal_buffer_get_fairy2i_w1_coeff_lut(ggml_metal_get_buffer(scales), scales) :
+                             ggml_metal_buffer_id{ nullptr, 0 };
+    if (is_exact_bundle) {
+        const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+        GGML_ASSERT(props_dev->has_bfloat);
+        GGML_ASSERT(props_dev->has_simdgroup_mm);
+        GGML_ASSERT(props_dev->has_simdgroup_reduction);
+    }
+    int32_t strict_staged_reconstruction = is_exact_bundle_w2 ? 1 : 0;
     if (is_exact_bundle_w2) {
         const char * strict_env           = getenv("GGML_FAIRY2I_STRICT_STAGED_RECONSTRUCTION");
         strict_staged_reconstruction      = !strict_env || strcmp(strict_env, "0") != 0;
@@ -1954,7 +2001,22 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     const int32_t                           m                        = (int32_t) op->ne[0];
     const int32_t                           act_rows                 = (int32_t) ggml_nrows(x);
     const bool                              use_bundle_w1_direct_act = is_bundle && is_w1 && act_rows % 16 == 0;
-    ggml_metal_kargs_fairy2i_wide_linear_w2 args                     = {
+    if (is_exact_bundle_w1) {
+        static std::atomic_bool logged_decode         = false;
+        static std::atomic_bool logged_prefill_direct = false;
+        static std::atomic_bool logged_prefill_staged = false;
+        std::atomic_bool *      logged                = act_rows == 1            ? &logged_decode :
+                                                        use_bundle_w1_direct_act ? &logged_prefill_direct :
+                                                                                   &logged_prefill_staged;
+        if (!logged->exchange(true, std::memory_order_relaxed)) {
+            GGML_LOG_INFO("FAIRY2I Metal bundle W1 %s path: %s (BF16 activation/scale, BF16 MMA, F32 accumulate)\n",
+                          is_qat_bundle ? "QAT" : "exact",
+                          act_rows == 1            ? "decode" :
+                          use_bundle_w1_direct_act ? "prefill_direct" :
+                                                     "prefill_staged");
+        }
+    }
+    ggml_metal_kargs_fairy2i_wide_linear_w2 args = {
         /*.k         =*/k,
         /*.m         =*/m,
         /*.act_rows  =*/act_rows,
@@ -1985,9 +2047,16 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_buffer_id act_q = ggml_metal_get_buffer_id(op);
     act_q.offs += ggml_nbytes(op) + op_act_q_pad;
+    ggml_metal_buffer_id act_metrics = act_q;
+    if (act_rows != 1) {
+        act_metrics.offs += (size_t) act_rows * (size_t) (k / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2)) * 2u *
+                            (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64) * sizeof(ggml_bf16_t);
+    }
 
     if (act_rows != 1) {
-        const char * pipeline_name     = is_exact_bundle_w2       ? "kernel_fairy2i_act_bfloat_64_stage_bf16_exact" :
+        const char * pipeline_name     = is_exact_bundle_w1 && use_bundle_w1_direct_act ?
+                                             "kernel_fairy2i_act_bfloat_64_stage_bf16_kmajor_exact" :
+                                         is_exact_bundle          ? "kernel_fairy2i_act_bfloat_64_stage_bf16_exact" :
                                          use_bundle_w1_direct_act ? "kernel_fairy2i_act_half_64_stage_bf16_kmajor" :
                                                                     "kernel_fairy2i_act_half_64_stage_bf16";
         ggml_metal_pipeline_t pipeline = nullptr;
@@ -2007,7 +2076,27 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 1);
         ggml_metal_encoder_set_buffer(enc, act_q, 2);
+        if (is_exact_bundle) {
+            ggml_metal_encoder_set_buffer(enc, act_metrics, 3);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, 2 * sizeof(uint32_t), 0);
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, k / nth, act_rows, 1, nth, 1, 1);
+    } else if (is_exact_bundle_w1 && !is_qat_bundle) {
+        const char *          pipeline_name = "kernel_fairy2i_act_bfloat_64_metric_bf16_exact";
+        ggml_metal_pipeline_t pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
+        if (!pipeline) {
+            pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+        }
+
+        const int nth = ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
+        GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 1);
+        ggml_metal_encoder_set_buffer(enc, act_q, 2);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 2 * sizeof(uint32_t), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, k / nth, 1, 1, nth, 1, 1);
     }
 
     if (act_rows != 1 && ctx->use_concurrency) {
@@ -2015,13 +2104,16 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     }
 
     if (act_rows != 1) {
-        const char * pipeline_name = is_exact_bundle_w2 ? "kernel_fairy2i_bundle_w2_bfloat_bf16scale_exact_mma32x16" :
-                                     use_bundle_w1_direct_act ?
-                                                          "kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act" :
-                                     is_bundle ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
-                                                          "kernel_fairy2i_bundle_w2_half_mma32x16") :
-                                     is_w1     ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
-                                                 "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
+        const char * pipeline_name =
+            is_exact_bundle_w1 && use_bundle_w1_direct_act ?
+                "kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_act" :
+            is_exact_bundle_w1       ? "kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32" :
+            is_exact_bundle_w2       ? "kernel_fairy2i_bundle_w2_bfloat_bf16scale_exact_mma32x16" :
+            use_bundle_w1_direct_act ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16_direct_act" :
+            is_bundle                ? (is_w1 ? "kernel_fairy2i_bundle_w1_half_mma32x16_k16" :
+                                                "kernel_fairy2i_bundle_w2_half_mma32x16") :
+            is_w1                    ? "kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16" :
+                                       "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
         ggml_metal_pipeline_t pipeline      = nullptr;
         if (use_bundle_w1_direct_act) {
             pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, act_rows);
@@ -2033,7 +2125,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         }
 
         const int row_tile = 32;
-        const int k_tile   = is_w1 ? 16 : 8;
+        const int k_tile   = is_exact_bundle_w1 ? 32 : is_w1 ? 16 : 8;
         const int nth      = row_tile * 4;
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -2045,6 +2137,10 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, act_q, 3);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+            if (is_exact_bundle_w1) {
+                ggml_metal_encoder_set_buffer(enc, act_metrics, 6);
+                ggml_metal_encoder_set_buffer(enc, exact_w1_coeff_lut, 7);
+            }
         } else if (is_w1) {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(u_s0), 1);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(w_s0), 2);
@@ -2060,7 +2156,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 6);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 7);
         }
-        const size_t mma_element_size = is_exact_bundle_w2 ? sizeof(ggml_bf16_t) : sizeof(ggml_fp16_t);
+        const size_t mma_element_size = is_exact_bundle ? sizeof(ggml_bf16_t) : sizeof(ggml_fp16_t);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * mma_element_size, 0);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * mma_element_size, 1);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * mma_element_size, 2);
@@ -2082,7 +2178,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
 
     if (is_w1) {
         const int  rows_per_tile = 8;
-        const int  block_slots   = is_bundle && !bias ? 8 : 16;
+        const int  block_slots   = is_exact_bundle_w1 || (is_bundle && !bias) ? 8 : 16;
         const int  nth           = block_slots * 16;
         const bool full_rows     = (m % rows_per_tile) == 0;
         const int  blocks        = k / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
@@ -2091,7 +2187,18 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
                                    (k % ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2)) == 0;
 
         ggml_metal_pipeline_t pipeline = nullptr;
-        if (is_bundle && use_fc_decode) {
+        if (is_exact_bundle_w1 && use_fc_decode) {
+            pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_exact_decode_fc(lib, blocks, (int32_t) x->nb[0],
+                                                                                 (int32_t) op->nb[0], is_qat_bundle);
+        } else if (is_exact_bundle_w1) {
+            const char * pipeline_name = is_qat_bundle ?
+                                             "kernel_fairy2i_bundle_w1_bf16_bf16scale_qat_tile8x1_w8_simd" :
+                                             "kernel_fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8_simd";
+            pipeline                   = ggml_metal_library_get_pipeline(lib, pipeline_name);
+            if (!pipeline) {
+                pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
+            }
+        } else if (is_bundle && use_fc_decode) {
             pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_decode_fc(lib, blocks, (int32_t) x->nb[0],
                                                                            (int32_t) op->nb[0]);
         } else if (is_bundle) {
@@ -2127,8 +2234,16 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(bias), 4);
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
         }
+        if (is_exact_bundle_w1) {
+            ggml_metal_encoder_set_buffer(enc, act_q, use_fc_decode ? 5 : 6);
+            ggml_metal_encoder_set_buffer(enc, exact_w1_coeff_lut, use_fc_decode ? 6 : 7);
+        }
         ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 0);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, rows_per_tile * (nth / 32) * sizeof(float), 1);
+        if (is_exact_bundle_w1) {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, block_slots * 16 * 4 * sizeof(uint16_t), 2);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, block_slots * 16 * sizeof(uint8_t), 3);
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, (m + rows_per_tile - 1) / rows_per_tile, 1, 1, nth, 1, 1);
         return 1;
     }
@@ -2237,7 +2352,16 @@ size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const ggml_tensor * op) 
 
     const int64_t act_rows = ggml_nrows(x);
     if (act_rows == 1) {
-        return 0;
+        const ggml_tensor * scales = op->src[2];
+        const bool          exact_bundle_w1 =
+            op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 && scales && scales->type == GGML_TYPE_BF16;
+        if (!exact_bundle_w1) {
+            return 0;
+        }
+
+        const int64_t blocks = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
+        const size_t  pad    = GGML_PAD(ggml_nbytes(op), 32) - ggml_nbytes(op);
+        return pad + (size_t) blocks * sizeof(uint32_t);
     }
 
     const int64_t blocks = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
@@ -2246,8 +2370,11 @@ size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const ggml_tensor * op) 
     const size_t q8_size =
         (size_t) act_rows * (size_t) blocks * 2u * (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64);
     const size_t half_stage_size = q8_size * sizeof(ggml_fp16_t);
+    const ggml_tensor * scales          = op->src[2];
+    const bool          exact_bundle    = scales && scales->type == GGML_TYPE_BF16;
+    const size_t        metric_size     = exact_bundle ? (size_t) act_rows * (size_t) blocks * sizeof(uint32_t) : 0;
 
-    return pad + half_stage_size;
+    return pad + half_stage_size + metric_size;
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
@@ -2511,7 +2638,7 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    if (ggml_flash_attn_ext_get_fairy2i_exact(op)) {
+    if (ggml_flash_attn_ext_get_fairy2i_exact(op) && !ggml_flash_attn_ext_get_fairy2i_flash3(op)) {
         return false;
     }
 
@@ -2531,14 +2658,16 @@ static bool ggml_metal_op_flash_attn_ext_use_fairy2i_decode_vec(const ggml_tenso
     const ggml_tensor * k = op->src[1];
     const ggml_tensor * v = op->src[2];
 
-    return q->ne[0] == 128 && q->ne[1] == 1 && q->ne[2] == 40 && k->ne[0] == 128 && k->ne[1] >= 512 && k->ne[2] == 8 &&
-           v->ne[0] == 128 && q->ne[2] / k->ne[2] == 5;
+    const int64_t gqa_ratio = q->ne[2] / k->ne[2];
+
+    return q->ne[0] == 128 && q->ne[1] == 1 && k->ne[0] == 128 && k->ne[1] >= 512 && v->ne[0] == 128 &&
+           k->ne[2] == v->ne[2] && q->ne[2] > k->ne[2] && q->ne[2] % k->ne[2] == 0 && gqa_ratio <= 8;
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    if (ggml_flash_attn_ext_get_fairy2i_exact(op)) {
+    if (ggml_flash_attn_ext_get_fairy2i_exact(op) && !ggml_flash_attn_ext_get_fairy2i_flash3(op)) {
         if (!ggml_metal_op_flash_attn_ext_use_fairy2i_decode_vec(op)) {
             return 0;
         }
@@ -2586,7 +2715,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(int32_t, ne, op, ne);
     GGML_TENSOR_LOCALS(int32_t, nb, op, nb);
 
-    const bool fairy2i_exact = ggml_flash_attn_ext_get_fairy2i_exact(op);
+    const bool fairy2i_exact  = ggml_flash_attn_ext_get_fairy2i_exact(op);
+    const bool fairy2i_flash3 = ggml_flash_attn_ext_get_fairy2i_flash3(op);
 
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne11 % 32 == 0);
@@ -2598,7 +2728,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ne11 == ne21);
     GGML_ASSERT(ne12 == ne22);
 
-    GGML_ASSERT(!op->src[3] || op->src[3]->type == (fairy2i_exact ? GGML_TYPE_F32 : GGML_TYPE_F16));
+    GGML_ASSERT(!op->src[3] || op->src[3]->type == (fairy2i_exact && !fairy2i_flash3 ? GGML_TYPE_F32 : GGML_TYPE_F16));
     GGML_ASSERT(!op->src[3] ||
                 op->src[3]->ne[1] >= GGML_PAD(op->src[0]->ne[1], 8) &&
                     "the Flash-Attention Metal kernel requires the mask to be padded to 8 and at least n_queries big");
@@ -2628,7 +2758,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     GGML_ASSERT(ne01 < 65536);
 
-    if (fairy2i_exact) {
+    if (fairy2i_exact && !fairy2i_flash3) {
         constexpr int32_t nqptg = 8;
         constexpr int32_t ncpsg = 8;
         constexpr int32_t nwg   = 32;
@@ -2792,6 +2922,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                                                  use_decode_gqa ? ne12 : ne02, ne03, 32, 1, 1);
 
         return 1;
+    }
+
+    if (fairy2i_flash3) {
+        static bool logged_fairy2i_flash3 = false;
+        if (!logged_fairy2i_flash3) {
+            GGML_LOG_INFO("FAIRY2I FlashAttention-3 path: BF16 Q/K/V with the standard online-softmax schedule\n");
+            logged_fairy2i_flash3 = true;
+        }
     }
 
     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
@@ -3039,7 +3177,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                     nrows,
                 };
 
-                ggml_metal_pipeline_t pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+                ggml_metal_pipeline_t pipeline0 =
+                    ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg, fairy2i_flash3);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
@@ -3406,7 +3545,8 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
         /*.eps  =*/eps,
     };
 
-    ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ctx->lib);
+    const bool            qat      = ggml_fairy2i_exact_get_qat(op);
+    ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ctx->lib, qat);
 
     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
     ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
@@ -3434,14 +3574,16 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
         GGML_ASSERT(ggml_is_contiguous(op->src[1]));
         GGML_ASSERT(op->type == GGML_TYPE_F32);
     } else if (op->op == GGML_OP_FAIRY2I_PACK_BF16_EXACT) {
-        GGML_ASSERT(op->type == GGML_TYPE_BF16);
+        GGML_ASSERT(op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F32);
     } else {
         GGML_ASSERT(op->type == GGML_TYPE_F32);
     }
 
     uint64_t ne = (uint64_t) ggml_nelements(op);
 
-    ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_elementwise_exact(ctx->lib, op->op);
+    const bool qat =
+        op->op == GGML_OP_FAIRY2I_PACK_BF16_EXACT ? op->type == GGML_TYPE_F32 : ggml_fairy2i_exact_get_qat(op);
+    ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_elementwise_exact(ctx->lib, op->op, qat);
 
     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
     ggml_metal_encoder_set_bytes(ctx->enc, &ne, sizeof(ne), 0);
@@ -3687,6 +3829,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
     };
 
     const bool exact = op->op == GGML_OP_FAIRY2I_ROPE_EXACT;
+    const bool qat   = exact && ggml_fairy2i_exact_get_qat(op);
     if (exact) {
         const int mode = ((const int32_t *) op->op_params)[2];
         GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32);
@@ -3697,8 +3840,8 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
     }
 
     ggml_metal_pipeline_t pipeline =
-        exact ? ggml_metal_get_pipeline_fairy2i_rope_exact(lib) : ggml_metal_library_get_pipeline_rope(lib, op);
-    const int nth = exact ? (int) std::min<int64_t>(1024, (int64_t) ne00 * ne01) : std::min(1024, ne00);
+        exact ? ggml_metal_get_pipeline_fairy2i_rope_exact(lib, qat) : ggml_metal_library_get_pipeline_rope(lib, op);
+    const int nth = exact && !qat ? (int) std::min<int64_t>(1024, (int64_t) ne00 * ne01) : std::min(1024, ne00);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -3711,12 +3854,12 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
     }
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         4);
 
-    if (exact) {
+    if (exact && !qat) {
         const size_t smem = GGML_PAD((size_t) n_dims * sizeof(float), 16);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
     }
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, exact ? 1 : ne01, ne02, ne03, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, exact && !qat ? 1 : ne01, ne02, ne03, nth, 1, 1);
 
     return 1;
 }

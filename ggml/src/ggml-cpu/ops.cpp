@@ -3788,9 +3788,9 @@ void ggml_compute_forward_fairy2i_pack_bf16_exact(const ggml_compute_params * pa
     const ggml_tensor * src0 = dst->src[0];
 
     GGML_ASSERT(src0);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && (dst->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_F32));
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
-    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(ggml_bf16_t));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
 
     const int64_t nrows = ggml_nrows(src0);
     const int64_t begin = nrows * params->ith / params->nth;
@@ -3803,10 +3803,18 @@ void ggml_compute_forward_fairy2i_pack_bf16_exact(const ggml_compute_params * pa
 
         const float * x =
             (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
-        ggml_bf16_t * y = (ggml_bf16_t *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        char * y = (char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
 
-        for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
-            y[i0] = fairy2i_f32_carrier_to_bf16(x[i0]);
+        if (dst->type == GGML_TYPE_BF16) {
+            GGML_ASSERT(dst->nb[0] == sizeof(ggml_bf16_t));
+            for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+                ((ggml_bf16_t *) y)[i0] = fairy2i_f32_carrier_to_bf16(x[i0]);
+            }
+        } else {
+            GGML_ASSERT(dst->nb[0] == sizeof(float));
+            for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+                ((float *) y)[i0] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x[i0]));
+            }
         }
     }
 }

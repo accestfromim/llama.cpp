@@ -362,6 +362,17 @@ static fairy2i_bundle_data make_fairy2i_exact_empty_bundle(int64_t M, int64_t K)
     return bundle;
 }
 
+static fairy2i_bundle_data make_fairy2i_exact_w1_empty_bundle(int64_t M, int64_t K) {
+    fairy2i_bundle_data bundle;
+    bundle.branches   = 2;
+    bundle.scale_type = GGML_TYPE_BF16;
+
+    const int64_t physical_tiles = (M / 64) * (K / 64);
+    bundle.codes.assign((size_t) physical_tiles * 64u * 2u * 16u, 0);
+    bundle.scales_bf16.assign((size_t) physical_tiles * 4u, GGML_FP32_TO_BF16(0.0f));
+    return bundle;
+}
+
 static void set_fairy2i_exact_scale(fairy2i_bundle_data & bundle, size_t index, float value) {
     GGML_ASSERT(bundle.scale_type == GGML_TYPE_BF16);
     GGML_ASSERT(index < bundle.scales_bf16.size());
@@ -517,6 +528,83 @@ static fairy2i_exact_coeff_bits reconstruct_fairy2i_exact_coeff_bits(const uint8
         bf16_bits(bf16_round(u_imag + w_imag)),
         bf16_bits(bf16_round(u_real - w_real)),
     };
+}
+
+static fairy2i_exact_stage_bits fairy2i_exact_w1_signed_stage(uint8_t code, float scale_real, float scale_imag) {
+    const bool     is_real = (code & 2u) == 0;
+    const uint16_t scale   = bf16_bits(is_real ? scale_real : scale_imag);
+    const uint16_t stage   = (uint16_t) (scale ^ ((code & 1u) != 0 ? 0x0000u : 0x8000u));
+    return is_real ? fairy2i_exact_stage_bits{ stage, 0 } : fairy2i_exact_stage_bits{ 0, stage };
+}
+
+static fairy2i_exact_coeff_bits reconstruct_fairy2i_exact_w1_coeff_bits(const uint8_t code[2], const float scales[4]) {
+    const fairy2i_exact_stage_bits u = fairy2i_exact_w1_signed_stage(code[0], scales[0], scales[1]);
+    const fairy2i_exact_stage_bits w = fairy2i_exact_w1_signed_stage(code[1], scales[2], scales[3]);
+    return {
+        add_fairy2i_exact_bf16_bits(u.real, w.real),
+        add_fairy2i_exact_bf16_bits((uint16_t) (u.imag ^ 0x8000u), w.imag),
+        add_fairy2i_exact_bf16_bits(u.imag, w.imag),
+        add_fairy2i_exact_bf16_bits(u.real, (uint16_t) (w.real ^ 0x8000u)),
+    };
+}
+
+static fairy2i_exact_coeff_bits reconstruct_fairy2i_exact_w1_coeff_reference(const uint8_t code[2],
+                                                                             const float   scales[4]) {
+    float real[2] = {};
+    float imag[2] = {};
+    for (int branch = 0; branch < 2; ++branch) {
+        const bool  is_real = (code[branch] & 2u) == 0;
+        const float scale   = scales[2 * branch + (is_real ? 0 : 1)];
+        const float stage   = bf16_round((code[branch] & 1u) != 0 ? scale : -scale);
+        if (is_real) {
+            real[branch] = stage;
+        } else {
+            imag[branch] = stage;
+        }
+    }
+    return {
+        bf16_bits(bf16_round(real[0] + real[1])),
+        bf16_bits(bf16_round(-imag[0] + imag[1])),
+        bf16_bits(bf16_round(imag[0] + imag[1])),
+        bf16_bits(bf16_round(real[0] - real[1])),
+    };
+}
+
+static bool test_fairy2i_exact_w1_coefficient_bits() {
+    const float profiles[][4] = {
+        { bf16_from_bits(0x3f81), 0.5f,    bf16_from_bits(0x3b80), 0.25f    },
+        { -0x1p20f,               0x1p19f, 0x1p18f,                -0x1p17f },
+        { -1.0f,                  -0.5f,   -0.25f,                 -0.125f  },
+    };
+
+    bool ok = true;
+    for (size_t profile = 0; profile < sizeof(profiles) / sizeof(profiles[0]); ++profile) {
+        for (uint8_t pattern = 0; pattern < 16; ++pattern) {
+            const uint8_t                  code[2] = { (uint8_t) (pattern & 3u), (uint8_t) ((pattern >> 2) & 3u) };
+            const fairy2i_exact_coeff_bits actual  = reconstruct_fairy2i_exact_w1_coeff_bits(code, profiles[profile]);
+            const fairy2i_exact_coeff_bits expected =
+                reconstruct_fairy2i_exact_w1_coeff_reference(code, profiles[profile]);
+            if (memcmp(&actual, &expected, sizeof(actual)) != 0) {
+                fprintf(stderr,
+                        "Exact W1 coefficient mismatch profile=%zu pattern=0x%02x "
+                        "actual={%04x,%04x,%04x,%04x} expected={%04x,%04x,%04x,%04x}\n",
+                        profile, pattern, actual.rr, actual.ri, actual.ir, actual.ii, expected.rr, expected.ri,
+                        expected.ir, expected.ii);
+                ok = false;
+            }
+        }
+    }
+
+    const uint8_t                  tie_code[2] = { 1, 1 };
+    const fairy2i_exact_coeff_bits tie         = reconstruct_fairy2i_exact_w1_coeff_bits(tie_code, profiles[0]);
+    if (tie.rr != 0x3f82 || tie.ii != 0x3f80) {
+        fprintf(stderr, "Exact W1 BF16 tie mismatch: rr=0x%04x ii=0x%04x expected={0x3f82,0x3f80}\n", tie.rr, tie.ii);
+        ok = false;
+    }
+
+    printf("  Fairy2i exact W1 coefficient bits: 16 patterns x %zu profiles - %s\n",
+           sizeof(profiles) / sizeof(profiles[0]), ok ? "PASS" : "FAIL");
+    return ok;
 }
 
 static uint32_t fairy2i_exact_bf16_product_metric(uint16_t value) {
@@ -4246,6 +4334,151 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
     return true;
 }
 
+static bool test_fairy2i_exact_w1_metal_packed_bits() {
+    printf("\n=== Fairy2i exact W1 Metal packed BF16 bits ===\n");
+
+    ggml_backend_dev_t dev = find_metal_test_device();
+    if (!dev) {
+        printf("  Metal backend not found; exact W1 checks skipped.\n");
+        return true;
+    }
+
+    struct ggml_init_params probe_params = {
+        /*.mem_size   =*/64 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * probe_ctx = ggml_init(probe_params);
+    if (!probe_ctx) {
+        fprintf(stderr, "  Failed to initialize exact W1 Metal capability probe.\n");
+        return false;
+    }
+    ggml_tensor * probe_x      = ggml_new_tensor_2d(probe_ctx, GGML_TYPE_F32, 64, 1);
+    ggml_tensor * probe_codes  = ggml_new_tensor_4d(probe_ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, 2, 64, 1);
+    ggml_tensor * probe_scales = ggml_new_tensor_3d(probe_ctx, GGML_TYPE_BF16, 2, 2, 1);
+    ggml_tensor * exact_w1 =
+        ggml_fairy2i_wide_linear_w1_bundle(probe_ctx, probe_x, probe_codes, probe_scales, nullptr, 64, 64);
+    const bool exact_w1_supported = ggml_backend_dev_supports_op(dev, exact_w1);
+    ggml_free(probe_ctx);
+
+    if (!exact_w1_supported) {
+        printf(
+            "  Metal supports_op(exact_w1) rejected the BF16-scale path; "
+            "bfloat exact execution is unavailable and checks are skipped.\n");
+        return true;
+    }
+    printf("  Metal supports_op(exact_w1) accepted the BF16-scale path; running exact checks.\n");
+
+    struct exact_w1_case {
+        int64_t      m;
+        int64_t      n;
+        int64_t      k;
+        bool         bias;
+        bool         dense;
+        const char * path;
+    };
+
+    const exact_w1_case cases[] = {
+        { 64,  1,  64,   false, false, "decode/no-bias"         },
+        { 64,  1,  64,   true,  false, "decode/bias"            },
+        { 64,  16, 64,   false, false, "prefill/direct"         },
+        { 64,  17, 64,   true,  false, "prefill/staged"         },
+        { 128, 1,  640,  false, true,  "decode/dense-multitile" },
+        { 128, 16, 1024, true,  true,  "prefill/direct-dense"   },
+        { 128, 17, 640,  true,  true,  "prefill/staged-dense"   },
+    };
+    const float sparse_scales[4] = { -0x1p20f, 0x1p19f, 0x1p18f, -0x1p17f };
+    const float dense_scales[4]  = { 1.0f, 2.0f, 4.0f, 8.0f };
+
+    bool                                       ok = true;
+    const std::vector<block_fairy2i_tile64_v2> unused;
+    for (const exact_w1_case & exact_case : cases) {
+        const fairy2i_w2_case tc             = { exact_case.m, exact_case.n, exact_case.k, exact_case.bias };
+        fairy2i_bundle_data   bundle         = make_fairy2i_exact_w1_empty_bundle(tc.M, tc.K);
+        const float *         scales         = exact_case.dense ? dense_scales : sparse_scales;
+        const int64_t         physical_tiles = (tc.M / 64) * (tc.K / 64);
+        for (int64_t tile = 0; tile < physical_tiles; ++tile) {
+            for (int i = 0; i < 4; ++i) {
+                bundle.scales_bf16[(size_t) tile * 4u + (size_t) i] = GGML_FP32_TO_BF16(scales[i]);
+            }
+        }
+        for (int64_t row = 0; row < tc.M; ++row) {
+            const int64_t k_end = exact_case.dense ? tc.K : 1;
+            for (int64_t k = 0; k < k_end; ++k) {
+                set_fairy2i_bundle_code(bundle, tc.M, tc.K, row, k, 0, (uint8_t) ((row + 3 * k) & 3));
+                set_fairy2i_bundle_code(bundle, tc.M, tc.K, row, k, 1, (uint8_t) (((row >> 1) + k + 1) & 3));
+            }
+        }
+
+        std::vector<float> input((size_t) tc.N * (size_t) tc.K, pack_complex_bf16(0.0f, 0.0f));
+        std::vector<float> input_real((size_t) tc.N * (size_t) tc.K);
+        std::vector<float> input_imag((size_t) tc.N * (size_t) tc.K);
+        for (int64_t n = 0; n < tc.N; ++n) {
+            const int64_t k_end = exact_case.dense ? tc.K : 1;
+            for (int64_t k = 0; k < k_end; ++k) {
+                const size_t index = (size_t) n * (size_t) tc.K + (size_t) k;
+                const float  real  = exact_case.dense ? (float) ((n + k) % 7 - 3) * 0x1p-8f :
+                                     n % 3 == 1       ? 0.0f :
+                                                        0x1p-20f;
+                const float  imag  = exact_case.dense ? (float) ((2 * n + 3 * k) % 5 - 2) * 0x1p-9f :
+                                     n % 3 == 0       ? 0.0f :
+                                                        -0x1p-20f;
+                input_real[index]  = bf16_round(real);
+                input_imag[index]  = bf16_round(imag);
+                input[index]       = pack_complex_bf16(input_real[index], input_imag[index]);
+            }
+        }
+
+        std::vector<float> bias;
+        if (tc.bias) {
+            bias.resize((size_t) 2 * (size_t) tc.M);
+            for (int64_t row = 0; row < tc.M; ++row) {
+                bias[(size_t) row]                 = (float) ((row % 5) - 2) * 0.125f;
+                bias[(size_t) tc.M + (size_t) row] = (float) ((row % 7) - 3) * 0.0625f;
+            }
+        }
+
+        std::vector<uint32_t> expected((size_t) tc.M * (size_t) tc.N);
+        for (int64_t n = 0; n < tc.N; ++n) {
+            for (int64_t row = 0; row < tc.M; ++row) {
+                float         real  = 0.0f;
+                float         imag  = 0.0f;
+                const int64_t k_end = exact_case.dense ? tc.K : 1;
+                for (int64_t k = 0; k < k_end; ++k) {
+                    const uint8_t code[2] = {
+                        (uint8_t) ((row + 3 * k) & 3),
+                        (uint8_t) (((row >> 1) + k + 1) & 3),
+                    };
+                    const fairy2i_exact_coeff_bits coeff       = reconstruct_fairy2i_exact_w1_coeff_bits(code, scales);
+                    const size_t                   input_index = (size_t) n * (size_t) tc.K + (size_t) k;
+                    real = std::fma(bf16_from_bits(coeff.rr), input_real[input_index], real);
+                    real = std::fma(bf16_from_bits(coeff.ri), input_imag[input_index], real);
+                    imag = std::fma(bf16_from_bits(coeff.ir), input_real[input_index], imag);
+                    imag = std::fma(bf16_from_bits(coeff.ii), input_imag[input_index], imag);
+                }
+                if (tc.bias) {
+                    real += bias[(size_t) row];
+                    imag += bias[(size_t) tc.M + (size_t) row];
+                }
+                expected[(size_t) n * (size_t) tc.M + (size_t) row] = pack_bf16_pair(real, imag);
+            }
+        }
+
+        std::vector<uint32_t> actual;
+        char                  label[128];
+        snprintf(label, sizeof(label), "Fairy2i exact W1 Metal %s M=%lld N=%lld K=%lld", exact_case.path,
+                 (long long) tc.M, (long long) tc.N, (long long) tc.K);
+        if (!run_fairy2i_metal_backend(actual, dev, tc, input, unused, nullptr, unused, nullptr, bias, &bundle) ||
+            !compare_exact(label, actual, expected)) {
+            ok = false;
+        }
+    }
+
+    printf("  Fairy2i exact W1 Metal packed bits: %zu paths (negative finite scales) - %s\n",
+           sizeof(cases) / sizeof(cases[0]), ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool test_fairy2i_exact_w2_packed_bits() {
     printf("\n=== Fairy2i exact W2 packed BF16 bits ===\n");
 
@@ -5369,6 +5602,10 @@ int main() {
         fprintf(stderr, "Fairy2i exact coefficient stage tests FAILED\n");
         ++num_failed;
     }
+    if (!test_fairy2i_exact_w1_coefficient_bits()) {
+        fprintf(stderr, "Fairy2i exact W1 coefficient bit tests FAILED\n");
+        ++num_failed;
+    }
     if (!test_fairy2i_exact_rms_norm()) {
         fprintf(stderr, "Fairy2i exact RMSNorm FAILED\n");
         ++num_failed;
@@ -5431,6 +5668,10 @@ int main() {
     }
     if (!test_fairy2i_metal_wide_linear()) {
         fprintf(stderr, "Fairy2i Metal W1/W2 FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_exact_w1_metal_packed_bits()) {
+        fprintf(stderr, "Fairy2i exact W1 Metal packed BF16 bits FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_exact_w2_packed_bits()) {

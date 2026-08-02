@@ -206,6 +206,7 @@ enum llama_fairy2i_weight_layout {
 enum llama_fairy2i_numeric_profile {
     LLAMA_FAIRY2I_NUMERIC_PROFILE_LEGACY_F16_V1 = 0,
     LLAMA_FAIRY2I_NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+    LLAMA_FAIRY2I_NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
 };
 
 struct llama_layer_nextn {
@@ -438,8 +439,32 @@ struct llama_model {
     llama_fairy2i_numeric_profile fairy2i_numeric_profile = LLAMA_FAIRY2I_NUMERIC_PROFILE_LEGACY_F16_V1;
     uint32_t                      fairy2i_schema_version  = 1;
 
-    bool fairy2i_uses_exact_numeric_profile() const {
+    bool fairy2i_uses_qwen2_exact_numeric_profile() const {
         return fairy2i_numeric_profile == LLAMA_FAIRY2I_NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1;
+    }
+
+    bool fairy2i_uses_qwen3_qat_numeric_profile() const {
+        return fairy2i_numeric_profile == LLAMA_FAIRY2I_NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1;
+    }
+
+    bool fairy2i_uses_bf16_runtime_profile() const {
+        return fairy2i_uses_qwen2_exact_numeric_profile() || fairy2i_uses_qwen3_qat_numeric_profile();
+    }
+
+    // Kept as a Qwen2-specific compatibility alias. New shared runtime checks must use
+    // fairy2i_uses_bf16_runtime_profile().
+    bool fairy2i_uses_exact_numeric_profile() const { return fairy2i_uses_qwen2_exact_numeric_profile(); }
+
+    const char * fairy2i_numeric_profile_name() const {
+        switch (fairy2i_numeric_profile) {
+            case LLAMA_FAIRY2I_NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1:
+                return "script_f32reduce_bf16scale_v1";
+            case LLAMA_FAIRY2I_NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1:
+                return "qat_bf16_learned_scale_v1";
+            case LLAMA_FAIRY2I_NUMERIC_PROFILE_LEGACY_F16_V1:
+                return "legacy_f16_v1";
+        }
+        return "unknown";
     }
 
     // for classifier models
