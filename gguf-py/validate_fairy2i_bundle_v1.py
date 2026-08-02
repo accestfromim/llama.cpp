@@ -3,11 +3,13 @@
 """Validate a Fairy2i bundle_v1 GGUF and its tensor mapping.
 
 Schema2 is compared bit-exactly against a tile64_v2 GGUF after canonical code
-reordering. Schema3 uses a BF16-compute/F32-reduction contract with serialized
-BF16 scale payloads, so its bundle codes/scales are validated structurally and
-hashed while common tensors and the linear tensor mapping are still checked
-against the supplied GGUF when one is available. ``--schema3-structural-only``
-validates a schema3 bundle without a tile64_v2 reference.
+reordering. Schema3 validates the Qwen2 residual-W2 BF16-compute/F32-reduction
+contract. Schema4 validates the Qwen3 learned-scale W1 BF16 QAT contract,
+including signed finite BF16 learned-scale payloads and a BF16 lm_head.
+Exact-profile bundle codes/scales are validated structurally and hashed.
+Schema4 has no meaningful tile64_v2 reference representation and therefore
+requires ``--exact-structural-only``. The legacy
+``--schema3-structural-only`` spelling remains accepted.
 """
 
 from __future__ import annotations
@@ -42,6 +44,19 @@ QWEN2_LAYER_COMMON_SUFFIXES = (
     "attn_q.bias",
     "attn_k.bias",
     "attn_v.bias",
+)
+QWEN3_LAYER_BUNDLE_SUFFIXES = (
+    "attn_qkv",
+    "attn_output",
+    "ffn_gate",
+    "ffn_up",
+    "ffn_down",
+)
+QWEN3_LAYER_COMMON_SUFFIXES = (
+    "attn_norm",
+    "ffn_norm",
+    "attn_q_norm",
+    "attn_k_norm",
 )
 
 
@@ -218,6 +233,136 @@ def qwen2_schema3_tensor_contract(
     return linear_dims, common_shapes
 
 
+def qwen3_schema4_tensor_sets(
+    n_layer: int,
+) -> tuple[set[str], set[str], set[str]]:
+    if n_layer <= 0:
+        raise ValueError(f"schema4 exact profile requires a positive block count, got {n_layer}")
+    bundle_bases: set[str] = set()
+    required_common_names = {"token_embd", "output_norm", "output"}
+    optional_common_names: set[str] = set()
+    for il in range(n_layer):
+        bundle_bases.update(
+            f"blk.{il}.{suffix}" for suffix in QWEN3_LAYER_BUNDLE_SUFFIXES
+        )
+        required_common_names.update(
+            f"blk.{il}.{suffix}" for suffix in QWEN3_LAYER_COMMON_SUFFIXES
+        )
+        optional_common_names.add(f"blk.{il}.attn_qkv.bias")
+    return bundle_bases, required_common_names, optional_common_names
+
+
+def qwen3_schema4_tensor_contract(
+    reader: gguf.GGUFReader,
+) -> tuple[
+    dict[str, tuple[int, int]],
+    dict[str, tuple[int, ...]],
+    dict[str, tuple[int, ...]],
+]:
+    """Derive the Qwen3 W1 bundle and dense tensor shapes from GGUF metadata."""
+
+    dimension_keys = (
+        "fairy2i.block_count",
+        "fairy2i.embedding_length",
+        "fairy2i.feed_forward_length",
+        "fairy2i.attention.head_count",
+        "fairy2i.attention.head_count_kv",
+        "fairy2i.vocab_size",
+    )
+    dimensions = {name: uint32_field_value(reader, name) for name in dimension_keys}
+    invalid = {name: value for name, value in dimensions.items() if value <= 0}
+    if invalid:
+        raise ValueError(f"schema4 exact dimensions must be positive: {invalid}")
+
+    n_layer = dimensions["fairy2i.block_count"]
+    n_embd = dimensions["fairy2i.embedding_length"]
+    n_ff = dimensions["fairy2i.feed_forward_length"]
+    n_head = dimensions["fairy2i.attention.head_count"]
+    n_head_kv = dimensions["fairy2i.attention.head_count_kv"]
+    n_vocab = dimensions["fairy2i.vocab_size"]
+    if n_head % n_head_kv != 0:
+        raise ValueError(
+            "schema4 exact GQA dimensions are inconsistent: "
+            f"head_count={n_head} is not divisible by head_count_kv={n_head_kv}"
+        )
+    if (2 * n_embd) % n_head != 0:
+        raise ValueError(
+            "schema4 exact attention dimensions are inconsistent: "
+            f"2*embedding_length={2 * n_embd} is not divisible by "
+            f"head_count={n_head}"
+        )
+    n_head_dim = (2 * n_embd) // n_head
+    if "fairy2i.rope.dimension_count" in reader.fields:
+        n_rot = uint32_field_value(reader, "fairy2i.rope.dimension_count")
+        if n_rot != n_head_dim:
+            raise ValueError(
+                "schema4 exact attention dimensions are inconsistent: "
+                f"derived head dimension={n_head_dim}, rope.dimension_count={n_rot}"
+            )
+    n_embd_gqa = n_head_kv * n_head_dim
+    if n_embd_gqa % 2 != 0:
+        raise ValueError(
+            "schema4 exact KV carrier width must be even: "
+            f"head_count_kv={n_head_kv}, head_dim={n_head_dim}"
+        )
+
+    linear_dims: dict[str, tuple[int, int]] = {}
+    common_shapes: dict[str, tuple[int, ...]] = {
+        "token_embd": (n_embd, n_vocab),
+        "output_norm": (2 * n_embd,),
+        "output": (2 * n_embd, n_vocab),
+    }
+    optional_common_shapes: dict[str, tuple[int, ...]] = {}
+    for il in range(n_layer):
+        prefix = f"blk.{il}."
+        linear_dims.update(
+            {
+                prefix + "attn_qkv": (n_embd, n_embd + n_embd_gqa),
+                prefix + "attn_output": (n_embd, n_embd),
+                prefix + "ffn_gate": (n_embd, n_ff),
+                prefix + "ffn_up": (n_embd, n_ff),
+                prefix + "ffn_down": (n_ff, n_embd),
+            }
+        )
+        common_shapes.update(
+            {
+                prefix + "attn_norm": (2 * n_embd,),
+                prefix + "ffn_norm": (2 * n_embd,),
+                prefix + "attn_q_norm": (n_head_dim,),
+                prefix + "attn_k_norm": (n_head_dim,),
+            }
+        )
+        optional_common_shapes[prefix + "attn_qkv.bias"] = (
+            2 * (n_embd + n_embd_gqa),
+        )
+
+    invalid_linear_dims = {
+        name: dims
+        for name, dims in linear_dims.items()
+        if dims[0] % 64 != 0 or dims[1] % 64 != 0
+    }
+    if invalid_linear_dims:
+        name, dims = next(iter(invalid_linear_dims.items()))
+        raise ValueError(
+            "schema4 exact W1 logical dimensions must be multiples of 64: "
+            f"{name} has K={dims[0]}, M={dims[1]}"
+        )
+    return linear_dims, common_shapes, optional_common_shapes
+
+
+def bf16_tensor_payload(tensor: gguf.ReaderTensor) -> np.ndarray:
+    storage = np.asarray(tensor.data)
+    if storage.dtype == np.uint8:
+        if storage.nbytes % 2 != 0:
+            raise ValueError(f"invalid BF16 tensor byte count: {tensor.name}")
+        return np.ascontiguousarray(storage).view(np.uint16)
+    if storage.dtype == np.uint16:
+        return np.asarray(storage, dtype=np.uint16)
+    raise ValueError(
+        f"invalid BF16 tensor storage dtype for {tensor.name}: {storage.dtype}"
+    )
+
+
 def validate_schema3_common_finite(
     common_tensors: dict[str, gguf.ReaderTensor],
 ) -> None:
@@ -247,6 +392,47 @@ def validate_schema3_common_finite(
                         "schema3 exact common tensor is not a BF16-widened "
                         f"F32 value: {name} at flat index {start + local_index}; "
                         "reconvert schema3 from the original BF16 checkpoint"
+                    )
+
+
+def validate_schema4_common_finite(
+    common_tensors: dict[str, gguf.ReaderTensor],
+) -> None:
+    chunk_elements = 1 << 20
+    for name, tensor in common_tensors.items():
+        if name == "output":
+            bits = bf16_tensor_payload(tensor).reshape(-1)
+            invalid = (bits & np.uint16(0x7F80)) == np.uint16(0x7F80)
+            if np.any(invalid):
+                raise ValueError(
+                    "non-finite schema4 exact BF16 lm_head value: "
+                    f"{name} at flat index {int(np.flatnonzero(invalid)[0])}"
+                )
+            continue
+
+        flat = np.asarray(tensor.data).reshape(-1)
+        for start in range(0, flat.size, chunk_elements):
+            chunk = flat[start : start + chunk_elements]
+            if name == "token_embd":
+                bits = chunk.view(np.uint32)
+                invalid = ((bits & 0x7F80) == 0x7F80) | (
+                    ((bits >> 16) & 0x7F80) == 0x7F80
+                )
+            else:
+                invalid = ~np.isfinite(chunk)
+            if np.any(invalid):
+                local_index = int(np.flatnonzero(invalid)[0])
+                raise ValueError(
+                    "non-finite schema4 exact common tensor value: "
+                    f"{name} at flat index {start + local_index}"
+                )
+            if name != "token_embd":
+                non_bf16 = (chunk.view(np.uint32) & np.uint32(0xFFFF)) != 0
+                if np.any(non_bf16):
+                    local_index = int(np.flatnonzero(non_bf16)[0])
+                    raise ValueError(
+                        "schema4 exact common tensor is not a BF16-widened "
+                        f"F32 value: {name} at flat index {start + local_index}"
                     )
 
 
@@ -378,9 +564,29 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
             if v2_reader is not None
             else "exact_bundle_structural_only"
         )
+    elif schema_version == 4:
+        if v2_reader is not None:
+            raise ValueError(
+                "schema4 reference validation is unsupported because the exact "
+                "BF16 learned-scale/lm_head contract has no tile64_v2 reference; "
+                "use --exact-structural-only SCHEMA4_BUNDLE.gguf"
+            )
+        if base_arch != "qwen3":
+            raise ValueError("schema4 exact profile requires base_arch=qwen3")
+        if branch_order != "U0,W0":
+            raise ValueError("schema4 exact profile requires the learned-scale W1 branch order")
+        if (
+            field_value(bundle_reader, "fairy2i.quant.numeric_profile")
+            != "qat_bf16_learned_scale_v1"
+        ):
+            raise ValueError("fairy2i.quant.numeric_profile: schema4 bundle has an invalid numeric profile")
+        if field_value(bundle_reader, "fairy2i.weight.scale_dtype") != "bf16":
+            raise ValueError("fairy2i.weight.scale_dtype: schema4 bundle has an invalid scale dtype")
+        scale_tensor_type = gguf.GGMLQuantizationType.BF16
+        comparison_mode = "exact_bundle_structural_only"
     else:
         raise ValueError(f"unsupported bundle schema version: {schema_version}")
-    if v2_reader is None and schema_version != 3:
+    if v2_reader is None and schema_version not in (3, 4):
         raise ValueError("schema2 validation requires a tile64_v2 reference GGUF")
 
     expected_fields: dict[str, object] = {
@@ -409,10 +615,23 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
                 "fairy2i.tokenizer.profile": "qwen2",
             }
         )
+    elif schema_version == 4:
+        expected_fields.update(
+            {
+                "fairy2i.quant.format": "fairy2i_tile64_v2",
+                "fairy2i.quant.variant": "tile64_v2_w1_learned_scale",
+                "fairy2i.quant.residual_steps": 1,
+                "fairy2i.quant.codebook": "{+/-1,+/-i}",
+                "fairy2i.quant.tile_size": 64,
+                "fairy2i.quant.scale_source": "learned",
+                "fairy2i.attn.layout": "qwen3_real",
+                "fairy2i.tokenizer.profile": "qwen2",
+            }
+        )
     for name, expected in expected_fields.items():
         actual = (
             uint32_field_value(bundle_reader, name)
-            if schema_version == 3 and isinstance(expected, int)
+            if schema_version in (3, 4) and isinstance(expected, int)
             else field_value(bundle_reader, name)
         )
         if actual != expected:
@@ -429,12 +648,12 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
     actual_bundle_scales = {name for name in bundle_tensors if name.endswith(".bundle.scales")}
     if actual_bundle_scales != expected_bundle_scales:
         raise ValueError("bundle code and scale tensor sets differ")
-    schema3_linear_dims: dict[str, tuple[int, int]] = {}
+    exact_linear_dims: dict[str, tuple[int, int]] = {}
     if schema_version == 3:
         expected_bases, expected_common_names = qwen2_schema3_tensor_sets(
             uint32_field_value(bundle_reader, "fairy2i.block_count")
         )
-        schema3_linear_dims, expected_common_shapes = qwen2_schema3_tensor_contract(
+        exact_linear_dims, expected_common_shapes = qwen2_schema3_tensor_contract(
             bundle_reader
         )
         actual_bases = set(bundle_bases)
@@ -487,6 +706,77 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
         validate_schema3_common_finite(
             {name: bundle_tensors[name] for name in actual_common_names}
         )
+    elif schema_version == 4:
+        (
+            expected_bases,
+            required_common_names,
+            optional_common_names,
+        ) = qwen3_schema4_tensor_sets(
+            uint32_field_value(bundle_reader, "fairy2i.block_count")
+        )
+        (
+            exact_linear_dims,
+            expected_common_shapes,
+            optional_common_shapes,
+        ) = qwen3_schema4_tensor_contract(bundle_reader)
+        actual_bases = set(bundle_bases)
+        if actual_bases != expected_bases:
+            missing = sorted(expected_bases - actual_bases)
+            extra = sorted(actual_bases - expected_bases)
+            raise ValueError(
+                "schema4 exact linear tensor sets differ: "
+                f"missing={missing[:4]}, extra={extra[:4]}"
+            )
+        bundle_layout_names = {
+            name
+            for name in bundle_tensors
+            if name.endswith(".bundle.codes") or name.endswith(".bundle.scales")
+        }
+        actual_common_names = set(bundle_tensors) - bundle_layout_names
+        missing = sorted(required_common_names - actual_common_names)
+        extra = sorted(
+            actual_common_names - required_common_names - optional_common_names
+        )
+        if missing or extra:
+            raise ValueError(
+                "schema4 exact common tensor sets differ: "
+                f"missing={missing[:4]}, extra={extra[:4]}"
+            )
+        expected_common_shapes.update(optional_common_shapes)
+        invalid_common_types = sorted(
+            name
+            for name in actual_common_names
+            if bundle_tensors[name].tensor_type
+            != (
+                gguf.GGMLQuantizationType.BF16
+                if name == "output"
+                else gguf.GGMLQuantizationType.F32
+            )
+        )
+        if invalid_common_types:
+            raise ValueError(
+                "schema4 exact lm_head must use BF16 and other common tensors "
+                f"must use F32 carriers: {invalid_common_types[:4]}"
+            )
+        invalid_common_shapes = sorted(
+            (
+                name,
+                tuple(int(value) for value in bundle_tensors[name].shape),
+                expected_common_shapes[name],
+            )
+            for name in actual_common_names
+            if tuple(int(value) for value in bundle_tensors[name].shape)
+            != expected_common_shapes[name]
+        )
+        if invalid_common_shapes:
+            name, actual, expected = invalid_common_shapes[0]
+            raise ValueError(
+                "invalid schema4 exact common tensor shape: "
+                f"{name} expected {expected}, got {actual}"
+            )
+        validate_schema4_common_finite(
+            {name: bundle_tensors[name] for name in actual_common_names}
+        )
 
     canonical_hash = hashlib.sha256()
     v2_weight_bytes = 0
@@ -509,7 +799,9 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
             )
             if np.any((scale_bits & np.uint16(0x7F80)) == np.uint16(0x7F80)):
                 raise ValueError(f"non-finite bundle scales: {base}")
-            if np.any((scale_bits & np.uint16(0x8000)) != 0):
+            if schema_version == 3 and np.any(
+                (scale_bits & np.uint16(0x8000)) != 0
+            ):
                 raise ValueError(f"negative bundle scales: {base}")
         else:
             if not np.all(np.isfinite(scales.data)):
@@ -519,8 +811,8 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
 
         code_shape = tuple(int(value) for value in codes.shape)
         scale_shape = tuple(int(value) for value in scales.shape)
-        if schema_version == 3:
-            logical_k, logical_m = schema3_linear_dims[base]
+        if schema_version in (3, 4):
+            logical_k, logical_m = exact_linear_dims[base]
             expected_physical_tiles = (logical_m // 64) * (logical_k // 64)
             expected_code_shape = (16, branch_count, 64, expected_physical_tiles)
             expected_scale_shape = (2, branch_count, expected_physical_tiles)
@@ -562,7 +854,7 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
                     base,
                     component_k,
                     component_m,
-                    schema3_linear_dims,
+                    exact_linear_dims,
                 )
             if any(
                 tuple(int(value) for value in tensor.shape) != (component_k, component_m)
@@ -573,6 +865,16 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
                 raise ValueError(f"merged bundle K mismatch: {base} has {logical_k} and {component_k}")
             logical_k = component_k
             components.append((source_base, branch_tensors, component_m, component_k))
+
+        if schema_version == 4:
+            expected_k, expected_m = exact_linear_dims[base]
+            actual_m = sum(component_m for _, _, component_m, _ in components)
+            if (logical_k, actual_m) != (expected_k, expected_m):
+                raise ValueError(
+                    "schema4 reference linear dimensions mismatch: "
+                    f"{base} expected K={expected_k}, M={expected_m}, "
+                    f"got K={logical_k}, M={actual_m}"
+                )
 
         k_blocks = logical_k // 64
         physical_tiles = sum((component_m // 64) * k_blocks for _, _, component_m, _ in components)
@@ -632,7 +934,9 @@ def validate_layout(v2_path: Path | None, bundle_path: Path) -> dict[str, object
     else:
         stale_layout = sorted(name for name in bundle_tensors if name.endswith(branch_suffixes))
         if stale_layout:
-            raise ValueError(f"schema3 bundle contains legacy tile64_v2 tensors: {stale_layout[:4]}")
+            raise ValueError(
+                f"exact-profile bundle contains legacy tile64_v2 tensors: {stale_layout[:4]}"
+            )
         bundle_layout_names = {
             name
             for name in bundle_tensors
@@ -662,20 +966,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--schema3-structural-only",
+        "--exact-structural-only",
+        dest="exact_structural_only",
         action="store_true",
-        help="validate one schema3 bundle without a tile64_v2 reference",
+        help="validate one schema3/schema4 exact bundle without a tile64_v2 reference",
     )
     parser.add_argument(
         "gguf",
         type=Path,
         nargs="+",
-        help="TILE64_V2_GGUF BUNDLE_V1_GGUF, or one BUNDLE_V1_GGUF with --schema3-structural-only",
+        help=(
+            "schema2/schema3: TILE64_V2_GGUF BUNDLE_V1_GGUF; "
+            "schema3/schema4: one BUNDLE_V1_GGUF with --exact-structural-only"
+        ),
     )
     args = parser.parse_args()
 
-    if args.schema3_structural_only:
+    if args.exact_structural_only:
         if len(args.gguf) != 1:
-            parser.error("--schema3-structural-only accepts exactly one bundle GGUF")
+            parser.error("--exact-structural-only accepts exactly one bundle GGUF")
         v2_path = None
         bundle_path = args.gguf[0]
     else:

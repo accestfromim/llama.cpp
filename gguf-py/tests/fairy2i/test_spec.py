@@ -4,6 +4,7 @@ import pytest
 
 from fairy2i.spec import (
     NUMERIC_PROFILE_LEGACY_F16_V1,
+    NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
     NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
     QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE,
     WEIGHT_SCALE_DTYPE_F16,
@@ -245,6 +246,63 @@ def test_write_tile64_v2_w1_learned_scale_metadata() -> None:
     assert writer.values["fairy2i.schema_version"] == 2
     assert "fairy2i.quant.numeric_profile" not in writer.values
     assert "fairy2i.weight.scale_dtype" not in writer.values
+
+
+def test_write_qwen3_qat_bf16_learned_scale_metadata() -> None:
+    writer = RecordingWriter()
+
+    write_metadata(
+        writer,  # type: ignore[arg-type]
+        Fairy2IMetadata(
+            base_arch="qwen3",
+            base_model_type="qwen3",
+            base_architecture="Qwen3ForCausalLM",
+            attn_layout="qwen3_real",
+            tokenizer_profile="qwen2",
+            quant_variant=QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE,
+            residual_steps=1,
+            scale_source=SCALE_SOURCE_LEARNED,
+            numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+            weight_scale_dtype=WEIGHT_SCALE_DTYPE_BF16,
+        ),
+    )
+
+    assert writer.values["fairy2i.schema_version"] == 4
+    assert (
+        writer.values["fairy2i.quant.numeric_profile"]
+        == NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1
+    )
+    assert writer.values["fairy2i.weight.scale_dtype"] == WEIGHT_SCALE_DTYPE_BF16
+    assert writer.values["fairy2i.quant.scale_source"] == SCALE_SOURCE_LEARNED
+    assert writer.values["fairy2i.weight.branch_order"] == "U0,W0"
+
+
+@pytest.mark.parametrize(
+    ("numeric_profile", "weight_scale_dtype"),
+    [
+        (NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1, None),
+        (None, WEIGHT_SCALE_DTYPE_BF16),
+        (NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1, WEIGHT_SCALE_DTYPE_F16),
+    ],
+)
+def test_rejects_invalid_qwen3_exact_numeric_pair(
+    numeric_profile: str | None,
+    weight_scale_dtype: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="Qwen3 bundle learned-scale metadata requires"):
+        write_metadata(
+            RecordingWriter(),  # type: ignore[arg-type]
+            Fairy2IMetadata(
+                base_arch="qwen3",
+                attn_layout="qwen3_real",
+                tokenizer_profile="qwen2",
+                quant_variant=QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE,
+                residual_steps=1,
+                scale_source=SCALE_SOURCE_LEARNED,
+                numeric_profile=numeric_profile,
+                weight_scale_dtype=weight_scale_dtype,
+            ),
+        )
 
 
 def test_rejects_wrong_w1_residual_steps() -> None:

@@ -7,6 +7,7 @@ import pytest
 
 import fairy2i.quant.tile64_v2 as tile64_v2
 from fairy2i.quant.tile64_v2 import (
+    NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
     NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
     TILE64,
     canonical_quantize_complex_tile64_v2_script_bf16_f32,
@@ -18,6 +19,7 @@ from fairy2i.quant.tile64_v2 import (
     pack_fairy2i_tile64_v2_stage,
     pairwise_sum_float32,
     quantize_linear_to_fairy2i_bundle_v1_m64,
+    quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale,
     quantize_linear_to_fairy2i_tile64_v2_branch_data,
     quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale,
     quantize_complex_tile64_v2_script_bf16_f32,
@@ -27,6 +29,7 @@ from fairy2i.quant.tile64_v2 import (
     reconstruct_wide_linear_tile64_script_bf16_f32,
     round_float32_to_bf16,
     round_float32_to_bf16_bits,
+    split_wide_linear_components,
     unpack_fairy2i_bundle_v1,
 )
 
@@ -829,3 +832,225 @@ def test_w1_learned_scale_rejects_bad_scale_shape() -> None:
 
     with pytest.raises(ValueError, match="learned scale shape mismatch"):
         quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(weight, bad_scale, TILE64, TILE64)
+
+
+@pytest.mark.parametrize("weight_dtype", ["float16", "float32"])
+def test_qat_bf16_w1_rejects_non_bf16_checkpoint_weight(
+    weight_dtype: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    weight = torch.zeros(
+        (TILE64 * 2, TILE64 * 2),
+        dtype=getattr(torch, weight_dtype),
+    )
+    scale = torch.ones((4, 1, 1), dtype=torch.bfloat16)
+
+    with pytest.raises(
+        ValueError,
+        match=r"checkpoint weight dtype=torch\.bfloat16",
+    ):
+        quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+            weight,
+            scale,
+            TILE64,
+            TILE64,
+            numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+        )
+
+
+@pytest.mark.parametrize("weight_dtype", ["float16", "float32"])
+def test_legacy_w1_keeps_non_bf16_checkpoint_weight_compatibility(
+    weight_dtype: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    weight = torch.zeros(
+        (TILE64 * 2, TILE64 * 2),
+        dtype=getattr(torch, weight_dtype),
+    )
+    scale = torch.ones((4, 1, 1), dtype=torch.float32)
+
+    codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        weight,
+        scale,
+        TILE64,
+        TILE64,
+    )
+
+    assert codes.dtype == np.uint8
+    assert scales.dtype == np.float16
+
+
+def test_qat_bf16_w1_rounds_add_before_half_and_uses_tie_to_imag() -> None:
+    torch = pytest.importorskip("torch")
+
+    # BF16 1 + 2^-8 is exactly halfway between BF16 1 and 1 + 2^-7.
+    # RNE chooses 1 before the exact 0.5 multiply, making U.real == U.imag.
+    one = np.ones((TILE64, TILE64), dtype=np.float32)
+    half_ulp = np.full_like(one, np.float32(2.0**-8))
+    zero = np.zeros_like(one)
+    checkpoint = torch.from_numpy(np.block([[one, zero], [one, half_ulp]])).to(
+        torch.bfloat16
+    )
+    learned_scale = torch.tensor(
+        [[[1.0]], [[-2.0]], [[-3.0]], [[4.0]]],
+        dtype=torch.bfloat16,
+    )
+
+    exact_codes, exact_scales = (
+        quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+            checkpoint,
+            learned_scale,
+            TILE64,
+            TILE64,
+            numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+        )
+    )
+    legacy_codes, _ = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        checkpoint,
+        learned_scale,
+        TILE64,
+        TILE64,
+    )
+    exact = unpack_fairy2i_bundle_v1(
+        exact_codes,
+        exact_scales,
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )
+    legacy = unpack_fairy2i_bundle_v1(
+        legacy_codes,
+        np.zeros((1, 2, 2), dtype=np.float16),
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )
+
+    # Training uses strict abs(real) > abs(imag); exact ties select +imag.
+    assert np.all(exact["U.s0"][0] == np.uint8(3))
+    assert np.all(legacy["U.s0"][0] == np.uint8(1))
+    expected_scale_bits = (
+        learned_scale.contiguous().view(torch.int16).numpy().view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        exact_scales[0],
+        expected_scale_bits[:, 0, 0].reshape(2, 2),
+    )
+    assert np.any((exact_scales & np.uint16(0x8000)) != 0)
+
+
+def test_qat_bf16_w1_tie_sign_codes_match_training_oracle() -> None:
+    torch = pytest.importorskip("torch")
+
+    u_real = np.ones((TILE64, TILE64), dtype=np.float32)
+    u_imag = np.ones_like(u_real)
+    u_real[:, 2::4] = -1.0
+    u_real[:, 3::4] = -1.0
+    u_imag[:, 1::4] = -1.0
+    u_imag[:, 3::4] = -1.0
+    zero = np.zeros_like(u_real)
+    weight = torch.from_numpy(
+        make_wide_linear_weight(u_real, u_imag, zero, zero)
+    ).to(torch.bfloat16)
+    scale = torch.ones((4, 1, 1), dtype=torch.bfloat16)
+
+    codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        weight,
+        scale,
+        TILE64,
+        TILE64,
+        numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    )
+    decoded = unpack_fairy2i_bundle_v1(
+        codes,
+        scales,
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )["U.s0"][0]
+    expected = np.tile(
+        np.asarray([3, 2, 3, 2], dtype=np.uint8),
+        (TILE64, TILE64 // 4),
+    )
+    np.testing.assert_array_equal(decoded, expected)
+
+
+def test_qat_bf16_w1_post_half_rne_and_signed_zero_match_training() -> None:
+    torch = pytest.importorskip("torch")
+
+    smallest_bf16 = np.asarray([0x00010000], dtype=np.uint32).view(np.float32)[0]
+    a11 = np.full((TILE64, TILE64), smallest_bf16, dtype=np.float32)
+    a12 = np.zeros_like(a11)
+    a21 = np.full_like(a11, np.float32(-0.0))
+    a22 = np.zeros_like(a11)
+    weight = torch.from_numpy(np.block([[a11, a12], [a21, a22]])).to(
+        torch.bfloat16
+    )
+    scale = torch.ones((4, 1, 1), dtype=torch.bfloat16)
+
+    u_real, u_imag, _, _, _, _ = split_wide_linear_components(
+        weight,
+        TILE64,
+        TILE64,
+        numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    )
+    assert not np.any(u_real)
+    assert np.all(np.signbit(u_imag))
+
+    codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        weight,
+        scale,
+        TILE64,
+        TILE64,
+        numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    )
+    decoded = unpack_fairy2i_bundle_v1(
+        codes,
+        scales,
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )["U.s0"][0]
+    # 0.5 * the smallest BF16 subnormal is an RNE tie to +0. A -0 imag
+    # compares >= 0 in Triton, so the equal-magnitude tie still selects +imag.
+    assert np.all(decoded == np.uint8(3))
+
+
+def test_qat_bf16_qkv_merge_preserves_component_and_signed_scale_payloads() -> None:
+    torch = pytest.importorskip("torch")
+
+    bundles = []
+    for seed in range(3):
+        u_real = np.full((TILE64, TILE64), seed + 1, dtype=np.float32)
+        zero = np.zeros_like(u_real)
+        weight = torch.from_numpy(
+            make_wide_linear_weight(u_real, zero, zero, zero)
+        ).to(torch.bfloat16)
+        scale = torch.tensor(
+            [[[-(seed + 1.0)]], [[seed + 2.0]], [[seed + 3.0]], [[-(seed + 4.0)]]],
+            dtype=torch.bfloat16,
+        )
+        bundles.append(
+            quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+                weight,
+                scale,
+                TILE64,
+                TILE64,
+                numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+            )
+        )
+
+    merged_codes, merged_scales = merge_fairy2i_bundle_v1_m(bundles)
+
+    np.testing.assert_array_equal(
+        merged_codes,
+        np.concatenate([bundle[0] for bundle in bundles], axis=0),
+    )
+    np.testing.assert_array_equal(
+        merged_scales,
+        np.concatenate([bundle[1] for bundle in bundles], axis=0),
+    )
+    assert merged_scales.dtype == np.uint16
+    assert np.any((merged_scales & np.uint16(0x8000)) != 0)

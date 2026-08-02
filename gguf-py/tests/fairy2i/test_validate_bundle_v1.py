@@ -213,6 +213,141 @@ def _validate_schema3_readers(
     return validator.validate_layout(v2_path if with_reference else None, bundle_path)
 
 
+def _schema4_reader(
+    *,
+    field_overrides: dict[str, object] | None = None,
+    output_type: gguf.GGMLQuantizationType = gguf.GGMLQuantizationType.BF16,
+    scale_bits: int = 0xBF80,
+) -> SimpleNamespace:
+    bundle_bases, required_common, _ = validator.qwen3_schema4_tensor_sets(1)
+    linear_dims = {
+        "blk.0.attn_qkv": (64, 128),
+        "blk.0.attn_output": (64, 64),
+        "blk.0.ffn_gate": (64, 64),
+        "blk.0.ffn_up": (64, 64),
+        "blk.0.ffn_down": (64, 64),
+    }
+    common_shapes = {
+        "token_embd": (64, 128),
+        "output_norm": (128,),
+        "output": (128, 128),
+        "blk.0.attn_norm": (128,),
+        "blk.0.ffn_norm": (128,),
+        "blk.0.attn_q_norm": (64,),
+        "blk.0.attn_k_norm": (64,),
+    }
+    assert set(common_shapes) == required_common
+
+    tensors = []
+    for base in sorted(bundle_bases):
+        logical_k, logical_m = linear_dims[base]
+        tile_count = logical_k // 64 * (logical_m // 64)
+        code_shape = (16, 2, 64, tile_count)
+        scale_shape = (2, 2, tile_count)
+        tensors.extend(
+            [
+                _named_tensor(
+                    base + ".bundle.codes",
+                    gguf.GGMLQuantizationType.FAIRY2I_BUNDLE_CODES,
+                    code_shape,
+                    np.zeros(tuple(reversed(code_shape)), dtype=np.uint8),
+                ),
+                _named_tensor(
+                    base + ".bundle.scales",
+                    gguf.GGMLQuantizationType.BF16,
+                    scale_shape,
+                    np.full(
+                        tuple(reversed(scale_shape)),
+                        np.uint16(scale_bits),
+                        dtype=np.uint16,
+                    ),
+                ),
+            ]
+        )
+    for name, shape in common_shapes.items():
+        tensor_type = output_type if name == "output" else gguf.GGMLQuantizationType.F32
+        dtype = (
+            np.uint16
+            if tensor_type == gguf.GGMLQuantizationType.BF16
+            else np.float16
+            if tensor_type == gguf.GGMLQuantizationType.F16
+            else np.float32
+        )
+        fill = np.uint16(0x3F80) if dtype == np.uint16 else 1.0
+        tensors.append(
+            _named_tensor(
+                name,
+                tensor_type,
+                shape,
+                np.full(tuple(reversed(shape)), fill, dtype=dtype),
+            )
+        )
+
+    field_values: dict[str, object] = {
+        "general.architecture": "fairy2i",
+        "general.file_type": 42,
+        "general.alignment": 64,
+        "fairy2i.schema_version": 4,
+        "fairy2i.block_count": 1,
+        "fairy2i.embedding_length": 64,
+        "fairy2i.feed_forward_length": 64,
+        "fairy2i.attention.head_count": 2,
+        "fairy2i.attention.head_count_kv": 1,
+        "fairy2i.rope.dimension_count": 64,
+        "fairy2i.vocab_size": 128,
+        "fairy2i.base_arch": "qwen3",
+        "fairy2i.quant.format": "fairy2i_tile64_v2",
+        "fairy2i.quant.variant": "tile64_v2_w1_learned_scale",
+        "fairy2i.quant.residual_steps": 1,
+        "fairy2i.quant.codebook": "{+/-1,+/-i}",
+        "fairy2i.quant.tile_size": 64,
+        "fairy2i.quant.scale_source": "learned",
+        "fairy2i.quant.numeric_profile": "qat_bf16_learned_scale_v1",
+        "fairy2i.attn.layout": "qwen3_real",
+        "fairy2i.tokenizer.profile": "qwen2",
+        "fairy2i.weight.scale_dtype": "bf16",
+        "fairy2i.weight.layout": "bundle_m64k64_v1",
+        "fairy2i.weight.scale_scope": "m64_k64",
+        "fairy2i.weight.code_order": "m16_q4_branch_lane",
+        "fairy2i.weight.branch_order": "U0,W0",
+        "fairy2i.weight.m_block": 64,
+        "fairy2i.weight.k_block": 64,
+        "fairy2i.weight.m_subtile": 16,
+    }
+    field_values.update(field_overrides or {})
+
+    def field_type(value: object) -> gguf.GGUFValueType:
+        if isinstance(value, numbers.Integral):
+            return gguf.GGUFValueType.UINT32
+        if isinstance(value, str):
+            return gguf.GGUFValueType.STRING
+        raise TypeError(value)
+
+    fields = {
+        name: SimpleNamespace(
+            types=[field_type(value)],
+            contents=lambda value=value: value,
+        )
+        for name, value in field_values.items()
+    }
+    return SimpleNamespace(fields=fields, tensors=tensors)
+
+
+def _validate_schema4_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bundle_reader: SimpleNamespace,
+) -> dict[str, object]:
+    bundle_path = tmp_path / "schema4.gguf"
+    bundle_path.touch()
+    monkeypatch.setattr(
+        validator.gguf,
+        "GGUFReader",
+        lambda path, mode: bundle_reader,
+    )
+    return validator.validate_layout(None, bundle_path)
+
+
 def test_common_tensor_sets_must_match_exactly() -> None:
     v2_tensors = {
         "token_embd": _tensor(1),
@@ -232,6 +367,76 @@ def test_common_tensor_sets_must_match_exactly() -> None:
 
     assert count == 1
     assert n_bytes == v2_tensors["token_embd"].n_bytes
+
+
+def test_schema4_accepts_signed_bf16_scales_and_bf16_lm_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _validate_schema4_reader(
+        tmp_path,
+        monkeypatch,
+        _schema4_reader(scale_bits=0xBF80),
+    )
+
+    assert result["schema_version"] == 4
+    assert result["branch_order"] == "U0,W0"
+    assert result["linear_count"] == 5
+    assert result["comparison_mode"] == "exact_bundle_structural_only"
+
+
+def test_schema4_rejects_unusable_tile64_reference_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    v2_path = tmp_path / "legacy-v2.gguf"
+    bundle_path = tmp_path / "schema4.gguf"
+    v2_path.touch()
+    bundle_path.touch()
+    v2_reader = SimpleNamespace(fields={}, tensors=[])
+    bundle_reader = _schema4_reader()
+
+    def fake_reader(path: object, mode: str) -> SimpleNamespace:
+        assert mode == "r"
+        return v2_reader if Path(path) == v2_path else bundle_reader
+
+    monkeypatch.setattr(validator.gguf, "GGUFReader", fake_reader)
+    with pytest.raises(
+        ValueError,
+        match=r"use --exact-structural-only SCHEMA4_BUNDLE\.gguf",
+    ):
+        validator.validate_layout(v2_path, bundle_path)
+
+
+@pytest.mark.parametrize(
+    ("reader", "message"),
+    [
+        (
+            _schema4_reader(
+                field_overrides={
+                    "fairy2i.quant.numeric_profile": "script_f32reduce_bf16scale_v1"
+                }
+            ),
+            "fairy2i.quant.numeric_profile",
+        ),
+        (
+            _schema4_reader(output_type=gguf.GGMLQuantizationType.F16),
+            "lm_head must use BF16",
+        ),
+        (
+            _schema4_reader(scale_bits=0x7F80),
+            "non-finite bundle scales",
+        ),
+    ],
+)
+def test_schema4_rejects_wrong_exact_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: SimpleNamespace,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _validate_schema4_reader(tmp_path, monkeypatch, reader)
 
 
 def test_rejects_missing_common_tensor() -> None:

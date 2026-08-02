@@ -8,12 +8,14 @@ import gguf
 SCHEMA_VERSION = 1
 BUNDLE_SCHEMA_VERSION = 2
 BUNDLE_EXACT_SCHEMA_VERSION = 3
+BUNDLE_QAT_EXACT_SCHEMA_VERSION = 4
 ARCHITECTURE = "fairy2i"
 QUANT_FORMAT_TILE64_V2 = "fairy2i_tile64_v2"
 QUANT_VARIANT_TILE64_V2 = "tile64_v2"
 QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE = "tile64_v2_w1_learned_scale"
 NUMERIC_PROFILE_LEGACY_F16_V1 = "legacy_f16_v1"
 NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1 = "script_f32reduce_bf16scale_v1"
+NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1 = "qat_bf16_learned_scale_v1"
 WEIGHT_SCALE_DTYPE_F16 = "f16"
 WEIGHT_SCALE_DTYPE_BF16 = "bf16"
 CODEBOOK_ROOTS4 = "{+/-1,+/-i}"
@@ -95,9 +97,32 @@ def write_metadata(writer: gguf.GGUFWriter, metadata: Fairy2IMetadata) -> None:
             "('script_f32reduce_bf16scale_v1', 'bf16')"
         )
 
-    exact_profile = metadata.numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+    qwen3_bundle_w1 = (
+        metadata.base_arch == "qwen3"
+        and metadata.quant_variant == QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE
+        and metadata.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1
+    )
+    if qwen3_bundle_w1 and (
+        metadata.numeric_profile,
+        metadata.weight_scale_dtype,
+    ) not in (
+        (None, None),
+        (NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1, WEIGHT_SCALE_DTYPE_BF16),
+    ):
+        raise ValueError(
+            "Qwen3 bundle learned-scale metadata requires an implicit schema2 legacy "
+            "contract or numeric_profile/weight_scale_dtype "
+            "('qat_bf16_learned_scale_v1', 'bf16')"
+        )
+
+    qwen2_exact_profile = (
+        metadata.numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+    )
+    qwen3_exact_profile = (
+        metadata.numeric_profile == NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1
+    )
     explicit_legacy_profile = metadata.numeric_profile == NUMERIC_PROFILE_LEGACY_F16_V1
-    if exact_profile:
+    if qwen2_exact_profile:
         if metadata.base_arch != "qwen2":
             raise ValueError("script_f32reduce_bf16scale_v1 is supported only for the Qwen2 Fairy2i path")
         if metadata.attn_layout != "qwen2_real":
@@ -110,6 +135,25 @@ def write_metadata(writer: gguf.GGUFWriter, metadata: Fairy2IMetadata) -> None:
             raise ValueError("script_f32reduce_bf16scale_v1 requires the bundle_v1 weight layout")
         if metadata.weight_scale_dtype != WEIGHT_SCALE_DTYPE_BF16:
             raise ValueError("script_f32reduce_bf16scale_v1 requires weight_scale_dtype='bf16'")
+    elif qwen3_exact_profile:
+        if metadata.base_arch != "qwen3":
+            raise ValueError("qat_bf16_learned_scale_v1 is supported only for the Qwen3 Fairy2i path")
+        if metadata.attn_layout != "qwen3_real":
+            raise ValueError("qat_bf16_learned_scale_v1 requires attn_layout='qwen3_real'")
+        if metadata.tokenizer_profile != "qwen2":
+            raise ValueError("qat_bf16_learned_scale_v1 requires tokenizer_profile='qwen2'")
+        if metadata.quant_variant != QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE:
+            raise ValueError(
+                "qat_bf16_learned_scale_v1 requires the tile64_v2 W1 learned-scale quantization variant"
+            )
+        if metadata.residual_steps != 1:
+            raise ValueError("qat_bf16_learned_scale_v1 requires exactly one residual step")
+        if scale_source != SCALE_SOURCE_LEARNED:
+            raise ValueError("qat_bf16_learned_scale_v1 requires scale_source='learned'")
+        if metadata.weight_layout != WEIGHT_LAYOUT_BUNDLE_V1:
+            raise ValueError("qat_bf16_learned_scale_v1 requires the bundle_v1 weight layout")
+        if metadata.weight_scale_dtype != WEIGHT_SCALE_DTYPE_BF16:
+            raise ValueError("qat_bf16_learned_scale_v1 requires weight_scale_dtype='bf16'")
     elif explicit_legacy_profile:
         if metadata.base_arch != "qwen2":
             raise ValueError("legacy_f16_v1 metadata is supported only for the Qwen2 Fairy2i path")
@@ -124,7 +168,9 @@ def write_metadata(writer: gguf.GGUFWriter, metadata: Fairy2IMetadata) -> None:
             "Fairy2i numeric_profile and weight_scale_dtype must form a supported pair"
         )
 
-    if exact_profile:
+    if qwen3_exact_profile:
+        schema_version = BUNDLE_QAT_EXACT_SCHEMA_VERSION
+    elif qwen2_exact_profile:
         schema_version = BUNDLE_EXACT_SCHEMA_VERSION
     elif metadata.weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
         schema_version = BUNDLE_SCHEMA_VERSION
@@ -148,7 +194,7 @@ def write_metadata(writer: gguf.GGUFWriter, metadata: Fairy2IMetadata) -> None:
         writer.add_uint32("fairy2i.quant.tile_size", TILE_SIZE_TILE64_V2)
     if metadata.quant_variant == QUANT_VARIANT_TILE64_V2:
         writer.add_string("fairy2i.quant.scale_stat", SCALE_STAT_DOMINANT_MEAN_ABS)
-    if exact_profile or explicit_legacy_profile:
+    if qwen2_exact_profile or qwen3_exact_profile or explicit_legacy_profile:
         writer.add_string("fairy2i.quant.numeric_profile", metadata.numeric_profile)
     if scale_source is not None:
         writer.add_string("fairy2i.quant.scale_source", scale_source)
@@ -161,7 +207,7 @@ def write_metadata(writer: gguf.GGUFWriter, metadata: Fairy2IMetadata) -> None:
         )
         writer.add_string("fairy2i.weight.layout", BUNDLE_LAYOUT_NAME)
         writer.add_string("fairy2i.weight.scale_scope", BUNDLE_SCALE_SCOPE)
-        if exact_profile or explicit_legacy_profile:
+        if qwen2_exact_profile or qwen3_exact_profile or explicit_legacy_profile:
             writer.add_string("fairy2i.weight.scale_dtype", metadata.weight_scale_dtype)
         writer.add_string("fairy2i.weight.code_order", BUNDLE_CODE_ORDER)
         writer.add_string("fairy2i.weight.branch_order", branch_order)

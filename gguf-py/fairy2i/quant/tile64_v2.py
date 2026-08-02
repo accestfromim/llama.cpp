@@ -29,6 +29,7 @@ FAIRY2I_BUNDLE_W2_BRANCH_ORDER = ("U.s0", "U.s1", "W.s0", "W.s1")
 
 NUMERIC_PROFILE_LEGACY_F16_V1 = "legacy_f16_v1"
 NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1 = "script_f32reduce_bf16scale_v1"
+NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1 = "qat_bf16_learned_scale_v1"
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ def _validate_numeric_profile(numeric_profile: str) -> None:
     if numeric_profile not in (
         NUMERIC_PROFILE_LEGACY_F16_V1,
         NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+        NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
     ):
         raise ValueError(f"unsupported Fairy2i numeric profile: {numeric_profile!r}")
 
@@ -62,8 +64,39 @@ def _scale_dtype_for_profile(numeric_profile: str) -> np.dtype[Any]:
     _validate_numeric_profile(numeric_profile)
     return np.dtype(
         np.uint16
-        if numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+        if numeric_profile
+        in (
+            NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+            NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+        )
         else np.float16
+    )
+
+
+def _validate_w1_numeric_profile(numeric_profile: str) -> None:
+    if numeric_profile not in (
+        NUMERIC_PROFILE_LEGACY_F16_V1,
+        NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    ):
+        raise ValueError(
+            f"unsupported Fairy2i learned-scale W1 numeric profile: {numeric_profile!r}"
+        )
+
+
+def _validate_w2_numeric_profile(numeric_profile: str) -> None:
+    if numeric_profile not in (
+        NUMERIC_PROFILE_LEGACY_F16_V1,
+        NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+    ):
+        raise ValueError(
+            f"unsupported Fairy2i residual W2 numeric profile: {numeric_profile!r}"
+        )
+
+
+def _uses_bf16_wide_decomposition(numeric_profile: str) -> bool:
+    return numeric_profile in (
+        NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+        NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
     )
 
 
@@ -230,6 +263,27 @@ def pad_scale_matrix(scale: np.ndarray, out_dim: int, in_dim: int) -> np.ndarray
     return out
 
 
+def pad_bf16_scale_bits(scale: np.ndarray, out_dim: int, in_dim: int) -> np.ndarray:
+    """Pad a learned-scale matrix without changing any checkpoint BF16 payload."""
+
+    out_tiles = out_dim // TILE64
+    in_tiles = in_dim // TILE64
+    scale = np.asarray(scale)
+    if scale.dtype != np.uint16 or scale.ndim != 2:
+        raise ValueError(
+            "BF16 scale payload must be a 2D uint16 tile matrix, "
+            f"got shape {scale.shape}/{scale.dtype}"
+        )
+    if scale.shape[0] > out_tiles or scale.shape[1] > in_tiles:
+        raise ValueError(f"cannot pad scale from {scale.shape} to {(out_tiles, in_tiles)}")
+    if scale.shape == (out_tiles, in_tiles):
+        return np.ascontiguousarray(scale)
+
+    out = np.zeros((out_tiles, in_tiles), dtype=np.uint16)
+    out[: scale.shape[0], : scale.shape[1]] = scale
+    return out
+
+
 def split_wide_linear_components(
     weight: "torch.Tensor",
     out_target: int,
@@ -253,9 +307,9 @@ def split_wide_linear_components(
     a21 = a[out_c:, :in_c]
     a22 = a[out_c:, in_c:]
 
-    if numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1:
+    if _uses_bf16_wide_decomposition(numeric_profile):
         if not np.all(np.isfinite(a)):
-            raise ValueError("script_f32reduce_bf16scale_v1 requires finite checkpoint weights")
+            raise ValueError(f"{numeric_profile} requires finite checkpoint weights")
         a11 = round_float32_to_bf16(a11)
         a12 = round_float32_to_bf16(a12)
         a21 = round_float32_to_bf16(a21)
@@ -745,7 +799,7 @@ def quantize_matrix_tile64_v2(
     *,
     numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    _validate_numeric_profile(numeric_profile)
+    _validate_w2_numeric_profile(numeric_profile)
     if w_real.shape != w_imag.shape:
         raise ValueError(f"shape mismatch: {w_real.shape} vs {w_imag.shape}")
     if w_real.shape[0] % TILE64 != 0 or w_real.shape[1] % TILE64 != 0:
@@ -906,15 +960,31 @@ def pack_fairy2i_bundle_v1(
         packed = encode_stage_codes_bundle_v1(stage_real, stage_imag)
         packed = packed.reshape(mb_count, 4, FAIRY2I_BUNDLE_M_SUBTILE, kb_count, FAIRY2I_BUNDLE_Q4)
         code_planes.append(packed.transpose(0, 3, 1, 4, 2))
-        scale_planes.append(
-            np.stack(
+        if numeric_profile == NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1:
+            if scale_real.dtype != np.uint16 or scale_imag.dtype != np.uint16:
+                raise ValueError(
+                    f"branch {name} exact learned scales must be original BF16 uint16 payloads"
+                )
+            scale_bits = np.stack(
                 (
-                    np.ascontiguousarray(scale_real, dtype=scale_dtype),
-                    np.ascontiguousarray(scale_imag, dtype=scale_dtype),
+                    np.ascontiguousarray(scale_real),
+                    np.ascontiguousarray(scale_imag),
                 ),
                 axis=-1,
             )
-        )
+            if np.any((scale_bits & np.uint16(0x7F80)) == np.uint16(0x7F80)):
+                raise ValueError(f"branch {name} exact learned scales must be finite BF16 values")
+            scale_planes.append(scale_bits)
+        else:
+            scale_planes.append(
+                np.stack(
+                    (
+                        np.ascontiguousarray(scale_real, dtype=scale_dtype),
+                        np.ascontiguousarray(scale_imag, dtype=scale_dtype),
+                    ),
+                    axis=-1,
+                )
+            )
 
     codes = np.stack(code_planes, axis=-2)
     codes = np.ascontiguousarray(codes.reshape(mb_count * kb_count, 64, len(branch_order), 16))
@@ -1041,6 +1111,7 @@ def quantize_linear_to_fairy2i_tile64_v2_branch_data(
     *,
     numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> dict[str, Fairy2IBranch]:
+    _validate_w2_numeric_profile(numeric_profile)
     u_real, u_imag, w_real, w_imag, _, _ = split_wide_linear_components(
         weight,
         out_target,
@@ -1240,7 +1311,7 @@ def iter_quantize_linear_to_fairy2i_bundle_v1_m64(
     arrays are constructed.
     """
 
-    _validate_numeric_profile(numeric_profile)
+    _validate_w2_numeric_profile(numeric_profile)
     scale_dtype = _scale_dtype_for_profile(numeric_profile)
     source, source_shape = _resolve_weight_slice_source(weight_or_source, weight_shape)
     if len(source_shape) != 2:
@@ -1482,24 +1553,67 @@ def quantize_linear_to_fairy2i_bundle_v1_stages(
 
 
 def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
-    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+    weight: "torch.Tensor",
+    quant_scale: "torch.Tensor",
+    out_target: int,
+    in_target: int,
+    *,
+    numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> dict[str, Fairy2IBranch]:
     _require_torch()
+    _validate_w1_numeric_profile(numeric_profile)
+    if (
+        numeric_profile == NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1
+        and weight.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "qat_bf16_learned_scale_v1 requires checkpoint weight dtype=torch.bfloat16"
+        )
 
-    u_real, u_imag, w_real, w_imag, out_c, in_c = split_wide_linear_components(weight, out_target, in_target)
+    u_real, u_imag, w_real, w_imag, out_c, in_c = split_wide_linear_components(
+        weight,
+        out_target,
+        in_target,
+        numeric_profile=numeric_profile,
+    )
 
     if out_target % TILE64 != 0 or in_target % TILE64 != 0:
         raise ValueError(f"tile64 packing requires target dims divisible by {TILE64}, got {(out_target, in_target)}")
 
     expected_scale_shape = (4, out_c // TILE64, in_c // TILE64)
-    scale = quant_scale.to(torch.float32).cpu().numpy()
-    if scale.shape != expected_scale_shape:
-        raise ValueError(f"learned scale shape mismatch: expected {expected_scale_shape}, got {scale.shape}")
+    if tuple(quant_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"learned scale shape mismatch: expected {expected_scale_shape}, "
+            f"got {tuple(quant_scale.shape)}"
+        )
 
-    u_s_real = pad_scale_matrix(scale[0], out_target, in_target)
-    u_s_imag = pad_scale_matrix(scale[1], out_target, in_target)
-    w_s_real = pad_scale_matrix(scale[2], out_target, in_target)
-    w_s_imag = pad_scale_matrix(scale[3], out_target, in_target)
+    if numeric_profile == NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1:
+        if quant_scale.dtype != torch.bfloat16:
+            raise ValueError(
+                "qat_bf16_learned_scale_v1 requires checkpoint quant_scale dtype=torch.bfloat16"
+            )
+        scale = (
+            quant_scale.detach()
+            .contiguous()
+            .view(torch.int16)
+            .cpu()
+            .numpy()
+            .view(np.uint16)
+        )
+        if np.any((scale & np.uint16(0x7F80)) == np.uint16(0x7F80)):
+            raise ValueError(
+                "qat_bf16_learned_scale_v1 requires finite checkpoint BF16 learned scales"
+            )
+        u_s_real = pad_bf16_scale_bits(scale[0], out_target, in_target)
+        u_s_imag = pad_bf16_scale_bits(scale[1], out_target, in_target)
+        w_s_real = pad_bf16_scale_bits(scale[2], out_target, in_target)
+        w_s_imag = pad_bf16_scale_bits(scale[3], out_target, in_target)
+    else:
+        scale = quant_scale.to(torch.float32).cpu().numpy()
+        u_s_real = pad_scale_matrix(scale[0], out_target, in_target)
+        u_s_imag = pad_scale_matrix(scale[1], out_target, in_target)
+        w_s_real = pad_scale_matrix(scale[2], out_target, in_target)
+        w_s_imag = pad_scale_matrix(scale[3], out_target, in_target)
 
     out: dict[str, Fairy2IBranch] = {
         "U.s0": (u_real, u_imag, u_s_real, u_s_imag),
@@ -1513,10 +1627,25 @@ def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
 
 
 def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(
-    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+    weight: "torch.Tensor",
+    quant_scale: "torch.Tensor",
+    out_target: int,
+    in_target: int,
+    *,
+    numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> dict[str, np.ndarray]:
+    _validate_w1_numeric_profile(numeric_profile)
+    if numeric_profile == NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1:
+        raise ValueError(
+            "qat_bf16_learned_scale_v1 requires bundle_v1 because the tile64_v2 "
+            "stage carrier stores F16 scales"
+        )
     branches = quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
-        weight, quant_scale, out_target, in_target
+        weight,
+        quant_scale,
+        out_target,
+        in_target,
+        numeric_profile=numeric_profile,
     )
     return {
         name: pack_fairy2i_tile64_v2_stage(*branch)
@@ -1525,9 +1654,23 @@ def quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(
 
 
 def quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
-    weight: "torch.Tensor", quant_scale: "torch.Tensor", out_target: int, in_target: int
+    weight: "torch.Tensor",
+    quant_scale: "torch.Tensor",
+    out_target: int,
+    in_target: int,
+    *,
+    numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> tuple[np.ndarray, np.ndarray]:
+    _validate_w1_numeric_profile(numeric_profile)
     branches = quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale_branch_data(
-        weight, quant_scale, out_target, in_target
+        weight,
+        quant_scale,
+        out_target,
+        in_target,
+        numeric_profile=numeric_profile,
     )
-    return pack_fairy2i_bundle_v1(branches, ("U.s0", "W.s0"))
+    return pack_fairy2i_bundle_v1(
+        branches,
+        ("U.s0", "W.s0"),
+        numeric_profile=numeric_profile,
+    )
