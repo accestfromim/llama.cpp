@@ -1030,7 +1030,8 @@ static bool run_fairy2i_exact_rms_norm_backend(std::vector<float> &       out,
                                                const std::vector<float> & weight_data,
                                                int64_t                    n_dims,
                                                int64_t                    n_rows,
-                                               float                      eps) {
+                                               float                      eps,
+                                               bool                       qat = false) {
     struct ggml_init_params params = {
         /*.mem_size   =*/256 * 1024,
         /*.mem_buffer =*/nullptr,
@@ -1044,6 +1045,7 @@ static bool run_fairy2i_exact_rms_norm_backend(std::vector<float> &       out,
     ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_dims, n_rows);
     ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims);
     ggml_tensor * y      = ggml_fairy2i_rms_norm_exact(ctx, x, weight, eps);
+    ggml_fairy2i_exact_set_qat(y, qat);
     if (!ggml_backend_supports_op(backend, y)) {
         ggml_free(ctx);
         return false;
@@ -1153,6 +1155,19 @@ static bool test_fairy2i_exact_rms_norm() {
         }
         ok = run_case("Fairy2i exact RMSNorm large normal SIMD reduction", x, weight, n_dims, n_rows, 1.0e-5f, false) &&
              ok;
+
+        if (metal_dev) {
+            const std::vector<float> expected = fairy2i_exact_rms_norm_oracle(x, weight, n_dims, n_rows, 1.0e-5f);
+            ggml_backend_t           metal    = ggml_backend_dev_init(metal_dev, nullptr);
+            std::vector<float>       actual;
+            const bool               qat_ok =
+                metal && run_fairy2i_exact_rms_norm_backend(actual, metal, x, weight, n_dims, n_rows, 1.0e-5f, true) &&
+                compare_bf16_value_bits_one_step("Fairy2i QAT RMSNorm parallel reduction Metal", actual, expected);
+            if (metal) {
+                ggml_backend_free(metal);
+            }
+            ok = qat_ok && ok;
+        }
     }
 
     {

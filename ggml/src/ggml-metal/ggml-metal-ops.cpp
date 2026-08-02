@@ -217,7 +217,7 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ggml
     ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
     if (!pipeline) {
         pipeline = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
-        ggml_metal_pipeline_set_smem(pipeline, 16);
+        ggml_metal_pipeline_set_smem(pipeline, qat ? 32 : 16);
     }
 
     return pipeline;
@@ -3554,7 +3554,7 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(weight), 2);
     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op), 3);
     ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, ggml_metal_pipeline_get_smem(pipeline), 0);
-    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, src0->ne[1], src0->ne[2], src0->ne[3], 32, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, src0->ne[1], src0->ne[2], src0->ne[3], qat ? 256 : 32, 1, 1);
 
     return 1;
 }

@@ -7753,8 +7753,20 @@ kernel void kernel_fairy2i_rms_norm_qat_f32(
     }
     sum = simd_sum(sum);
 
+    const ushort tiisg = tiitg % N_SIMDWIDTH;
+    const ushort sgitg = tiitg / N_SIMDWIDTH;
+    if (tiisg == 0) {
+        inv_rms_shared[sgitg] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     if (tiitg == 0) {
-        inv_rms_shared[0] = 1.0f / precise::sqrt(sum / (float) args.ne00 + args.eps);
+        float row_sum = 0.0f;
+        for (ushort isg = 0; isg < ntg.x / N_SIMDWIDTH; ++isg) {
+            row_sum = precise::fma(1.0f, inv_rms_shared[isg], row_sum);
+        }
+        inv_rms_shared[0] = 1.0f / precise::sqrt(row_sum / (float) args.ne00 + args.eps);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
