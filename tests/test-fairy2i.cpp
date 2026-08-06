@@ -4226,7 +4226,8 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
                                       const std::vector<block_fairy2i_tile64_v2> & w_s0_data,
                                       const std::vector<block_fairy2i_tile64_v2> * w_s1_data,
                                       const std::vector<float> &                   bias_data,
-                                      const fairy2i_bundle_data *                  bundle_data = nullptr) {
+                                      const fairy2i_bundle_data *                  bundle_data = nullptr,
+                                      bool                                         qat         = false) {
     const bool is_bundle = bundle_data != nullptr;
     const bool is_w1     = is_bundle ? bundle_data->branches == 2 : u_s1_data == nullptr && w_s1_data == nullptr;
     if (!is_w1 && (!u_s1_data || !w_s1_data)) {
@@ -4275,6 +4276,9 @@ static bool run_fairy2i_metal_backend(std::vector<uint32_t> &                   
                              (is_w1 ? ggml_fairy2i_wide_linear_w1_bundle(ctx, x, codes, scales, bias, tc.M, tc.K) :
                                       ggml_fairy2i_wide_linear_w2_bundle(ctx, x, codes, scales, bias, tc.M, tc.K)) :
                              ggml_fairy2i_wide_linear_w2(ctx, x, u_s0, u_s1, w_s0, w_s1, bias);
+    if (qat) {
+        ggml_fairy2i_wide_linear_set_qat(y, true);
+    }
     ggml_set_name(y, is_bundle ? (is_w1 ? "fairy2i_metal_bundle_w1" : "fairy2i_metal_bundle_w2") :
                      is_w1     ? "fairy2i_metal_wide_linear_w1" :
                                  "fairy2i_metal_wide_linear_w2");
@@ -4390,17 +4394,20 @@ static bool test_fairy2i_exact_w1_metal_packed_bits() {
         int64_t      k;
         bool         bias;
         bool         dense;
+        bool         qat;
         const char * path;
     };
 
     const exact_w1_case cases[] = {
-        { 64,  1,  64,   false, false, "decode/no-bias"         },
-        { 64,  1,  64,   true,  false, "decode/bias"            },
-        { 64,  16, 64,   false, false, "prefill/direct"         },
-        { 64,  17, 64,   true,  false, "prefill/staged"         },
-        { 128, 1,  640,  false, true,  "decode/dense-multitile" },
-        { 128, 16, 1024, true,  true,  "prefill/direct-dense"   },
-        { 128, 17, 640,  true,  true,  "prefill/staged-dense"   },
+        { 64,  1,  64,   false, false, false, "decode/no-bias"           },
+        { 64,  1,  64,   true,  false, false, "decode/bias"              },
+        { 64,  16, 64,   false, false, false, "prefill/direct"           },
+        { 64,  17, 64,   true,  false, false, "prefill/staged"           },
+        { 128, 1,  640,  false, true,  false, "decode/dense-multitile"   },
+        { 128, 16, 1024, true,  true,  false, "prefill/direct-dense"     },
+        { 128, 17, 640,  true,  true,  false, "prefill/staged-dense"     },
+        { 64,  16, 64,   false, true,  true,  "QAT prefill/direct-dense" },
+        { 64,  17, 64,   true,  true,  true,  "QAT prefill/staged-dense" },
     };
     const float sparse_scales[4] = { -0x1p20f, 0x1p19f, 0x1p18f, -0x1p17f };
     const float dense_scales[4]  = { 1.0f, 2.0f, 4.0f, 8.0f };
@@ -4483,7 +4490,8 @@ static bool test_fairy2i_exact_w1_metal_packed_bits() {
         char                  label[128];
         snprintf(label, sizeof(label), "Fairy2i exact W1 Metal %s M=%lld N=%lld K=%lld", exact_case.path,
                  (long long) tc.M, (long long) tc.N, (long long) tc.K);
-        if (!run_fairy2i_metal_backend(actual, dev, tc, input, unused, nullptr, unused, nullptr, bias, &bundle) ||
+        if (!run_fairy2i_metal_backend(actual, dev, tc, input, unused, nullptr, unused, nullptr, bias, &bundle,
+                                       exact_case.qat) ||
             !compare_exact(label, actual, expected)) {
             ok = false;
         }

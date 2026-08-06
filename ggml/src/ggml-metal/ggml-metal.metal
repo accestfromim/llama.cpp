@@ -2016,6 +2016,14 @@ static inline void fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8(
     const int simd_groups = n_threads / 32;
     const int m16 = (row_base & 63) >> 4;
     const int row_lane_base = row_base & 15;
+    const int act_row = (int) tgpig.y;
+    const int i1 = act_row % args.x_ne1;
+    const int i2 = (act_row / args.x_ne1) % args.x_ne2;
+    const int i3 = act_row / (args.x_ne1 * args.x_ne2);
+    const ulong x_row_offset =
+        (ulong) i1 * args.x_nb1 + (ulong) i2 * args.x_nb2 + (ulong) i3 * args.x_nb3;
+    const ulong dst_row_offset =
+        (ulong) i1 * args.dst_nb1 + (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3;
     device const uchar * packed_coeff_metrics =
         (device const uchar *) (packed_coeff_lut +
                                 (ulong) (args.m / QK_FAIRY2I_TILE64) * (ulong) blocks * 16UL);
@@ -2057,7 +2065,7 @@ static inline void fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8(
             FOR_UNROLL (int part = 0; part < 4; ++part) {
                 const int j = q4 * 4 + part;
                 const int k_idx = wb * QK_FAIRY2I_TILE64 + j;
-                const uint pair = *((device const uint *) (x + (ulong) k_idx * x_nb0));
+                const uint pair = *((device const uint *) (x + x_row_offset + (ulong) k_idx * x_nb0));
                 act_real_bits[part] = (ushort) (pair & 0xffffU);
                 act_imag_bits[part] = (ushort) (pair >> 16);
                 act_real[part] = fairy2i_bf16_to_f32(act_real_bits[part]);
@@ -2127,7 +2135,7 @@ static inline void fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8(
             uint real_bits = 0;
             uint imag_bits = 0;
             for (int k = 0; k < blocks * QK_FAIRY2I_TILE64; ++k) {
-                const uint pair = *((device const uint *) (x + (ulong) k * x_nb0));
+                const uint pair = *((device const uint *) (x + x_row_offset + (ulong) k * x_nb0));
                 const ushort xr_bits = (ushort) (pair & 0xffffU);
                 const ushort xi_bits = (ushort) (pair >> 16);
                 const ushort4 coeff_bits =
@@ -2141,17 +2149,22 @@ static inline void fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8(
             ushort out_real_bits;
             ushort out_imag_bits;
             if (has_bias) {
-                const float bias_real =
-                    *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));
-                const float bias_imag =
-                    *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0));
+                const int b1 = i1 % args.bias_ne1;
+                const int b2 = i2 % args.bias_ne2;
+                const int b3 = i3 % args.bias_ne3;
+                const float bias_real = *((device const float *)
+                    (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0 + (ulong) b1 * args.bias_nb1 +
+                     (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+                const float bias_imag = *((device const float *)
+                    (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0 +
+                     (ulong) b1 * args.bias_nb1 + (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
                 out_real_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(real_bits, bias_real);
                 out_imag_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(imag_bits, bias_imag);
             } else {
                 out_real_bits = fairy2i_f32_to_bf16(as_type<float>(real_bits));
                 out_imag_bits = fairy2i_f32_to_bf16(as_type<float>(imag_bits));
             }
-            *((device uint *) (dst + (ulong) row * dst_nb0)) =
+            *((device uint *) (dst + dst_row_offset + (ulong) row * dst_nb0)) =
                 (uint) out_real_bits | ((uint) out_imag_bits << 16);
         }
         return;
@@ -2179,17 +2192,22 @@ static inline void fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8(
         ushort real_bits;
         ushort imag_bits;
         if (has_bias) {
-            const float bias_real =
-                *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));
-            const float bias_imag =
-                *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0));
+            const int b1 = i1 % args.bias_ne1;
+            const int b2 = i2 % args.bias_ne2;
+            const int b3 = i3 % args.bias_ne3;
+            const float bias_real = *((device const float *)
+                (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0 + (ulong) b1 * args.bias_nb1 +
+                 (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+            const float bias_imag = *((device const float *)
+                (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0 +
+                 (ulong) b1 * args.bias_nb1 + (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
             real_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(real, bias_real);
             imag_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(imag, bias_imag);
         } else {
             real_bits = fairy2i_f32_to_bf16(real);
             imag_bits = fairy2i_f32_to_bf16(imag);
         }
-        *((device uint *) (dst + (ulong) row * dst_nb0)) =
+        *((device uint *) (dst + dst_row_offset + (ulong) row * dst_nb0)) =
             (uint) real_bits | ((uint) imag_bits << 16);
     }
 }

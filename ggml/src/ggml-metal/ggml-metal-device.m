@@ -11,6 +11,7 @@
 #include <Metal/Metal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -26,6 +27,15 @@
 
 // overload of MTLGPUFamilyMetal3 (not available in some environments)
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
+static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
+
+static bool ggml_metal_env_flag(const char * name, bool default_value) {
+    const char * value = getenv(name);
+    if (value == NULL) {
+        return default_value;
+    }
+    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 && strcasecmp(value, "off") != 0;
+}
 
 #if !GGML_METAL_EMBED_LIBRARY
 // Here to assist with NSBundle Path Hack
@@ -498,6 +508,10 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 dev->props.use_shared_buffers = false;
             }
 
+            const bool supports_metal4 = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal4_GGML];
+            dev->props.fairy2i_metal3_compat = ggml_metal_env_flag(
+                "GGML_FAIRY2I_METAL3_COMPAT", !supports_metal4);
+
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
@@ -550,6 +564,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
             GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
             GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
+            GGML_LOG_INFO("%s: Fairy2i Metal3 compat = %s\n", __func__, dev->props.fairy2i_metal3_compat   ? "true" : "false");
 
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
             if (@available(macOS 10.12, iOS 16.0, *)) {

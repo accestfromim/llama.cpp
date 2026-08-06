@@ -178,6 +178,7 @@ struct ggml_metal_device_props {
     bool has_bfloat;
     bool use_residency_sets;
     bool use_shared_buffers;
+    bool fairy2i_metal3_compat;
 
     bool supports_gpu_family_apple7;
 };
