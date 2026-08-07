@@ -2000,7 +2000,11 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     const int32_t                           k                        = (int32_t) x->ne[0];
     const int32_t                           m                        = (int32_t) op->ne[0];
     const int32_t                           act_rows                 = (int32_t) ggml_nrows(x);
-    const bool                              use_bundle_w1_direct_act = is_bundle && is_w1 && act_rows % 16 == 0;
+    const bool                              use_bundle_w1_direct_act =
+        is_bundle && is_w1 && (act_rows % 16 == 0 || (is_exact_bundle_w1 && act_rows != 1));
+    // The direct kernel loads two N8 activation tiles. Pad the staged row stride so tail prefill batches can use the
+    // same coalesced K-major path; the kernel masks stores above act_rows.
+    const int32_t staged_act_rows = use_bundle_w1_direct_act ? (int32_t) GGML_PAD(act_rows, 16) : act_rows;
     const bool                              use_metal3_qat_prefill =
         is_exact_bundle_w1 && is_qat_bundle && act_rows != 1 && props_dev->fairy2i_metal3_compat;
     if (is_exact_bundle_w1) {
@@ -2064,7 +2068,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
     act_q.offs += ggml_nbytes(op) + op_act_q_pad;
     ggml_metal_buffer_id act_metrics = act_q;
     if (act_rows != 1 && !use_metal3_qat_prefill) {
-        act_metrics.offs += (size_t) act_rows * (size_t) (k / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2)) * 2u *
+        act_metrics.offs += (size_t) staged_act_rows * (size_t) (k / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2)) * 2u *
                             (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64) * sizeof(ggml_bf16_t);
     }
 
@@ -2076,7 +2080,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
                                                                     "kernel_fairy2i_act_half_64_stage_bf16";
         ggml_metal_pipeline_t pipeline = nullptr;
         if (use_bundle_w1_direct_act) {
-            pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, act_rows);
+            pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, staged_act_rows);
         } else {
             pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
             if (!pipeline) {
@@ -2161,7 +2165,7 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
                                        "kernel_fairy2i_wide_linear_w2_half_w64scale_mma32x16";
         ggml_metal_pipeline_t pipeline      = nullptr;
         if (use_bundle_w1_direct_act) {
-            pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, act_rows);
+            pipeline = ggml_metal_get_pipeline_fairy2i_bundle_w1_prefill_fc(lib, pipeline_name, staged_act_rows);
         } else {
             pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
             if (!pipeline) {
@@ -2409,13 +2413,15 @@ size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const ggml_tensor * op) 
         return pad + (size_t) blocks * sizeof(uint32_t);
     }
 
-    const int64_t blocks = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
+    const int64_t       blocks = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
+    const ggml_tensor * scales = op->src[2];
+    const bool exact_bundle_w1 = op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 && scales && scales->type == GGML_TYPE_BF16;
+    const int64_t staged_act_rows = exact_bundle_w1 ? GGML_PAD(act_rows, 16) : act_rows;
 
     const size_t pad = GGML_PAD(ggml_nbytes(op), 32) - ggml_nbytes(op);
     const size_t q8_size =
-        (size_t) act_rows * (size_t) blocks * 2u * (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64);
-    const size_t half_stage_size = q8_size * sizeof(ggml_fp16_t);
-    const ggml_tensor * scales          = op->src[2];
+        (size_t) staged_act_rows * (size_t) blocks * 2u * (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64);
+    const size_t        half_stage_size = q8_size * sizeof(ggml_fp16_t);
     const bool          exact_bundle    = scales && scales->type == GGML_TYPE_BF16;
     const size_t        metric_size     = exact_bundle ? (size_t) act_rows * (size_t) blocks * sizeof(uint32_t) : 0;
 

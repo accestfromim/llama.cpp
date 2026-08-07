@@ -4296,7 +4296,7 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
             const int col_local = (int) idx & 15;
             const int row = row_base + output_row_lane;
             const int col = col_base + col_local;
-            if (row < args.m) {
+            if (row < args.m && col < args.act_rows) {
                 uint real_bits = 0;
                 uint imag_bits = 0;
                 for (int k = 0; k < args.k; ++k) {
@@ -4363,7 +4363,7 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
         const int col_lane = col_local & 7;
         const int row = row_base + output_row_lane;
         const int col = col_base + col_local;
-        if (row < args.m) {
+        if (row < args.m && col < args.act_rows) {
             const int i1 = col % args.x_ne1;
             const int i2 = (col / args.x_ne1) % args.x_ne2;
             const int i3 = col / (args.x_ne1 * args.x_ne2);

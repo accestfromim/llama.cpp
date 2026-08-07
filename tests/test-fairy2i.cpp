@@ -4399,15 +4399,18 @@ static bool test_fairy2i_exact_w1_metal_packed_bits() {
     };
 
     const exact_w1_case cases[] = {
-        { 64,  1,  64,   false, false, false, "decode/no-bias"           },
-        { 64,  1,  64,   true,  false, false, "decode/bias"              },
-        { 64,  16, 64,   false, false, false, "prefill/direct"           },
-        { 64,  17, 64,   true,  false, false, "prefill/staged"           },
-        { 128, 1,  640,  false, true,  false, "decode/dense-multitile"   },
-        { 128, 16, 1024, true,  true,  false, "prefill/direct-dense"     },
-        { 128, 17, 640,  true,  true,  false, "prefill/staged-dense"     },
-        { 64,  16, 64,   false, true,  true,  "QAT prefill/direct-dense" },
-        { 64,  17, 64,   true,  true,  true,  "QAT prefill/staged-dense" },
+        { 64,  1,  64,   false, false, false, "decode/no-bias"            },
+        { 64,  1,  64,   true,  false, false, "decode/bias"               },
+        { 64,  9,  64,   false, false, false, "prefill/direct-padded"     },
+        { 64,  16, 64,   false, false, false, "prefill/direct"            },
+        { 64,  17, 64,   true,  false, false, "prefill/direct-tail"       },
+        { 128, 1,  640,  false, true,  false, "decode/dense-multitile"    },
+        { 128, 16, 1024, true,  true,  false, "prefill/direct-dense"      },
+        { 128, 17, 640,  true,  true,  false, "prefill/direct-tail-dense" },
+        { 64,  5,  64,   false, true,  true,  "QAT prefill/direct-padded" },
+        { 64,  9,  64,   true,  true,  true,  "QAT prefill/direct-padded" },
+        { 64,  16, 64,   false, true,  true,  "QAT prefill/direct-dense"  },
+        { 64,  17, 64,   true,  true,  true,  "QAT prefill/direct-tail"   },
     };
     const float sparse_scales[4] = { -0x1p20f, 0x1p19f, 0x1p18f, -0x1p17f };
     const float dense_scales[4]  = { 1.0f, 2.0f, 4.0f, 8.0f };
