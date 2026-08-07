@@ -2004,8 +2004,9 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         is_bundle && is_w1 && (act_rows % 16 == 0 || (is_exact_bundle_w1 && act_rows != 1));
     // The direct kernel loads two N8 activation tiles. Pad the staged row stride so tail prefill batches can use the
     // same coalesced K-major path; the kernel masks stores above act_rows.
-    const int32_t staged_act_rows = use_bundle_w1_direct_act ? (int32_t) GGML_PAD(act_rows, 16) : act_rows;
-    const bool                              use_metal3_qat_prefill =
+    const int32_t staged_act_rows =
+        use_bundle_w1_direct_act ? (int32_t) GGML_PAD(act_rows, act_rows <= 8 ? 8 : 16) : act_rows;
+    const bool use_metal3_qat_prefill =
         is_exact_bundle_w1 && is_qat_bundle && act_rows != 1 && props_dev->fairy2i_metal3_compat;
     if (is_exact_bundle_w1) {
         static std::atomic_bool logged_decode         = false;
@@ -2211,7 +2212,8 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * mma_element_size, 2);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * k_tile * mma_element_size, 3);
         if (use_bundle_w1_direct_act) {
-            ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 4);
+            const int col_tile = staged_act_rows <= 8 ? 8 : 16;
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * col_tile * 2 * sizeof(float), 4);
         } else {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * mma_element_size, 4);
             ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * mma_element_size, 5);
@@ -2219,8 +2221,9 @@ int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_threadgroup_memory_size(enc, k_tile * 8 * mma_element_size, 7);
             ggml_metal_encoder_set_threadgroup_memory_size(enc, row_tile * 16 * 2 * sizeof(float), 8);
         }
-        ggml_metal_encoder_dispatch_threadgroups(enc, (m + row_tile - 1) / row_tile, (act_rows + 15) / 16, 1, nth, 1,
-                                                 1);
+        const int col_tile = use_bundle_w1_direct_act && staged_act_rows <= 8 ? 8 : 16;
+        ggml_metal_encoder_dispatch_threadgroups(enc, (m + row_tile - 1) / row_tile,
+                                                 (act_rows + col_tile - 1) / col_tile, 1, nth, 1, 1);
 
         return 1;
     }
@@ -2416,14 +2419,14 @@ size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const ggml_tensor * op) 
     const int64_t       blocks = x->ne[0] / ggml_blck_size(GGML_TYPE_FAIRY2I_TILE64_V2);
     const ggml_tensor * scales = op->src[2];
     const bool exact_bundle_w1 = op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 && scales && scales->type == GGML_TYPE_BF16;
-    const int64_t staged_act_rows = exact_bundle_w1 ? GGML_PAD(act_rows, 16) : act_rows;
+    const int64_t staged_act_rows = exact_bundle_w1 ? GGML_PAD(act_rows, act_rows <= 8 ? 8 : 16) : act_rows;
 
     const size_t pad = GGML_PAD(ggml_nbytes(op), 32) - ggml_nbytes(op);
     const size_t q8_size =
         (size_t) staged_act_rows * (size_t) blocks * 2u * (size_t) ggml_blck_size(GGML_TYPE_FAIRY2I_ACT_Q16_64);
-    const size_t        half_stage_size = q8_size * sizeof(ggml_fp16_t);
-    const bool          exact_bundle    = scales && scales->type == GGML_TYPE_BF16;
-    const size_t        metric_size     = exact_bundle ? (size_t) act_rows * (size_t) blocks * sizeof(uint32_t) : 0;
+    const size_t half_stage_size = q8_size * sizeof(ggml_fp16_t);
+    const bool   exact_bundle    = scales && scales->type == GGML_TYPE_BF16;
+    const size_t metric_size     = exact_bundle ? (size_t) act_rows * (size_t) blocks * sizeof(uint32_t) : 0;
 
     return pad + half_stage_size + metric_size;
 }

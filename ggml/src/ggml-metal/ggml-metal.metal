@@ -4090,7 +4090,8 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
     constexpr int n_threads = 128;
 
     const int row_base = (int) tgpig.x * row_tile;
-    const int col_base = (int) tgpig.y * 16;
+    const int col_tile = FC_fairy2i_bundle_w1_prefill_act_rows <= 8 ? 8 : 16;
+    const int col_base = (int) tgpig.y * col_tile;
     const int blocks = args.k / QK_FAIRY2I_TILE64;
     const int physical_m_tile = row_base / QK_FAIRY2I_TILE64;
     const int coeff_base = (int) sgitg * 8 * k_tile;
@@ -4117,7 +4118,7 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
     uint min_act_metric = 255U;
 
     for (int wb = 0; wb < blocks; ++wb) {
-        if (tiitg < 16) {
+        if (tiitg < (uint) col_tile) {
             const int col = col_base + (int) tiitg;
             if (col < args.act_rows) {
                 min_act_metric = min(min_act_metric, act_block_metrics[col * blocks + wb]);
@@ -4171,20 +4172,24 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
                 b_r0, act_b + act_real_base, FC_fairy2i_bundle_w1_prefill_act_rows);
             simdgroup_load(
                 b_i0, act_b + act_imag_base, FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_r1, act_b + act_real_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_i1, act_b + act_imag_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
 
             simdgroup_barrier(mem_flags::mem_none);
             simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
             simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
             simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
             simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
-            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
-            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
-            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
-            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
 
             simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 8, k_tile);
             simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 8, k_tile);
@@ -4196,22 +4201,26 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
             simdgroup_load(
                 b_i0, act_b + act_imag_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows,
                 FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_r1, act_b + act_real_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
-                FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_i1, act_b + act_imag_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
-                FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
 
             simdgroup_barrier(mem_flags::mem_none);
             simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
             simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
             simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
             simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
-            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
-            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
-            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
-            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
 
             simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 16, k_tile);
             simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 16, k_tile);
@@ -4223,22 +4232,26 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
             simdgroup_load(
                 b_i0, act_b + act_imag_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows,
                 FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_r1, act_b + act_real_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
-                FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_i1, act_b + act_imag_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
-                FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
 
             simdgroup_barrier(mem_flags::mem_none);
             simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
             simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
             simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
             simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
-            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
-            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
-            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
-            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
 
             simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 24, k_tile);
             simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 24, k_tile);
@@ -4250,22 +4263,26 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
             simdgroup_load(
                 b_i0, act_b + act_imag_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows,
                 FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_r1, act_b + act_real_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
-                FC_fairy2i_bundle_w1_prefill_act_rows);
-            simdgroup_load(
-                b_i1, act_b + act_imag_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
-                FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
 
             simdgroup_barrier(mem_flags::mem_none);
             simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
             simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
             simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
             simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
-            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
-            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
-            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
-            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
         }
     }
 
@@ -4291,9 +4308,9 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
     const bool requires_software = fairy2i_product_metrics_require_software(
         ((threadgroup uint *) out_tile)[0], ((threadgroup uint *) out_tile)[1]);
     if (requires_software) {
-        for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
-            const int output_row_lane = (int) idx / 16;
-            const int col_local = (int) idx & 15;
+        for (uint idx = tiitg; idx < row_tile * col_tile; idx += n_threads) {
+            const int output_row_lane = (int) idx / col_tile;
+            const int col_local = (int) idx % col_tile;
             const int row = row_base + output_row_lane;
             const int col = col_base + col_local;
             if (row < args.m && col < args.act_rows) {
@@ -4349,16 +4366,19 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
         return;
     }
 
-    const int simdgroup_out_base = (int) sgitg * 256;
+    const int simdgroup_out_stride = col_tile * 16;
+    const int simdgroup_out_base = (int) sgitg * simdgroup_out_stride;
     simdgroup_store(c_r0, out_tile + simdgroup_out_base, 8);
     simdgroup_store(c_i0, out_tile + simdgroup_out_base + 64, 8);
-    simdgroup_store(c_r1, out_tile + simdgroup_out_base + 128, 8);
-    simdgroup_store(c_i1, out_tile + simdgroup_out_base + 192, 8);
+    if (col_tile > 8) {
+        simdgroup_store(c_r1, out_tile + simdgroup_out_base + 128, 8);
+        simdgroup_store(c_i1, out_tile + simdgroup_out_base + 192, 8);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
-        const int output_row_lane = (int) idx / 16;
-        const int col_local = (int) idx & 15;
+    for (uint idx = tiitg; idx < row_tile * col_tile; idx += n_threads) {
+        const int output_row_lane = (int) idx / col_tile;
+        const int col_local = (int) idx % col_tile;
         const int tile = col_local >> 3;
         const int col_lane = col_local & 7;
         const int row = row_base + output_row_lane;
@@ -4369,7 +4389,7 @@ kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_
             const int i3 = col / (args.x_ne1 * args.x_ne2);
             const int row_group = output_row_lane >> 3;
             const int row_in_group = output_row_lane & 7;
-            const int out_base = row_group * 256 + tile * 128;
+            const int out_base = row_group * simdgroup_out_stride + tile * 128;
             const float out_real = out_tile[out_base + row_in_group * 8 + col_lane];
             const float out_imag = out_tile[out_base + 64 + row_in_group * 8 + col_lane];
 

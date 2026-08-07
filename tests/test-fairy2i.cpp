@@ -4408,6 +4408,7 @@ static bool test_fairy2i_exact_w1_metal_packed_bits() {
         { 128, 16, 1024, true,  true,  false, "prefill/direct-dense"      },
         { 128, 17, 640,  true,  true,  false, "prefill/direct-tail-dense" },
         { 64,  5,  64,   false, true,  true,  "QAT prefill/direct-padded" },
+        { 64,  8,  64,   true,  true,  true,  "QAT prefill/direct-n8"     },
         { 64,  9,  64,   true,  true,  true,  "QAT prefill/direct-padded" },
         { 64,  16, 64,   false, true,  true,  "QAT prefill/direct-dense"  },
         { 64,  17, 64,   true,  true,  true,  "QAT prefill/direct-tail"   },
