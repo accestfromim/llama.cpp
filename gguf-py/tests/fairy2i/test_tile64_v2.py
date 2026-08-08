@@ -1,21 +1,35 @@
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import pytest
 
 import fairy2i.quant.tile64_v2 as tile64_v2
 from fairy2i.quant.tile64_v2 import (
+    NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
     TILE64,
+    canonical_quantize_complex_tile64_v2_script_bf16_f32,
+    canonical_quantize_wide_linear_tile64_script_bf16_f32,
     encode_stage_codes,
     iter_quantize_linear_to_fairy2i_bundle_v1_m64,
     merge_fairy2i_bundle_v1_m,
     pack_fairy2i_bundle_v1,
     pack_fairy2i_tile64_v2_stage,
+    pairwise_sum_float32,
     quantize_linear_to_fairy2i_bundle_v1_m64,
+    quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale,
     quantize_linear_to_fairy2i_tile64_v2_branch_data,
     quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale,
+    quantize_complex_tile64_v2_script_bf16_f32,
     quantize_matrix_tile64_v2,
     quantize_tile64_once,
+    reconstruct_complex_tile64_v2_script_bf16_f32,
+    reconstruct_wide_linear_tile64_script_bf16_f32,
+    round_float32_to_bf16,
+    round_float32_to_bf16_bits,
+    split_wide_linear_components,
     unpack_fairy2i_bundle_v1,
 )
 
@@ -109,6 +123,21 @@ def test_bundle_v1_slot_order_is_m16_then_q4() -> None:
     assert codes[0, 0, 0, 0] == np.uint8(0b11100100)
     assert codes[0, 1, 0, 0] == np.uint8(0b11100100)
     assert codes[0, 16, 0, 0] == np.uint8(0b11100100)
+
+
+def test_bundle_v1_branch_packer_rejects_exact_profile_without_mask_codes() -> None:
+    branch_order = ("U.s0", "U.s1", "W.s0", "W.s1")
+    branches = {
+        name: make_bundle_branch(seed)[:4]
+        for seed, name in enumerate(branch_order)
+    }
+
+    with pytest.raises(ValueError, match="cannot recover exact-profile sign masks"):
+        pack_fairy2i_bundle_v1(
+            branches,
+            branch_order,
+            numeric_profile=NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+        )
 
 
 def test_bundle_v1_merge_m_preserves_component_tile_order() -> None:
@@ -262,6 +291,504 @@ def test_quantize_tile64_once_ties_zeros_and_signs() -> None:
     assert not np.any(zero_imag)
 
 
+def test_script_bf16_rounding_is_rne_and_preserves_signed_zero() -> None:
+    input_bits = np.array(
+        [
+            0x00000000,
+            0x80000000,
+            0x00008000,
+            0x00008001,
+            0x3F808000,
+            0x3F818000,
+            0x7F7F0000,
+            0x7F7F8000,
+            0xFF7F8000,
+        ],
+        dtype=np.uint32,
+    )
+    expected_bits = np.array(
+        [
+            0x00000000,
+            0x80000000,
+            0x00000000,
+            0x00010000,
+            0x3F800000,
+            0x3F820000,
+            0x7F7F0000,
+            0x7F800000,
+            0xFF800000,
+        ],
+        dtype=np.uint32,
+    )
+
+    actual = round_float32_to_bf16(input_bits.view(np.float32))
+
+    np.testing.assert_array_equal(actual.view(np.uint32), expected_bits)
+    np.testing.assert_array_equal(
+        round_float32_to_bf16_bits(input_bits.view(np.float32)),
+        (expected_bits >> np.uint32(16)).astype(np.uint16),
+    )
+
+
+def test_script_f32_reduction_is_balanced_pairwise_not_sequential() -> None:
+    values = np.zeros(TILE64 * TILE64, dtype=np.float32)
+    values[:4] = np.asarray([1e20, 1.0, -1e20, 1.0], dtype=np.float32)
+
+    sequential = np.float32(0.0)
+    for value in values:
+        sequential = np.float32(sequential + value)
+
+    assert pairwise_sum_float32(values).view(np.uint32) == np.float32(0.0).view(
+        np.uint32
+    )
+    assert sequential.view(np.uint32) == np.float32(1.0).view(np.uint32)
+
+
+def _script_profile_fixture() -> tuple[np.ndarray, np.ndarray]:
+    row = np.arange(TILE64, dtype=np.int32)[:, None]
+    col = np.arange(TILE64, dtype=np.int32)[None, :]
+    real = (((row * 17 + col * 13) % 257) - 128).astype(np.float32) / np.float32(32.0)
+    imag = (((row * 29 + col * 7 + 11) % 263) - 131).astype(np.float32) / np.float32(32.0)
+    return real, imag
+
+
+def _script_profile_wide_fixture(
+    mb_count: int,
+    kb_count: int,
+) -> np.ndarray:
+    out_target = mb_count * TILE64
+    in_target = kb_count * TILE64
+    components = [
+        np.empty((out_target, in_target), dtype=np.float32)
+        for _ in range(4)
+    ]
+    fixture_real, fixture_imag = _script_profile_fixture()
+    for mb in range(mb_count):
+        rows = slice(mb * TILE64, (mb + 1) * TILE64)
+        for kb in range(kb_count):
+            cols = slice(kb * TILE64, (kb + 1) * TILE64)
+            tile_seed = mb * kb_count + kb
+            components[0][rows, cols] = np.roll(
+                fixture_real,
+                shift=(3 * tile_seed, 5 * tile_seed),
+                axis=(0, 1),
+            )
+            components[1][rows, cols] = np.roll(
+                fixture_imag,
+                shift=(7 * tile_seed, 2 * tile_seed),
+                axis=(0, 1),
+            )
+            components[2][rows, cols] = np.roll(
+                fixture_real,
+                shift=(7 + 2 * tile_seed, 11 + tile_seed),
+                axis=(0, 1),
+            )
+            components[3][rows, cols] = np.roll(
+                fixture_imag,
+                shift=(13 + tile_seed, 17 + 3 * tile_seed),
+                axis=(0, 1),
+            )
+    return np.block(
+        [
+            [components[0], components[1]],
+            [components[2], components[3]],
+        ]
+    )
+
+
+def _pack_scalar_oracle_stage_codes(codes: np.ndarray) -> np.ndarray:
+    """Pack scalar-oracle codes without using the production bundle helpers."""
+
+    assert codes.shape == (TILE64, TILE64)
+    assert codes.dtype == np.uint8
+    q4 = codes.reshape(TILE64, TILE64 // 4, 4)
+    packed = (
+        q4[..., 0]
+        | (q4[..., 1] << np.uint8(2))
+        | (q4[..., 2] << np.uint8(4))
+        | (q4[..., 3] << np.uint8(6))
+    ).astype(np.uint8)
+    return np.ascontiguousarray(
+        packed.reshape(TILE64 // 16, 16, TILE64 // 4)
+        .transpose(0, 2, 1)
+        .reshape(TILE64, 16)
+    )
+
+
+def _canonical_bundle_from_wide_checkpoint(
+    checkpoint_weight: np.ndarray,
+    out_target: int,
+    in_target: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble a whole bundle tile-by-tile from the independent scalar oracle."""
+
+    assert checkpoint_weight.shape == (2 * out_target, 2 * in_target)
+    a11 = checkpoint_weight[:out_target, :in_target]
+    a12 = checkpoint_weight[:out_target, in_target:]
+    a21 = checkpoint_weight[out_target:, :in_target]
+    a22 = checkpoint_weight[out_target:, in_target:]
+    mb_count = out_target // TILE64
+    kb_count = in_target // TILE64
+    codes = np.empty((mb_count * kb_count, TILE64, 4, 16), dtype=np.uint8)
+    scales = np.empty((mb_count * kb_count, 4, 2), dtype=np.uint16)
+
+    for mb in range(mb_count):
+        rows = slice(mb * TILE64, (mb + 1) * TILE64)
+        for kb in range(kb_count):
+            cols = slice(kb * TILE64, (kb + 1) * TILE64)
+            u_tile, w_tile, _ = canonical_quantize_wide_linear_tile64_script_bf16_f32(
+                a11[rows, cols],
+                a12[rows, cols],
+                a21[rows, cols],
+                a22[rows, cols],
+            )
+            tile_index = mb * kb_count + kb
+            for branch, stage in enumerate(
+                (u_tile.stage0, u_tile.stage1, w_tile.stage0, w_tile.stage1)
+            ):
+                codes[tile_index, :, branch, :] = _pack_scalar_oracle_stage_codes(
+                    stage.codes
+                )
+                scales[tile_index, branch, :] = round_float32_to_bf16_bits(
+                    np.asarray(
+                        (stage.scale_real, stage.scale_imag),
+                        dtype=np.float32,
+                    )
+                )
+
+    return codes, scales
+
+
+def test_script_bf16_f32_scalar_oracle_matches_vectorized_fixture_bits() -> None:
+    tile_real, tile_imag = _script_profile_fixture()
+
+    expected = canonical_quantize_complex_tile64_v2_script_bf16_f32(
+        tile_real,
+        tile_imag,
+    )
+    actual = quantize_complex_tile64_v2_script_bf16_f32(tile_real, tile_imag)
+
+    digest = hashlib.sha256()
+    for stage_name in ("stage0", "stage1"):
+        expected_stage = getattr(expected, stage_name)
+        actual_stage = getattr(actual, stage_name)
+        np.testing.assert_array_equal(actual_stage.codes, expected_stage.codes)
+        np.testing.assert_array_equal(
+            actual_stage.quant_real.view(np.uint32),
+            expected_stage.quant_real.view(np.uint32),
+        )
+        np.testing.assert_array_equal(
+            actual_stage.quant_imag.view(np.uint32),
+            expected_stage.quant_imag.view(np.uint32),
+        )
+        assert actual_stage.scale_real.view(np.uint32) == expected_stage.scale_real.view(
+            np.uint32
+        )
+        assert actual_stage.scale_imag.view(np.uint32) == expected_stage.scale_imag.view(
+            np.uint32
+        )
+        digest.update(actual_stage.codes.tobytes())
+        digest.update(actual_stage.scale_real.tobytes())
+        digest.update(actual_stage.scale_imag.tobytes())
+
+    serialized_scale_bits = tuple(
+        round_float32_to_bf16_bits(
+            np.asarray((stage.scale_real, stage.scale_imag), dtype=np.float32)
+        )
+        for stage in (actual.stage0, actual.stage1)
+    )
+    reconstructed_real, reconstructed_imag = (
+        reconstruct_complex_tile64_v2_script_bf16_f32(
+            actual,
+            serialized_scale_bits=serialized_scale_bits,
+        )
+    )
+    legacy_reconstructed = reconstruct_complex_tile64_v2_script_bf16_f32(actual)
+    expected_real = round_float32_to_bf16(
+        np.add(actual.stage0.quant_real, actual.stage1.quant_real, dtype=np.float32)
+    )
+    expected_imag = round_float32_to_bf16(
+        np.add(actual.stage0.quant_imag, actual.stage1.quant_imag, dtype=np.float32)
+    )
+    np.testing.assert_array_equal(
+        reconstructed_real.view(np.uint32),
+        expected_real.view(np.uint32),
+    )
+    np.testing.assert_array_equal(
+        reconstructed_imag.view(np.uint32),
+        expected_imag.view(np.uint32),
+    )
+    np.testing.assert_array_equal(
+        reconstructed_real.view(np.uint32),
+        legacy_reconstructed[0].view(np.uint32),
+    )
+    np.testing.assert_array_equal(
+        reconstructed_imag.view(np.uint32),
+        legacy_reconstructed[1].view(np.uint32),
+    )
+    assert digest.hexdigest() == "42a3d98624c7b70e236b4db3f99c2bcd18ddcb08c190be8f22f6f0ccdb702d6c"
+
+
+def test_script_bf16_f32_scalar_wide_oracle_matches_vectorized_u_w_and_a_bits() -> None:
+    a11, a12 = _script_profile_fixture()
+    a21 = np.roll(a11, shift=7, axis=0)
+    a22 = np.roll(a12, shift=11, axis=1)
+
+    expected_u, expected_w, expected_a = (
+        canonical_quantize_wide_linear_tile64_script_bf16_f32(
+            a11,
+            a12,
+            a21,
+            a22,
+        )
+    )
+
+    x11, x12, x21, x22 = (
+        round_float32_to_bf16(component)
+        for component in (a11, a12, a21, a22)
+    )
+
+    def bf16_half(value: np.ndarray) -> np.ndarray:
+        return round_float32_to_bf16(
+            np.multiply(value, np.float32(0.5), dtype=np.float32)
+        )
+
+    u_real = bf16_half(
+        round_float32_to_bf16(np.add(x11, x22, dtype=np.float32))
+    )
+    u_imag = bf16_half(
+        round_float32_to_bf16(np.subtract(x21, x12, dtype=np.float32))
+    )
+    w_real = bf16_half(
+        round_float32_to_bf16(np.subtract(x11, x22, dtype=np.float32))
+    )
+    w_imag = bf16_half(
+        round_float32_to_bf16(np.add(x12, x21, dtype=np.float32))
+    )
+    actual_u = quantize_complex_tile64_v2_script_bf16_f32(u_real, u_imag)
+    actual_w = quantize_complex_tile64_v2_script_bf16_f32(w_real, w_imag)
+    def serialized_scales(tile: tile64_v2.ScriptBF16F32Tile) -> tuple[np.ndarray, np.ndarray]:
+        return tuple(
+            round_float32_to_bf16_bits(
+                np.asarray((stage.scale_real, stage.scale_imag), dtype=np.float32)
+            )
+            for stage in (tile.stage0, tile.stage1)
+        )
+
+    actual_a = reconstruct_wide_linear_tile64_script_bf16_f32(
+        actual_u,
+        actual_w,
+        u_serialized_scale_bits=serialized_scales(actual_u),
+        w_serialized_scale_bits=serialized_scales(actual_w),
+    )
+
+    for expected_tile, actual_tile in (
+        (expected_u, actual_u),
+        (expected_w, actual_w),
+    ):
+        for stage_name in ("stage0", "stage1"):
+            expected_stage = getattr(expected_tile, stage_name)
+            actual_stage = getattr(actual_tile, stage_name)
+            np.testing.assert_array_equal(actual_stage.codes, expected_stage.codes)
+            assert (
+                actual_stage.scale_real.view(np.uint32)
+                == expected_stage.scale_real.view(np.uint32)
+            )
+            assert (
+                actual_stage.scale_imag.view(np.uint32)
+                == expected_stage.scale_imag.view(np.uint32)
+            )
+
+    for expected_component, actual_component in zip(expected_a, actual_a):
+        np.testing.assert_array_equal(
+            actual_component.view(np.uint32),
+            expected_component.view(np.uint32),
+        )
+
+
+@pytest.mark.parametrize(
+    ("scale_bits", "match"),
+    [
+        (np.asarray([0x3F80, 0x3F00], dtype=np.int16), "BF16 uint16"),
+        (np.asarray([0xBF80, 0x3F00], dtype=np.uint16), "non-negative"),
+        (np.asarray([0x7F80, 0x3F00], dtype=np.uint16), "finite BF16"),
+        (np.asarray([0x7FC1, 0x3F00], dtype=np.uint16), "finite BF16"),
+    ],
+)
+def test_script_reconstruction_rejects_invalid_serialized_bf16_scales(
+    scale_bits: np.ndarray,
+    match: str,
+) -> None:
+    tile_real, tile_imag = _script_profile_fixture()
+    tile = quantize_complex_tile64_v2_script_bf16_f32(tile_real, tile_imag)
+
+    with pytest.raises(ValueError, match=match):
+        reconstruct_complex_tile64_v2_script_bf16_f32(
+            tile,
+            serialized_scale_bits=(scale_bits, np.asarray([0x3F80, 0x3F00], dtype=np.uint16)),
+        )
+
+
+@pytest.mark.parametrize(
+    ("tile_real", "tile_imag", "match"),
+    [
+        (
+            np.ones((TILE64, TILE64), dtype=np.float32),
+            np.zeros((TILE64, TILE64), dtype=np.float32),
+            "empty imag-dominant category",
+        ),
+        (
+            np.zeros((TILE64, TILE64), dtype=np.float32),
+            np.zeros((TILE64, TILE64), dtype=np.float32),
+            "empty real-dominant category",
+        ),
+        (
+            np.full((TILE64, TILE64), np.nan, dtype=np.float32),
+            np.zeros((TILE64, TILE64), dtype=np.float32),
+            "requires finite",
+        ),
+        (
+            np.full((TILE64, TILE64), np.inf, dtype=np.float32),
+            np.zeros((TILE64, TILE64), dtype=np.float32),
+            "requires finite",
+        ),
+        (
+            np.full((TILE64, TILE64), -np.inf, dtype=np.float32),
+            np.zeros((TILE64, TILE64), dtype=np.float32),
+            "requires finite",
+        ),
+    ],
+)
+def test_script_bf16_f32_rejects_degenerate_or_nonfinite_tiles(
+    tile_real: np.ndarray,
+    tile_imag: np.ndarray,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        quantize_complex_tile64_v2_script_bf16_f32(tile_real, tile_imag)
+
+
+def test_script_bf16_f32_rejects_empty_stage1_dominant_group() -> None:
+    tile_real = np.zeros((TILE64, TILE64), dtype=np.float32)
+    tile_imag = np.ones_like(tile_real)
+    tile_real[:, : TILE64 // 2] = 1.0
+    tile_imag[:, : TILE64 // 2] = 0.0
+
+    with pytest.raises(ValueError, match="stage1: empty real-dominant category"):
+        quantize_complex_tile64_v2_script_bf16_f32(tile_real, tile_imag)
+
+
+def test_script_bf16_f32_bundle_streaming_is_bit_identical_and_keeps_bf16_scale_bits() -> None:
+    torch = pytest.importorskip("torch")
+
+    out_target = 2 * TILE64
+    in_target = 3 * TILE64
+    weight = torch.from_numpy(
+        _script_profile_wide_fixture(
+            out_target // TILE64,
+            in_target // TILE64,
+        )
+    ).to(torch.bfloat16)
+    expected_codes, expected_scales = _canonical_bundle_from_wide_checkpoint(
+        weight.to(torch.float32).numpy(),
+        out_target,
+        in_target,
+    )
+    nonstreaming_codes, nonstreaming_scales = (
+        quantize_linear_to_fairy2i_bundle_v1_m64(
+            weight,
+            out_target,
+            in_target,
+            numeric_profile=NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+            tensor_name="fixture.weight",
+        )
+    )
+    strips = list(
+        iter_quantize_linear_to_fairy2i_bundle_v1_m64(
+            lambda rows, cols: weight[rows, cols],
+            out_target,
+            in_target,
+            weight_shape=tuple(weight.shape),
+            numeric_profile=NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+            tensor_name="fixture.weight",
+        )
+    )
+    streaming_codes, streaming_scales = merge_fairy2i_bundle_v1_m(strips)
+
+    assert expected_codes.shape == (6, TILE64, 4, 16)
+    assert expected_scales.shape == (6, 4, 2)
+    assert len(strips) == 2
+    assert all(strip_codes.shape == (3, TILE64, 4, 16) for strip_codes, _ in strips)
+    assert all(strip_scales.shape == (3, 4, 2) for _, strip_scales in strips)
+    np.testing.assert_array_equal(nonstreaming_codes, expected_codes)
+    np.testing.assert_array_equal(nonstreaming_scales, expected_scales)
+    np.testing.assert_array_equal(streaming_codes, expected_codes)
+    np.testing.assert_array_equal(streaming_scales, expected_scales)
+
+    expected_hash = hashlib.sha256(
+        expected_codes.tobytes() + expected_scales.tobytes()
+    ).hexdigest()
+    assert expected_hash == "50933c0ea9e1616543da7364b9c03ceab81ecb4fa4a82bc0f4d064274044377f"
+    assert (
+        hashlib.sha256(
+            nonstreaming_codes.tobytes() + nonstreaming_scales.tobytes()
+        ).hexdigest()
+        == expected_hash
+    )
+    assert (
+        hashlib.sha256(
+            streaming_codes.tobytes() + streaming_scales.tobytes()
+        ).hexdigest()
+        == expected_hash
+    )
+    assert streaming_scales.dtype == np.uint16
+    assert np.all((streaming_scales & np.uint16(0x8000)) == 0)
+    assert np.all((streaming_scales & np.uint16(0x7F80)) != np.uint16(0x7F80))
+
+
+def test_script_bf16_f32_bundle_error_names_tensor_tile_and_branch() -> None:
+    torch = pytest.importorskip("torch")
+    weight = torch.ones((TILE64 * 2, TILE64 * 2), dtype=torch.bfloat16)
+
+    with pytest.raises(
+        ValueError,
+        match=r"fixture\.weight: tile\(mb=0, kb=0\) branch=U: .*empty",
+    ):
+        quantize_linear_to_fairy2i_bundle_v1_m64(
+            weight,
+            TILE64,
+            TILE64,
+            numeric_profile=NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+            tensor_name="fixture.weight",
+        )
+
+
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")])
+def test_script_bf16_f32_bundle_nonfinite_error_names_tensor_tile_and_branch(
+    nonfinite: float,
+) -> None:
+    torch = pytest.importorskip("torch")
+    generator = torch.Generator().manual_seed(20260729)
+    weight = torch.randn(
+        (TILE64 * 2, TILE64 * 2),
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    weight[0, 0] = nonfinite
+
+    with pytest.raises(
+        ValueError,
+        match=r"fixture\.weight: tile\(mb=0, kb=0\) branch=U: .*finite",
+    ):
+        quantize_linear_to_fairy2i_bundle_v1_m64(
+            weight,
+            TILE64,
+            TILE64,
+            numeric_profile=NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+            tensor_name="fixture.weight",
+        )
+
+
 def test_quantize_matrix_tile64_requires_divisible_dims() -> None:
     real = np.zeros((TILE64, TILE64 + 1), dtype=np.float32)
     imag = np.zeros_like(real)
@@ -305,3 +832,225 @@ def test_w1_learned_scale_rejects_bad_scale_shape() -> None:
 
     with pytest.raises(ValueError, match="learned scale shape mismatch"):
         quantize_linear_to_fairy2i_tile64_v2_w1_learned_scale(weight, bad_scale, TILE64, TILE64)
+
+
+@pytest.mark.parametrize("weight_dtype", ["float16", "float32"])
+def test_qat_bf16_w1_rejects_non_bf16_checkpoint_weight(
+    weight_dtype: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    weight = torch.zeros(
+        (TILE64 * 2, TILE64 * 2),
+        dtype=getattr(torch, weight_dtype),
+    )
+    scale = torch.ones((4, 1, 1), dtype=torch.bfloat16)
+
+    with pytest.raises(
+        ValueError,
+        match=r"checkpoint weight dtype=torch\.bfloat16",
+    ):
+        quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+            weight,
+            scale,
+            TILE64,
+            TILE64,
+            numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+        )
+
+
+@pytest.mark.parametrize("weight_dtype", ["float16", "float32"])
+def test_legacy_w1_keeps_non_bf16_checkpoint_weight_compatibility(
+    weight_dtype: str,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    weight = torch.zeros(
+        (TILE64 * 2, TILE64 * 2),
+        dtype=getattr(torch, weight_dtype),
+    )
+    scale = torch.ones((4, 1, 1), dtype=torch.float32)
+
+    codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        weight,
+        scale,
+        TILE64,
+        TILE64,
+    )
+
+    assert codes.dtype == np.uint8
+    assert scales.dtype == np.float16
+
+
+def test_qat_bf16_w1_rounds_add_before_half_and_uses_tie_to_imag() -> None:
+    torch = pytest.importorskip("torch")
+
+    # BF16 1 + 2^-8 is exactly halfway between BF16 1 and 1 + 2^-7.
+    # RNE chooses 1 before the exact 0.5 multiply, making U.real == U.imag.
+    one = np.ones((TILE64, TILE64), dtype=np.float32)
+    half_ulp = np.full_like(one, np.float32(2.0**-8))
+    zero = np.zeros_like(one)
+    checkpoint = torch.from_numpy(np.block([[one, zero], [one, half_ulp]])).to(
+        torch.bfloat16
+    )
+    learned_scale = torch.tensor(
+        [[[1.0]], [[-2.0]], [[-3.0]], [[4.0]]],
+        dtype=torch.bfloat16,
+    )
+
+    exact_codes, exact_scales = (
+        quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+            checkpoint,
+            learned_scale,
+            TILE64,
+            TILE64,
+            numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+        )
+    )
+    legacy_codes, _ = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        checkpoint,
+        learned_scale,
+        TILE64,
+        TILE64,
+    )
+    exact = unpack_fairy2i_bundle_v1(
+        exact_codes,
+        exact_scales,
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )
+    legacy = unpack_fairy2i_bundle_v1(
+        legacy_codes,
+        np.zeros((1, 2, 2), dtype=np.float16),
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )
+
+    # Training uses strict abs(real) > abs(imag); exact ties select +imag.
+    assert np.all(exact["U.s0"][0] == np.uint8(3))
+    assert np.all(legacy["U.s0"][0] == np.uint8(1))
+    expected_scale_bits = (
+        learned_scale.contiguous().view(torch.int16).numpy().view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        exact_scales[0],
+        expected_scale_bits[:, 0, 0].reshape(2, 2),
+    )
+    assert np.any((exact_scales & np.uint16(0x8000)) != 0)
+
+
+def test_qat_bf16_w1_tie_sign_codes_match_training_oracle() -> None:
+    torch = pytest.importorskip("torch")
+
+    u_real = np.ones((TILE64, TILE64), dtype=np.float32)
+    u_imag = np.ones_like(u_real)
+    u_real[:, 2::4] = -1.0
+    u_real[:, 3::4] = -1.0
+    u_imag[:, 1::4] = -1.0
+    u_imag[:, 3::4] = -1.0
+    zero = np.zeros_like(u_real)
+    weight = torch.from_numpy(
+        make_wide_linear_weight(u_real, u_imag, zero, zero)
+    ).to(torch.bfloat16)
+    scale = torch.ones((4, 1, 1), dtype=torch.bfloat16)
+
+    codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        weight,
+        scale,
+        TILE64,
+        TILE64,
+        numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    )
+    decoded = unpack_fairy2i_bundle_v1(
+        codes,
+        scales,
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )["U.s0"][0]
+    expected = np.tile(
+        np.asarray([3, 2, 3, 2], dtype=np.uint8),
+        (TILE64, TILE64 // 4),
+    )
+    np.testing.assert_array_equal(decoded, expected)
+
+
+def test_qat_bf16_w1_post_half_rne_and_signed_zero_match_training() -> None:
+    torch = pytest.importorskip("torch")
+
+    smallest_bf16 = np.asarray([0x00010000], dtype=np.uint32).view(np.float32)[0]
+    a11 = np.full((TILE64, TILE64), smallest_bf16, dtype=np.float32)
+    a12 = np.zeros_like(a11)
+    a21 = np.full_like(a11, np.float32(-0.0))
+    a22 = np.zeros_like(a11)
+    weight = torch.from_numpy(np.block([[a11, a12], [a21, a22]])).to(
+        torch.bfloat16
+    )
+    scale = torch.ones((4, 1, 1), dtype=torch.bfloat16)
+
+    u_real, u_imag, _, _, _, _ = split_wide_linear_components(
+        weight,
+        TILE64,
+        TILE64,
+        numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    )
+    assert not np.any(u_real)
+    assert np.all(np.signbit(u_imag))
+
+    codes, scales = quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+        weight,
+        scale,
+        TILE64,
+        TILE64,
+        numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+    )
+    decoded = unpack_fairy2i_bundle_v1(
+        codes,
+        scales,
+        TILE64,
+        TILE64,
+        ("U.s0", "W.s0"),
+    )["U.s0"][0]
+    # 0.5 * the smallest BF16 subnormal is an RNE tie to +0. A -0 imag
+    # compares >= 0 in Triton, so the equal-magnitude tie still selects +imag.
+    assert np.all(decoded == np.uint8(3))
+
+
+def test_qat_bf16_qkv_merge_preserves_component_and_signed_scale_payloads() -> None:
+    torch = pytest.importorskip("torch")
+
+    bundles = []
+    for seed in range(3):
+        u_real = np.full((TILE64, TILE64), seed + 1, dtype=np.float32)
+        zero = np.zeros_like(u_real)
+        weight = torch.from_numpy(
+            make_wide_linear_weight(u_real, zero, zero, zero)
+        ).to(torch.bfloat16)
+        scale = torch.tensor(
+            [[[-(seed + 1.0)]], [[seed + 2.0]], [[seed + 3.0]], [[-(seed + 4.0)]]],
+            dtype=torch.bfloat16,
+        )
+        bundles.append(
+            quantize_linear_to_fairy2i_bundle_v1_w1_learned_scale(
+                weight,
+                scale,
+                TILE64,
+                TILE64,
+                numeric_profile=NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1,
+            )
+        )
+
+    merged_codes, merged_scales = merge_fairy2i_bundle_v1_m(bundles)
+
+    np.testing.assert_array_equal(
+        merged_codes,
+        np.concatenate([bundle[0] for bundle in bundles], axis=0),
+    )
+    np.testing.assert_array_equal(
+        merged_scales,
+        np.concatenate([bundle[1] for bundle in bundles], axis=0),
+    )
+    assert merged_scales.dtype == np.uint16
+    assert np.any((merged_scales & np.uint16(0x8000)) != 0)

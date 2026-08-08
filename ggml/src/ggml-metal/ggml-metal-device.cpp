@@ -924,11 +924,10 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext",
-            ggml_type_name(op->src[1]->type),
-            dk,
-            dv);
+    const char * type_name =
+        ggml_flash_attn_ext_get_fairy2i_flash3(op) ? "fairy_bf16" : ggml_type_name(op->src[1]->type);
+
+    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d", "flash_attn_ext", type_name, dk, dv);
 
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_ns10=%d_ns20=%d_nsg=%d",
             base,
@@ -983,11 +982,10 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
-            "flash_attn_ext_vec",
-            ggml_type_name(op->src[1]->type),
-            dk,
-            dv);
+    const char * type_name =
+        ggml_flash_attn_ext_get_fairy2i_flash3(op) ? "fairy_bf16" : ggml_type_name(op->src[1]->type);
+
+    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d", "flash_attn_ext_vec", type_name, dk, dv);
 
     snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_softcap=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
             base,
@@ -1023,18 +1021,18 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(
     return res;
 }
 
-ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
-        ggml_metal_library_t lib,
-        const ggml_tensor * op,
-        int32_t dv,
-        int32_t nwg) {
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(ggml_metal_library_t lib,
+                                                                                const ggml_tensor *  op,
+                                                                                int32_t              dv,
+                                                                                int32_t              nwg,
+                                                                                bool                 round_bf16) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
     char name[256];
 
     snprintf(base, 256, "kernel_flash_attn_ext_vec_reduce");
-    snprintf(name, 256, "%s_dv=%d_nwg=%d", base, dv, nwg);
+    snprintf(name, 256, "%s_dv=%d_nwg=%d_bf16=%d", base, dv, nwg, round_bf16 ? 1 : 0);
 
     ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
     if (res) {
@@ -1045,6 +1043,7 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
 
     ggml_metal_cv_set_int32(cv, dv,  FC_FLASH_ATTN_EXT_VEC_REDUCE + 0);
     ggml_metal_cv_set_int32(cv, nwg, FC_FLASH_ATTN_EXT_VEC_REDUCE + 1);
+    ggml_metal_cv_set_bool(cv, round_bf16, FC_FLASH_ATTN_EXT_VEC_REDUCE + 2);
 
     res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

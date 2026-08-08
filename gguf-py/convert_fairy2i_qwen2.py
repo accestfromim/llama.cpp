@@ -39,6 +39,10 @@ from fairy2i.quant.tile64_v2 import (
     quantize_linear_to_fairy2i_tile64_v2_stages,
 )
 from fairy2i.spec import (
+    NUMERIC_PROFILE_LEGACY_F16_V1,
+    NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+    WEIGHT_SCALE_DTYPE_BF16,
+    WEIGHT_SCALE_DTYPE_F16,
     WEIGHT_LAYOUT_BUNDLE_V1,
     WEIGHT_LAYOUT_TILE64_V2,
     Fairy2IMetadata,
@@ -635,7 +639,12 @@ def validate_qwen2_tokenizer(
     return Qwen2TokenizerInfo(chat_template=chat_template, token_count=len(id_to_token))
 
 
-def _wide_linear_storage_bytes(shape: tuple[int, ...], weight_layout: str) -> int:
+def _wide_linear_storage_bytes(
+    shape: tuple[int, ...],
+    weight_layout: str,
+    numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
+) -> int:
+    _validate_numeric_profile(numeric_profile)
     out_complex = shape[0] // 2
     in_complex = shape[1] // 2
     tile_count = out_complex // FAIRY2I_TILE64 * (in_complex // FAIRY2I_TILE64)
@@ -646,25 +655,39 @@ def _wide_linear_storage_bytes(shape: tuple[int, ...], weight_layout: str) -> in
     raise ValueError(f"unsupported Fairy2i weight layout: {weight_layout}")
 
 
+def _validate_numeric_profile(numeric_profile: str) -> None:
+    if numeric_profile not in (
+        NUMERIC_PROFILE_LEGACY_F16_V1,
+        NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+    ):
+        raise ValueError(f"unsupported Qwen2 Fairy2i numeric profile: {numeric_profile!r}")
+
+
 def estimate_qwen2_gguf_bytes(
     dimensions: Qwen2Dimensions,
     *,
     output_layer: str,
     weight_layout: str,
+    numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> int:
+    _validate_numeric_profile(numeric_profile)
     shapes = expected_qwen2_tensor_shapes(dimensions)
     tensor_bytes = math.prod(shapes["model.embed_tokens.weight"]) * 2
     tensor_bytes += math.prod(shapes["model.norm.weight"]) * 4
     for il in range(dimensions.n_layer):
         tensor_bytes += dimensions.hidden_real * 4 * 2
         for suffix, _, _ in LINEAR_SPECS:
-            tensor_bytes += _wide_linear_storage_bytes(shapes[f"model.layers.{il}.{suffix}"], weight_layout)
+            tensor_bytes += _wide_linear_storage_bytes(
+                shapes[f"model.layers.{il}.{suffix}"],
+                weight_layout,
+                numeric_profile,
+            )
         for suffix, _ in QKV_BIAS_SPECS:
             tensor_bytes += math.prod(shapes[f"model.layers.{il}.{suffix}"]) * 4
 
     output_shape = shapes["lm_head.weight"]
     if output_layer in ("wide-linear", "both"):
-        tensor_bytes += _wide_linear_storage_bytes(output_shape, weight_layout)
+        tensor_bytes += _wide_linear_storage_bytes(output_shape, weight_layout, numeric_profile)
     if output_layer in ("dense", "both"):
         tensor_bytes += math.prod(output_shape) * 2
     return tensor_bytes + GGUF_ESTIMATE_OVERHEAD_BYTES
@@ -676,7 +699,17 @@ def run_qwen2_preflight(
     output_file: Path | None,
     output_layer: str,
     weight_layout: str,
+    numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> Qwen2PreflightReport:
+    _validate_numeric_profile(numeric_profile)
+    if (
+        numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+        and output_layer != "wide-linear"
+    ):
+        raise ValueError(
+            "script_f32reduce_bf16scale_v1 requires --output-layer wide-linear; "
+            "dense F16 output is forbidden"
+        )
     config_file = model_dir / "config.json"
     if not config_file.is_file():
         raise FileNotFoundError(f"required Qwen2 config not found: {config_file}")
@@ -699,6 +732,7 @@ def run_qwen2_preflight(
         dimensions,
         output_layer=output_layer,
         weight_layout=weight_layout,
+        numeric_profile=numeric_profile,
     )
     output_parent = output_file.parent if output_file is not None else model_dir
     if not output_parent.is_dir():
@@ -938,6 +972,13 @@ class TensorReader:
 
 
 def pack_token_embedding(embed: torch.Tensor, hidden_complex: int) -> np.ndarray:
+    if not torch.isfinite(embed).all().item():
+        flat_index = int((~torch.isfinite(embed)).reshape(-1).nonzero()[0].item())
+        raise ValueError(
+            "model.embed_tokens.weight contains a non-finite BF16 value "
+            f"at flat index {flat_index}"
+        )
+
     real = embed[:, :hidden_complex].to(torch.float32)
     imag = embed[:, hidden_complex:].to(torch.float32)
 
@@ -988,6 +1029,12 @@ def _tensor_write_entry(
 
 def _iter_tensor_f32(reader: TensorReader, key: str) -> Iterator[np.ndarray]:
     tensor = reader.get(key)
+    finite = torch.isfinite(tensor)
+    if not finite.all().item():
+        flat_index = int((~finite).reshape(-1).nonzero()[0].item())
+        raise ValueError(
+            f"{key} contains a non-finite BF16 value at flat index {flat_index}"
+        )
     data = tensor.to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
     yield np.ascontiguousarray(data)
 
@@ -1036,11 +1083,13 @@ class BundleM64TensorWriter:
         key: str,
         out_target: int,
         in_target: int,
+        numeric_profile: str,
     ):
         self.reader = reader
         self.key = key
         self.out_target = out_target
         self.in_target = in_target
+        self.numeric_profile = numeric_profile
         self._scale_chunks: list[np.ndarray] | None = None
 
     def iter_codes(self) -> Iterator[np.ndarray]:
@@ -1053,6 +1102,8 @@ class BundleM64TensorWriter:
                 self.out_target,
                 self.in_target,
                 weight_shape=self.reader.shape(self.key),
+                numeric_profile=self.numeric_profile,
+                tensor_name=self.key,
             ):
                 scale_chunks.append(scales)
                 yield codes
@@ -1106,10 +1157,27 @@ def _add_wide_linear_plan(
     out_target: int,
     in_target: int,
     weight_layout: str,
+    numeric_profile: str,
 ) -> None:
     tile_count = out_target // FAIRY2I_TILE64 * (in_target // FAIRY2I_TILE64)
     if weight_layout == WEIGHT_LAYOUT_BUNDLE_V1:
-        bundle_writer = BundleM64TensorWriter(reader, hf_key, out_target, in_target)
+        bundle_writer = BundleM64TensorWriter(
+            reader,
+            hf_key,
+            out_target,
+            in_target,
+            numeric_profile,
+        )
+        scale_dtype = (
+            np.uint16
+            if numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+            else np.float16
+        )
+        scale_raw_dtype = (
+            gguf.GGMLQuantizationType.BF16
+            if numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+            else gguf.GGMLQuantizationType.F16
+        )
         plan.append(
             _tensor_write_entry(
                 f"{gguf_base}.bundle.codes",
@@ -1123,8 +1191,9 @@ def _add_wide_linear_plan(
             _tensor_write_entry(
                 f"{gguf_base}.bundle.scales",
                 (tile_count, 4, 2),
-                np.float16,
+                scale_dtype,
                 bundle_writer.iter_scales,
+                raw_dtype=scale_raw_dtype,
             )
         )
         return
@@ -1151,7 +1220,16 @@ def build_qwen2_tensor_write_plan(
     *,
     output_layer: str,
     weight_layout: str,
+    numeric_profile: str = NUMERIC_PROFILE_LEGACY_F16_V1,
 ) -> list[TensorWriteEntry]:
+    _validate_numeric_profile(numeric_profile)
+    if (
+        numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+        and output_layer != "wide-linear"
+    ):
+        raise ValueError(
+            "script_f32reduce_bf16scale_v1 requires wide-linear output without an F16 dense fallback"
+        )
     plan: list[TensorWriteEntry] = []
     plan.append(
         _tensor_write_entry(
@@ -1188,6 +1266,7 @@ def build_qwen2_tensor_write_plan(
             out_target=output_out_c,
             in_target=output_in_c,
             weight_layout=weight_layout,
+            numeric_profile=numeric_profile,
         )
     if output_layer in ("dense", "both"):
         plan.append(
@@ -1238,6 +1317,7 @@ def build_qwen2_tensor_write_plan(
                 out_target=weight_shape[0] // 2,
                 in_target=weight_shape[1] // 2,
                 weight_layout=weight_layout,
+                numeric_profile=numeric_profile,
             )
 
         for hf_suffix, gguf_name in QKV_BIAS_SPECS:
@@ -1325,6 +1405,20 @@ def main(argv: list[str] | None = None) -> None:
         default=WEIGHT_LAYOUT_BUNDLE_V1,
         help="Fairy2i weight storage layout (Qwen2 supports Bundle v1 only)",
     )
+    parser.add_argument(
+        "--numeric-profile",
+        choices=[
+            NUMERIC_PROFILE_LEGACY_F16_V1,
+            NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1,
+        ],
+        default=NUMERIC_PROFILE_LEGACY_F16_V1,
+        help=(
+            "Numeric contract for W2 export. legacy_f16_v1 preserves schema2/F16 scales; "
+            "script_f32reduce_bf16scale_v1 recomputes schema3 scales with an F32 reduction "
+            "and serializes the forward-visible BF16 payload bits "
+            "(legacy GGUF scale widening is unsupported)."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="Print conversion progress")
     args = parser.parse_args(argv)
 
@@ -1355,6 +1449,7 @@ def main(argv: list[str] | None = None) -> None:
         output_file=args.output_file,
         output_layer=args.output_layer,
         weight_layout=args.weight_layout,
+        numeric_profile=args.numeric_profile,
     )
     print_qwen2_preflight(report)
     if args.dry_run:
@@ -1367,7 +1462,10 @@ def main(argv: list[str] | None = None) -> None:
     rope_theta = get_rope_theta(config)
     if args.verbose:
         print(f"rope_theta={rope_theta}")
-        print(f"output_layer={args.output_layer}, weight_layout={args.weight_layout}")
+        print(
+            f"output_layer={args.output_layer}, weight_layout={args.weight_layout}, "
+            f"numeric_profile={args.numeric_profile}"
+        )
 
     reader = TensorReader(
         model_dir,
@@ -1379,6 +1477,7 @@ def main(argv: list[str] | None = None) -> None:
         dimensions,
         output_layer=args.output_layer,
         weight_layout=args.weight_layout,
+        numeric_profile=args.numeric_profile,
     )
 
     temporary_output = output_file.with_name(f".{output_file.name}.tmp")
@@ -1410,6 +1509,12 @@ def main(argv: list[str] | None = None) -> None:
                 quant_variant=args.quant_variant,
                 residual_steps=args.residual_steps,
                 weight_layout=args.weight_layout,
+                numeric_profile=args.numeric_profile,
+                weight_scale_dtype=(
+                    WEIGHT_SCALE_DTYPE_BF16
+                    if args.numeric_profile == NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1
+                    else WEIGHT_SCALE_DTYPE_F16
+                ),
             ),
         )
 

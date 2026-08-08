@@ -1757,17 +1757,30 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         format("unsupported FAIRY2I quant variant: %s", quant_variant.c_str()));
                 }
 
-                uint32_t    schema_version = 1;
-                std::string weight_layout  = "tile64_v2";
-                ml.get_key("fairy2i.schema_version", schema_version, false);
+                std::string fairy2i_base_arch;
+                ml.get_key("fairy2i.base_arch", fairy2i_base_arch, false);
+
+                std::string attn_layout =
+                    fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2                  ? "qwen2_real" :
+                    fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE ? "qwen3_real" :
+                                                                                                      "legacy_complex";
+                const bool has_attn_layout = ml.get_key("fairy2i.attn.layout", attn_layout, false);
+                const bool is_qwen2_path   = fairy2i_base_arch == "qwen2" || attn_layout == "qwen2_real";
+
+                std::string tokenizer_profile;
+                const bool  has_tokenizer_profile = ml.get_key("fairy2i.tokenizer.profile", tokenizer_profile, false);
+
+                std::string weight_layout = "tile64_v2";
+                ml.get_key("fairy2i.schema_version", fairy2i_schema_version, false);
                 const bool has_weight_layout = ml.get_key("fairy2i.weight.layout", weight_layout, false);
-                if (!has_weight_layout && schema_version >= 2) {
-                    throw std::runtime_error("FAIRY2I schema v2 requires fairy2i.weight.layout");
+                if (!has_weight_layout && fairy2i_schema_version >= 2) {
+                    throw std::runtime_error(
+                        format("FAIRY2I schema v%u requires fairy2i.weight.layout", fairy2i_schema_version));
                 }
                 if (weight_layout == "tile64_v2") {
-                    if (schema_version > 1) {
+                    if (fairy2i_schema_version > 1) {
                         throw std::runtime_error(
-                            format("unsupported FAIRY2I tile64_v2 schema version: %u", schema_version));
+                            format("unsupported FAIRY2I tile64_v2 schema version: %u", fairy2i_schema_version));
                     }
                     fairy2i_weight_layout = LLAMA_FAIRY2I_WEIGHT_LAYOUT_TILE64_V2;
                 } else if (weight_layout == "bundle_m64k64_v1") {
@@ -1784,10 +1797,11 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     ml.get_key("fairy2i.weight.m_block", m_block);
                     ml.get_key("fairy2i.weight.k_block", k_block);
                     ml.get_key("fairy2i.weight.m_subtile", m_subtile);
-                    if (schema_version != 2 || alignment < 64 || m_block != 64 || k_block != 64 || m_subtile != 16) {
+                    if ((fairy2i_schema_version != 2 && fairy2i_schema_version != 3 && fairy2i_schema_version != 4) ||
+                        alignment < 64 || m_block != 64 || k_block != 64 || m_subtile != 16) {
                         throw std::runtime_error(format(
                             "invalid FAIRY2I bundle_v1 descriptor: schema=%u alignment=%u M=%u K=%u M_subtile=%u",
-                            schema_version, alignment, m_block, k_block, m_subtile));
+                            fairy2i_schema_version, alignment, m_block, k_block, m_subtile));
                     }
 
                     std::string scale_scope;
@@ -1806,15 +1820,149 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                                    "(expected %s)",
                                    scale_scope.c_str(), code_order.c_str(), branch_order.c_str(), expected_branches));
                     }
+
+                    std::string scale_dtype;
+                    std::string numeric_profile;
+                    const bool  has_scale_dtype = ml.get_key("fairy2i.weight.scale_dtype", scale_dtype, false);
+                    const bool  has_numeric_profile =
+                        ml.get_key("fairy2i.quant.numeric_profile", numeric_profile, false);
+                    if (fairy2i_schema_version == 2) {
+                        if (is_qwen2_path && fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2 &&
+                            (!has_scale_dtype || !has_numeric_profile)) {
+                            throw std::runtime_error(
+                                "FAIRY2I Qwen2 schema v2 W2 bundle weights require "
+                                "fairy2i.weight.scale_dtype=f16 and "
+                                "fairy2i.quant.numeric_profile=legacy_f16_v1");
+                        }
+                        if (has_scale_dtype != has_numeric_profile) {
+                            throw std::runtime_error(
+                                "FAIRY2I schema v2 must declare fairy2i.weight.scale_dtype and "
+                                "fairy2i.quant.numeric_profile together");
+                        }
+                        if (has_scale_dtype && (scale_dtype != "f16" || numeric_profile != "legacy_f16_v1")) {
+                            throw std::runtime_error(
+                                format("invalid FAIRY2I schema v2 numeric contract: scale_dtype=%s numeric_profile=%s "
+                                       "(expected f16/legacy_f16_v1)",
+                                       scale_dtype.c_str(), numeric_profile.c_str()));
+                        }
+                        fairy2i_numeric_profile = LLAMA_FAIRY2I_NUMERIC_PROFILE_LEGACY_F16_V1;
+                    } else if (fairy2i_schema_version == 3) {
+                        if (fairy2i_base_arch != "qwen2") {
+                            throw std::runtime_error("FAIRY2I schema v3 is only supported for fairy2i.base_arch=qwen2");
+                        }
+                        if (fairy2i_quant_variant != LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2) {
+                            throw std::runtime_error(
+                                "FAIRY2I schema v3 is only supported for tile64_v2 W2 bundle weights");
+                        }
+                        if (!has_attn_layout) {
+                            throw std::runtime_error(
+                                "FAIRY2I schema v3 requires explicit fairy2i.attn.layout=qwen2_real");
+                        }
+                        if (!has_tokenizer_profile || tokenizer_profile != "qwen2") {
+                            throw std::runtime_error(
+                                format("FAIRY2I schema v3 requires fairy2i.tokenizer.profile=qwen2, got %s",
+                                       has_tokenizer_profile ? tokenizer_profile.c_str() : "<missing>"));
+                        }
+                        if (!has_scale_dtype || !has_numeric_profile) {
+                            throw std::runtime_error(
+                                "FAIRY2I schema v3 requires fairy2i.weight.scale_dtype=bf16 and "
+                                "fairy2i.quant.numeric_profile=script_f32reduce_bf16scale_v1");
+                        }
+                        if (scale_dtype == "f32" && numeric_profile == "script_bf16_f32_v1") {
+                            throw std::runtime_error(
+                                "obsolete FAIRY2I schema v3 F32-scale profile; reconvert the original BF16 "
+                                "checkpoint with --numeric-profile script_f32reduce_bf16scale_v1");
+                        }
+                        if (scale_dtype != "bf16" || numeric_profile != "script_f32reduce_bf16scale_v1") {
+                            throw std::runtime_error(
+                                format("invalid FAIRY2I schema v3 numeric contract: scale_dtype=%s numeric_profile=%s "
+                                       "(expected bf16/script_f32reduce_bf16scale_v1)",
+                                       scale_dtype.c_str(), numeric_profile.c_str()));
+                        }
+                        uint32_t general_file_type = 0;
+                        if (!ml.get_key(LLM_KV_GENERAL_FILE_TYPE, general_file_type, false) ||
+                            general_file_type != LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1) {
+                            throw std::runtime_error(format("FAIRY2I schema v3 requires general.file_type=%u, got %u",
+                                                            (unsigned) LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1,
+                                                            general_file_type));
+                        }
+                        std::string quant_format;
+                        std::string quant_codebook;
+                        ml.get_key("fairy2i.quant.format", quant_format);
+                        ml.get_key("fairy2i.quant.codebook", quant_codebook);
+                        if (quant_format != "fairy2i_tile64_v2" || quant_codebook != "{+/-1,+/-i}") {
+                            throw std::runtime_error(
+                                format("invalid FAIRY2I schema v3 quant descriptor: format=%s codebook=%s "
+                                       "(expected fairy2i_tile64_v2/{+/-1,+/-i})",
+                                       quant_format.c_str(), quant_codebook.c_str()));
+                        }
+                        fairy2i_numeric_profile = LLAMA_FAIRY2I_NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1;
+                    } else {
+                        if (fairy2i_base_arch != "qwen3") {
+                            throw std::runtime_error("FAIRY2I schema v4 is only supported for fairy2i.base_arch=qwen3");
+                        }
+                        if (fairy2i_quant_variant != LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE) {
+                            throw std::runtime_error(
+                                "FAIRY2I schema v4 is only supported for tile64_v2 W1 learned-scale bundle weights");
+                        }
+                        if (!has_attn_layout || attn_layout != "qwen3_real") {
+                            throw std::runtime_error(
+                                format("FAIRY2I schema v4 requires fairy2i.attn.layout=qwen3_real, got %s",
+                                       has_attn_layout ? attn_layout.c_str() : "<missing>"));
+                        }
+                        if (!has_tokenizer_profile || tokenizer_profile != "qwen2") {
+                            throw std::runtime_error(
+                                format("FAIRY2I schema v4 requires fairy2i.tokenizer.profile=qwen2, got %s",
+                                       has_tokenizer_profile ? tokenizer_profile.c_str() : "<missing>"));
+                        }
+                        if (!has_scale_dtype || !has_numeric_profile) {
+                            throw std::runtime_error(
+                                "FAIRY2I schema v4 requires fairy2i.weight.scale_dtype=bf16 and "
+                                "fairy2i.quant.numeric_profile=qat_bf16_learned_scale_v1");
+                        }
+                        if (scale_dtype != "bf16" || numeric_profile != "qat_bf16_learned_scale_v1") {
+                            throw std::runtime_error(
+                                format("invalid FAIRY2I schema v4 numeric contract: scale_dtype=%s "
+                                       "numeric_profile=%s (expected bf16/qat_bf16_learned_scale_v1)",
+                                       scale_dtype.c_str(), numeric_profile.c_str()));
+                        }
+                        uint32_t general_file_type = 0;
+                        if (!ml.get_key(LLM_KV_GENERAL_FILE_TYPE, general_file_type, false) ||
+                            general_file_type != LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1) {
+                            throw std::runtime_error(format("FAIRY2I schema v4 requires general.file_type=%u, got %u",
+                                                            (unsigned) LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1,
+                                                            general_file_type));
+                        }
+                        std::string quant_format;
+                        std::string quant_codebook;
+                        ml.get_key("fairy2i.quant.format", quant_format);
+                        ml.get_key("fairy2i.quant.codebook", quant_codebook);
+                        if (quant_format != "fairy2i_tile64_v2" || quant_codebook != "{+/-1,+/-i}") {
+                            throw std::runtime_error(
+                                format("invalid FAIRY2I schema v4 quant descriptor: format=%s codebook=%s "
+                                       "(expected fairy2i_tile64_v2/{+/-1,+/-i})",
+                                       quant_format.c_str(), quant_codebook.c_str()));
+                        }
+                        fairy2i_numeric_profile = LLAMA_FAIRY2I_NUMERIC_PROFILE_QAT_BF16_LEARNED_SCALE_V1;
+                    }
                 } else {
                     throw std::runtime_error(format("unsupported FAIRY2I weight layout: %s", weight_layout.c_str()));
                 }
 
-                std::string attn_layout =
-                    fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2                  ? "qwen2_real" :
-                    fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2_W1_LEARNED_SCALE ? "qwen3_real" :
-                                                                                                      "legacy_complex";
-                ml.get_key("fairy2i.attn.layout", attn_layout, false);
+                if (fairy2i_uses_qwen2_exact_numeric_profile()) {
+                    const char * force_dense_output_env = getenv("LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT");
+                    if (force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0) {
+                        throw std::runtime_error(
+                            "FAIRY2I script_f32reduce_bf16scale_v1 forbids LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT; "
+                            "the exact profile requires the W2 bundle output");
+                    }
+                }
+                if (fairy2i_uses_bf16_runtime_profile() && llama_fairy2i_output_neon_enabled()) {
+                    throw std::runtime_error(
+                        format("FAIRY2I %s forbids LLAMA_FAIRY2I_OUTPUT_NEON; "
+                               "the BF16 runtime profile requires a validated all-CPU or all-Metal route",
+                               fairy2i_numeric_profile_name()));
+                }
 
                 if (attn_layout == "legacy_complex") {
                     fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_LEGACY_COMPLEX;
@@ -1825,8 +1973,13 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 } else if (attn_layout == "qwen3_real") {
                     fairy2i_attn_layout = LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL;
                 } else {
+                    throw std::runtime_error(format("unsupported FAIRY2I attention layout: %s", attn_layout.c_str()));
+                }
+                if (fairy2i_uses_qwen2_exact_numeric_profile() &&
+                    fairy2i_attn_layout != LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL) {
                     throw std::runtime_error(
-                        format("unsupported FAIRY2I attention layout: %s", attn_layout.c_str()));
+                        format("FAIRY2I script_f32reduce_bf16scale_v1 requires fairy2i.attn.layout=qwen2_real, got %s",
+                               attn_layout.c_str()));
                 }
 
                 switch (hparams.n_layer) {
@@ -4847,8 +5000,28 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD), { n_embd, n_vocab }, 0);
 
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM), { n_embd * 2 }, 0);
+                    auto require_bf16_runtime_f32_carrier = [&](const ggml_tensor * tensor, const char * role) {
+                        if (fairy2i_uses_bf16_runtime_profile() && tensor && tensor->type != GGML_TYPE_F32) {
+                            throw std::runtime_error(format(
+                                "FAIRY2I %s requires an F32 carrier tensor for %s (%s); got %s",
+                                fairy2i_numeric_profile_name(), role, tensor->name, ggml_type_name(tensor->type)));
+                        }
+                    };
+                    require_bf16_runtime_f32_carrier(tok_embd, "checkpoint BF16 token embedding");
+                    require_bf16_runtime_f32_carrier(output_norm, "checkpoint BF16 output norm");
+
                     // Optional dense output for ablation/fallback.
-                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT), { n_embd * 2, n_vocab }, TENSOR_NOT_REQUIRED);
+                    output = create_tensor(tn(LLM_TENSOR_OUTPUT), { n_embd * 2, n_vocab }, TENSOR_NOT_REQUIRED);
+                    if (fairy2i_uses_qwen2_exact_numeric_profile() && output) {
+                        throw std::runtime_error(
+                            "FAIRY2I script_f32reduce_bf16scale_v1 forbids a dense output tensor; "
+                            "only output.bundle.{codes,scales} is permitted");
+                    }
+                    if (fairy2i_uses_qwen3_qat_numeric_profile() && (!output || output->type != GGML_TYPE_BF16)) {
+                        throw std::runtime_error(
+                            format("FAIRY2I qat_bf16_learned_scale_v1 requires a dense BF16 output tensor; got %s",
+                                   output ? ggml_type_name(output->type) : "<missing>"));
+                    }
 
                     const bool fairy2i_is_tile64 =
                         fairy2i_quant_variant == LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2 ||
@@ -4937,12 +5110,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                            (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str(),
                                            codes_name.str().c_str(), scales_name.str().c_str()));
                             }
+                            const ggml_type expected_scales_type =
+                                fairy2i_uses_bf16_runtime_profile() ? GGML_TYPE_BF16 : GGML_TYPE_F16;
                             if (codes_meta->type != GGML_TYPE_FAIRY2I_BUNDLE_CODES ||
-                                scales_meta->type != GGML_TYPE_F16) {
+                                scales_meta->type != expected_scales_type) {
                                 throw std::runtime_error(
-                                    format("invalid FAIRY2I bundle_v1 types for %s: codes=%s scales=%s",
+                                    format("invalid FAIRY2I bundle_v1 types for %s under schema v%u/%s: "
+                                           "codes=%s scales=%s (expected %s/%s)",
                                            (bid >= 0 ? tn(tensor, bid).str() : tn(tensor).str()).c_str(),
-                                           ggml_type_name(codes_meta->type), ggml_type_name(scales_meta->type)));
+                                           fairy2i_schema_version, fairy2i_numeric_profile_name(),
+                                           ggml_type_name(codes_meta->type), ggml_type_name(scales_meta->type),
+                                           ggml_type_name(GGML_TYPE_FAIRY2I_BUNDLE_CODES),
+                                           ggml_type_name(expected_scales_type)));
                             }
 
                             linear.bundle_codes =
@@ -4998,6 +5177,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             fairy2i_is_w1     ? "incomplete FAIRY2I W1 output tensor set: expected output.{U,W}.s0" :
                                                 "incomplete FAIRY2I output tensor set: expected output.{U,W}.s{0,1}");
                     }
+                    if (fairy2i_uses_qwen2_exact_numeric_profile() && !has_output_fairy2i) {
+                        throw std::runtime_error(
+                            "FAIRY2I script_f32reduce_bf16scale_v1 requires output.bundle.{codes,scales}; "
+                            "dense output fallback is not permitted");
+                    }
+                    if (fairy2i_uses_qwen3_qat_numeric_profile() && has_output_fairy2i_any) {
+                        throw std::runtime_error(
+                            "FAIRY2I qat_bf16_learned_scale_v1 requires the dense BF16 output tensor; "
+                            "output bundle weights are not permitted");
+                    }
                     if (!has_output_fairy2i && !output) {
                         throw std::runtime_error(
                             fairy2i_is_bundle ? "FAIRY2I bundle_v1 requires either output.bundle.{codes,scales} "
@@ -5028,18 +5217,39 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, i), { n_embd * 2 }, 0);
                         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM, i), { n_embd * 2 }, 0);
+                        require_bf16_runtime_f32_carrier(layer.attn_norm, "checkpoint BF16 attention norm");
+                        require_bf16_runtime_f32_carrier(layer.ffn_norm, "checkpoint BF16 FFN norm");
                         if (fairy2i_is_qwen3) {
                             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, i), { n_embd_head_k }, 0);
                             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, i), { n_embd_head_k }, 0);
+                            require_bf16_runtime_f32_carrier(layer.attn_q_norm, "checkpoint BF16 Q norm");
+                            require_bf16_runtime_f32_carrier(layer.attn_k_norm, "checkpoint BF16 K norm");
                         }
 
-                        // optional bias tensors from Qwen2-based Fairy2i checkpoints
-                        layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
-                        layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias", i), { n_embd_gqa }, TENSOR_NOT_REQUIRED);
-                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias", i), { n_embd_gqa }, TENSOR_NOT_REQUIRED);
+                        // Qwen2 exact exports preserve the checkpoint's BF16 Q/K/V biases and must not silently
+                        // substitute zero bias. Legacy and Qwen3 paths keep their existing optional behavior.
+                        const int qkv_bias_flags = fairy2i_uses_qwen2_exact_numeric_profile() ? 0 : TENSOR_NOT_REQUIRED;
+                        layer.bq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", i), { n_embd * 2 }, qkv_bias_flags);
+                        layer.bk = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", i), { n_embd_gqa }, qkv_bias_flags);
+                        layer.bv = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", i), { n_embd_gqa }, qkv_bias_flags);
+                        require_bf16_runtime_f32_carrier(layer.bq, "checkpoint BF16 Q bias");
+                        require_bf16_runtime_f32_carrier(layer.bk, "checkpoint BF16 K bias");
+                        require_bf16_runtime_f32_carrier(layer.bv, "checkpoint BF16 V bias");
                         layer.bqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", i), { 2 * (n_embd + n_embd_gqa) },
                                                    TENSOR_NOT_REQUIRED);
-                        layer.bo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
+                        require_bf16_runtime_f32_carrier(layer.bqkv, "checkpoint BF16 merged QKV bias");
+                        if (fairy2i_uses_qwen2_exact_numeric_profile()) {
+                            const auto output_bias_name = tn(LLM_TENSOR_ATTN_OUT, "bias", i);
+                            if (ml.get_tensor_meta(output_bias_name.str().c_str())) {
+                                throw std::runtime_error(format(
+                                    "FAIRY2I script_f32reduce_bf16scale_v1 forbids attention output bias tensor %s; "
+                                    "it is not part of the Qwen2 exact tensor contract",
+                                    output_bias_name.str().c_str()));
+                            }
+                        }
+                        layer.bo =
+                            create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), { n_embd * 2 }, TENSOR_NOT_REQUIRED);
+                        require_bf16_runtime_f32_carrier(layer.bo, "checkpoint BF16 attention output bias");
 
                         if (fairy2i_is_bundle && fairy2i_is_w1 && fairy2i_is_qwen3) {
                             create_fairy2i_linear(layer.wqkv_fairy2i, LLM_TENSOR_ATTN_QKV, i, n_embd,
@@ -6790,6 +7000,11 @@ void llama_model::print_info() const {
 
     // general kv
     LLAMA_LOG_INFO("%s: general.name     = %s\n",    __func__, name.c_str());
+
+    if (arch == LLM_ARCH_FAIRY2I) {
+        LLAMA_LOG_INFO("%s: fairy2i schema   = %u\n", __func__, fairy2i_schema_version);
+        LLAMA_LOG_INFO("%s: fairy2i numeric  = %s\n", __func__, fairy2i_numeric_profile_name());
+    }
 
     if (arch == LLM_ARCH_DEEPSEEK) {
         LLAMA_LOG_INFO("%s: n_layer_dense_lead   = %d\n",     __func__, hparams.n_layer_dense_lead);
@@ -14446,13 +14661,19 @@ struct llm_build_ifairy : public llm_graph_context {
 
 struct llm_build_fairy2i : public llm_graph_context {
     llm_build_fairy2i(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-        const int64_t n_embd_head = hparams.n_embd_head_v;
-        const bool    use_real_attn = model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL ||
-                                      model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL ||
-                                      model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL;
+        const int64_t n_embd_head          = hparams.n_embd_head_v;
+        const bool    fairy2i_qwen2_exact  = model.fairy2i_uses_qwen2_exact_numeric_profile();
+        const bool    fairy2i_qwen3_qat    = model.fairy2i_uses_qwen3_qat_numeric_profile();
+        const bool    fairy2i_bf16_runtime = model.fairy2i_uses_bf16_runtime_profile();
+        const bool    use_real_attn        = model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_LLAMA_REAL ||
+                                             model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL ||
+                                             model.fairy2i_attn_layout == LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN3_REAL;
 
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head % 2 == 0);
+        if (fairy2i_qwen2_exact && model.fairy2i_attn_layout != LLAMA_FAIRY2I_ATTN_LAYOUT_QWEN2_REAL) {
+            throw std::runtime_error("FAIRY2I script_f32reduce_bf16scale_v1 requires qwen2_real attention");
+        }
 
         ggml_tensor * inpL     = build_inp_embd(model.tok_embd);
         ggml_tensor * inp_pos  = build_inp_pos();
@@ -14484,7 +14705,12 @@ struct llm_build_fairy2i : public llm_graph_context {
                                           const char * name) -> ggml_tensor * {
             // Fairy2i keeps Llama2 RMSNorm semantics on the real-expanded hidden size.
             ggml_tensor * x_split = ggml_complex_split(ctx0, x);
-            ggml_tensor * x_norm  = build_norm(x_split, norm_w, nullptr, LLM_NORM_RMS, il);
+            ggml_tensor * x_norm  = fairy2i_bf16_runtime ?
+                                        ggml_fairy2i_rms_norm_exact(ctx0, x_split, norm_w, hparams.f_norm_rms_eps) :
+                                        build_norm(x_split, norm_w, nullptr, LLM_NORM_RMS, il);
+            if (fairy2i_bf16_runtime) {
+                ggml_fairy2i_exact_set_qat(x_norm, fairy2i_qwen3_qat);
+            }
             ggml_tensor * x_merge = ggml_complex_merge(ctx0, x_norm);
             cb(x_merge, name, il);
             return x_merge;
@@ -14533,7 +14759,17 @@ struct llm_build_fairy2i : public llm_graph_context {
                                                                linear.logical_m, linear.logical_k) :
                             ggml_fairy2i_wide_linear_w2_bundle(ctx0, x, linear.bundle_codes, linear.bundle_scales, bias,
                                                                linear.logical_m, linear.logical_k);
+                // Schema 4 follows the QAT kernel contract: reconstructed BF16 weights are consumed by the native
+                // F32-accumulating matmul. The schema 3 bit-exact profile retains its exceptional-value replay guards.
+                ggml_fairy2i_wide_linear_set_qat(y, fairy2i_qwen3_qat);
                 if (!target_dev || !ggml_backend_dev_supports_op(target_dev, y)) {
+                    if (fairy2i_bf16_runtime && target_dev_is_metal) {
+                        throw std::runtime_error(format(
+                            "FAIRY2I %s target device %s does not support the BF16 W%d pipeline; native Metal BF16 "
+                            "and simdgroup matrix support are required, and FP16 fallback is forbidden",
+                            model.fairy2i_numeric_profile_name(),
+                            target_dev ? ggml_backend_dev_name(target_dev) : "none", is_w1 ? 1 : 2));
+                    }
                     throw std::runtime_error(
                         format("FAIRY2I bundle_v1 target device %s does not support the dedicated Bundle W%d op "
                                "(policy=%s)",
@@ -14631,32 +14867,79 @@ struct llm_build_fairy2i : public llm_graph_context {
                 cb(Qcur, "Qcur_split", il);
                 cb(Kcur, "Kcur_split", il);
                 cb(Vcur, "Vcur_split", il);
+                if (fairy2i_bf16_runtime) {
+                    GGML_ASSERT(Qcur->type == GGML_TYPE_F32);
+                    GGML_ASSERT(Kcur->type == GGML_TYPE_F32);
+                    GGML_ASSERT(Vcur->type == GGML_TYPE_F32);
+                }
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
                 Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
+                if (fairy2i_qwen2_exact && (model.layers[il].attn_q_norm || model.layers[il].attn_k_norm)) {
+                    throw std::runtime_error(
+                        "FAIRY2I script_f32reduce_bf16scale_v1 does not support Q/K normalization; "
+                        "the exact Qwen2 profile must not contain attn_q_norm or attn_k_norm tensors");
+                }
                 if (model.layers[il].attn_q_norm) {
-                    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+                    Qcur = fairy2i_qwen3_qat ?
+                               ggml_fairy2i_rms_norm_exact(ctx0, Qcur, model.layers[il].attn_q_norm,
+                                                           hparams.f_norm_rms_eps) :
+                               build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+                    if (fairy2i_qwen3_qat) {
+                        ggml_fairy2i_exact_set_qat(Qcur, true);
+                    }
                     cb(Qcur, "Qcur_normed", il);
                 }
                 if (model.layers[il].attn_k_norm) {
-                    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+                    Kcur = fairy2i_qwen3_qat ?
+                               ggml_fairy2i_rms_norm_exact(ctx0, Kcur, model.layers[il].attn_k_norm,
+                                                           hparams.f_norm_rms_eps) :
+                               build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+                    if (fairy2i_qwen3_qat) {
+                        ggml_fairy2i_exact_set_qat(Kcur, true);
+                    }
                     cb(Kcur, "Kcur_normed", il);
                 }
 
                 const int fairy2i_real_rope_type = LLAMA_ROPE_TYPE_NEOX;
 
-                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, fairy2i_real_rope_type, n_ctx_orig, freq_base,
-                                     freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                Qcur = fairy2i_bf16_runtime ?
+                           ggml_fairy2i_rope_ext_exact(ctx0, Qcur, inp_pos, nullptr, n_rot, fairy2i_real_rope_type,
+                                                       n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+                                                       beta_fast, beta_slow) :
+                           ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, fairy2i_real_rope_type, n_ctx_orig,
+                                         freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                if (fairy2i_bf16_runtime) {
+                    ggml_fairy2i_exact_set_qat(Qcur, fairy2i_qwen3_qat);
+                }
                 cb(Qcur, "Qcur_rope", il);
 
-                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, fairy2i_real_rope_type, n_ctx_orig, freq_base,
-                                     freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                Kcur = fairy2i_bf16_runtime ?
+                           ggml_fairy2i_rope_ext_exact(ctx0, Kcur, inp_pos, nullptr, n_rot, fairy2i_real_rope_type,
+                                                       n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor,
+                                                       beta_fast, beta_slow) :
+                           ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, fairy2i_real_rope_type, n_ctx_orig,
+                                         freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                if (fairy2i_bf16_runtime) {
+                    ggml_fairy2i_exact_set_qat(Kcur, fairy2i_qwen3_qat);
+                }
                 cb(Kcur, "Kcur_rope", il);
 
-                cur = build_attn(inp_attn, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                if (fairy2i_bf16_runtime) {
+                    Kcur = ggml_fairy2i_pack_bf16_exact(ctx0, Kcur);
+                    Vcur = ggml_fairy2i_pack_bf16_exact(ctx0, Vcur);
+                    cb(Kcur, "Kcur_bf16_exact", il);
+                    cb(Vcur, "Vcur_bf16_exact", il);
+                }
+
+                cur = build_attn(inp_attn, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il,
+                                 fairy2i_bf16_runtime, fairy2i_qwen3_qat);
                 cb(cur, "attn_out_split", il);
+                if (fairy2i_bf16_runtime) {
+                    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+                }
 
                 cur = ggml_complex_merge(ctx0, cur);
                 cb(cur, "attn_out", il);
@@ -14687,6 +14970,7 @@ struct llm_build_fairy2i : public llm_graph_context {
             }
 
             cur = ggml_complex_add(ctx0, cur, inpSA);
+            ggml_complex_add_set_qat(cur, fairy2i_qwen3_qat);
             cb(cur, "attn_res", il);
 
             ggml_tensor * ffn_inp = cur;
@@ -14700,17 +14984,38 @@ struct llm_build_fairy2i : public llm_graph_context {
 
             ggml_tensor * gate_s = ggml_complex_split(ctx0, gate);
             ggml_tensor * up_s   = ggml_complex_split(ctx0, up);
-            gate_s               = ggml_silu(ctx0, gate_s);
+            if (fairy2i_bf16_runtime) {
+                GGML_ASSERT(gate_s->type == GGML_TYPE_F32 && up_s->type == GGML_TYPE_F32);
+            }
+            gate_s = fairy2i_bf16_runtime ? ggml_fairy2i_silu_exact(ctx0, gate_s) : ggml_silu(ctx0, gate_s);
+            if (fairy2i_bf16_runtime) {
+                ggml_fairy2i_exact_set_qat(gate_s, fairy2i_qwen3_qat);
+            }
+            if (fairy2i_bf16_runtime) {
+                cb(gate_s, "ffn_gate_silu_bf16_exact", il);
+            }
 
-            ggml_tensor * mul_s = ggml_mul(ctx0, gate_s, up_s);
-            ggml_tensor * mul   = ggml_complex_merge(ctx0, mul_s);
+            ggml_tensor * mul_s =
+                fairy2i_bf16_runtime ? ggml_fairy2i_mul_exact(ctx0, gate_s, up_s) : ggml_mul(ctx0, gate_s, up_s);
+            if (fairy2i_bf16_runtime) {
+                ggml_fairy2i_exact_set_qat(mul_s, fairy2i_qwen3_qat);
+                cb(mul_s, "ffn_mul_bf16_exact", il);
+            }
+            ggml_tensor * mul = ggml_complex_merge(ctx0, mul_s);
 
             ggml_tensor * mul_conj = build_complex_conj(mul, il, "ffn_mul_conj");
             cur = build_wide_linear(model.layers[il].ffn_down_fairy2i, mul, mul_conj, nullptr, il, "ffn_down");
 
             cur = ggml_complex_add(ctx0, cur, ffn_inp);
+            ggml_complex_add_set_qat(cur, fairy2i_qwen3_qat);
             cb(cur, "ffn_res", il);
 
+            if (fairy2i_bf16_runtime && cvec->tensor_for(il) != nullptr) {
+                throw std::runtime_error(
+                    format("FAIRY2I %s does not support control-vector adapters; "
+                           "their F32 add is outside the exact BF16 boundary contract",
+                           model.fairy2i_numeric_profile_name()));
+            }
             cur = build_cvec(cur, il);
             cb(cur, "l_out", il);
 
@@ -14728,10 +15033,20 @@ struct llm_build_fairy2i : public llm_graph_context {
                 (model.output_fairy2i.U[0] && model.output_fairy2i.U[1] && model.output_fairy2i.W[0] &&
                  model.output_fairy2i.W[1]);
         const bool has_output_fairy2i_merged = model.output_fairy2i_merged.U[0] && model.output_fairy2i_merged.W[0];
+        if (fairy2i_qwen2_exact && has_output_fairy2i_merged) {
+            throw std::runtime_error(
+                "FAIRY2I script_f32reduce_bf16scale_v1 forbids synthesized merged output weights; "
+                "the exact profile requires schema v3 output.bundle.{codes,scales}");
+        }
         const char * force_dense_output_env = getenv("LLAMA_FAIRY2I_FORCE_DENSE_OUTPUT");
         const bool   force_dense_output =
             (force_dense_output_env != nullptr && strcmp(force_dense_output_env, "0") != 0) ||
             llama_fairy2i_output_neon_enabled();
+        if (fairy2i_qwen2_exact && force_dense_output) {
+            throw std::runtime_error(
+                "FAIRY2I script_f32reduce_bf16scale_v1 forbids dense output overrides; "
+                "the exact profile requires the W2 bundle output");
+        }
 
         if (has_output_fairy2i_merged && (!force_dense_output || !model.output)) {
             ggml_tensor * cur_conj = build_complex_conj(cur, -1, "result_norm_conj");
@@ -14739,13 +15054,23 @@ struct llm_build_fairy2i : public llm_graph_context {
             cur = ggml_complex_split(ctx0, cur);
         } else if (has_output_fairy2i && (!force_dense_output || !model.output)) {
             ggml_tensor * cur_conj = build_complex_conj(cur, -1, "result_norm_conj");
-            cur                    = build_wide_linear(model.output_fairy2i, cur, cur_conj, nullptr, -1, "result_output_wide");
-            cur                    = ggml_complex_split(ctx0, cur);
+            cur = build_wide_linear(model.output_fairy2i, cur, cur_conj, nullptr, -1, "result_output_wide");
+            cur = ggml_complex_split(ctx0, cur);
+            if (fairy2i_qwen2_exact) {
+                GGML_ASSERT(cur->type == GGML_TYPE_F32);
+                cb(cur, "result_output_f32_exact", -1);
+            }
         } else if (model.output) {
             cur = ggml_complex_split(ctx0, cur);
-            cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
-            cb(cur, "result_output_inp_f16", -1);
+            cur = ggml_cast(ctx0, cur, fairy2i_qwen3_qat ? GGML_TYPE_BF16 : GGML_TYPE_F16);
+            cb(cur, fairy2i_qwen3_qat ? "result_output_inp_bf16" : "result_output_inp_f16", -1);
             cur = build_lora_mm(model.output, cur);
+            if (fairy2i_qwen3_qat) {
+                // torch.nn.functional.linear(BF16, BF16) exposes a BF16 result. ggml mul_mat accumulates into
+                // F32, so preserve the training-side output boundary in a single F32-carrier kernel.
+                cur = ggml_fairy2i_round_bf16_exact(ctx0, cur);
+                cb(cur, "result_output_f32", -1);
+            }
             if (llama_fairy2i_output_neon_enabled() && backend_cpu != nullptr &&
                 ggml_backend_supports_op(backend_cpu, cur)) {
                 ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);

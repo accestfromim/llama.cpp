@@ -991,6 +991,8 @@ struct test_case {
         return 1e-7;
     }
 
+    virtual double max_abs_err() { return INFINITY; }
+
     virtual double max_maa_err() {
         return 1e-4;
     }
@@ -1195,17 +1197,13 @@ struct test_case {
         // compare
         struct callback_userdata {
             bool   ok;
-            double max_err;
+            double         max_nmse;
+            double         max_abs;
             ggml_backend_t backend1;
             ggml_backend_t backend2;
         };
 
-        callback_userdata ud {
-            true,
-            max_nmse_err(),
-            backend1,
-            backend2
-        };
+        callback_userdata ud{ true, max_nmse_err(), max_abs_err(), backend1, backend2 };
 
         auto callback = [](int index, ggml_tensor * t1, ggml_tensor * t2, void * user_data) -> bool {
             callback_userdata * ud = (callback_userdata *) user_data;
@@ -1252,14 +1250,23 @@ struct test_case {
                 }
             }
 
-            double err = nmse(f1.data(), f2.data(), f1.size());
-            if (err > ud->max_err) {
-                printf("[%s] NMSE = %.9f > %.9f ", ggml_op_desc(t1), err, ud->max_err);
+            const double nmse_err = nmse(f1.data(), f2.data(), f1.size());
+            if (nmse_err > ud->max_nmse) {
+                printf("[%s] NMSE = %.9f > %.9f ", ggml_op_desc(t1), nmse_err, ud->max_nmse);
                 //for (int i = 0; i < (int) f1.size(); i++) {
                 //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
                 //}
                 //printf("\n");
                 //exit(1);
+                ud->ok = false;
+            }
+
+            double abs_err = 0.0;
+            for (size_t i = 0; i < f1.size(); ++i) {
+                abs_err = std::max(abs_err, (double) fabsf(f1[i] - f2[i]));
+            }
+            if (abs_err > ud->max_abs) {
+                printf("[%s] max_abs = %.9f > %.9f ", ggml_op_desc(t1), abs_err, ud->max_abs);
                 ud->ok = false;
             }
             return true;
@@ -3000,17 +3007,24 @@ struct test_fairy2i_wide_linear_bundle : public test_case {
     const int64_t N;
     const int64_t K;
     const bool    use_bias;
+    const ggml_type scale_type;
 
-    test_fairy2i_wide_linear_bundle(bool is_w1, int64_t M, int64_t N, int64_t K, bool use_bias) :
+    test_fairy2i_wide_linear_bundle(bool      is_w1,
+                                    int64_t   M,
+                                    int64_t   N,
+                                    int64_t   K,
+                                    bool      use_bias,
+                                    ggml_type scale_type = GGML_TYPE_F16) :
         is_w1(is_w1),
         M(M),
         N(N),
         K(K),
-        use_bias(use_bias) {}
+        use_bias(use_bias),
+        scale_type(scale_type) {}
 
     bool run_whole_graph() override { return true; }
 
-    std::string vars() override { return VARS_TO_STR5(is_w1, M, N, K, use_bias); }
+    std::string vars() override { return VARS_TO_STR6(is_w1, M, N, K, use_bias, scale_type); }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t branches       = is_w1 ? 2 : 4;
@@ -3022,7 +3036,7 @@ struct test_fairy2i_wide_linear_bundle : public test_case {
         ggml_tensor * codes = ggml_new_tensor_4d(ctx, GGML_TYPE_FAIRY2I_BUNDLE_CODES, 16, branches, 64, physical_tiles);
         ggml_set_name(codes, "codes");
 
-        ggml_tensor * scales = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 2, branches, physical_tiles);
+        ggml_tensor * scales = ggml_new_tensor_3d(ctx, scale_type, 2, branches, physical_tiles);
         ggml_set_name(scales, "scales");
 
         ggml_tensor * bias = use_bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * M) : nullptr;
@@ -3042,8 +3056,12 @@ struct test_fairy2i_wide_linear_bundle : public test_case {
                 std::vector<float> data(ggml_nelements(t));
                 for (int64_t n = 0; n < N; ++n) {
                     for (int64_t k = 0; k < K; ++k) {
-                        const float real                           = 0.25f + (float) ((k + 7 * n) % 19) / 16.0f;
-                        const float imag                           = 0.125f + (float) ((2 * k + 5 * n) % 23) / 20.0f;
+                        const float real = scale_type == GGML_TYPE_BF16 && n == 0 && k == 0 ?
+                                               65536.0f :
+                                               0.25f + (float) ((k + 7 * n) % 19) / 16.0f;
+                        const float imag = scale_type == GGML_TYPE_BF16 && n == 0 && k == 0 ?
+                                               -65536.0f :
+                                               0.125f + (float) ((2 * k + 5 * n) % 23) / 20.0f;
                         data[(size_t) n * (size_t) K + (size_t) k] = pack_ifairy_bf16_pair(real, imag);
                     }
                 }
@@ -3079,19 +3097,35 @@ struct test_fairy2i_wide_linear_bundle : public test_case {
             } else if (strcmp(t->name, "scales") == 0) {
                 const int64_t            branches       = is_w1 ? 2 : 4;
                 const int64_t            physical_tiles = (M / 64) * (K / 64);
-                std::vector<ggml_fp16_t> data(ggml_nelements(t));
-
-                // One real/imag scale pair per branch and complete M64xK64 tile.
-                for (int64_t tile = 0; tile < physical_tiles; ++tile) {
-                    for (int64_t branch = 0; branch < branches; ++branch) {
-                        const size_t offset = ((size_t) tile * (size_t) branches + (size_t) branch) * 2u;
-                        data[offset + 0] =
-                            ggml_fp32_to_fp16(0.021f + 0.003f * (float) branch + 0.001f * (float) (tile % 5));
-                        data[offset + 1] =
-                            ggml_fp32_to_fp16(0.017f + 0.002f * (float) branch + 0.001f * (float) (tile % 3));
+                if (scale_type == GGML_TYPE_BF16) {
+                    std::vector<ggml_bf16_t> data(ggml_nelements(t));
+                    for (int64_t tile = 0; tile < physical_tiles; ++tile) {
+                        for (int64_t branch = 0; branch < branches; ++branch) {
+                            const size_t offset = ((size_t) tile * (size_t) branches + (size_t) branch) * 2u;
+                            const float  real   = branch == 3 ? 70000.125f :
+                                                                0.021000385f + 0.003000125f * (float) branch +
+                                                                    0.001000031f * (float) (tile % 5);
+                            const float imag = tile == 0 && branch == 0 ? 0x1p-130f :
+                                                                          0.017000275f + 0.002000093f * (float) branch +
+                                                                              0.001000017f * (float) (tile % 3);
+                            data[offset + 0] = ggml_fp32_to_bf16(real);
+                            data[offset + 1] = ggml_fp32_to_bf16(imag);
+                        }
                     }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_bf16_t));
+                } else {
+                    std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                    for (int64_t tile = 0; tile < physical_tiles; ++tile) {
+                        for (int64_t branch = 0; branch < branches; ++branch) {
+                            const size_t offset = ((size_t) tile * (size_t) branches + (size_t) branch) * 2u;
+                            data[offset + 0] =
+                                ggml_fp32_to_fp16(0.021f + 0.003f * (float) branch + 0.001f * (float) (tile % 5));
+                            data[offset + 1] =
+                                ggml_fp32_to_fp16(0.017f + 0.002f * (float) branch + 0.001f * (float) (tile % 3));
+                        }
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
             } else if (strcmp(t->name, "bias") == 0) {
                 std::vector<float> data(ggml_nelements(t));
                 for (int64_t row = 0; row < M; ++row) {
@@ -3105,7 +3139,9 @@ struct test_fairy2i_wide_linear_bundle : public test_case {
         }
     }
 
-    double max_nmse_err() override { return 1e-5; }
+    double max_nmse_err() override { return scale_type == GGML_TYPE_BF16 ? 1e-6 : 1e-5; }
+
+    double max_abs_err() override { return scale_type == GGML_TYPE_BF16 ? 1e-2 : INFINITY; }
 };
 
 // GGML_OP_ADD_ID
@@ -6642,6 +6678,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(is_w1, 64, 16, 128, true));
         test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(is_w1, 64, 17, 128, true));
     }
+    for (int64_t n : { 1, 3, 16, 17, 31, 32, 33, 63, 64, 65 }) {
+        for (bool use_bias : { false, true }) {
+            test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 64, n, 128, use_bias, GGML_TYPE_BF16));
+        }
+    }
+    test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 64, 32, 64, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 192, 33, 192, true, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 128, 17, 320, false, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 128, 17, 320, true, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 64, 3, 1024, false, GGML_TYPE_BF16));
 
     // single in-place tests, especially important for WebGPU backend since kernels for in-place vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));

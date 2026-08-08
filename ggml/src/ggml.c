@@ -1039,7 +1039,7 @@ struct ggml_context {
 // data types
 //
 
-static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+static const char * GGML_OP_NAME[] = {
     "NONE",
 
     "DUP",
@@ -1155,11 +1155,17 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "COMPLEX_MUL",
     "FAIRY2I_WIDE_LINEAR_W1",
     "FAIRY2I_WIDE_LINEAR_W2",
+    "FAIRY2I_RMS_NORM_EXACT",
+    "FAIRY2I_ROPE_EXACT",
+    "FAIRY2I_SILU_EXACT",
+    "FAIRY2I_MUL_EXACT",
+    "FAIRY2I_PACK_BF16_EXACT",
+    "FAIRY2I_ATTN_EXACT_CPU",
 };
 
-// static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(sizeof(GGML_OP_NAME) / sizeof(GGML_OP_NAME[0]) == GGML_OP_COUNT, "GGML_OP_NAME must match GGML_OP_COUNT");
 
-static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+static const char * GGML_OP_SYMBOL[] = {
     "none",
 
     "x",
@@ -1275,9 +1281,16 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "complex_mul(x,y)",
     "fairy2i_wide_linear_w1(x)",
     "fairy2i_wide_linear_w2(x)",
+    "fairy2i_rms_norm_exact(x,w)",
+    "fairy2i_rope_exact(x)",
+    "fairy2i_silu_exact(x)",
+    "fairy2i_mul_exact(x,y)",
+    "fairy2i_pack_bf16_exact(x)",
+    "fairy2i_attn_exact_cpu(q,k,v,mask)",
 };
 
-// static_assert(GGML_OP_COUNT == 90, "GGML_OP_COUNT != 90");
+static_assert(sizeof(GGML_OP_SYMBOL) / sizeof(GGML_OP_SYMBOL[0]) == GGML_OP_COUNT,
+              "GGML_OP_SYMBOL must match GGML_OP_COUNT");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3823,7 +3836,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || (a->type == GGML_TYPE_BF16 && b->type == GGML_TYPE_BF16));
     GGML_ASSERT(c->type == GGML_TYPE_I64);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));
@@ -4216,6 +4229,16 @@ struct ggml_tensor * ggml_complex_add(struct ggml_context * ctx, struct ggml_ten
     return ggml_complex_add_impl(ctx, a, b, false, GGML_OP_COMPLEX_ADD);
 }
 
+void ggml_complex_add_set_qat(struct ggml_tensor * a, bool qat) {
+    GGML_ASSERT(a && a->op == GGML_OP_COMPLEX_ADD);
+    a->op_params[15] = qat ? 1 : 0;
+}
+
+bool ggml_complex_add_get_qat(const struct ggml_tensor * a) {
+    GGML_ASSERT(a && a->op == GGML_OP_COMPLEX_ADD);
+    return a->op_params[15] != 0;
+}
+
 struct ggml_tensor * ggml_ifairy_add(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
     return ggml_complex_add_impl(ctx, a, b, false, GGML_OP_IFAIRY_ADD);
 }
@@ -4349,7 +4372,9 @@ static struct ggml_tensor * ggml_fairy2i_wide_linear_bundle_impl(struct ggml_con
     GGML_ASSERT(x && codes && scales);
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(codes->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES);
-    GGML_ASSERT(scales->type == GGML_TYPE_F16);
+    GGML_ASSERT(scales->type == GGML_TYPE_F16 || scales->type == GGML_TYPE_BF16);
+    GGML_ASSERT(scales->type != GGML_TYPE_BF16 || (branches == 2 && op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1) ||
+                (branches == 4 && op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2));
     GGML_ASSERT(logical_m > 0 && logical_m % 64 == 0);
     GGML_ASSERT(logical_k > 0 && logical_k % 64 == 0);
     GGML_ASSERT(logical_m <= INT32_MAX && logical_k <= INT32_MAX);
@@ -4375,7 +4400,7 @@ static struct ggml_tensor * ggml_fairy2i_wide_linear_bundle_impl(struct ggml_con
     result->src[1]              = codes;
     result->src[2]              = scales;
     result->src[3]              = bias;
-    ggml_set_op_params_i32(result, 0, 1);  // bundle layout version
+    ggml_set_op_params_i32(result, 0, 1);  // bundle source layout version
     ggml_set_op_params_i32(result, 1, (int32_t) logical_m);
     ggml_set_op_params_i32(result, 2, (int32_t) logical_k);
     ggml_set_op_params_i32(result, 3, branches);
@@ -4402,6 +4427,16 @@ struct ggml_tensor * ggml_fairy2i_wide_linear_w2_bundle(struct ggml_context * ct
                                                         int64_t               logical_k) {
     return ggml_fairy2i_wide_linear_bundle_impl(ctx, x, codes, scales, bias, logical_m, logical_k, 4,
                                                 GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+}
+
+void ggml_fairy2i_wide_linear_set_qat(struct ggml_tensor * a, bool qat) {
+    GGML_ASSERT(a->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || a->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+    ggml_set_op_params_i32(a, 4, qat ? 1 : 0);
+}
+
+bool ggml_fairy2i_wide_linear_get_qat(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || a->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+    return ggml_get_op_params_i32(a, 4) == 1;
 }
 
 struct ggml_tensor * ggml_ifairy_wide_linear_w2(struct ggml_context * ctx,
@@ -4448,6 +4483,108 @@ static struct ggml_tensor * ggml_complex_rms_norm_impl(struct ggml_context * ctx
 
 struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps) {
     return ggml_complex_rms_norm_impl(ctx, a, eps, false, GGML_OP_COMPLEX_RMSNORM);
+}
+
+struct ggml_tensor * ggml_fairy2i_rms_norm_exact(struct ggml_context * ctx,
+                                                 struct ggml_tensor *  a,
+                                                 struct ggml_tensor *  weight,
+                                                 float                 eps) {
+    GGML_ASSERT(a && weight);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_can_repeat(weight, a));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_FAIRY2I_RMS_NORM_EXACT;
+    result->src[0] = a;
+    result->src[1] = weight;
+    return result;
+}
+
+struct ggml_tensor * ggml_fairy2i_silu_exact(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(a);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op                  = GGML_OP_FAIRY2I_SILU_EXACT;
+    result->src[0]              = a;
+    return result;
+}
+
+struct ggml_tensor * ggml_fairy2i_mul_exact(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
+    GGML_ASSERT(a && b);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(a, b));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op                  = GGML_OP_FAIRY2I_MUL_EXACT;
+    result->src[0]              = a;
+    result->src[1]              = b;
+    return result;
+}
+
+void ggml_fairy2i_exact_set_qat(struct ggml_tensor * a, bool qat) {
+    GGML_ASSERT(a);
+    GGML_ASSERT(a->op == GGML_OP_FAIRY2I_RMS_NORM_EXACT || a->op == GGML_OP_FAIRY2I_ROPE_EXACT ||
+                a->op == GGML_OP_FAIRY2I_SILU_EXACT || a->op == GGML_OP_FAIRY2I_MUL_EXACT);
+    a->op_params[15] = qat ? 1 : 0;
+}
+
+bool ggml_fairy2i_exact_get_qat(const struct ggml_tensor * a) {
+    GGML_ASSERT(a);
+    GGML_ASSERT(a->op == GGML_OP_FAIRY2I_RMS_NORM_EXACT || a->op == GGML_OP_FAIRY2I_ROPE_EXACT ||
+                a->op == GGML_OP_FAIRY2I_SILU_EXACT || a->op == GGML_OP_FAIRY2I_MUL_EXACT);
+    return a->op_params[15] != 0;
+}
+
+struct ggml_tensor * ggml_fairy2i_pack_bf16_exact(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(a);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_BF16, GGML_MAX_DIMS, a->ne);
+    result->op                  = GGML_OP_FAIRY2I_PACK_BF16_EXACT;
+    result->src[0]              = a;
+    return result;
+}
+
+struct ggml_tensor * ggml_fairy2i_round_bf16_exact(struct ggml_context * ctx, struct ggml_tensor * a) {
+    GGML_ASSERT(a);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+    result->op                  = GGML_OP_FAIRY2I_PACK_BF16_EXACT;
+    result->src[0]              = a;
+    result->op_params[0]        = 1;
+    return result;
+}
+
+struct ggml_tensor * ggml_fairy2i_attn_exact_cpu(struct ggml_context * ctx,
+                                                 struct ggml_tensor *  q,
+                                                 struct ggml_tensor *  k,
+                                                 struct ggml_tensor *  v,
+                                                 struct ggml_tensor *  mask,
+                                                 float                 scale) {
+    GGML_ASSERT(q && k && v && mask);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[1]);
+    GGML_ASSERT(k->ne[1] == v->ne[0] && k->ne[1] == mask->ne[0]);
+    GGML_ASSERT(k->ne[2] == v->ne[2] && k->ne[2] > 0);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3] && q->ne[3] == mask->ne[3]);
+    GGML_ASSERT(mask->ne[1] >= q->ne[1] && mask->ne[2] == 1);
+    GGML_ASSERT(isfinite(scale));
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, q);
+    ggml_set_op_params(result, &scale, sizeof(scale));
+    result->op     = GGML_OP_FAIRY2I_ATTN_EXACT_CPU;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    return result;
 }
 
 struct ggml_tensor * ggml_ifairy_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps) {
@@ -4536,6 +4673,30 @@ struct ggml_tensor * ggml_rope_ext(
         ctx, a, b, c, n_dims, NULL, mode, n_ctx_orig, freq_base, freq_scale,
         ext_factor, attn_factor, beta_fast, beta_slow, false
     );
+}
+
+struct ggml_tensor * ggml_fairy2i_rope_ext_exact(struct ggml_context * ctx,
+                                                 struct ggml_tensor *  a,
+                                                 struct ggml_tensor *  b,
+                                                 struct ggml_tensor *  c,
+                                                 int                   n_dims,
+                                                 int                   mode,
+                                                 int                   n_ctx_orig,
+                                                 float                 freq_base,
+                                                 float                 freq_scale,
+                                                 float                 ext_factor,
+                                                 float                 attn_factor,
+                                                 float                 beta_fast,
+                                                 float                 beta_slow) {
+    GGML_ASSERT(a && a->type == GGML_TYPE_F32);
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_NEOX) != 0);
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_MROPE) == 0);
+    GGML_ASSERT(mode != GGML_ROPE_TYPE_VISION);
+
+    struct ggml_tensor * result = ggml_rope_ext(ctx, a, b, c, n_dims, mode, n_ctx_orig, freq_base, freq_scale,
+                                                ext_factor, attn_factor, beta_fast, beta_slow);
+    result->op                  = GGML_OP_FAIRY2I_ROPE_EXACT;
+    return result;
 }
 
 struct ggml_tensor * ggml_rope_ext_inplace(
@@ -5548,6 +5709,26 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
     return (enum ggml_prec) prec_i32;
+}
+
+void ggml_flash_attn_ext_set_fairy2i_exact(struct ggml_tensor * a, bool exact) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 4, exact ? 1 : 0);
+}
+
+bool ggml_flash_attn_ext_get_fairy2i_exact(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 4) != 0;
+}
+
+void ggml_flash_attn_ext_set_fairy2i_flash3(struct ggml_tensor * a, bool flash3) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 4, flash3 ? 2 : 0);
+}
+
+bool ggml_flash_attn_ext_get_fairy2i_flash3(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 4) == 2;
 }
 
 void ggml_flash_attn_ext_add_sinks(

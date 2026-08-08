@@ -200,7 +200,31 @@ struct common_params_model {
     std::string docker_repo = ""; // Docker repo                                            // NOLINT
 };
 
+enum common_speculative_type {
+    COMMON_SPECULATIVE_TYPE_NONE,
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
+    COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
+    COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
+    COMMON_SPECULATIVE_TYPE_COUNT,
+};
+
+struct common_params_speculative_ngram_mod {
+    int32_t n_match = 24;
+    int32_t n_max   = 64;
+    int32_t n_min   = 48;
+};
+
+struct common_params_speculative_ngram_map {
+    uint16_t size_n   = 12; // ngram size for lookup
+    uint16_t size_m   = 48; // mgram size for speculative tokens
+    uint16_t min_hits = 1;  // minimum hits at ngram/mgram lookup for mgram to be proposed
+};
+
 struct common_params_speculative {
+    std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     int32_t n_ctx        =     0; // draft context size
@@ -212,13 +236,22 @@ struct common_params_speculative {
     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k = GGML_TYPE_COUNT;  // KV cache data type for K; COUNT selects the model default
+    ggml_type cache_type_v = GGML_TYPE_COUNT;  // KV cache data type for V; COUNT selects the model default
 
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
 
     struct common_params_model model;
+
+    // runtime-only contexts, set by callers that initialize speculative decoding
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    common_params_speculative_ngram_mod ngram_mod;
+    common_params_speculative_ngram_map ngram_simple;
+    common_params_speculative_ngram_map ngram_map_k;
+    common_params_speculative_ngram_map ngram_map_k4v;
 };
 
 struct common_params_vocoder {
@@ -395,8 +428,8 @@ struct common_params {
 
     bool single_turn       = false; // single turn chat conversation
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k = GGML_TYPE_COUNT;  // KV cache data type for K; COUNT selects the model default
+    ggml_type cache_type_v = GGML_TYPE_COUNT;  // KV cache data type for V; COUNT selects the model default
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

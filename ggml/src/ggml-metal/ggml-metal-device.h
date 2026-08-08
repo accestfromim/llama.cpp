@@ -155,11 +155,11 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(
         int32_t nsg,
         int32_t nwg);
 
-ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
-        ggml_metal_library_t lib,
-        const struct ggml_tensor * op,
-        int32_t dv,
-        int32_t nwg);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(ggml_metal_library_t       lib,
+                                                                                const struct ggml_tensor * op,
+                                                                                int32_t                    dv,
+                                                                                int32_t                    nwg,
+                                                                                bool                       round_bf16);
 
 //
 // device
@@ -178,6 +178,7 @@ struct ggml_metal_device_props {
     bool has_bfloat;
     bool use_residency_sets;
     bool use_shared_buffers;
+    bool fairy2i_metal3_compat;
 
     bool supports_gpu_family_apple7;
 };
@@ -223,6 +224,8 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+struct ggml_metal_buffer_id ggml_metal_buffer_get_fairy2i_w1_coeff_lut(ggml_metal_buffer_t        buf,
+                                                                       const struct ggml_tensor * scales);
 
 size_t ggml_metal_fairy2i_packed_weight_extra(const struct ggml_tensor * tensor);
 

@@ -80,6 +80,8 @@ int main(int argc, char ** argv) {
     params.devices = params.speculative.devices;
     params.model = params.speculative.model;
     params.n_gpu_layers = params.speculative.n_gpu_layers;
+    params.cache_type_k = params.speculative.cache_type_k;
+    params.cache_type_v = params.speculative.cache_type_v;
     if (params.speculative.cpuparams.n_threads > 0) {
         params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
     }

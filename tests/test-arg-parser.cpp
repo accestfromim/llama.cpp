@@ -98,6 +98,11 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.n_max == 123);
 
+    argv = { "binary_name", "--cache-type-k-draft", "f16", "--cache-type-v-draft", "f16" };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.cache_type_k == GGML_TYPE_F16);
+    assert(params.speculative.cache_type_v == GGML_TYPE_F16);
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");

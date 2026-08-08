@@ -11,6 +11,7 @@
 #include <Metal/Metal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -26,6 +27,15 @@
 
 // overload of MTLGPUFamilyMetal3 (not available in some environments)
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
+static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
+
+static bool ggml_metal_env_flag(const char * name, bool default_value) {
+    const char * value = getenv(name);
+    if (value == NULL) {
+        return default_value;
+    }
+    return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 && strcasecmp(value, "off") != 0;
+}
 
 #if !GGML_METAL_EMBED_LIBRARY
 // Here to assist with NSBundle Path Hack
@@ -482,6 +492,10 @@ ggml_metal_device_t ggml_metal_device_init(void) {
 
             dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
             dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
+#if !defined(GGML_METAL_EMBED_LIBRARY) && !defined(GGML_METAL_HAS_BF16_LIBRARY)
+            // The precompiled library was built without its BF16 entry points.
+            dev->props.has_bfloat = false;
+#endif
 
             dev->props.use_residency_sets = true;
 #if defined(GGML_METAL_HAS_RESIDENCY_SETS)
@@ -493,6 +507,10 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             if (getenv("GGML_METAL_SHARED_BUFFERS_DISABLE") != NULL) {
                 dev->props.use_shared_buffers = false;
             }
+
+            const bool supports_metal4 = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal4_GGML];
+            dev->props.fairy2i_metal3_compat = ggml_metal_env_flag(
+                "GGML_FAIRY2I_METAL3_COMPAT", !supports_metal4);
 
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
@@ -546,6 +564,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
             GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
             GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
+            GGML_LOG_INFO("%s: Fairy2i Metal3 compat = %s\n", __func__, dev->props.fairy2i_metal3_compat   ? "true" : "false");
 
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
             if (@available(macOS 10.12, iOS 16.0, *)) {
@@ -611,21 +630,25 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 
     if ((op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2) && op->src[1] &&
         op->src[1]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES) {
-        const struct ggml_tensor * x      = op->src[0];
-        const struct ggml_tensor * codes  = op->src[1];
-        const struct ggml_tensor * scales = op->src[2];
-        const struct ggml_tensor * bias   = op->src[3];
-
         const int32_t layout   = ggml_get_op_params_i32(op, 0);
         const int32_t m        = ggml_get_op_params_i32(op, 1);
         const int32_t k        = ggml_get_op_params_i32(op, 2);
         const int32_t branches = ggml_get_op_params_i32(op, 3);
+        const struct ggml_tensor * x      = op->src[0];
+        const struct ggml_tensor * codes  = op->src[1];
+        const struct ggml_tensor * scales = op->src[2];
+        const struct ggml_tensor * bias   = op->src[3];
         const int64_t tiles    = m > 0 && k > 0 ? (int64_t) (m / 64) * (k / 64) : 0;
         const int32_t expected_branches = op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 ? 2 : 4;
-
+        const bool exact_bundle =
+            scales && scales->type == GGML_TYPE_BF16 &&
+            ((op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 && branches == 2) ||
+             (op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2 && branches == 4));
+        const bool valid_scale_type = scales && (scales->type == GGML_TYPE_F16 || exact_bundle);
         return has_simdgroup_mm && has_simdgroup_reduction && x && scales && layout == 1 && m > 0 && k > 0 &&
                m % 64 == 0 && k % 64 == 0 && branches == expected_branches && op->type == GGML_TYPE_F32 &&
-               x->type == GGML_TYPE_F32 && scales->type == GGML_TYPE_F16 && (!bias || bias->type == GGML_TYPE_F32) &&
+               x->type == GGML_TYPE_F32 && valid_scale_type && (!exact_bundle || has_bfloat) &&
+               (!bias || bias->type == GGML_TYPE_F32) &&
                x->ne[0] == k && op->ne[0] == m && codes->ne[0] == 16 && codes->ne[1] == branches &&
                codes->ne[2] == 64 && codes->ne[3] == tiles && scales->ne[0] == 2 && scales->ne[1] == branches &&
                scales->ne[2] == tiles && scales->ne[3] == 1 && ggml_is_contiguous(x) && ggml_is_contiguous(op) &&
@@ -769,12 +792,52 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RMS_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && (op->ne[0] % 4 == 0 && ggml_is_contiguous_1(op->src[0]));
+        case GGML_OP_FAIRY2I_RMS_NORM_EXACT:
+            return has_bfloat && op->src[0] && op->src[1] && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
+                   op->nb[0] == sizeof(float) && ggml_are_same_shape(op->src[0], op) &&
+                   ggml_can_repeat(op->src[1], op->src[0]);
+        case GGML_OP_FAIRY2I_SILU_EXACT:
+            return has_bfloat && op->src[0] && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_FAIRY2I_MUL_EXACT:
+            return has_bfloat && op->src[0] && op->src[1] && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_are_same_shape(op->src[0], op->src[1]) && ggml_are_same_shape(op->src[0], op) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op);
+        case GGML_OP_FAIRY2I_PACK_BF16_EXACT:
+            return has_bfloat && op->src[0] && (op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F32) &&
+                   op->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_FAIRY2I_ATTN_EXACT_CPU:
+            return false;
         case GGML_OP_ARGMAX:
             return has_simdgroup_reduction;
         case GGML_OP_NORM:
             return has_simdgroup_reduction && (op->ne[0] % 4 == 0 && ggml_is_contiguous_1(op->src[0]));
         case GGML_OP_ROPE:
             return true;
+        case GGML_OP_FAIRY2I_ROPE_EXACT:
+            {
+                const int mode   = ggml_get_op_params_i32(op, 2);
+                const int n_dims = ggml_get_op_params_i32(op, 1);
+                return has_bfloat && op->src[0] && op->src[1] && op->type == GGML_TYPE_F32 &&
+                       op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+                       (!op->src[2] || op->src[2]->type == GGML_TYPE_F32) &&
+                       op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(int32_t) &&
+                       (!op->src[2] ||
+                        (op->src[2]->nb[0] == sizeof(float) && op->src[2]->ne[0] >= n_dims / 2)) &&
+                       op->nb[0] == sizeof(float) && ggml_are_same_shape(op->src[0], op) &&
+                       op->src[1]->ne[0] >= op->src[0]->ne[2] &&
+                       op->src[1]->ne[0] % op->src[0]->ne[2] == 0 &&
+                       (mode & GGML_ROPE_TYPE_NEOX) != 0 && (mode & GGML_ROPE_TYPE_MROPE) == 0 &&
+                       mode != GGML_ROPE_TYPE_VISION && n_dims > 0 && n_dims <= op->src[0]->ne[0] &&
+                       n_dims % 2 == 0 &&
+                       GGML_PAD((size_t) n_dims * sizeof(float), 16) <= dev->props.max_theadgroup_memory_size;
+            }
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
         case GGML_OP_POOL_1D:
@@ -794,6 +857,42 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ARANGE:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
+            if (ggml_flash_attn_ext_get_fairy2i_exact(op) && !ggml_flash_attn_ext_get_fairy2i_flash3(op)) {
+                const struct ggml_tensor * q    = op->src[0];
+                const struct ggml_tensor * k    = op->src[1];
+                const struct ggml_tensor * v    = op->src[2];
+                const struct ggml_tensor * mask = op->src[3];
+
+                if (!q || !k || !v || !mask || op->src[4]) {
+                    return false;
+                }
+
+                const float max_bias      = ggml_get_op_params_f32(op, 1);
+                const float logit_softcap = ggml_get_op_params_f32(op, 2);
+                const bool supported_dims =
+                    (q->ne[0] == v->ne[0] &&
+                     (q->ne[0] == 40 || q->ne[0] == 64 || q->ne[0] == 80 ||
+                      q->ne[0] == 96 || q->ne[0] == 112 || q->ne[0] == 128 ||
+                      q->ne[0] == 192 || q->ne[0] == 256)) ||
+                    (q->ne[0] == 192 && v->ne[0] == 128);
+
+                return has_bfloat && has_simdgroup_mm && has_simdgroup_reduction &&
+                       op->type == GGML_TYPE_F32 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_BF16 &&
+                       v->type == GGML_TYPE_BF16 && mask->type == GGML_TYPE_F32 &&
+                       max_bias == 0.0f && logit_softcap == 0.0f && supported_dims &&
+                       q->ne[0] == k->ne[0] && k->ne[1] == v->ne[1] &&
+                       k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3] &&
+                       q->ne[2] % k->ne[2] == 0 && q->ne[3] == k->ne[3] &&
+                       k->ne[1] % 32 == 0 && mask->ne[0] >= k->ne[1] &&
+                       mask->ne[1] >= GGML_PAD(q->ne[1], GGML_KQ_MASK_PAD) &&
+                       q->ne[2] % mask->ne[2] == 0 && q->ne[3] % mask->ne[3] == 0 &&
+                       q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_bf16_t) &&
+                       v->nb[0] == sizeof(ggml_bf16_t) && mask->nb[0] == sizeof(float) &&
+                       op->nb[0] == sizeof(float) && ggml_is_contiguous_rows(q) &&
+                       ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v) &&
+                       ggml_is_contiguous(mask) && ggml_is_contiguous(op);
+            }
+
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 40 &&
                 op->src[0]->ne[0] != 64 &&
@@ -885,6 +984,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_SET_ROWS:
             {
+                if (op->src[0]->type == GGML_TYPE_BF16) {
+                    return op->type == GGML_TYPE_BF16;
+                }
                 if (op->src[0]->type != GGML_TYPE_F32) {
                     return false;
                 }
@@ -927,6 +1029,14 @@ struct ggml_metal_buffer_wrapper {
     id<MTLBuffer> metal;
 };
 
+struct ggml_metal_fairy2i_w1_coeff_lut {
+    const void * tensor_data;
+    size_t tensor_size;
+    id<MTLBuffer> metal;
+
+    struct ggml_metal_fairy2i_w1_coeff_lut * next;
+};
+
 struct ggml_metal_buffer {
     void * all_data; // TODO: https://github.com/ggml-org/llama.cpp/pull/15985
     size_t all_size;
@@ -948,6 +1058,8 @@ struct ggml_metal_buffer {
     // pointers to global device objects
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+
+    struct ggml_metal_fairy2i_w1_coeff_lut * fairy2i_w1_coeff_luts;
 };
 
 static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_aligned) {
@@ -1213,6 +1325,14 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    struct ggml_metal_fairy2i_w1_coeff_lut * lut = buf->fairy2i_w1_coeff_luts;
+    while (lut) {
+        struct ggml_metal_fairy2i_w1_coeff_lut * next = lut->next;
+        [lut->metal release];
+        free(lut);
+        lut = next;
+    }
+
     for (int i = 0; i < buf->n_buffers; i++) {
         [buf->buffers[i].metal release];
     }
@@ -1238,12 +1358,105 @@ bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
 
+static bool ggml_metal_fairy2i_is_exact_w1_bundle_scales(const struct ggml_tensor * tensor) {
+    return tensor->type == GGML_TYPE_BF16 && tensor->ne[0] == 2 && tensor->ne[1] == 2 && tensor->ne[2] > 0 &&
+           tensor->ne[3] == 1 && ggml_is_contiguous(tensor);
+}
+
+static uint16_t ggml_metal_fairy2i_add_bf16_rne(uint16_t a, uint16_t b) {
+    const ggml_bf16_t a_bf16 = { a };
+    const ggml_bf16_t b_bf16 = { b };
+    return ggml_fp32_to_bf16(ggml_bf16_to_fp32(a_bf16) + ggml_bf16_to_fp32(b_bf16)).bits;
+}
+
+static uint8_t ggml_metal_fairy2i_bf16_product_metric(uint16_t value) {
+    const uint16_t abs_value = value & 0x7fff;
+    if (abs_value == 0) {
+        return 255;
+    }
+    const uint16_t exponent = abs_value >> 7;
+    return exponent == 0 || exponent == 0xff ? 0 : exponent;
+}
+
+static uint8_t ggml_metal_fairy2i_one_add_coefficient_metric_bound(uint8_t min_metric, uint8_t max_exponent) {
+    if (min_metric == 255) {
+        return 255;
+    }
+    if (min_metric <= 7 || max_exponent >= 254) {
+        return 0;
+    }
+    return min_metric - 7;
+}
+
+static void ggml_metal_fairy2i_build_exact_w1_coeff_lut(
+        uint16_t * dst,
+        const uint16_t * scales,
+        size_t tiles) {
+    const size_t entries = tiles * 16;
+    uint8_t * metrics = (uint8_t *) (dst + entries * 4);
+    uint8_t * tile_metrics = metrics + entries;
+    for (size_t tile = 0; tile < tiles; ++tile) {
+        const uint16_t * scale = scales + tile * 4;
+        uint8_t min_scale_metric = 255;
+        uint8_t max_scale_exponent = 0;
+        for (int component = 0; component < 4; ++component) {
+            const uint8_t metric = ggml_metal_fairy2i_bf16_product_metric(scale[component]);
+            min_scale_metric = MIN(min_scale_metric, metric);
+            max_scale_exponent = MAX(max_scale_exponent, metric == 255 ? 0 : metric);
+        }
+        tile_metrics[tile] =
+            ggml_metal_fairy2i_one_add_coefficient_metric_bound(min_scale_metric, max_scale_exponent);
+        for (uint32_t pattern = 0; pattern < 16; ++pattern) {
+            const uint32_t u_code = pattern & 3u;
+            const uint32_t w_code = pattern >> 2;
+            const uint16_t u_scale = scale[(u_code & 2u) == 0u ? 0 : 1];
+            const uint16_t w_scale = scale[(w_code & 2u) == 0u ? 2 : 3];
+            const uint16_t u_stage = u_scale ^ ((u_code & 1u) != 0u ? 0x0000u : 0x8000u);
+            const uint16_t w_stage = w_scale ^ ((w_code & 1u) != 0u ? 0x0000u : 0x8000u);
+            const uint16_t u_real = (u_code & 2u) == 0u ? u_stage : 0;
+            const uint16_t u_imag = (u_code & 2u) == 0u ? 0 : u_stage;
+            const uint16_t w_real = (w_code & 2u) == 0u ? w_stage : 0;
+            const uint16_t w_imag = (w_code & 2u) == 0u ? 0 : w_stage;
+            uint16_t * coeff = dst + (tile * 16 + pattern) * 4;
+            coeff[0] = ggml_metal_fairy2i_add_bf16_rne(u_real, w_real);
+            coeff[1] = ggml_metal_fairy2i_add_bf16_rne(u_imag ^ 0x8000u, w_imag);
+            coeff[2] = ggml_metal_fairy2i_add_bf16_rne(u_imag, w_imag);
+            coeff[3] = ggml_metal_fairy2i_add_bf16_rne(u_real, w_real ^ 0x8000u);
+            metrics[tile * 16 + pattern] = MIN(
+                MIN(ggml_metal_fairy2i_bf16_product_metric(coeff[0]),
+                    ggml_metal_fairy2i_bf16_product_metric(coeff[1])),
+                MIN(ggml_metal_fairy2i_bf16_product_metric(coeff[2]),
+                    ggml_metal_fairy2i_bf16_product_metric(coeff[3])));
+        }
+    }
+}
+
+static void ggml_metal_fairy2i_invalidate_w1_coeff_lut(
+        ggml_metal_buffer_t buf,
+        const struct ggml_tensor * tensor) {
+    struct ggml_metal_fairy2i_w1_coeff_lut ** next = &buf->fairy2i_w1_coeff_luts;
+    while (*next) {
+        struct ggml_metal_fairy2i_w1_coeff_lut * lut = *next;
+        if (lut->tensor_data == tensor->data) {
+            *next = lut->next;
+            [lut->metal release];
+            free(lut);
+            continue;
+        }
+        next = &lut->next;
+    }
+}
+
 size_t ggml_metal_fairy2i_packed_weight_extra(const struct ggml_tensor * tensor) {
     GGML_UNUSED(tensor);
     return 0;
 }
 
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    @synchronized (buf->buffers[0].metal) {
+        ggml_metal_fairy2i_invalidate_w1_coeff_lut(buf, tensor);
+    }
+
     if (buf->is_shared) {
         memset((char *)tensor->data + offset, value, size);
         return;
@@ -1273,6 +1486,10 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 }
 
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    @synchronized (buf->buffers[0].metal) {
+        ggml_metal_fairy2i_invalidate_w1_coeff_lut(buf, tensor);
+    }
+
     if (buf->is_shared) {
         memcpy((char *)tensor->data + offset, data, size);
         return;
@@ -1363,6 +1580,17 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 }
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
+    @synchronized (buf->buffers[0].metal) {
+        struct ggml_metal_fairy2i_w1_coeff_lut * lut = buf->fairy2i_w1_coeff_luts;
+        while (lut) {
+            struct ggml_metal_fairy2i_w1_coeff_lut * next = lut->next;
+            [lut->metal release];
+            free(lut);
+            lut = next;
+        }
+        buf->fairy2i_w1_coeff_luts = NULL;
+    }
+
     if (buf->is_shared) {
         memset(buf->all_data, value, buf->all_size);
         return;
@@ -1410,6 +1638,50 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
 
     return res;
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_fairy2i_w1_coeff_lut(
+        ggml_metal_buffer_t buf,
+        const struct ggml_tensor * scales) {
+    GGML_ASSERT(ggml_metal_fairy2i_is_exact_w1_bundle_scales(scales));
+
+    @synchronized (buf->buffers[0].metal) {
+        for (struct ggml_metal_fairy2i_w1_coeff_lut * lut = buf->fairy2i_w1_coeff_luts; lut; lut = lut->next) {
+            if (lut->tensor_data == scales->data && lut->tensor_size == ggml_nbytes(scales)) {
+                return (struct ggml_metal_buffer_id) { lut->metal, 0 };
+            }
+        }
+
+        const size_t tiles = scales->ne[2];
+        const size_t scale_size = ggml_nbytes(scales);
+        const size_t lut_size = tiles * 16 * (4 * sizeof(uint16_t) + sizeof(uint8_t)) + tiles * sizeof(uint8_t);
+        uint16_t * scale_data = malloc(scale_size);
+        uint16_t * lut_data = malloc(lut_size);
+        GGML_ASSERT(scale_data != NULL);
+        GGML_ASSERT(lut_data != NULL);
+
+        ggml_metal_buffer_get_tensor(buf, scales, scale_data, 0, scale_size);
+        ggml_metal_fairy2i_build_exact_w1_coeff_lut(lut_data, scale_data, tiles);
+
+        id<MTLBuffer> metal = [buf->device newBufferWithBytes:lut_data
+                                                      length:lut_size
+                                                     options:MTLResourceStorageModeShared];
+        GGML_ASSERT(metal != nil);
+
+        free(lut_data);
+        free(scale_data);
+
+        struct ggml_metal_fairy2i_w1_coeff_lut * lut = calloc(1, sizeof(*lut));
+        GGML_ASSERT(lut != NULL);
+        lut->tensor_data = scales->data;
+        lut->tensor_size = scale_size;
+        lut->metal = metal;
+        lut->next = buf->fairy2i_w1_coeff_luts;
+        buf->fairy2i_w1_coeff_luts = lut;
+
+        ggml_metal_log_allocated_size(buf->device, lut_size);
+        return (struct ggml_metal_buffer_id) { metal, 0 };
+    }
 }
 
 struct ggml_metal_buffer_id ggml_metal_device_get_scratch(ggml_metal_device_t dev, size_t size) {

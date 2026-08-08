@@ -2014,6 +2014,31 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ifairy_rmsnorm(params, tensor);
             }
             break;
+        case GGML_OP_FAIRY2I_RMS_NORM_EXACT:
+            {
+                ggml_compute_forward_fairy2i_rms_norm_exact(params, tensor);
+            }
+            break;
+        case GGML_OP_FAIRY2I_SILU_EXACT:
+            {
+                ggml_compute_forward_fairy2i_silu_exact(params, tensor);
+            }
+            break;
+        case GGML_OP_FAIRY2I_MUL_EXACT:
+            {
+                ggml_compute_forward_fairy2i_mul_exact(params, tensor);
+            }
+            break;
+        case GGML_OP_FAIRY2I_PACK_BF16_EXACT:
+            {
+                ggml_compute_forward_fairy2i_pack_bf16_exact(params, tensor);
+            }
+            break;
+        case GGML_OP_FAIRY2I_ATTN_EXACT_CPU:
+            {
+                ggml_compute_forward_fairy2i_attn_exact_cpu(params, tensor);
+            }
+            break;
         case GGML_OP_COMPLEX_ROPE:
             {
                 ggml_compute_forward_complex_rope(params, tensor);
@@ -2022,6 +2047,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_IFAIRY_ROPE:
             {
                 ggml_compute_forward_ifairy_rope(params, tensor);
+            }
+            break;
+        case GGML_OP_FAIRY2I_ROPE_EXACT:
+            {
+                ggml_compute_forward_fairy2i_rope_exact(params, tensor);
             }
             break;
         case GGML_OP_COMPLEX_SPLIT:
@@ -2484,6 +2514,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_IFAIRY_SPLIT:
         case GGML_OP_IFAIRY_ROPE:
         case GGML_OP_IFAIRY_MERGE:
+        case GGML_OP_FAIRY2I_RMS_NORM_EXACT:
+        case GGML_OP_FAIRY2I_ROPE_EXACT:
+        case GGML_OP_FAIRY2I_SILU_EXACT:
+        case GGML_OP_FAIRY2I_MUL_EXACT:
+        case GGML_OP_FAIRY2I_PACK_BF16_EXACT:
+        case GGML_OP_FAIRY2I_ATTN_EXACT_CPU:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
         case GGML_OP_ADD_REL_POS:
@@ -3017,9 +3053,19 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_IFAIRY_MERGE:
                 case GGML_OP_IFAIRY_ROPE:
                 case GGML_OP_IFAIRY_RMSNORM:
+                case GGML_OP_FAIRY2I_RMS_NORM_EXACT:
+                case GGML_OP_FAIRY2I_ROPE_EXACT:
+                case GGML_OP_FAIRY2I_SILU_EXACT:
+                case GGML_OP_FAIRY2I_MUL_EXACT:
+                case GGML_OP_FAIRY2I_PACK_BF16_EXACT:
                     {
                         cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
                     } break;
+                case GGML_OP_FAIRY2I_ATTN_EXACT_CPU:
+                    {
+                        cur = GGML_PAD((size_t) node->src[1]->ne[1] * sizeof(float), CACHE_LINE_SIZE) * n_tasks;
+                    }
+                    break;
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:

@@ -458,6 +458,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 #else
             return false;
 #endif
+        case GGML_OP_FLASH_ATTN_EXT:
+            return !ggml_flash_attn_ext_get_fairy2i_exact(op);
         case GGML_OP_SOFT_MAX_BACK: {
             if (op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32) {
                 return false;

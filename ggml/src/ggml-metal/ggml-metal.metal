@@ -70,12 +70,732 @@ static inline float fairy2i_bf16_to_f32(ushort h) {
     return as_type<float>(((uint) h) << 16);
 }
 
-static inline ushort fairy2i_f32_to_bf16(float x) {
-    const uint bits = as_type<uint>(x);
+static inline ushort fairy2i_f32_bits_to_bf16_rne(uint bits) {
     if ((bits & 0x7fffffffU) > 0x7f800000U) {
         return (ushort) ((bits >> 16) | 64U);
     }
     return (ushort) ((bits + (0x7fffU + ((bits >> 16) & 1U))) >> 16);
+}
+
+static inline ushort fairy2i_f32_to_bf16(float x) {
+    return fairy2i_f32_bits_to_bf16_rne(as_type<uint>(x));
+}
+
+static inline ushort4 fairy2i_f32_to_bf16(float4 x) {
+    const uint4 bits = as_type<uint4>(x);
+    const uint4 rounded =
+        (bits + (uint4(0x7fffU) + ((bits >> uint4(16)) & uint4(1)))) >> uint4(16);
+    const uint4 quiet_nan = (bits >> uint4(16)) | uint4(64U);
+    return ushort4(select(rounded, quiet_nan, (bits & uint4(0x7fffffffU)) > uint4(0x7f800000U)));
+}
+
+static inline float fairy2i_round_to_bf16_f32(float x) {
+    return fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(x));
+}
+
+static inline float4 fairy2i_round_to_bf16_f32(float4 x) {
+    const uint4 bits = as_type<uint4>(x);
+    const uint4 rounded =
+        (bits + (uint4(0x7fffU) + ((bits >> uint4(16)) & uint4(1)))) & uint4(0xffff0000U);
+    const uint4 quiet_nan = (bits & uint4(0xffff0000U)) | uint4(0x00400000U);
+    return as_type<float4>(
+        select(rounded, quiet_nan, (bits & uint4(0x7fffffffU)) > uint4(0x7f800000U)));
+}
+
+static inline uint fairy2i_shift_right_jam(uint value, uint shift) {
+    if (shift == 0) {
+        return value;
+    }
+    if (shift >= 32) {
+        return value != 0 ? 1U : 0U;
+    }
+    const uint mask = (1U << shift) - 1U;
+    return (value >> shift) | ((value & mask) != 0 ? 1U : 0U);
+}
+
+static inline uint fairy2i_shift_right_rne(uint value, uint shift) {
+    if (shift == 0) {
+        return value;
+    }
+    if (shift >= 32) {
+        return 0;
+    }
+
+    const uint result = value >> shift;
+    const uint halfway = 1U << (shift - 1);
+    const uint lost   = value & ((1U << shift) - 1U);
+    return result + (lost > halfway || (lost == halfway && (result & 1U) != 0) ? 1U : 0U);
+}
+
+static inline ulong fairy2i_shift_right_rne_u64(ulong value, uint shift) {
+    if (shift == 0) {
+        return value;
+    }
+    if (shift >= 64) {
+        return 0;
+    }
+
+    const ulong result  = value >> shift;
+    const ulong halfway = (ulong) 1 << (shift - 1);
+    const ulong lost    = value & (((ulong) 1 << shift) - 1);
+    return result + (lost > halfway || (lost == halfway && (result & 1UL) != 0) ? 1UL : 0UL);
+}
+
+// Returns the exponent of the least-significant bit in a finite non-zero BF16 value, encoded so
+// `metric - 134` is the binary exponent. Zero has no product quantum and maps to 255. BF16
+// subnormals and non-finite values map to zero so the caller can force the software path even when
+// the other operand has a very large exponent.
+static inline uint fairy2i_bf16_product_metric(ushort value) {
+    const uint abs_value = (uint) value & 0x7fffU;
+    if (abs_value == 0) {
+        return 255U;
+    }
+    const uint exponent = abs_value >> 7;
+    if (exponent == 0 || exponent == 0xffU) {
+        return 0U;
+    }
+    return exponent;
+}
+
+static inline bool fairy2i_product_metrics_require_software(uint lhs, uint rhs) {
+    const bool lhs_nonzero = lhs != 255U;
+    const bool rhs_nonzero = rhs != 255U;
+    return lhs == 0U || rhs == 0U ||
+           (lhs_nonzero && rhs_nonzero && lhs + rhs < 142U);
+}
+
+// A non-zero BF16 add can lower its smallest input exponent field by at most seven.
+// The U/W and Aij hierarchy crosses two add boundaries. Stages that can underflow or
+// overflow the hierarchy conservatively force software replay.
+static inline uint fairy2i_bf16_two_add_coefficient_metric_bound(uint min_stage_metric, uint max_stage_exponent) {
+    if (min_stage_metric == 255U) {
+        return 255U;
+    }
+    if (min_stage_metric <= 14U || max_stage_exponent >= 253U) {
+        return 0U;
+    }
+    return min_stage_metric - 14U;
+}
+
+// Bundle W1 has one BF16 add boundary between its signed U/W stages and Aij.
+static inline uint fairy2i_bf16_one_add_coefficient_metric_bound(uint min_stage_metric, uint max_stage_exponent) {
+    if (min_stage_metric == 255U) {
+        return 255U;
+    }
+    if (min_stage_metric <= 7U || max_stage_exponent >= 254U) {
+        return 0U;
+    }
+    return min_stage_metric - 7U;
+}
+
+// BF16 inputs contain at most eight significant bits, so their product is represented exactly by
+// F32 unless it must be rounded into the F32 subnormal range. Build the result from payload bits to
+// avoid Apple GPU F32/BF16 flush-to-zero behavior.
+static inline uint fairy2i_mul_bf16_to_f32_bits_rne(ushort a, ushort b) {
+    const uint sign_a = (uint) a >> 15;
+    const uint sign_b = (uint) b >> 15;
+    const uint abs_a  = (uint) a & 0x7fffU;
+    const uint abs_b  = (uint) b & 0x7fffU;
+    const uint exp_a  = abs_a >> 7;
+    const uint exp_b  = abs_b >> 7;
+    const uint frac_a = abs_a & 0x7fU;
+    const uint frac_b = abs_b & 0x7fU;
+    const uint sign   = (sign_a ^ sign_b) << 31;
+
+    if (exp_a == 0xffU || exp_b == 0xffU) {
+        const bool nan_a = exp_a == 0xffU && frac_a != 0;
+        const bool nan_b = exp_b == 0xffU && frac_b != 0;
+        if (nan_a || nan_b || ((abs_a == 0x7f80U || abs_b == 0x7f80U) && (abs_a == 0 || abs_b == 0))) {
+            return 0x7fc00000U;
+        }
+        return sign | 0x7f800000U;
+    }
+    if (abs_a == 0 || abs_b == 0) {
+        return sign;
+    }
+
+    const uint sig_a = exp_a == 0 ? frac_a : 0x80U | frac_a;
+    const uint sig_b = exp_b == 0 ? frac_b : 0x80U | frac_b;
+    const int  e_a   = exp_a == 0 ? -133 : (int) exp_a - 134;
+    const int  e_b   = exp_b == 0 ? -133 : (int) exp_b - 134;
+    const uint product = sig_a * sig_b;
+    const int  msb     = 31 - (int) clz(product);
+    const int  result_e = e_a + e_b + msb;
+
+    if (result_e > 127) {
+        return sign | 0x7f800000U;
+    }
+    if (result_e >= -126) {
+        const uint significand = product << (23 - msb);
+        return sign | ((uint) (result_e + 127) << 23) | (significand & 0x7fffffU);
+    }
+
+    const int subnormal_shift = e_a + e_b + 149;
+    uint      fraction;
+    if (subnormal_shift >= 0) {
+        fraction = product << subnormal_shift;
+    } else {
+        fraction = fairy2i_shift_right_rne(product, (uint) -subnormal_shift);
+    }
+    if (fraction >= 0x800000U) {
+        return sign | 0x00800000U;
+    }
+    return sign | fraction;
+}
+
+static inline uint fairy2i_mul_f32_bits_rne(uint a, uint b) {
+    const uint sign_a = a >> 31;
+    const uint sign_b = b >> 31;
+    const uint abs_a  = a & 0x7fffffffU;
+    const uint abs_b  = b & 0x7fffffffU;
+    const uint exp_a  = abs_a >> 23;
+    const uint exp_b  = abs_b >> 23;
+    const uint frac_a = abs_a & 0x7fffffU;
+    const uint frac_b = abs_b & 0x7fffffU;
+    const uint sign   = (sign_a ^ sign_b) << 31;
+
+    if (exp_a == 0xffU || exp_b == 0xffU) {
+        const bool nan_a = exp_a == 0xffU && frac_a != 0;
+        const bool nan_b = exp_b == 0xffU && frac_b != 0;
+        if (nan_a || nan_b || ((exp_a == 0xffU || exp_b == 0xffU) && (abs_a == 0 || abs_b == 0))) {
+            return 0x7fc00000U;
+        }
+        return sign | 0x7f800000U;
+    }
+    if (abs_a == 0 || abs_b == 0) {
+        return sign;
+    }
+
+    const ulong sig_a = exp_a == 0 ? (ulong) frac_a : (ulong) (0x800000U | frac_a);
+    const ulong sig_b = exp_b == 0 ? (ulong) frac_b : (ulong) (0x800000U | frac_b);
+    const int e_a = exp_a == 0 ? -149 : (int) exp_a - 150;
+    const int e_b = exp_b == 0 ? -149 : (int) exp_b - 150;
+    const ulong product = sig_a * sig_b;
+    const uint product_hi = (uint) (product >> 32);
+    const int msb = product_hi != 0 ? 32 + 31 - (int) clz(product_hi) :
+                                      31 - (int) clz((uint) product);
+    int result_e = e_a + e_b + msb;
+
+    if (result_e > 127) {
+        return sign | 0x7f800000U;
+    }
+    if (result_e >= -126) {
+        ulong significand = msb > 23 ? fairy2i_shift_right_rne_u64(product, (uint) (msb - 23)) :
+                                       product << (23 - msb);
+        if (significand >= 0x1000000UL) {
+            significand >>= 1;
+            ++result_e;
+            if (result_e > 127) {
+                return sign | 0x7f800000U;
+            }
+        }
+        return sign | ((uint) (result_e + 127) << 23) | ((uint) significand & 0x7fffffU);
+    }
+
+    const int subnormal_shift = e_a + e_b + 149;
+    ulong fraction = subnormal_shift >= 0 ? product << subnormal_shift :
+                                            fairy2i_shift_right_rne_u64(product, (uint) -subnormal_shift);
+    if (fraction >= 0x800000UL) {
+        return sign | 0x00800000U;
+    }
+    return sign | (uint) fraction;
+}
+
+// Divide a finite F32 value by a positive integer with IEEE-754 RNE semantics.
+// Metal fast-math may lower even a normal division to reciprocal-multiply (and
+// flush subnormals), so RMSNorm cannot use native `/` for its canonical mean.
+static inline uint fairy2i_div_f32_by_positive_int_bits_rne(uint value, uint divisor) {
+    const uint sign      = value & 0x80000000U;
+    const uint abs_value = value & 0x7fffffffU;
+    const uint exponent  = abs_value >> 23;
+    const uint fraction  = abs_value & 0x7fffffU;
+
+    if (divisor == 0) {
+        return abs_value == 0 ? 0x7fc00000U : sign | 0x7f800000U;
+    }
+    if (exponent == 0xffU) {
+        return fraction == 0 ? value : value | 0x00400000U;
+    }
+    if (abs_value == 0) {
+        return value;
+    }
+
+    const uint significand = exponent == 0 ? fraction : 0x800000U | fraction;
+    const int  value_e     = exponent == 0 ? -149 : (int) exponent - 150;
+    const int  sig_msb     = 31 - (int) clz(significand);
+    const int  divisor_msb = 31 - (int) clz(divisor);
+
+    int ratio_e = sig_msb - divisor_msb;
+    if (ratio_e >= 0) {
+        if ((ulong) significand < ((ulong) divisor << (uint) ratio_e)) {
+            --ratio_e;
+        }
+    } else if (((ulong) significand << (uint) -ratio_e) < (ulong) divisor) {
+        --ratio_e;
+    }
+
+    int result_e = value_e + ratio_e;
+    if (result_e >= -126) {
+        const uint  shift     = (uint) (23 - ratio_e);
+        const ulong numerator = (ulong) significand << shift;
+        ulong       quotient  = numerator / divisor;
+        const ulong remainder = numerator % divisor;
+        const ulong twice_remainder = remainder << 1;
+        if (twice_remainder > divisor ||
+            (twice_remainder == divisor && (quotient & 1UL) != 0)) {
+            ++quotient;
+        }
+        if (quotient >= 0x1000000UL) {
+            quotient >>= 1;
+            ++result_e;
+        }
+        if (result_e > 127) {
+            return sign | 0x7f800000U;
+        }
+        return sign | ((uint) (result_e + 127) << 23) | ((uint) quotient & 0x7fffffU);
+    }
+
+    const uint  shift     = exponent == 0 ? 0U : exponent - 1U;
+    const ulong numerator = (ulong) significand << shift;
+    ulong       quotient  = numerator / divisor;
+    const ulong remainder = numerator % divisor;
+    const ulong twice_remainder = remainder << 1;
+    if (twice_remainder > divisor ||
+        (twice_remainder == divisor && (quotient & 1UL) != 0)) {
+        ++quotient;
+    }
+    return sign | (quotient >= 0x800000UL ? 0x00800000U : (uint) quotient);
+}
+
+// Exact reciprocal for a positive normal F32. RMSNorm applies this to the
+// rounded result of precise::sqrt; that range always produces a normal finite
+// reciprocal for finite BF16 inputs.
+static inline uint fairy2i_reciprocal_positive_normal_f32_bits_rne(uint value) {
+    const uint exponent    = (value & 0x7fffffffU) >> 23;
+    const uint fraction    = value & 0x7fffffU;
+    const uint significand = 0x800000U | fraction;
+
+    if (exponent == 0xffU) {
+        return fraction == 0 ? 0U : value | 0x00400000U;
+    }
+    if (exponent == 0U) {
+        return 0x7f800000U;
+    }
+
+    const int ratio_e = significand > 0x800000U ? -1 : 0;
+    int       result_e = 127 - (int) exponent + ratio_e;
+    const ulong numerator = (ulong) 0x800000U << (uint) (23 - ratio_e);
+    ulong       quotient  = numerator / significand;
+    const ulong remainder = numerator % significand;
+    const ulong twice_remainder = remainder << 1;
+    if (twice_remainder > significand ||
+        (twice_remainder == significand && (quotient & 1UL) != 0)) {
+        ++quotient;
+    }
+    if (quotient >= 0x1000000UL) {
+        quotient >>= 1;
+        ++result_e;
+    }
+    return ((uint) (result_e + 127) << 23) | ((uint) quotient & 0x7fffffU);
+}
+
+static inline ushort fairy2i_add_bf16_bits_rne(ushort a, ushort b) {
+    const uint sign_a = (uint) a >> 15;
+    const uint sign_b = (uint) b >> 15;
+    const uint abs_a = (uint) a & 0x7fffU;
+    const uint abs_b = (uint) b & 0x7fffU;
+    const uint exp_a_raw = abs_a >> 7;
+    const uint exp_b_raw = abs_b >> 7;
+    const uint frac_a = abs_a & 0x7fU;
+    const uint frac_b = abs_b & 0x7fU;
+
+    // Normal BF16 values with exponent >= 8 cannot cancel to an F32
+    // subnormal, so the native F32 add is exact and substantially cheaper.
+    if (exp_a_raw >= 8U && exp_a_raw < 0xffU &&
+        exp_b_raw >= 8U && exp_b_raw < 0xffU) {
+        return fairy2i_f32_to_bf16(fairy2i_bf16_to_f32(a) + fairy2i_bf16_to_f32(b));
+    }
+
+    if (exp_a_raw == 0xffU || exp_b_raw == 0xffU) {
+        const bool nan_a = exp_a_raw == 0xffU && frac_a != 0;
+        const bool nan_b = exp_b_raw == 0xffU && frac_b != 0;
+        if (nan_a) {
+            return (ushort) ((uint) a | 0x40U);
+        }
+        if (nan_b) {
+            return (ushort) ((uint) b | 0x40U);
+        }
+        if (sign_a != sign_b && exp_a_raw == 0xffU && exp_b_raw == 0xffU) {
+            return (ushort) 0x7fc0U;
+        }
+        return exp_a_raw == 0xffU ? a : b;
+    }
+
+    if (abs_a == 0 && abs_b == 0) {
+        return (ushort) ((sign_a & sign_b) << 15);
+    }
+    if (abs_a == 0) {
+        return b;
+    }
+    if (abs_b == 0) {
+        return a;
+    }
+
+    uint sig_a = exp_a_raw == 0 ? frac_a : 0x80U | frac_a;
+    uint sig_b = exp_b_raw == 0 ? frac_b : 0x80U | frac_b;
+    int exp_a = exp_a_raw == 0 ? -133 : (int) exp_a_raw - 134;
+    int exp_b = exp_b_raw == 0 ? -133 : (int) exp_b_raw - 134;
+    uint work_sign_a = sign_a;
+    uint work_sign_b = sign_b;
+
+    while (sig_a < 0x80U) {
+        sig_a <<= 1;
+        --exp_a;
+    }
+    while (sig_b < 0x80U) {
+        sig_b <<= 1;
+        --exp_b;
+    }
+
+    if (exp_a < exp_b || (exp_a == exp_b && sig_a < sig_b)) {
+        uint tmp_sig = sig_a;
+        sig_a = sig_b;
+        sig_b = tmp_sig;
+        int tmp_exp = exp_a;
+        exp_a = exp_b;
+        exp_b = tmp_exp;
+        const uint tmp_sign = work_sign_a;
+        work_sign_a = work_sign_b;
+        work_sign_b = tmp_sign;
+    }
+
+    const uint result_sign = work_sign_a;
+    uint ext_a = sig_a << 3;
+    uint ext_b = fairy2i_shift_right_jam(sig_b << 3, (uint) (exp_a - exp_b));
+    uint ext;
+    int result_exp = exp_a;
+
+    if (work_sign_a == work_sign_b) {
+        ext = ext_a + ext_b;
+        if (ext >= (0x100U << 3)) {
+            ext = fairy2i_shift_right_jam(ext, 1);
+            ++result_exp;
+        }
+    } else {
+        ext = ext_a - ext_b;
+        if (ext == 0) {
+            return (ushort) 0;
+        }
+        while (ext < (0x80U << 3)) {
+            ext <<= 1;
+            --result_exp;
+        }
+    }
+
+    bool subnormal = false;
+    if (result_exp < -133) {
+        ext = fairy2i_shift_right_jam(ext, (uint) (-133 - result_exp));
+        result_exp = -133;
+        subnormal = true;
+    }
+
+    uint rounded_sig = ext >> 3;
+    const uint remainder = ext & 7U;
+    if (remainder > 4U || (remainder == 4U && (rounded_sig & 1U) != 0)) {
+        ++rounded_sig;
+    }
+
+    if (rounded_sig >= 0x100U) {
+        rounded_sig >>= 1;
+        ++result_exp;
+        subnormal = false;
+    }
+
+    if (subnormal) {
+        return (ushort) ((result_sign << 15) | min(rounded_sig, 0x80U));
+    }
+
+    const int result_exp_raw = result_exp + 134;
+    if (result_exp_raw >= 0xff) {
+        return (ushort) ((result_sign << 15) | 0x7f80U);
+    }
+    return (ushort) ((result_sign << 15) | ((uint) result_exp_raw << 7) | (rounded_sig & 0x7fU));
+}
+
+static inline uint fairy2i_add_f32_bits_rne(uint a, uint b) {
+    const uint sign_a    = a >> 31;
+    const uint sign_b    = b >> 31;
+    const uint abs_a     = a & 0x7fffffffU;
+    const uint abs_b     = b & 0x7fffffffU;
+    const uint exp_a_raw = abs_a >> 23;
+    const uint exp_b_raw = abs_b >> 23;
+    const uint frac_a    = abs_a & 0x7fffffU;
+    const uint frac_b    = abs_b & 0x7fffffU;
+
+    // With both exponents at least 24, cancellation cannot produce an F32 subnormal:
+    // the smallest possible difference is one ULP at exponent 24, exactly 2^-126.
+    if (exp_a_raw >= 24U && exp_a_raw < 0xffU &&
+        exp_b_raw >= 24U && exp_b_raw < 0xffU) {
+        return as_type<uint>(as_type<float>(a) + as_type<float>(b));
+    }
+
+    if (exp_a_raw == 0xffU || exp_b_raw == 0xffU) {
+        const bool nan_a = exp_a_raw == 0xffU && frac_a != 0;
+        const bool nan_b = exp_b_raw == 0xffU && frac_b != 0;
+        if (nan_a) {
+            return a | 0x00400000U;
+        }
+        if (nan_b) {
+            return b | 0x00400000U;
+        }
+        if (sign_a != sign_b && exp_a_raw == 0xffU && exp_b_raw == 0xffU) {
+            return 0x7fc00000U;
+        }
+        return exp_a_raw == 0xffU ? a : b;
+    }
+
+    if (abs_a == 0 && abs_b == 0) {
+        return (sign_a & sign_b) << 31;
+    }
+    if (abs_a == 0) {
+        return b;
+    }
+    if (abs_b == 0) {
+        return a;
+    }
+
+    uint sig_a = exp_a_raw == 0 ? frac_a : 0x800000U | frac_a;
+    uint sig_b = exp_b_raw == 0 ? frac_b : 0x800000U | frac_b;
+    int  exp_a = exp_a_raw == 0 ? -149 : (int) exp_a_raw - 150;
+    int  exp_b = exp_b_raw == 0 ? -149 : (int) exp_b_raw - 150;
+    uint work_sign_a = sign_a;
+    uint work_sign_b = sign_b;
+
+    while (sig_a < 0x800000U) {
+        sig_a <<= 1;
+        --exp_a;
+    }
+    while (sig_b < 0x800000U) {
+        sig_b <<= 1;
+        --exp_b;
+    }
+
+    if (exp_a < exp_b || (exp_a == exp_b && sig_a < sig_b)) {
+        uint tmp_sig = sig_a;
+        sig_a = sig_b;
+        sig_b = tmp_sig;
+        int tmp_exp = exp_a;
+        exp_a = exp_b;
+        exp_b = tmp_exp;
+        const uint tmp_sign = work_sign_a;
+        work_sign_a = work_sign_b;
+        work_sign_b = tmp_sign;
+    }
+
+    const uint result_sign = work_sign_a;
+    uint ext_a = sig_a << 3;
+    uint ext_b = fairy2i_shift_right_jam(sig_b << 3, (uint) (exp_a - exp_b));
+    uint ext;
+    int result_exp = exp_a;
+
+    if (work_sign_a == work_sign_b) {
+        ext = ext_a + ext_b;
+        if (ext >= (0x1000000U << 3)) {
+            ext = fairy2i_shift_right_jam(ext, 1);
+            ++result_exp;
+        }
+    } else {
+        ext = ext_a - ext_b;
+        if (ext == 0) {
+            return 0;
+        }
+        while (ext < (0x800000U << 3)) {
+            ext <<= 1;
+            --result_exp;
+        }
+    }
+
+    bool subnormal = false;
+    if (result_exp < -149) {
+        ext = fairy2i_shift_right_jam(ext, (uint) (-149 - result_exp));
+        result_exp = -149;
+        subnormal = true;
+    }
+
+    uint rounded_sig = ext >> 3;
+    const uint remainder = ext & 7U;
+    if (remainder > 4U || (remainder == 4U && (rounded_sig & 1U) != 0)) {
+        ++rounded_sig;
+    }
+
+    if (rounded_sig >= 0x1000000U) {
+        rounded_sig >>= 1;
+        ++result_exp;
+        subnormal = false;
+    }
+
+    if (subnormal) {
+        return (result_sign << 31) | min(rounded_sig, 0x800000U);
+    }
+
+    const int result_exp_raw = result_exp + 150;
+    if (result_exp_raw >= 0xff) {
+        return (result_sign << 31) | 0x7f800000U;
+    }
+    return (result_sign << 31) | ((uint) result_exp_raw << 23) | (rounded_sig & 0x7fffffU);
+}
+
+// Exact fused BF16*BF16+F32. Keeping the unrounded 16-bit BF16 product until after it is aligned
+// with the accumulator avoids the double-rounding error at the bottom of the F32 subnormal range.
+static inline uint fairy2i_fma_bf16_bf16_f32_bits_rne(ushort a, ushort b, uint acc) {
+    const uint sign_a = (uint) a >> 15;
+    const uint sign_b = (uint) b >> 15;
+    const uint abs_a  = (uint) a & 0x7fffU;
+    const uint abs_b  = (uint) b & 0x7fffU;
+    const uint exp_a  = abs_a >> 7;
+    const uint exp_b  = abs_b >> 7;
+    const uint frac_a = abs_a & 0x7fU;
+    const uint frac_b = abs_b & 0x7fU;
+    const uint product_sign = sign_a ^ sign_b;
+
+    const uint acc_sign = acc >> 31;
+    const uint acc_abs  = acc & 0x7fffffffU;
+    const uint acc_exp  = acc_abs >> 23;
+    const uint acc_frac = acc_abs & 0x7fffffU;
+
+    const bool nan_a   = exp_a == 0xffU && frac_a != 0;
+    const bool nan_b   = exp_b == 0xffU && frac_b != 0;
+    const bool nan_acc = acc_exp == 0xffU && acc_frac != 0;
+    if (nan_a || nan_b || nan_acc) {
+        return 0x7fc00000U;
+    }
+
+    const bool product_inf = exp_a == 0xffU || exp_b == 0xffU;
+    const bool product_zero = abs_a == 0 || abs_b == 0;
+    if (product_inf) {
+        if (product_zero || (acc_exp == 0xffU && product_sign != acc_sign)) {
+            return 0x7fc00000U;
+        }
+        return (product_sign << 31) | 0x7f800000U;
+    }
+    if (acc_exp == 0xffU) {
+        return acc;
+    }
+    if (product_zero) {
+        return fairy2i_add_f32_bits_rne(acc, product_sign << 31);
+    }
+
+    uint product_sig = (exp_a == 0 ? frac_a : 0x80U | frac_a) *
+                       (exp_b == 0 ? frac_b : 0x80U | frac_b);
+    int product_exp = (exp_a == 0 ? -133 : (int) exp_a - 134) +
+                      (exp_b == 0 ? -133 : (int) exp_b - 134);
+    while (product_sig < 0x800000U) {
+        product_sig <<= 1;
+        --product_exp;
+    }
+
+    if (acc_abs == 0) {
+        uint ext = product_sig << 3;
+        int result_exp = product_exp;
+        if (result_exp < -149) {
+            ext = fairy2i_shift_right_jam(ext, (uint) (-149 - result_exp));
+            result_exp = -149;
+        }
+        uint rounded_sig = ext >> 3;
+        const uint remainder = ext & 7U;
+        if (remainder > 4U || (remainder == 4U && (rounded_sig & 1U) != 0)) {
+            ++rounded_sig;
+        }
+        if (rounded_sig >= 0x1000000U) {
+            rounded_sig >>= 1;
+            ++result_exp;
+        }
+        if (result_exp == -149 && rounded_sig < 0x800000U) {
+            return (product_sign << 31) | rounded_sig;
+        }
+        const int result_exp_raw = result_exp + 150;
+        if (result_exp_raw >= 0xff) {
+            return (product_sign << 31) | 0x7f800000U;
+        }
+        return (product_sign << 31) | ((uint) result_exp_raw << 23) | (rounded_sig & 0x7fffffU);
+    }
+
+    uint acc_sig = acc_exp == 0 ? acc_frac : 0x800000U | acc_frac;
+    int  acc_lsb_exp = acc_exp == 0 ? -149 : (int) acc_exp - 150;
+    while (acc_sig < 0x800000U) {
+        acc_sig <<= 1;
+        --acc_lsb_exp;
+    }
+
+    uint large_sig  = product_sig;
+    int  large_exp  = product_exp;
+    uint large_sign = product_sign;
+    uint small_sig  = acc_sig;
+    int  small_exp  = acc_lsb_exp;
+    uint small_sign = acc_sign;
+    if (large_exp < small_exp || (large_exp == small_exp && large_sig < small_sig)) {
+        const uint tmp_sig = large_sig;
+        large_sig = small_sig;
+        small_sig = tmp_sig;
+        const int tmp_exp = large_exp;
+        large_exp = small_exp;
+        small_exp = tmp_exp;
+        const uint tmp_sign = large_sign;
+        large_sign = small_sign;
+        small_sign = tmp_sign;
+    }
+
+    uint ext = large_sig << 3;
+    const uint small_ext = fairy2i_shift_right_jam(small_sig << 3, (uint) (large_exp - small_exp));
+    int result_exp = large_exp;
+    if (large_sign == small_sign) {
+        ext += small_ext;
+        if (ext >= (0x1000000U << 3)) {
+            ext = fairy2i_shift_right_jam(ext, 1);
+            ++result_exp;
+        }
+    } else {
+        ext -= small_ext;
+        if (ext == 0) {
+            return 0;
+        }
+        while (ext < (0x800000U << 3)) {
+            ext <<= 1;
+            --result_exp;
+        }
+    }
+
+    if (result_exp < -149) {
+        ext = fairy2i_shift_right_jam(ext, (uint) (-149 - result_exp));
+        result_exp = -149;
+    }
+    uint rounded_sig = ext >> 3;
+    const uint remainder = ext & 7U;
+    if (remainder > 4U || (remainder == 4U && (rounded_sig & 1U) != 0)) {
+        ++rounded_sig;
+    }
+    if (rounded_sig >= 0x1000000U) {
+        rounded_sig >>= 1;
+        ++result_exp;
+    }
+    if (result_exp == -149 && rounded_sig < 0x800000U) {
+        return (large_sign << 31) | rounded_sig;
+    }
+    const int result_exp_raw = result_exp + 150;
+    if (result_exp_raw >= 0xff) {
+        return (large_sign << 31) | 0x7f800000U;
+    }
+    return (large_sign << 31) | ((uint) result_exp_raw << 23) | (rounded_sig & 0x7fffffU);
+}
+
+static inline ushort fairy2i_add_f32_bias_to_bf16_bits_rne(float acc, float bias) {
+    const uint sum_bits = fairy2i_add_f32_bits_rne(as_type<uint>(acc), as_type<uint>(bias));
+    return fairy2i_f32_to_bf16(as_type<float>(sum_bits));
+}
+
+static inline ushort fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(uint acc_bits, float bias) {
+    const uint sum_bits = fairy2i_add_f32_bits_rne(acc_bits, as_type<uint>(bias));
+    return fairy2i_f32_to_bf16(as_type<float>(sum_bits));
 }
 
 constant int FC_fairy2i_bundle_w1_prefill_act_rows [[function_constant(FC_FAIRY2I_BUNDLE_W1_PREFILL + 0)]];
@@ -109,6 +829,78 @@ kernel void kernel_fairy2i_act_half_64_stage_bf16(
     act_h[h_base + QK_FAIRY2I_ACT_Q16_64 + j] = (half) fairy2i_bf16_to_f32((ushort) (pair >> 16));
 }
 
+#if defined(GGML_METAL_HAS_BF16)
+kernel void kernel_fairy2i_act_bfloat_64_stage_bf16_exact(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const char * x                             [[buffer(1)]],
+        device ushort * act_b                             [[buffer(2)]],
+        device uint * block_metrics                       [[buffer(3)]],
+        threadgroup uint * simd_metrics                   [[threadgroup(0)]],
+        uint2 tgpig                                       [[threadgroup_position_in_grid]],
+        uint2 tiitg                                       [[thread_position_in_threadgroup]]) {
+    const uint block = tgpig.x;
+    const uint act_row = tgpig.y;
+    const uint lid = tiitg.x;
+    const int i1 = (int) act_row % args.x_ne1;
+    const int i2 = ((int) act_row / args.x_ne1) % args.x_ne2;
+    const int i3 = (int) act_row / (args.x_ne1 * args.x_ne2);
+    const int j = (int) lid;
+    const int k_idx = (int) block * QK_FAIRY2I_ACT_Q16_64 + j;
+
+    const uint pair = *((device const uint *) (x + (ulong) i1 * args.x_nb1 + (ulong) i2 * args.x_nb2 +
+                                               (ulong) i3 * args.x_nb3 + (ulong) k_idx * args.x_nb0));
+    const int blocks = args.k / QK_FAIRY2I_ACT_Q16_64;
+    const int act_index = (int) act_row * blocks + (int) block;
+    const int b_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
+
+    // The graph's F32-tagged complex value already contains two BF16 payloads. Preserve the payload bits
+    // verbatim in the bfloat staging buffer instead of introducing a numeric conversion.
+    act_b[b_base + j] = (ushort) (pair & 0xffffU);
+    act_b[b_base + QK_FAIRY2I_ACT_Q16_64 + j] = (ushort) (pair >> 16);
+
+    const uint thread_metric = min(
+        fairy2i_bf16_product_metric((ushort) (pair & 0xffffU)),
+        fairy2i_bf16_product_metric((ushort) (pair >> 16)));
+    const uint simd_lane = lid & 31U;
+    const uint simd_group = lid >> 5;
+    const uint simd_metric = simd_min(thread_metric);
+    if (simd_lane == 0U) {
+        simd_metrics[simd_group] = simd_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0U) {
+        block_metrics[act_index] = min(simd_metrics[0], simd_metrics[1]);
+    }
+}
+
+kernel void kernel_fairy2i_act_bfloat_64_metric_bf16_exact(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const char * x                             [[buffer(1)]],
+        device uint * block_metrics                       [[buffer(2)]],
+        threadgroup uint * simd_metrics                   [[threadgroup(0)]],
+        uint2 tgpig                                       [[threadgroup_position_in_grid]],
+        uint2 tiitg                                       [[thread_position_in_threadgroup]]) {
+    const uint block = tgpig.x;
+    const uint lid = tiitg.x;
+    const uint simd_lane = lid & 31U;
+    const uint simd_group = lid >> 5;
+    const int k_idx = (int) block * QK_FAIRY2I_ACT_Q16_64 + (int) lid;
+    const uint pair = *((device const uint *) (x + (ulong) k_idx * args.x_nb0));
+    const uint thread_metric = min(
+        fairy2i_bf16_product_metric((ushort) (pair & 0xffffU)),
+        fairy2i_bf16_product_metric((ushort) (pair >> 16)));
+    const uint simd_metric = simd_min(thread_metric);
+    if (simd_lane == 0U) {
+        simd_metrics[simd_group] = simd_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0U) {
+        block_metrics[block] = min(simd_metrics[0], simd_metrics[1]);
+    }
+}
+
+#endif
+
 kernel void kernel_fairy2i_act_half_64_stage_bf16_kmajor(
         constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
         device const char * x                             [[buffer(1)]],
@@ -133,6 +925,49 @@ kernel void kernel_fairy2i_act_half_64_stage_bf16_kmajor(
     act_h[block_base + plane_size + kmajor_index] = (half) fairy2i_bf16_to_f32((ushort) (pair >> 16));
 }
 
+#if defined(GGML_METAL_HAS_BF16)
+kernel void kernel_fairy2i_act_bfloat_64_stage_bf16_kmajor_exact(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const char * x                             [[buffer(1)]],
+        device ushort * act_b                             [[buffer(2)]],
+        device uint * block_metrics                       [[buffer(3)]],
+        threadgroup uint * simd_metrics                   [[threadgroup(0)]],
+        uint2 tgpig                                       [[threadgroup_position_in_grid]],
+        uint2 tiitg                                       [[thread_position_in_threadgroup]]) {
+    const uint block = tgpig.x;
+    const uint act_row = tgpig.y;
+    const uint j = tiitg.x;
+    const int i1 = (int) act_row % args.x_ne1;
+    const int i2 = ((int) act_row / args.x_ne1) % args.x_ne2;
+    const int i3 = (int) act_row / (args.x_ne1 * args.x_ne2);
+    const int k_idx = (int) block * QK_FAIRY2I_ACT_Q16_64 + (int) j;
+
+    const uint pair = *((device const uint *) (x + (ulong) i1 * args.x_nb1 + (ulong) i2 * args.x_nb2 +
+                                               (ulong) i3 * args.x_nb3 + (ulong) k_idx * args.x_nb0));
+    const ulong plane_size = (ulong) QK_FAIRY2I_ACT_Q16_64 * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows;
+    const ulong block_base = (ulong) block * 2 * plane_size;
+    const ulong kmajor_index = (ulong) j * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows + (ulong) act_row;
+
+    act_b[block_base + kmajor_index] = (ushort) (pair & 0xffffU);
+    act_b[block_base + plane_size + kmajor_index] = (ushort) (pair >> 16);
+
+    const uint thread_metric = min(
+        fairy2i_bf16_product_metric((ushort) (pair & 0xffffU)),
+        fairy2i_bf16_product_metric((ushort) (pair >> 16)));
+    const uint simd_lane = j & 31U;
+    const uint simd_group = j >> 5;
+    const uint simd_metric = simd_min(thread_metric);
+    if (simd_lane == 0U) {
+        simd_metrics[simd_group] = simd_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (j == 0U) {
+        const int blocks = args.k / QK_FAIRY2I_ACT_Q16_64;
+        block_metrics[(int) act_row * blocks + (int) block] = min(simd_metrics[0], simd_metrics[1]);
+    }
+}
+#endif
+
 static inline float fairy2i_sum_float4(float4 v) {
     return v.x + v.y + v.z + v.w;
 }
@@ -156,6 +991,65 @@ static inline half4 fairy2i_mma_coeff_w1_codes_scaled_half(uint2 code, half2 wr,
         real_coeff.x - real_coeff.y);
 }
 
+static inline ushort2 fairy2i_w1_signed_stage_bf16_exact_bits(
+        uint code,
+        ushort scale_real,
+        ushort scale_imag) {
+    const ushort scale = (code & 2U) == 0U ? scale_real : scale_imag;
+    const ushort stage = (ushort) ((uint) scale ^ ((code & 1U) != 0U ? 0x0000U : 0x8000U));
+    return (code & 2U) == 0U ? ushort2(stage, 0) : ushort2(0, stage);
+}
+
+static inline ushort4 fairy2i_mma_coeff_w1_codes_scaled_bf16_exact_bits(
+        uint2 code,
+        ushort2 scale_real,
+        ushort2 scale_imag) {
+    const ushort2 u = fairy2i_w1_signed_stage_bf16_exact_bits(
+        code.x, scale_real.x, scale_imag.x);
+    const ushort2 w = fairy2i_w1_signed_stage_bf16_exact_bits(
+        code.y, scale_real.y, scale_imag.y);
+
+    // U/W are already BF16 signed stages. A11/A12/A21/A22 are four separate
+    // BF16 RNE result boundaries, matching the training-side reconstruction.
+    return ushort4(
+        fairy2i_add_bf16_bits_rne(u.x, w.x),
+        fairy2i_add_bf16_bits_rne((ushort) ((uint) u.y ^ 0x8000U), w.y),
+        fairy2i_add_bf16_bits_rne(u.y, w.y),
+        fairy2i_add_bf16_bits_rne(u.x, (ushort) ((uint) w.x ^ 0x8000U)));
+}
+
+static inline void fairy2i_build_bundle_w1_coeff_lut_bf16_exact(
+        threadgroup ushort4 * coeff_lut,
+        ushort2 scale_real,
+        ushort2 scale_imag,
+        uint tid,
+        uint n_threads) {
+    for (uint pattern = tid; pattern < 16U; pattern += n_threads) {
+        coeff_lut[pattern] = fairy2i_mma_coeff_w1_codes_scaled_bf16_exact_bits(
+            uint2(pattern & 3U, (pattern >> 2) & 3U), scale_real, scale_imag);
+    }
+}
+
+static inline ushort4 fairy2i_bundle_w1_coeff_at_bf16_exact_bits(
+        device const uchar * codes,
+        device const ushort * scales,
+        int blocks,
+        int row,
+        int k) {
+    const int physical_tile = (row / QK_FAIRY2I_TILE64) * blocks + k / QK_FAIRY2I_TILE64;
+    const int slot = ((row & 63) >> 4) * 16 + ((k & 63) >> 2);
+    const int lane = row & 15;
+    const int q = k & 3;
+    const ulong code_base =
+        ((((ulong) physical_tile * 64 + (ulong) slot) * 2) * 16) + (ulong) lane;
+    const uint2 code = (uint2(
+        (uint) codes[code_base],
+        (uint) codes[code_base + 16]) >> uint2(2 * q)) & uint2(3);
+    const ushort4 scale = *((device const ushort4 *) (scales + (ulong) physical_tile * 4UL));
+    return fairy2i_mma_coeff_w1_codes_scaled_bf16_exact_bits(
+        code, scale.xz, scale.yw);
+}
+
 static inline float4 fairy2i_mma_coeff_w2_codes_scaled(uint4 code, float4 wr, float4 wi) {
     const float4 sign = select(float4(-1.0f), float4(1.0f), (code & uint4(1)) == uint4(1));
     const bool4 is_real = (code & uint4(2)) == uint4(0);
@@ -169,11 +1063,221 @@ static inline float4 fairy2i_mma_coeff_w2_codes_scaled(uint4 code, float4 wr, fl
     return float4(u_real + w_real, -u_imag + w_imag, u_imag + w_imag, u_real - w_real);
 }
 
+static inline ushort4 fairy2i_reconstruct_w2_coeff_from_uw_bf16_exact_bits(ushort2 u, ushort2 w) {
+    // The final A11..A22 reconstruction is a distinct BF16 result boundary.
+    return ushort4(
+        fairy2i_add_bf16_bits_rne(u.x, w.x),
+        fairy2i_add_bf16_bits_rne((ushort) ((uint) u.y ^ 0x8000U), w.y),
+        fairy2i_add_bf16_bits_rne(u.y, w.y),
+        fairy2i_add_bf16_bits_rne(u.x, (ushort) ((uint) w.x ^ 0x8000U)));
+}
+
+static inline ushort4 fairy2i_reconstruct_w2_coeff_from_stage_bf16_exact_bits(ushort4 real, ushort4 imag) {
+    // The stage merge (U/W) and final A11..A22 reconstruction are separate BF16 result boundaries.
+    // Keep them on payload bits so Metal's F32 flush-to-zero behavior cannot erase BF16 subnormals.
+    const ushort2 u = ushort2(
+        fairy2i_add_bf16_bits_rne(real.x, real.y),
+        fairy2i_add_bf16_bits_rne(imag.x, imag.y));
+    const ushort2 w = ushort2(
+        fairy2i_add_bf16_bits_rne(real.z, real.w),
+        fairy2i_add_bf16_bits_rne(imag.z, imag.w));
+
+    return fairy2i_reconstruct_w2_coeff_from_uw_bf16_exact_bits(u, w);
+}
+
+static inline ushort4 fairy2i_reconstruct_w2_coeff_from_stage_collapsed_f32_native_bits(
+        ushort4 real,
+        ushort4 imag) {
+    // Production tiles contain finite, normal BF16 scales. Widen them exactly,
+    // collapse U/W/Aij with native F32 adds, and round only the final Aij values
+    // to BF16. Exceptional tiles are discarded and replayed by the software path.
+    const float4 real_f = as_type<float4>(uint4(real) << uint4(16));
+    const float4 imag_f = as_type<float4>(uint4(imag) << uint4(16));
+    const float  u_real = real_f.x + real_f.y;
+    const float  u_imag = imag_f.x + imag_f.y;
+    const float  w_real = real_f.z + real_f.w;
+    const float  w_imag = imag_f.z + imag_f.w;
+
+    return fairy2i_f32_to_bf16(
+        float4(u_real + w_real, -u_imag + w_imag, u_imag + w_imag, u_real - w_real));
+}
+
+static inline ushort4 fairy2i_reconstruct_w2_coeff_from_stage_collapsed_f32_software_bits(
+        ushort4 real,
+        ushort4 imag) {
+    // The stored stage values are BF16, but all U/W/Aij additions stay in F32.
+    // The replay path keeps the additions in the bit domain so Metal FTZ cannot
+    // erase valid F32/BF16 subnormals.
+    const uint u_real = fairy2i_add_f32_bits_rne((uint) real.x << 16, (uint) real.y << 16);
+    const uint u_imag = fairy2i_add_f32_bits_rne((uint) imag.x << 16, (uint) imag.y << 16);
+    const uint w_real = fairy2i_add_f32_bits_rne((uint) real.z << 16, (uint) real.w << 16);
+    const uint w_imag = fairy2i_add_f32_bits_rne((uint) imag.z << 16, (uint) imag.w << 16);
+
+    return ushort4(
+        fairy2i_f32_to_bf16(as_type<float>(fairy2i_add_f32_bits_rne(u_real, w_real))),
+        fairy2i_f32_to_bf16(as_type<float>(fairy2i_add_f32_bits_rne(u_imag ^ 0x80000000U, w_imag))),
+        fairy2i_f32_to_bf16(as_type<float>(fairy2i_add_f32_bits_rne(u_imag, w_imag))),
+        fairy2i_f32_to_bf16(as_type<float>(fairy2i_add_f32_bits_rne(u_real, w_real ^ 0x80000000U))));
+}
+
+static inline ushort4 fairy2i_mma_coeff_w2_codes_scaled_bf16_exact_bits(
+        uint4 code,
+        ushort4 scale_real,
+        ushort4 scale_imag) {
+    // The converter stores the positive, forward-visible BF16 scale payloads.
+    // Apply the code sign by flipping the payload sign bit without another conversion.
+    const bool4 is_real  = (code & uint4(2)) == uint4(0);
+    const bool4 positive = (code & uint4(1)) == uint4(1);
+    ushort4      real     = ushort4(0);
+    ushort4      imag     = ushort4(0);
+
+    FOR_UNROLL (int branch = 0; branch < 4; ++branch) {
+        const ushort magnitude = is_real[branch] ? scale_real[branch] : scale_imag[branch];
+        const ushort stage = (ushort) ((uint) magnitude ^ (positive[branch] ? 0x0000U : 0x8000U));
+        if (is_real[branch]) {
+            real[branch] = stage;
+        } else {
+            imag[branch] = stage;
+        }
+    }
+
+    return fairy2i_reconstruct_w2_coeff_from_stage_bf16_exact_bits(real, imag);
+}
+
+static inline ushort4 fairy2i_mma_coeff_w2_codes_scaled_bf16_collapsed_f32_bits(
+        uint4 code,
+        ushort4 scale_real,
+        ushort4 scale_imag,
+        bool software_replay) {
+    if (!software_replay) {
+        const float4 coeff = fairy2i_mma_coeff_w2_codes_scaled(
+            code,
+            as_type<float4>(uint4(scale_real) << uint4(16)),
+            as_type<float4>(uint4(scale_imag) << uint4(16)));
+        return fairy2i_f32_to_bf16(coeff);
+    }
+
+    const bool4 is_real  = (code & uint4(2)) == uint4(0);
+    const bool4 positive = (code & uint4(1)) == uint4(1);
+    ushort4      real     = ushort4(0);
+    ushort4      imag     = ushort4(0);
+
+    FOR_UNROLL (int branch = 0; branch < 4; ++branch) {
+        const ushort magnitude = is_real[branch] ? scale_real[branch] : scale_imag[branch];
+        const ushort stage = (ushort) ((uint) magnitude ^ (positive[branch] ? 0x0000U : 0x8000U));
+        if (is_real[branch]) {
+            real[branch] = stage;
+        } else {
+            imag[branch] = stage;
+        }
+    }
+
+    return software_replay ?
+               fairy2i_reconstruct_w2_coeff_from_stage_collapsed_f32_software_bits(real, imag) :
+               fairy2i_reconstruct_w2_coeff_from_stage_collapsed_f32_native_bits(real, imag);
+}
+
+static inline uint fairy2i_bundle_w2_coeff_lut_index(uint4 code) {
+    return code.x | (code.y << 2) | (code.z << 4) | (code.w << 6);
+}
+
+static inline void fairy2i_build_bundle_w2_coeff_lut_bf16_exact(
+        threadgroup ushort4 * coeff_lut,
+        ushort4 scale_real,
+        ushort4 scale_imag,
+        uint tid,
+        uint n_threads,
+        bool strict_staged_reconstruction) {
+    for (uint pattern = tid; pattern < 256; pattern += n_threads) {
+        const uint4 code = uint4(
+            pattern & 3U,
+            (pattern >> 2) & 3U,
+            (pattern >> 4) & 3U,
+            (pattern >> 6) & 3U);
+        coeff_lut[pattern] = strict_staged_reconstruction ?
+                                 fairy2i_mma_coeff_w2_codes_scaled_bf16_exact_bits(
+                                     code, scale_real, scale_imag) :
+                                 fairy2i_mma_coeff_w2_codes_scaled_bf16_collapsed_f32_bits(
+                                     code, scale_real, scale_imag, false);
+    }
+}
+
+static inline ushort4 fairy2i_bundle_w2_coeff_at_bf16_exact_bits(
+        device const uchar * codes,
+        device const ushort * scales,
+        int blocks,
+        int row,
+        int k) {
+    const int physical_tile = (row / QK_FAIRY2I_TILE64) * blocks + k / QK_FAIRY2I_TILE64;
+    const int slot = ((row & 63) >> 4) * 16 + ((k & 63) >> 2);
+    const int lane = row & 15;
+    const int q = k & 3;
+    const ulong code_base =
+        ((((ulong) physical_tile * 64 + (ulong) slot) * 4) * 16) + (ulong) lane;
+    const uint4 code = (uint4(
+        (uint) codes[code_base],
+        (uint) codes[code_base + 16],
+        (uint) codes[code_base + 32],
+        (uint) codes[code_base + 48]) >> uint4(2 * q)) & uint4(3);
+    const int scale_base = physical_tile * 8;
+    const ushort4 scale01 = *((device const ushort4 *) (scales + scale_base));
+    const ushort4 scale23 = *((device const ushort4 *) (scales + scale_base + 4));
+    const ushort4 scale_real = ushort4(scale01.x, scale01.z, scale23.x, scale23.z);
+    const ushort4 scale_imag = ushort4(scale01.y, scale01.w, scale23.y, scale23.w);
+    return fairy2i_mma_coeff_w2_codes_scaled_bf16_exact_bits(code, scale_real, scale_imag);
+}
+
+static inline ushort4 fairy2i_bundle_w2_coeff_at_bf16_collapsed_f32_bits(
+        device const uchar * codes,
+        device const ushort * scales,
+        int blocks,
+        int row,
+        int k) {
+    const int physical_tile = (row / QK_FAIRY2I_TILE64) * blocks + k / QK_FAIRY2I_TILE64;
+    const int slot = ((row & 63) >> 4) * 16 + ((k & 63) >> 2);
+    const int lane = row & 15;
+    const int q = k & 3;
+    const ulong code_base =
+        ((((ulong) physical_tile * 64 + (ulong) slot) * 4) * 16) + (ulong) lane;
+    const uint4 code = (uint4(
+        (uint) codes[code_base],
+        (uint) codes[code_base + 16],
+        (uint) codes[code_base + 32],
+        (uint) codes[code_base + 48]) >> uint4(2 * q)) & uint4(3);
+    const int scale_base = physical_tile * 8;
+    const ushort4 scale01 = *((device const ushort4 *) (scales + scale_base));
+    const ushort4 scale23 = *((device const ushort4 *) (scales + scale_base + 4));
+    const ushort4 scale_real = ushort4(scale01.x, scale01.z, scale23.x, scale23.z);
+    const ushort4 scale_imag = ushort4(scale01.y, scale01.w, scale23.y, scale23.w);
+    return fairy2i_mma_coeff_w2_codes_scaled_bf16_collapsed_f32_bits(
+        code, scale_real, scale_imag, true);
+}
+
+static inline uint fairy2i_accumulate_bf16_product_f32_bits_rne(uint acc_bits, ushort lhs, ushort rhs) {
+    return fairy2i_fma_bf16_bf16_f32_bits_rne(lhs, rhs, acc_bits);
+}
+
 static inline half2 fairy2i_load_staged_half_activation_pair(device const half * act_h, int col, int wb, int blocks, int k) {
     const int act_index = col * blocks + wb;
     const int h_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
     return half2(act_h[h_base + k], act_h[h_base + QK_FAIRY2I_ACT_Q16_64 + k]);
 }
+
+#if defined(GGML_METAL_HAS_BF16)
+static inline void fairy2i_load_staged_bfloat_activation_pair(
+        device const bfloat * act_b,
+        int col,
+        int wb,
+        int blocks,
+        int k,
+        thread bfloat & real,
+        thread bfloat & imag) {
+    const int act_index = col * blocks + wb;
+    const int b_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
+    real = act_b[b_base + k];
+    imag = act_b[b_base + QK_FAIRY2I_ACT_Q16_64 + k];
+}
+#endif
 
 static inline void fairy2i_accumulate_tile_weight4_decode_f32_reg(
         uint4 packed,
@@ -212,6 +1316,51 @@ static inline void fairy2i_accumulate_tile_weight4_decode_f32_reg(
 
     acc_real[out_idx] += fairy2i_sum_float4(wr * sum_ac + bd_sign * wi * sum_bd);
     acc_imag[out_idx] += fairy2i_sum_float4(wi * sum_bc + ad_sign * wr * sum_ad);
+}
+
+static inline void fairy2i_accumulate_tile_weight4_decode_bf16_exact_f32_reg(
+        uint4 packed,
+        threadgroup const ushort2 * qstage_table,
+        threadgroup const ushort2 * uw_table,
+        bool strict_staged_reconstruction,
+        float4 act_real,
+        float4 act_imag,
+        int out_idx,
+        thread float * acc_real,
+        thread float * acc_imag,
+        thread uint & min_coeff_metric) {
+    FOR_UNROLL (int part = 0; part < 4; ++part) {
+        const uint4 code = (packed >> (uint) (2 * part)) & uint4(3);
+        ushort4 coeff_bits;
+        if (strict_staged_reconstruction) {
+            const uint u_pattern = code.x | (code.y << 2);
+            const uint w_pattern = code.z | (code.w << 2);
+            coeff_bits = fairy2i_reconstruct_w2_coeff_from_uw_bf16_exact_bits(
+                uw_table[u_pattern], uw_table[16 + w_pattern]);
+        } else {
+            const ushort2 u0 = qstage_table[code.x];
+            const ushort2 u1 = qstage_table[4 + code.y];
+            const ushort2 w0 = qstage_table[8 + code.z];
+            const ushort2 w1 = qstage_table[12 + code.w];
+            coeff_bits = fairy2i_reconstruct_w2_coeff_from_stage_collapsed_f32_native_bits(
+                ushort4(u0.x, u1.x, w0.x, w1.x),
+                ushort4(u0.y, u1.y, w0.y, w1.y));
+        }
+        min_coeff_metric = min(min_coeff_metric, fairy2i_bf16_product_metric(coeff_bits.x));
+        min_coeff_metric = min(min_coeff_metric, fairy2i_bf16_product_metric(coeff_bits.y));
+        min_coeff_metric = min(min_coeff_metric, fairy2i_bf16_product_metric(coeff_bits.z));
+        min_coeff_metric = min(min_coeff_metric, fairy2i_bf16_product_metric(coeff_bits.w));
+        const float4 coeff = float4(
+            fairy2i_bf16_to_f32(coeff_bits.x),
+            fairy2i_bf16_to_f32(coeff_bits.y),
+            fairy2i_bf16_to_f32(coeff_bits.z),
+            fairy2i_bf16_to_f32(coeff_bits.w));
+        const float xr = act_real[part];
+        const float xi = act_imag[part];
+
+        acc_real[out_idx] += coeff.x * xr + coeff.y * xi;
+        acc_imag[out_idx] += coeff.z * xr + coeff.w * xi;
+    }
 }
 
 static inline void fairy2i_accumulate_tile_weight2_decode_f32_reg(
@@ -658,7 +1807,6 @@ kernel void kernel_fairy2i_bundle_w1_bf16_tile8x1_w16_full_simd(
     const int simd_groups = n_threads / 32;
     const int m16 = (row_base & 63) >> 4;
     const int row_lane_base = row_base & 15;
-
     float acc_real[rows];
     float acc_imag[rows];
     for (int tr = 0; tr < rows; ++tr) {
@@ -832,6 +1980,380 @@ kernel void kernel_fairy2i_bundle_w1_bf16_tile8x1_w8_full_nobias_fc_simd(
             fairy2i_pack_bf16_pair(real, imag);
     }
 }
+
+#if defined(GGML_METAL_HAS_BF16)
+template <bool check_exact_product>
+static inline void fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args,
+        int blocks,
+        ulong x_nb0,
+        ulong dst_nb0,
+        bool has_bias,
+        device const uchar * codes,
+        device const ushort * scales,
+        device const char * x,
+        device const char * bias,
+        device char * dst,
+        device const uint * act_block_metrics,
+        device const ushort4 * packed_coeff_lut,
+        threadgroup float * tmp_real,
+        threadgroup float * tmp_imag,
+        threadgroup ushort4 * coeff_lut,
+        threadgroup uchar * coeff_metric_lut,
+        uint2 tgpig,
+        uint2 tiitg) {
+    constexpr int rows = 8;
+    constexpr int block_slots = 8;
+    constexpr int n_threads = 128;
+
+    const uint lid = tiitg.x;
+    const int row_base = (int) tgpig.x * rows;
+    const int block_slot = (int) lid >> 4;
+    const int pattern = (int) lid & 15;
+    const int q4 = pattern;
+    const int simd_lane = (int) lid & 31;
+    const int simd_group = (int) lid >> 5;
+    const int simd_groups = n_threads / 32;
+    const int m16 = (row_base & 63) >> 4;
+    const int row_lane_base = row_base & 15;
+    const int act_row = (int) tgpig.y;
+    const int i1 = act_row % args.x_ne1;
+    const int i2 = (act_row / args.x_ne1) % args.x_ne2;
+    const int i3 = act_row / (args.x_ne1 * args.x_ne2);
+    const ulong x_row_offset =
+        (ulong) i1 * args.x_nb1 + (ulong) i2 * args.x_nb2 + (ulong) i3 * args.x_nb3;
+    const ulong dst_row_offset =
+        (ulong) i1 * args.dst_nb1 + (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3;
+    device const uchar * packed_coeff_metrics =
+        (device const uchar *) (packed_coeff_lut +
+                                (ulong) (args.m / QK_FAIRY2I_TILE64) * (ulong) blocks * 16UL);
+
+    float acc_real[rows];
+    float acc_imag[rows];
+    uint min_coeff_metric = 255U;
+    uint min_act_metric = 255U;
+    for (int tr = 0; tr < rows; ++tr) {
+        acc_real[tr] = 0.0f;
+        acc_imag[tr] = 0.0f;
+    }
+
+    for (int wb_base = 0; wb_base < blocks; wb_base += block_slots) {
+        const int wb = wb_base + block_slot;
+        if (wb < blocks) {
+            if (check_exact_product && pattern == 0) {
+                min_act_metric = min(min_act_metric, act_block_metrics[wb]);
+            }
+            const int physical_tile = (row_base / QK_FAIRY2I_TILE64) * blocks + wb;
+            const ushort4 coeff = packed_coeff_lut[(ulong) physical_tile * 16UL + (ulong) pattern];
+            coeff_lut[lid] = coeff;
+            if (check_exact_product) {
+                coeff_metric_lut[lid] = packed_coeff_metrics[(ulong) physical_tile * 16UL + (ulong) pattern];
+            }
+        } else {
+            coeff_lut[lid] = ushort4(0);
+            if (check_exact_product) {
+                coeff_metric_lut[lid] = (uchar) 255U;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (wb < blocks) {
+            ushort4 act_real_bits;
+            ushort4 act_imag_bits;
+            float4 act_real;
+            float4 act_imag;
+            FOR_UNROLL (int part = 0; part < 4; ++part) {
+                const int j = q4 * 4 + part;
+                const int k_idx = wb * QK_FAIRY2I_TILE64 + j;
+                const uint pair = *((device const uint *) (x + x_row_offset + (ulong) k_idx * x_nb0));
+                act_real_bits[part] = (ushort) (pair & 0xffffU);
+                act_imag_bits[part] = (ushort) (pair >> 16);
+                act_real[part] = fairy2i_bf16_to_f32(act_real_bits[part]);
+                act_imag[part] = fairy2i_bf16_to_f32(act_imag_bits[part]);
+            }
+
+            const int physical_tile = (row_base / QK_FAIRY2I_TILE64) * blocks + wb;
+            const int slot = m16 * 16 + q4;
+            const ulong code_base =
+                ((((ulong) physical_tile * 64 + (ulong) slot) * 2) * 16) + (ulong) row_lane_base;
+            const ulong u_rows = *((device const ulong *) (codes + code_base));
+            const ulong w_rows = *((device const ulong *) (codes + code_base + 16));
+            threadgroup const ushort4 * block_lut = coeff_lut + block_slot * 16;
+
+            FOR_UNROLL (int tr = 0; tr < rows; ++tr) {
+                const uint u_packed = (uint) ((u_rows >> (8 * tr)) & 0xffUL);
+                const uint w_packed = (uint) ((w_rows >> (8 * tr)) & 0xffUL);
+                FOR_UNROLL (int part = 0; part < 4; ++part) {
+                    const uint u_code = (u_packed >> (2 * part)) & 3U;
+                    const uint w_code = (w_packed >> (2 * part)) & 3U;
+                    const uint coeff_index = u_code | (w_code << 2);
+                    const ushort4 coeff_bits = block_lut[coeff_index];
+                    if (check_exact_product) {
+                        min_coeff_metric = min(
+                            min_coeff_metric,
+                            (uint) coeff_metric_lut[block_slot * 16 + coeff_index]);
+                    }
+                    const float4 coeff = float4(
+                        fairy2i_bf16_to_f32(coeff_bits.x),
+                        fairy2i_bf16_to_f32(coeff_bits.y),
+                        fairy2i_bf16_to_f32(coeff_bits.z),
+                        fairy2i_bf16_to_f32(coeff_bits.w));
+                    acc_real[tr] += coeff.x * act_real[part] + coeff.y * act_imag[part];
+                    acc_imag[tr] += coeff.z * act_real[part] + coeff.w * act_imag[part];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    bool requires_software = false;
+    if (check_exact_product) {
+        const uint simd_coeff_metric = simd_min(min_coeff_metric);
+        const uint simd_act_metric = simd_min(min_act_metric);
+        if (simd_lane == 0) {
+            ((threadgroup uint *) tmp_real)[simd_group] = simd_coeff_metric;
+            ((threadgroup uint *) tmp_imag)[simd_group] = simd_act_metric;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) {
+            uint tile_coeff_metric = 255U;
+            uint tile_act_metric = 255U;
+            for (int sg = 0; sg < simd_groups; ++sg) {
+                tile_coeff_metric = min(tile_coeff_metric, ((threadgroup uint *) tmp_real)[sg]);
+                tile_act_metric = min(tile_act_metric, ((threadgroup uint *) tmp_imag)[sg]);
+            }
+            ((threadgroup uint *) tmp_real)[0] = tile_coeff_metric;
+            ((threadgroup uint *) tmp_imag)[0] = tile_act_metric;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        requires_software = fairy2i_product_metrics_require_software(
+            ((threadgroup uint *) tmp_real)[0], ((threadgroup uint *) tmp_imag)[0]);
+    }
+    if (requires_software) {
+        if (lid < rows) {
+            const int row = row_base + (int) lid;
+            uint real_bits = 0;
+            uint imag_bits = 0;
+            for (int k = 0; k < blocks * QK_FAIRY2I_TILE64; ++k) {
+                const uint pair = *((device const uint *) (x + x_row_offset + (ulong) k * x_nb0));
+                const ushort xr_bits = (ushort) (pair & 0xffffU);
+                const ushort xi_bits = (ushort) (pair >> 16);
+                const ushort4 coeff_bits =
+                    fairy2i_bundle_w1_coeff_at_bf16_exact_bits(codes, scales, blocks, row, k);
+                real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.x, xr_bits);
+                real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.y, xi_bits);
+                imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.z, xr_bits);
+                imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.w, xi_bits);
+            }
+
+            ushort out_real_bits;
+            ushort out_imag_bits;
+            if (has_bias) {
+                const int b1 = i1 % args.bias_ne1;
+                const int b2 = i2 % args.bias_ne2;
+                const int b3 = i3 % args.bias_ne3;
+                const float bias_real = *((device const float *)
+                    (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0 + (ulong) b1 * args.bias_nb1 +
+                     (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+                const float bias_imag = *((device const float *)
+                    (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0 +
+                     (ulong) b1 * args.bias_nb1 + (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+                out_real_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(real_bits, bias_real);
+                out_imag_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(imag_bits, bias_imag);
+            } else {
+                out_real_bits = fairy2i_f32_to_bf16(as_type<float>(real_bits));
+                out_imag_bits = fairy2i_f32_to_bf16(as_type<float>(imag_bits));
+            }
+            *((device uint *) (dst + dst_row_offset + (ulong) row * dst_nb0)) =
+                (uint) out_real_bits | ((uint) out_imag_bits << 16);
+        }
+        return;
+    }
+
+    for (int out_idx = 0; out_idx < rows; ++out_idx) {
+        const float real_sum = simd_sum(acc_real[out_idx]);
+        const float imag_sum = simd_sum(acc_imag[out_idx]);
+        if (simd_lane == 0) {
+            tmp_real[out_idx * simd_groups + simd_group] = real_sum;
+            tmp_imag[out_idx * simd_groups + simd_group] = imag_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < rows) {
+        const int row = row_base + (int) lid;
+        float real = 0.0f;
+        float imag = 0.0f;
+        for (int sg = 0; sg < simd_groups; ++sg) {
+            real += tmp_real[(int) lid * simd_groups + sg];
+            imag += tmp_imag[(int) lid * simd_groups + sg];
+        }
+
+        ushort real_bits;
+        ushort imag_bits;
+        if (has_bias) {
+            const int b1 = i1 % args.bias_ne1;
+            const int b2 = i2 % args.bias_ne2;
+            const int b3 = i3 % args.bias_ne3;
+            const float bias_real = *((device const float *)
+                (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0 + (ulong) b1 * args.bias_nb1 +
+                 (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+            const float bias_imag = *((device const float *)
+                (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0 +
+                 (ulong) b1 * args.bias_nb1 + (ulong) b2 * args.bias_nb2 + (ulong) b3 * args.bias_nb3));
+            real_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(real, bias_real);
+            imag_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(imag, bias_imag);
+        } else {
+            real_bits = fairy2i_f32_to_bf16(real);
+            imag_bits = fairy2i_f32_to_bf16(imag);
+        }
+        *((device uint *) (dst + dst_row_offset + (ulong) row * dst_nb0)) =
+            (uint) real_bits | ((uint) imag_bits << 16);
+    }
+}
+
+kernel void kernel_fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8_simd(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const char * x                                   [[buffer(3)]],
+        device const char * bias                                [[buffer(4)]],
+        device char * dst                                       [[buffer(5)]],
+        device const uint * act_block_metrics                   [[buffer(6)]],
+        device const ushort4 * packed_coeff_lut                  [[buffer(7)]],
+        threadgroup float * tmp_real                            [[threadgroup(0)]],
+        threadgroup float * tmp_imag                            [[threadgroup(1)]],
+        threadgroup ushort4 * coeff_lut                         [[threadgroup(2)]],
+        threadgroup uchar * coeff_metric_lut                    [[threadgroup(3)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
+    fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8<true>(
+        args,
+        args.k / QK_FAIRY2I_TILE64,
+        args.x_nb0,
+        args.dst_nb0,
+        args.has_bias,
+        codes,
+        scales,
+        x,
+        bias,
+        dst,
+        act_block_metrics,
+        packed_coeff_lut,
+        tmp_real,
+        tmp_imag,
+        coeff_lut,
+        coeff_metric_lut,
+        tgpig,
+        tiitg);
+}
+
+kernel void kernel_fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8_nobias_fc_simd(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const char * x                                   [[buffer(3)]],
+        device char * dst                                       [[buffer(4)]],
+        device const uint * act_block_metrics                   [[buffer(5)]],
+        device const ushort4 * packed_coeff_lut                  [[buffer(6)]],
+        threadgroup float * tmp_real                            [[threadgroup(0)]],
+        threadgroup float * tmp_imag                            [[threadgroup(1)]],
+        threadgroup ushort4 * coeff_lut                         [[threadgroup(2)]],
+        threadgroup uchar * coeff_metric_lut                    [[threadgroup(3)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
+    fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8<true>(
+        args,
+        FC_fairy2i_bundle_w1_decode_blocks,
+        (ulong) FC_fairy2i_bundle_w1_decode_x_nb0,
+        (ulong) FC_fairy2i_bundle_w1_decode_dst_nb0,
+        false,
+        codes,
+        scales,
+        x,
+        dst,
+        dst,
+        act_block_metrics,
+        packed_coeff_lut,
+        tmp_real,
+        tmp_imag,
+        coeff_lut,
+        coeff_metric_lut,
+        tgpig,
+        tiitg);
+}
+
+kernel void kernel_fairy2i_bundle_w1_bf16_bf16scale_qat_tile8x1_w8_simd(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const char * x                                   [[buffer(3)]],
+        device const char * bias                                [[buffer(4)]],
+        device char * dst                                       [[buffer(5)]],
+        device const uint * act_block_metrics                   [[buffer(6)]],
+        device const ushort4 * packed_coeff_lut                  [[buffer(7)]],
+        threadgroup float * tmp_real                            [[threadgroup(0)]],
+        threadgroup float * tmp_imag                            [[threadgroup(1)]],
+        threadgroup ushort4 * coeff_lut                         [[threadgroup(2)]],
+        threadgroup uchar * coeff_metric_lut                    [[threadgroup(3)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
+    fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8<false>(
+        args,
+        args.k / QK_FAIRY2I_TILE64,
+        args.x_nb0,
+        args.dst_nb0,
+        args.has_bias,
+        codes,
+        scales,
+        x,
+        bias,
+        dst,
+        act_block_metrics,
+        packed_coeff_lut,
+        tmp_real,
+        tmp_imag,
+        coeff_lut,
+        coeff_metric_lut,
+        tgpig,
+        tiitg);
+}
+
+kernel void kernel_fairy2i_bundle_w1_bf16_bf16scale_qat_tile8x1_w8_nobias_fc_simd(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const char * x                                   [[buffer(3)]],
+        device char * dst                                       [[buffer(4)]],
+        device const uint * act_block_metrics                   [[buffer(5)]],
+        device const ushort4 * packed_coeff_lut                  [[buffer(6)]],
+        threadgroup float * tmp_real                            [[threadgroup(0)]],
+        threadgroup float * tmp_imag                            [[threadgroup(1)]],
+        threadgroup ushort4 * coeff_lut                         [[threadgroup(2)]],
+        threadgroup uchar * coeff_metric_lut                    [[threadgroup(3)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
+    fairy2i_bundle_w1_bf16_bf16scale_exact_tile8x1_w8<false>(
+        args,
+        FC_fairy2i_bundle_w1_decode_blocks,
+        (ulong) FC_fairy2i_bundle_w1_decode_x_nb0,
+        (ulong) FC_fairy2i_bundle_w1_decode_dst_nb0,
+        false,
+        codes,
+        scales,
+        x,
+        dst,
+        dst,
+        act_block_metrics,
+        packed_coeff_lut,
+        tmp_real,
+        tmp_imag,
+        coeff_lut,
+        coeff_metric_lut,
+        tgpig,
+        tiitg);
+}
+#endif
 
 kernel void kernel_fairy2i_bundle_w2_bf16_tile4x1_w8_full_simd(
         constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
@@ -1021,6 +2543,549 @@ kernel void kernel_fairy2i_bundle_w2_bf16_tile4x1_w8_full_nobias_fc_simd(
             fairy2i_pack_bf16_pair(real, imag);
     }
 }
+
+#if defined(GGML_METAL_HAS_BF16)
+kernel void kernel_fairy2i_bundle_w2_bf16_bf16scale_exact_tile4x1_w8_simd(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const char * x                                   [[buffer(3)]],
+        device const char * bias                                [[buffer(4)]],
+        device char * dst                                       [[buffer(5)]],
+        threadgroup float * tmp_real                            [[threadgroup(0)]],
+        threadgroup float * tmp_imag                            [[threadgroup(1)]],
+        threadgroup ushort2 * qstage_table                      [[threadgroup(2)]],
+        threadgroup ushort2 * uw_table                          [[threadgroup(3)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
+    constexpr int rows = 4;
+    constexpr int block_slots = 8;
+    constexpr int n_threads = 128;
+
+    const uint lid = tiitg.x;
+    const int row_base = (int) tgpig.x * rows;
+    const int block_slot = (int) lid >> 4;
+    const int q4 = (int) lid & 15;
+    const int simd_lane = (int) lid & 31;
+    const int simd_group = (int) lid >> 5;
+    const int blocks = args.k / QK_FAIRY2I_TILE64;
+    const int simd_groups = n_threads / 32;
+    const int m16 = (row_base & 63) >> 4;
+    const int row_lane_base = row_base & 15;
+
+    float acc_real[rows];
+    float acc_imag[rows];
+    uint min_coeff_metric = 255U;
+    uint min_act_metric = 255U;
+    for (int tr = 0; tr < rows; ++tr) {
+        acc_real[tr] = 0.0f;
+        acc_imag[tr] = 0.0f;
+    }
+
+    for (int wb_base = 0; wb_base < blocks; wb_base += block_slots) {
+        const int wb = wb_base + block_slot;
+
+        // Each thread owns one {block, branch, code} entry. The inactive component is always +0;
+        // the active scale is already stored as the forward-visible BF16 magnitude payload.
+        const uint branch_code = lid & 15U;
+        const uint branch = branch_code >> 2;
+        const uint code = branch_code & 3U;
+        ushort2 qstage = ushort2(0);
+        if (wb < blocks) {
+            const int physical_tile = (row_base / QK_FAIRY2I_TILE64) * blocks + wb;
+            const ushort magnitude =
+                scales[(ulong) physical_tile * 8UL + (ulong) (2U * branch + (code >> 1))];
+            const ushort stage =
+                (ushort) ((uint) magnitude ^ ((code & 1U) != 0 ? 0x0000U : 0x8000U));
+            if ((code & 2U) == 0) {
+                qstage.x = stage;
+            } else {
+                qstage.y = stage;
+            }
+        }
+        qstage_table[lid] = qstage;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Build both U and W tables from the shared stage payloads. Each thread produces one
+        // 4-code pattern for U and one for W, preserving the BF16 merge boundary bit-for-bit.
+        FOR_UNROLL (uint pair = 0; pair < 2; ++pair) {
+            const uint pattern = lid & 15U;
+            const uint pair_index = ((lid >> 4) * 2U + pair) * 16U + pattern;
+            const uint branch0 = 2U * pair;
+            const uint branch1 = branch0 + 1U;
+            const uint code0 = pattern & 3U;
+            const uint code1 = (pattern >> 2) & 3U;
+            const ushort2 stage0 = qstage_table[((lid >> 4) * 4U + branch0) * 4U + code0];
+            const ushort2 stage1 = qstage_table[((lid >> 4) * 4U + branch1) * 4U + code1];
+            uw_table[pair_index] = ushort2(
+                fairy2i_add_bf16_bits_rne(stage0.x, stage1.x),
+                fairy2i_add_bf16_bits_rne(stage0.y, stage1.y));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (wb < blocks) {
+            float4 act_real;
+            float4 act_imag;
+            FOR_UNROLL (int part = 0; part < 4; ++part) {
+                const int j = q4 * 4 + part;
+                const int k_idx = wb * QK_FAIRY2I_TILE64 + j;
+                const uint pair = *((device const uint *) (x + (ulong) k_idx * args.x_nb0));
+                const ushort act_real_bits = (ushort) (pair & 0xffffU);
+                const ushort act_imag_bits = (ushort) (pair >> 16);
+                min_act_metric = min(min_act_metric, fairy2i_bf16_product_metric(act_real_bits));
+                min_act_metric = min(min_act_metric, fairy2i_bf16_product_metric(act_imag_bits));
+                act_real[part] = fairy2i_bf16_to_f32(act_real_bits);
+                act_imag[part] = fairy2i_bf16_to_f32(act_imag_bits);
+            }
+
+            const int physical_tile = (row_base / QK_FAIRY2I_TILE64) * blocks + wb;
+            const int slot = m16 * 16 + q4;
+            const ulong code_base =
+                ((((ulong) physical_tile * 64 + (ulong) slot) * 4) * 16) + (ulong) row_lane_base;
+            const uint4 branch_rows = uint4(
+                *((device const uint *) (codes + code_base)),
+                *((device const uint *) (codes + code_base + 16)),
+                *((device const uint *) (codes + code_base + 32)),
+                *((device const uint *) (codes + code_base + 48)));
+
+            FOR_UNROLL (int tr = 0; tr < rows; ++tr) {
+                const uint4 packed = (branch_rows >> uint4(8 * tr)) & uint4(0xffU);
+                fairy2i_accumulate_tile_weight4_decode_bf16_exact_f32_reg(
+                    packed, qstage_table + block_slot * 16, uw_table + block_slot * 32,
+                    args.strict_staged_reconstruction != 0, act_real, act_imag, tr, acc_real, acc_imag,
+                    min_coeff_metric);
+            }
+        }
+        // All slots, including an invalid tail slot, must rendezvous before the shared tables are reused.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint simd_coeff_metric = simd_min(min_coeff_metric);
+    const uint simd_act_metric = simd_min(min_act_metric);
+    if (simd_lane == 0) {
+        ((threadgroup uint *) tmp_real)[simd_group] = simd_coeff_metric;
+        ((threadgroup uint *) tmp_imag)[simd_group] = simd_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+        uint tile_coeff_metric = 255U;
+        uint tile_act_metric = 255U;
+        for (int sg = 0; sg < simd_groups; ++sg) {
+            tile_coeff_metric = min(tile_coeff_metric, ((threadgroup uint *) tmp_real)[sg]);
+            tile_act_metric = min(tile_act_metric, ((threadgroup uint *) tmp_imag)[sg]);
+        }
+        ((threadgroup uint *) tmp_real)[0] = tile_coeff_metric;
+        ((threadgroup uint *) tmp_imag)[0] = tile_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Every non-zero product in a safe tile has a quantum of at least 2^-126. Native F32 reduction
+    // therefore cannot flush a non-zero cancellation result. Rare low-exponent tiles are recomputed
+    // in logical K order with a software fused BF16*BF16+F32 operation.
+    const bool requires_software = fairy2i_product_metrics_require_software(
+        ((threadgroup uint *) tmp_real)[0], ((threadgroup uint *) tmp_imag)[0]);
+    if (requires_software) {
+        if (lid < rows) {
+            const int row = row_base + (int) lid;
+            if (row < args.m) {
+                uint real_bits = 0;
+                uint imag_bits = 0;
+                for (int k = 0; k < args.k; ++k) {
+                    const uint pair = *((device const uint *) (x + (ulong) k * args.x_nb0));
+                    const ushort xr_bits = (ushort) (pair & 0xffffU);
+                    const ushort xi_bits = (ushort) (pair >> 16);
+                    const ushort4 coeff_bits =
+                        args.strict_staged_reconstruction != 0 ?
+                            fairy2i_bundle_w2_coeff_at_bf16_exact_bits(codes, scales, blocks, row, k) :
+                            fairy2i_bundle_w2_coeff_at_bf16_collapsed_f32_bits(codes, scales, blocks, row, k);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.x, xr_bits);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.y, xi_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.z, xr_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.w, xi_bits);
+                }
+
+                ushort out_real_bits;
+                ushort out_imag_bits;
+                if (args.has_bias) {
+                    const float bias_real =
+                        *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));
+                    const float bias_imag =
+                        *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0));
+                    out_real_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(real_bits, bias_real);
+                    out_imag_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(imag_bits, bias_imag);
+                } else {
+                    out_real_bits = fairy2i_f32_to_bf16(as_type<float>(real_bits));
+                    out_imag_bits = fairy2i_f32_to_bf16(as_type<float>(imag_bits));
+                }
+                *((device uint *) (dst + (ulong) row * args.dst_nb0)) =
+                    (uint) out_real_bits | ((uint) out_imag_bits << 16);
+            }
+        }
+        return;
+    }
+
+    for (int out_idx = 0; out_idx < rows; ++out_idx) {
+        const float real_sum = simd_sum(acc_real[out_idx]);
+        const float imag_sum = simd_sum(acc_imag[out_idx]);
+        if (simd_lane == 0) {
+            tmp_real[out_idx * simd_groups + simd_group] = real_sum;
+            tmp_imag[out_idx * simd_groups + simd_group] = imag_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < rows) {
+        const int row = row_base + (int) lid;
+        if (row < args.m) {
+            float real = 0.0f;
+            float imag = 0.0f;
+            for (int sg = 0; sg < simd_groups; ++sg) {
+                real += tmp_real[(int) lid * simd_groups + sg];
+                imag += tmp_imag[(int) lid * simd_groups + sg];
+            }
+            ushort real_bits;
+            ushort imag_bits;
+            if (args.has_bias) {
+                const float bias_real =
+                    *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));
+                const float bias_imag =
+                    *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0));
+                real_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(real, bias_real);
+                imag_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(imag, bias_imag);
+            } else {
+                real_bits = fairy2i_f32_to_bf16(real);
+                imag_bits = fairy2i_f32_to_bf16(imag);
+            }
+
+            *((device uint *) (dst + (ulong) row * args.dst_nb0)) =
+                (uint) real_bits | ((uint) imag_bits << 16);
+        }
+    }
+}
+
+template <bool HAS_BIAS>
+static inline void fairy2i_bundle_w2_bf16_bf16scale_exact_m64x1_impl(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args,
+        device const uchar * codes,
+        device const ushort * scales,
+        device const char * x,
+        device const char * bias,
+        device char * dst,
+        int blocks,
+        ulong x_nb0,
+        ulong dst_nb0,
+        threadgroup uint * coeff01_lut,
+        threadgroup uint * coeff23_lut,
+        threadgroup uint * act_pairs,
+        threadgroup uint * metric_scratch,
+        threadgroup ushort2 * qstage,
+        threadgroup ushort2 * uw_table,
+        uint2 tgpig,
+        uint2 tiitg) {
+    constexpr uint rows = 64;
+    constexpr uint block_group = 4;
+    constexpr uint coeffs_per_block = 256;
+    constexpr uint acts_per_block = QK_FAIRY2I_TILE64;
+    constexpr uint qstage_per_block = 16;
+    constexpr uint uw_per_block = 32;
+    constexpr uint metrics_per_block = 4;
+
+    const uint lid = tiitg.x;
+    const uint simd_lane = lid & 31U;
+    const uint simd_group = lid >> 5;
+    const uint block_slot = lid >> 6;
+    const uint block_lid = lid & 63U;
+    const uint block_simd = simd_group & 1U;
+    const uint kseg = simd_lane >> 3;
+    const uint row8 = simd_lane & 7U;
+    const int row_base = (int) tgpig.x * (int) rows;
+    const int physical_m_tile = (int) tgpig.x;
+    const uint m16 = simd_group >> 1;
+    const uint row_lane = ((simd_group & 1U) << 3) | row8;
+
+    float acc_real = 0.0f;
+    float acc_imag = 0.0f;
+    uint leader_needs_software = 0U;
+
+    for (int wb_base = 0; wb_base < blocks; wb_base += (int) block_group) {
+        const uint group_blocks = (uint) min((int) block_group, blocks - wb_base);
+        const bool block_active = block_slot < group_blocks;
+        const int wb = wb_base + (int) block_slot;
+        const int physical_tile = physical_m_tile * blocks + wb;
+        uint       coeff_metric_bound = 255U;
+        uint       min_act_metric     = 255U;
+
+        // Four 64-thread subgroups stage four physical K64 tiles concurrently.
+        if (block_active) {
+            const uint pair =
+                *((device const uint *) (x + ((ulong) wb * QK_FAIRY2I_TILE64 + block_lid) * x_nb0));
+            const uint real_metric = fairy2i_bf16_product_metric((ushort) (pair & 0xffffU));
+            const uint imag_metric = fairy2i_bf16_product_metric((ushort) (pair >> 16));
+            act_pairs[block_slot * acts_per_block + block_lid] = pair;
+            min_act_metric = min(real_metric, imag_metric);
+        }
+
+        // The first SIMD-group in each 64-thread subgroup stages that K64 tile's
+        // four branch/code payloads. Strict regression mode also materializes
+        // the two intermediate BF16 U/W tables.
+        if (block_active && block_simd == 0U) {
+            threadgroup ushort2 * block_qstage       = qstage + block_slot * qstage_per_block;
+            threadgroup ushort2 * block_uw_table     = uw_table + block_slot * uw_per_block;
+            uint                  stage_metric       = 255U;
+            uint                  stage_max_exponent = 0U;
+            const uint q_index = simd_lane & 15U;
+            const uint branch = q_index >> 2;
+            const uint code = q_index & 3U;
+            const uint scale_index = branch * 2U + (code >> 1);
+            const uint scale_source =
+                simd_lane < 8U ? (uint) scales[(ulong) physical_tile * 8UL + simd_lane] : 0U;
+            const ushort magnitude = (ushort) simd_shuffle(scale_source, scale_index);
+
+            if (simd_lane < 16U) {
+                const ushort stage =
+                    (ushort) ((uint) magnitude ^ ((code & 1U) != 0 ? 0x0000U : 0x8000U));
+                block_qstage[q_index] = (code & 2U) == 0 ? ushort2(stage, 0) : ushort2(0, stage);
+                if ((code & 1U) == 0U) {
+                    // One sign of each of the eight unique qstage scale payloads is sufficient:
+                    // the product metric ignores the sign bit.
+                    stage_metric       = fairy2i_bf16_product_metric(stage);
+                    stage_max_exponent = stage_metric == 255U ? 0U : stage_metric;
+                }
+            }
+            const uint min_stage_metric   = simd_min(stage_metric);
+            const uint max_stage_exponent = simd_max(stage_max_exponent);
+            if (simd_lane == 0U) {
+                // A non-zero BF16 add can lower its smallest input exponent field by at most
+                // seven. U/W and then Aij cross two such boundaries, so min_stage - 14 is a
+                // lower bound for every non-zero final coefficient. Low/exceptional stages and
+                // inputs large enough for the two adds to overflow conservatively force replay.
+                coeff_metric_bound =
+                    fairy2i_bf16_two_add_coefficient_metric_bound(min_stage_metric, max_stage_exponent);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (args.strict_staged_reconstruction != 0) {
+                const uint pair = simd_lane >> 4;
+                const uint pattern = simd_lane & 15U;
+                const uint branch0 = 2U * pair;
+                const uint code0 = pattern & 3U;
+                const uint code1 = (pattern >> 2) & 3U;
+                const ushort2 stage0 = block_qstage[branch0 * 4U + code0];
+                const ushort2 stage1 = block_qstage[(branch0 + 1U) * 4U + code1];
+                block_uw_table[simd_lane] = ushort2(
+                    fairy2i_add_bf16_bits_rne(stage0.x, stage1.x),
+                    fairy2i_add_bf16_bits_rne(stage0.y, stage1.y));
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each 64-thread subgroup builds all 256 final Aij entries for one K64 tile.
+        if (block_active) {
+            threadgroup ushort2 * block_qstage = qstage + block_slot * qstage_per_block;
+            threadgroup ushort2 * block_uw_table = uw_table + block_slot * uw_per_block;
+            const uint coeff_base = block_slot * coeffs_per_block;
+            FOR_UNROLL (uint pattern_quarter = 0; pattern_quarter < 4U; ++pattern_quarter) {
+                const uint pattern = block_lid + pattern_quarter * 64U;
+                ushort4 coeff;
+                if (args.strict_staged_reconstruction != 0) {
+                    coeff = fairy2i_reconstruct_w2_coeff_from_uw_bf16_exact_bits(
+                        block_uw_table[pattern & 15U], block_uw_table[16U + (pattern >> 4)]);
+                } else {
+                    const uint4 code = uint4(
+                        pattern & 3U,
+                        (pattern >> 2) & 3U,
+                        (pattern >> 4) & 3U,
+                        (pattern >> 6) & 3U);
+                    const ushort2 u0 = block_qstage[code.x];
+                    const ushort2 u1 = block_qstage[4U + code.y];
+                    const ushort2 w0 = block_qstage[8U + code.z];
+                    const ushort2 w1 = block_qstage[12U + code.w];
+                    coeff = fairy2i_reconstruct_w2_coeff_from_stage_collapsed_f32_native_bits(
+                        ushort4(u0.x, u1.x, w0.x, w1.x),
+                        ushort4(u0.y, u1.y, w0.y, w1.y));
+                }
+                coeff01_lut[coeff_base + pattern] = (uint) coeff.x | ((uint) coeff.y << 16);
+                coeff23_lut[coeff_base + pattern] = (uint) coeff.z | ((uint) coeff.w << 16);
+            }
+        }
+
+        const uint simd_act_metric = simd_min(min_act_metric);
+        if (simd_lane == 0U) {
+            const uint metric_base = block_slot * metrics_per_block;
+            if (block_simd == 0U) {
+                metric_scratch[metric_base] = coeff_metric_bound;
+            }
+            metric_scratch[metric_base + 1U + block_simd * 2U] = simd_act_metric;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lid == 0U) {
+            for (uint metric_slot = 0; metric_slot < group_blocks; ++metric_slot) {
+                const uint metric_base       = metric_slot * metrics_per_block;
+                const uint tile_coeff_metric = metric_scratch[metric_base];
+                const uint tile_act_metric   = min(metric_scratch[metric_base + 1U], metric_scratch[metric_base + 3U]);
+                leader_needs_software |= fairy2i_product_metrics_require_software(tile_coeff_metric, tile_act_metric);
+            }
+        }
+
+        // Consume the four K64 tiles in their original order so every F32 FMA boundary is
+        // unchanged. The shared tables remain read-only until the complete group is consumed.
+        for (uint compute_slot = 0; compute_slot < group_blocks; ++compute_slot) {
+            const int compute_wb = wb_base + (int) compute_slot;
+            const int compute_physical_tile = physical_m_tile * blocks + compute_wb;
+            device const uchar * code_ptr =
+                codes + (ulong) compute_physical_tile * 64UL * 4UL * 16UL +
+                (ulong) (m16 * 16U + kseg * 4U) * 4UL * 16UL + row_lane;
+            const uint coeff_base = compute_slot * coeffs_per_block;
+            const uint act_base = compute_slot * acts_per_block;
+
+            FOR_UNROLL (uint q4_in_seg = 0; q4_in_seg < 4; ++q4_in_seg) {
+                // Transpose four branch-major code bytes into four byte-sized LUT indices.
+                uint packed_lut_indices =
+                    (uint) code_ptr[0] |
+                    ((uint) code_ptr[16] << 8) |
+                    ((uint) code_ptr[32] << 16) |
+                    ((uint) code_ptr[48] << 24);
+                uint swap = (packed_lut_indices ^ (packed_lut_indices >> 12)) & 0x0000f0f0U;
+                packed_lut_indices ^= swap ^ (swap << 12);
+                swap = (packed_lut_indices ^ (packed_lut_indices >> 6)) & 0x00cc00ccU;
+                packed_lut_indices ^= swap ^ (swap << 6);
+
+                FOR_UNROLL (uint part = 0; part < 4; ++part) {
+                    const uint lut_index = (packed_lut_indices >> (8U * part)) & 0xffU;
+                    const uint k_local = kseg * 16U + q4_in_seg * 4U + part;
+                    const uint act_pair = act_pairs[act_base + k_local];
+                    const ushort xr_bits = (ushort) (act_pair & 0xffffU);
+                    const ushort xi_bits = (ushort) (act_pair >> 16);
+                    const uint coeff01 = coeff01_lut[coeff_base + lut_index];
+                    const uint coeff23 = coeff23_lut[coeff_base + lut_index];
+                    const ushort rr_bits = (ushort) (coeff01 & 0xffffU);
+                    const ushort ri_bits = (ushort) (coeff01 >> 16);
+                    const ushort ir_bits = (ushort) (coeff23 & 0xffffU);
+                    const ushort ii_bits = (ushort) (coeff23 >> 16);
+                    const float xr = fairy2i_bf16_to_f32(xr_bits);
+                    const float xi = fairy2i_bf16_to_f32(xi_bits);
+
+                    acc_real = fma(fairy2i_bf16_to_f32(rr_bits), xr, acc_real);
+                    acc_real = fma(fairy2i_bf16_to_f32(ri_bits), xi, acc_real);
+                    acc_imag = fma(fairy2i_bf16_to_f32(ir_bits), xr, acc_imag);
+                    acc_imag = fma(fairy2i_bf16_to_f32(ii_bits), xi, acc_imag);
+                }
+                code_ptr += 4 * 16;
+            }
+        }
+
+        // Publish the leader's cumulative predicate before the existing group-end rendezvous.
+        // The next group may reuse this slot for metrics; the leader retains the cumulative value.
+        if (lid == 0U) {
+            metric_scratch[0] = leader_needs_software;
+        }
+
+        // Protect all four shared tables before their next grouped reconstruction and make the
+        // final cumulative predicate visible uniformly after the last group.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const bool needs_software = blocks > 0 && metric_scratch[0] != 0U;
+
+    // Four lanes hold the K16 partials for each row. Reduce only within the row's 4-lane set.
+    acc_real += simd_shuffle_down(acc_real, 16);
+    acc_imag += simd_shuffle_down(acc_imag, 16);
+    acc_real += simd_shuffle_down(acc_real, 8);
+    acc_imag += simd_shuffle_down(acc_imag, 8);
+
+    if (simd_lane < 8U) {
+        const int row = row_base + (int) (simd_group * 8U + simd_lane);
+        ushort out_real_bits;
+        ushort out_imag_bits;
+
+        if (needs_software) {
+            uint real_bits = 0;
+            uint imag_bits = 0;
+            const int k = blocks * QK_FAIRY2I_TILE64;
+            for (int ik = 0; ik < k; ++ik) {
+                const uint pair = *((device const uint *) (x + (ulong) ik * x_nb0));
+                const ushort xr_bits = (ushort) (pair & 0xffffU);
+                const ushort xi_bits = (ushort) (pair >> 16);
+                const ushort4 coeff_bits =
+                    args.strict_staged_reconstruction != 0 ?
+                        fairy2i_bundle_w2_coeff_at_bf16_exact_bits(codes, scales, blocks, row, ik) :
+                        fairy2i_bundle_w2_coeff_at_bf16_collapsed_f32_bits(codes, scales, blocks, row, ik);
+                real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.x, xr_bits);
+                real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.y, xi_bits);
+                imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.z, xr_bits);
+                imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.w, xi_bits);
+            }
+
+            if (HAS_BIAS && args.has_bias) {
+                const float bias_real =
+                    *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));
+                const float bias_imag =
+                    *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0));
+                out_real_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(real_bits, bias_real);
+                out_imag_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(imag_bits, bias_imag);
+            } else {
+                out_real_bits = fairy2i_f32_to_bf16(as_type<float>(real_bits));
+                out_imag_bits = fairy2i_f32_to_bf16(as_type<float>(imag_bits));
+            }
+        } else if (HAS_BIAS && args.has_bias) {
+            const float bias_real =
+                *((device const float *) (bias + (ulong) (row % args.bias_ne0) * args.bias_nb0));
+            const float bias_imag =
+                *((device const float *) (bias + (ulong) ((row + args.m) % args.bias_ne0) * args.bias_nb0));
+            out_real_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(acc_real, bias_real);
+            out_imag_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(acc_imag, bias_imag);
+        } else {
+            out_real_bits = fairy2i_f32_to_bf16(acc_real);
+            out_imag_bits = fairy2i_f32_to_bf16(acc_imag);
+        }
+
+        *((device uint *) (dst + (ulong) row * dst_nb0)) =
+            (uint) out_real_bits | ((uint) out_imag_bits << 16);
+    }
+}
+
+kernel void kernel_fairy2i_bundle_w2_bf16_bf16scale_exact_m64x1_simd(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const char * x                                   [[buffer(3)]],
+        device const char * bias                                [[buffer(4)]],
+        device char * dst                                       [[buffer(5)]],
+        threadgroup uint * coeff01_lut                          [[threadgroup(0)]],
+        threadgroup uint * coeff23_lut                          [[threadgroup(1)]],
+        threadgroup uint * act_pairs                            [[threadgroup(2)]],
+        threadgroup uint * metric_scratch                       [[threadgroup(3)]],
+        threadgroup ushort2 * qstage                            [[threadgroup(4)]],
+        threadgroup ushort2 * uw_table                          [[threadgroup(5)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
+    fairy2i_bundle_w2_bf16_bf16scale_exact_m64x1_impl<true>(
+        args, codes, scales, x, bias, dst, args.k / QK_FAIRY2I_TILE64, args.x_nb0, args.dst_nb0,
+        coeff01_lut, coeff23_lut, act_pairs, metric_scratch, qstage, uw_table, tgpig, tiitg);
+}
+
+kernel void kernel_fairy2i_bundle_w2_bf16_bf16scale_exact_m64x1_nobias_fc_simd(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const char * x                                   [[buffer(3)]],
+        device char * dst                                       [[buffer(4)]],
+        threadgroup uint * coeff01_lut                          [[threadgroup(0)]],
+        threadgroup uint * coeff23_lut                          [[threadgroup(1)]],
+        threadgroup uint * act_pairs                            [[threadgroup(2)]],
+        threadgroup uint * metric_scratch                       [[threadgroup(3)]],
+        threadgroup ushort2 * qstage                            [[threadgroup(4)]],
+        threadgroup ushort2 * uw_table                          [[threadgroup(5)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint2 tiitg                                             [[thread_position_in_threadgroup]]) {
+    fairy2i_bundle_w2_bf16_bf16scale_exact_m64x1_impl<false>(
+        args, codes, scales, x, x, dst, FC_fairy2i_bundle_w2_decode_blocks,
+        (ulong) FC_fairy2i_bundle_w2_decode_x_nb0, (ulong) FC_fairy2i_bundle_w2_decode_dst_nb0,
+        coeff01_lut, coeff23_lut, act_pairs, metric_scratch, qstage, uw_table, tgpig, tiitg);
+}
+#endif
 
 kernel void kernel_fairy2i_wide_linear_w1_half_w64scale_mma32x16_k16(
         constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
@@ -1673,6 +3738,993 @@ kernel void kernel_fairy2i_bundle_w2_half_mma32x16(
         }
     }
 }
+
+#if defined(GGML_METAL_HAS_BF16)
+kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const bfloat * act_b                             [[buffer(3)]],
+        device const char * bias                                [[buffer(4)]],
+        device char * dst                                       [[buffer(5)]],
+        device const uint * act_block_metrics                   [[buffer(6)]],
+        device const ushort4 * packed_coeff_lut                  [[buffer(7)]],
+        threadgroup bfloat * coeff_real_from_real               [[threadgroup(0)]],
+        threadgroup bfloat * coeff_real_from_imag               [[threadgroup(1)]],
+        threadgroup bfloat * coeff_imag_from_real               [[threadgroup(2)]],
+        threadgroup bfloat * coeff_imag_from_imag               [[threadgroup(3)]],
+        threadgroup bfloat * act_real_tile0                     [[threadgroup(4)]],
+        threadgroup bfloat * act_imag_tile0                     [[threadgroup(5)]],
+        threadgroup bfloat * act_real_tile1                     [[threadgroup(6)]],
+        threadgroup bfloat * act_imag_tile1                     [[threadgroup(7)]],
+        threadgroup float * out_tile                            [[threadgroup(8)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint tiitg                                              [[thread_index_in_threadgroup]],
+        uint sgitg                                              [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile = 32;
+    constexpr int k_tile = 32;
+    constexpr int n_threads = 128;
+
+    const int row_base = (int) tgpig.x * row_tile;
+    const int col_base = (int) tgpig.y * 16;
+    const int blocks = args.k / QK_FAIRY2I_TILE64;
+    const int physical_m_tile = row_base / QK_FAIRY2I_TILE64;
+    const int coeff_base = (int) sgitg * 8 * k_tile;
+    const int coeff_row = (int) tiitg & 31;
+    const int q4_local = (int) tiitg >> 5;
+    const int row_in_m64 = (row_base + coeff_row) & 63;
+    const int m16 = row_in_m64 >> 4;
+    const int row_lane = row_in_m64 & 15;
+    const int simd_lane = (int) tiitg & 31;
+    const ulong packed_coeff_entries =
+        (ulong) (args.m / QK_FAIRY2I_TILE64) * (ulong) blocks * 16UL;
+    device const uchar * packed_tile_metrics =
+        (device const uchar *) (packed_coeff_lut + packed_coeff_entries) + packed_coeff_entries;
+    simdgroup_bfloat8x8 a_rr;
+    simdgroup_bfloat8x8 a_ri;
+    simdgroup_bfloat8x8 a_ir;
+    simdgroup_bfloat8x8 a_ii;
+    simdgroup_bfloat8x8 b_r0;
+    simdgroup_bfloat8x8 b_i0;
+    simdgroup_bfloat8x8 b_r1;
+    simdgroup_bfloat8x8 b_i1;
+    simdgroup_float8x8 c_r0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_r1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    uint min_coeff_metric = 255U;
+    uint min_act_metric = 255U;
+
+    for (int wb = 0; wb < blocks; ++wb) {
+        if (tiitg < 16) {
+            const int col = col_base + (int) tiitg;
+            if (col < args.act_rows) {
+                min_act_metric = min(min_act_metric, act_block_metrics[col * blocks + wb]);
+            }
+        }
+        const int physical_tile = physical_m_tile * blocks + wb;
+        if (sgitg == 0U && simd_lane == 0) {
+            min_coeff_metric = min(min_coeff_metric, (uint) packed_tile_metrics[physical_tile]);
+        }
+        device const uchar * code_ptr =
+            codes + (ulong) physical_tile * 64 * 2 * 16 +
+            (ulong) (m16 * 16 + q4_local) * 2 * 16 + (ulong) row_lane;
+
+        for (int k_chunk = 0; k_chunk < QK_FAIRY2I_TILE64; k_chunk += k_tile) {
+            if (tiitg < 128) {
+                FOR_UNROLL (int code_group = 0; code_group < 2; ++code_group) {
+                    device const uchar * group_code_ptr = code_ptr + code_group * 4 * 2 * 16;
+                    const uint2 packed_codes = uint2(
+                        (uint) group_code_ptr[0],
+                        (uint) group_code_ptr[16]);
+                    FOR_UNROLL (int part = 0; part < 4; ++part) {
+                        const uint2 code = (packed_codes >> uint2(2 * part)) & uint2(3);
+                        const ushort4 coeff =
+                            packed_coeff_lut[(ulong) physical_tile * 16UL + (ulong) (code.x | (code.y << 2))];
+                        const int coeff_index = coeff_row * k_tile + code_group * 16 + q4_local * 4 + part;
+                        ((threadgroup ushort *) coeff_real_from_real)[coeff_index] = coeff.x;
+                        ((threadgroup ushort *) coeff_real_from_imag)[coeff_index] = coeff.y;
+                        ((threadgroup ushort *) coeff_imag_from_real)[coeff_index] = coeff.z;
+                        ((threadgroup ushort *) coeff_imag_from_imag)[coeff_index] = coeff.w;
+                    }
+                }
+                code_ptr += 8 * 2 * 16;
+            }
+
+            for (uint idx = tiitg; idx < 16 * k_tile; idx += n_threads) {
+                const int col_local = (int) idx / k_tile;
+                const int k_local = (int) idx % k_tile;
+                const int tile = col_local >> 3;
+                const int col_lane = col_local & 7;
+                const int col = col_base + col_local;
+
+                ushort xb_real_bits = 0;
+                ushort xb_imag_bits = 0;
+                if (col < args.act_rows) {
+                    const int act_index = col * blocks + wb;
+                    const int act_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
+                    xb_real_bits = ((device const ushort *) act_b)[act_base + k_chunk + k_local];
+                    xb_imag_bits =
+                        ((device const ushort *) act_b)[act_base + QK_FAIRY2I_ACT_Q16_64 + k_chunk + k_local];
+                }
+                const int act_tile_idx = k_local * 8 + col_lane;
+                if (tile == 0) {
+                    ((threadgroup ushort *) act_real_tile0)[act_tile_idx] = xb_real_bits;
+                    ((threadgroup ushort *) act_imag_tile0)[act_tile_idx] = xb_imag_bits;
+                } else {
+                    ((threadgroup ushort *) act_real_tile1)[act_tile_idx] = xb_real_bits;
+                    ((threadgroup ushort *) act_imag_tile1)[act_tile_idx] = xb_imag_bits;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base, k_tile);
+            simdgroup_load(b_r0, act_real_tile0);
+            simdgroup_load(b_i0, act_imag_tile0);
+            simdgroup_load(b_r1, act_real_tile1);
+            simdgroup_load(b_i1, act_imag_tile1);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 8, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 8, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base + 8, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base + 8, k_tile);
+            simdgroup_load(b_r0, act_real_tile0 + 64);
+            simdgroup_load(b_i0, act_imag_tile0 + 64);
+            simdgroup_load(b_r1, act_real_tile1 + 64);
+            simdgroup_load(b_i1, act_imag_tile1 + 64);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 16, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 16, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base + 16, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base + 16, k_tile);
+            simdgroup_load(b_r0, act_real_tile0 + 128);
+            simdgroup_load(b_i0, act_imag_tile0 + 128);
+            simdgroup_load(b_r1, act_real_tile1 + 128);
+            simdgroup_load(b_i1, act_imag_tile1 + 128);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 24, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 24, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base + 24, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base + 24, k_tile);
+            simdgroup_load(b_r0, act_real_tile0 + 192);
+            simdgroup_load(b_i0, act_imag_tile0 + 192);
+            simdgroup_load(b_r1, act_real_tile1 + 192);
+            simdgroup_load(b_i1, act_imag_tile1 + 192);
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+        }
+    }
+
+    const uint simd_coeff_metric = simd_min(min_coeff_metric);
+    const uint simd_act_metric = simd_min(min_act_metric);
+    if (simd_lane == 0) {
+        ((threadgroup uint *) out_tile)[sgitg] = simd_coeff_metric;
+        ((threadgroup uint *) out_tile)[4 + sgitg] = simd_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiitg == 0) {
+        uint tile_coeff_metric = 255U;
+        uint tile_act_metric = 255U;
+        for (int sg = 0; sg < 4; ++sg) {
+            tile_coeff_metric = min(tile_coeff_metric, ((threadgroup uint *) out_tile)[sg]);
+            tile_act_metric = min(tile_act_metric, ((threadgroup uint *) out_tile)[4 + sg]);
+        }
+        ((threadgroup uint *) out_tile)[0] = tile_coeff_metric;
+        ((threadgroup uint *) out_tile)[1] = tile_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const bool requires_software = fairy2i_product_metrics_require_software(
+        ((threadgroup uint *) out_tile)[0], ((threadgroup uint *) out_tile)[1]);
+    if (requires_software) {
+        for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
+            const int output_row_lane = (int) idx / 16;
+            const int col_local = (int) idx & 15;
+            const int row = row_base + output_row_lane;
+            const int col = col_base + col_local;
+            if (row < args.m && col < args.act_rows) {
+                uint real_bits = 0;
+                uint imag_bits = 0;
+                for (int k = 0; k < args.k; ++k) {
+                    const int wb = k / QK_FAIRY2I_TILE64;
+                    const int k_local = k & 63;
+                    const int act_index = col * blocks + wb;
+                    const int act_base = act_index * (2 * QK_FAIRY2I_TILE64);
+                    const ushort xr_bits = ((device const ushort *) act_b)[act_base + k_local];
+                    const ushort xi_bits =
+                        ((device const ushort *) act_b)[act_base + QK_FAIRY2I_TILE64 + k_local];
+                    const ushort4 coeff_bits =
+                        fairy2i_bundle_w1_coeff_at_bf16_exact_bits(codes, scales, blocks, row, k);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.x, xr_bits);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.y, xi_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.z, xr_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.w, xi_bits);
+                }
+
+                const int i1 = col % args.x_ne1;
+                const int i2 = (col / args.x_ne1) % args.x_ne2;
+                const int i3 = col / (args.x_ne1 * args.x_ne2);
+                ushort out_real_bits;
+                ushort out_imag_bits;
+                if (args.has_bias) {
+                    const int b0r = row % args.bias_ne0;
+                    const int b0i = (row + args.m) % args.bias_ne0;
+                    const int b1 = i1 % args.bias_ne1;
+                    const int b2 = i2 % args.bias_ne2;
+                    const int b3 = i3 % args.bias_ne3;
+                    const float bias_real = *((device const float *) (bias + (ulong) b0r * args.bias_nb0 +
+                                                                      (ulong) b1 * args.bias_nb1 +
+                                                                      (ulong) b2 * args.bias_nb2 +
+                                                                      (ulong) b3 * args.bias_nb3));
+                    const float bias_imag = *((device const float *) (bias + (ulong) b0i * args.bias_nb0 +
+                                                                      (ulong) b1 * args.bias_nb1 +
+                                                                      (ulong) b2 * args.bias_nb2 +
+                                                                      (ulong) b3 * args.bias_nb3));
+                    out_real_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(real_bits, bias_real);
+                    out_imag_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(imag_bits, bias_imag);
+                } else {
+                    out_real_bits = fairy2i_f32_to_bf16(as_type<float>(real_bits));
+                    out_imag_bits = fairy2i_f32_to_bf16(as_type<float>(imag_bits));
+                }
+                *((device uint *) (dst + (ulong) row * args.dst_nb0 + (ulong) i1 * args.dst_nb1 +
+                                   (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3)) =
+                    (uint) out_real_bits | ((uint) out_imag_bits << 16);
+            }
+        }
+        return;
+    }
+
+    const int simdgroup_out_base = (int) sgitg * 256;
+    simdgroup_store(c_r0, out_tile + simdgroup_out_base, 8);
+    simdgroup_store(c_i0, out_tile + simdgroup_out_base + 64, 8);
+    simdgroup_store(c_r1, out_tile + simdgroup_out_base + 128, 8);
+    simdgroup_store(c_i1, out_tile + simdgroup_out_base + 192, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
+        const int output_row_lane = (int) idx / 16;
+        const int col_local = (int) idx & 15;
+        const int tile = col_local >> 3;
+        const int col_lane = col_local & 7;
+        const int row = row_base + output_row_lane;
+        const int col = col_base + col_local;
+        if (row < args.m && col < args.act_rows) {
+            const int i1 = col % args.x_ne1;
+            const int i2 = (col / args.x_ne1) % args.x_ne2;
+            const int i3 = col / (args.x_ne1 * args.x_ne2);
+            const int row_group = output_row_lane >> 3;
+            const int row_in_group = output_row_lane & 7;
+            const int out_base = row_group * 256 + tile * 128;
+            const float out_real = out_tile[out_base + row_in_group * 8 + col_lane];
+            const float out_imag = out_tile[out_base + 64 + row_in_group * 8 + col_lane];
+
+            ushort out_real_bits;
+            ushort out_imag_bits;
+            if (args.has_bias) {
+                const int b0r = row % args.bias_ne0;
+                const int b0i = (row + args.m) % args.bias_ne0;
+                const int b1 = i1 % args.bias_ne1;
+                const int b2 = i2 % args.bias_ne2;
+                const int b3 = i3 % args.bias_ne3;
+                const float bias_real = *((device const float *) (bias + (ulong) b0r * args.bias_nb0 +
+                                                                  (ulong) b1 * args.bias_nb1 +
+                                                                  (ulong) b2 * args.bias_nb2 +
+                                                                  (ulong) b3 * args.bias_nb3));
+                const float bias_imag = *((device const float *) (bias + (ulong) b0i * args.bias_nb0 +
+                                                                  (ulong) b1 * args.bias_nb1 +
+                                                                  (ulong) b2 * args.bias_nb2 +
+                                                                  (ulong) b3 * args.bias_nb3));
+                out_real_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(out_real, bias_real);
+                out_imag_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(out_imag, bias_imag);
+            } else {
+                out_real_bits = fairy2i_f32_to_bf16(out_real);
+                out_imag_bits = fairy2i_f32_to_bf16(out_imag);
+            }
+            *((device uint *) (dst + (ulong) row * args.dst_nb0 + (ulong) i1 * args.dst_nb1 +
+                               (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3)) =
+                (uint) out_real_bits | ((uint) out_imag_bits << 16);
+        }
+    }
+}
+
+kernel void kernel_fairy2i_bundle_w1_bfloat_bf16scale_exact_mma32x16_k32_direct_act(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const bfloat * act_b                             [[buffer(3)]],
+        device const char * bias                                [[buffer(4)]],
+        device char * dst                                       [[buffer(5)]],
+        device const uint * act_block_metrics                   [[buffer(6)]],
+        device const ushort4 * packed_coeff_lut                  [[buffer(7)]],
+        threadgroup bfloat * coeff_real_from_real               [[threadgroup(0)]],
+        threadgroup bfloat * coeff_real_from_imag               [[threadgroup(1)]],
+        threadgroup bfloat * coeff_imag_from_real               [[threadgroup(2)]],
+        threadgroup bfloat * coeff_imag_from_imag               [[threadgroup(3)]],
+        threadgroup float * out_tile                            [[threadgroup(4)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint tiitg                                              [[thread_index_in_threadgroup]],
+        uint sgitg                                              [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile = 32;
+    constexpr int k_tile = 32;
+    constexpr int n_threads = 128;
+
+    const int row_base = (int) tgpig.x * row_tile;
+    const int col_tile = FC_fairy2i_bundle_w1_prefill_act_rows <= 8 ? 8 : 16;
+    const int col_base = (int) tgpig.y * col_tile;
+    const int blocks = args.k / QK_FAIRY2I_TILE64;
+    const int physical_m_tile = row_base / QK_FAIRY2I_TILE64;
+    const int coeff_base = (int) sgitg * 8 * k_tile;
+    const int simd_lane = (int) tiitg & 31;
+    const ulong act_plane_size =
+        (ulong) QK_FAIRY2I_ACT_Q16_64 * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows;
+    const ulong packed_coeff_entries =
+        (ulong) (args.m / QK_FAIRY2I_TILE64) * (ulong) blocks * 16UL;
+    device const uchar * packed_tile_metrics =
+        (device const uchar *) (packed_coeff_lut + packed_coeff_entries) + packed_coeff_entries;
+    simdgroup_bfloat8x8 a_rr;
+    simdgroup_bfloat8x8 a_ri;
+    simdgroup_bfloat8x8 a_ir;
+    simdgroup_bfloat8x8 a_ii;
+    simdgroup_bfloat8x8 b_r0;
+    simdgroup_bfloat8x8 b_i0;
+    simdgroup_bfloat8x8 b_r1;
+    simdgroup_bfloat8x8 b_i1;
+    simdgroup_float8x8 c_r0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_r1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    uint min_coeff_metric = 255U;
+    uint min_act_metric = 255U;
+
+    for (int wb = 0; wb < blocks; ++wb) {
+        if (tiitg < (uint) col_tile) {
+            const int col = col_base + (int) tiitg;
+            if (col < args.act_rows) {
+                min_act_metric = min(min_act_metric, act_block_metrics[col * blocks + wb]);
+            }
+        }
+        const int physical_tile = physical_m_tile * blocks + wb;
+        if (sgitg == 0U && simd_lane == 0) {
+            min_coeff_metric = min(min_coeff_metric, (uint) packed_tile_metrics[physical_tile]);
+        }
+        const ulong act_block_base = (ulong) wb * 2 * act_plane_size;
+
+        FOR_UNROLL (int k_chunk = 0; k_chunk < QK_FAIRY2I_TILE64; k_chunk += k_tile) {
+            {
+                const int coeff_row = (int) sgitg * 8 + (simd_lane >> 2);
+                const int q4_local = simd_lane & 3;
+                const int row_in_m64 = (row_base + coeff_row) & 63;
+                const int m16 = row_in_m64 >> 4;
+                const int row_lane = row_in_m64 & 15;
+                FOR_UNROLL (int code_group = 0; code_group < 2; ++code_group) {
+                    const int q4 = (k_chunk >> 2) + code_group * 4 + q4_local;
+                    const int slot = m16 * 16 + q4;
+                    const ulong code_base =
+                        ((((ulong) physical_tile * 64 + (ulong) slot) * 2) * 16) + (ulong) row_lane;
+                    const uint2 packed_codes = uint2(
+                        (uint) codes[code_base],
+                        (uint) codes[code_base + 16]);
+
+                    FOR_UNROLL (int part = 0; part < 4; ++part) {
+                        const uint2 code = (packed_codes >> uint2(2 * part)) & uint2(3);
+                        const ushort4 coeff =
+                            packed_coeff_lut[(ulong) physical_tile * 16UL + (ulong) (code.x | (code.y << 2))];
+                        const int coeff_index = coeff_row * k_tile + code_group * 16 + q4_local * 4 + part;
+                        ((threadgroup ushort *) coeff_real_from_real)[coeff_index] = coeff.x;
+                        ((threadgroup ushort *) coeff_real_from_imag)[coeff_index] = coeff.y;
+                        ((threadgroup ushort *) coeff_imag_from_real)[coeff_index] = coeff.z;
+                        ((threadgroup ushort *) coeff_imag_from_imag)[coeff_index] = coeff.w;
+                    }
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            const ulong act_real_base =
+                act_block_base + (ulong) k_chunk * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows +
+                (ulong) col_base;
+            const ulong act_imag_base = act_real_base + act_plane_size;
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base, k_tile);
+            simdgroup_load(
+                b_r0, act_b + act_real_base, FC_fairy2i_bundle_w1_prefill_act_rows);
+            simdgroup_load(
+                b_i0, act_b + act_imag_base, FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 8, FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 8, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 8, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base + 8, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base + 8, k_tile);
+            simdgroup_load(
+                b_r0, act_b + act_real_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows,
+                FC_fairy2i_bundle_w1_prefill_act_rows);
+            simdgroup_load(
+                b_i0, act_b + act_imag_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows,
+                FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 8 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 16, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 16, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base + 16, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base + 16, k_tile);
+            simdgroup_load(
+                b_r0, act_b + act_real_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows,
+                FC_fairy2i_bundle_w1_prefill_act_rows);
+            simdgroup_load(
+                b_i0, act_b + act_imag_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows,
+                FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 16 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base + 24, k_tile);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base + 24, k_tile);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base + 24, k_tile);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base + 24, k_tile);
+            simdgroup_load(
+                b_r0, act_b + act_real_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows,
+                FC_fairy2i_bundle_w1_prefill_act_rows);
+            simdgroup_load(
+                b_i0, act_b + act_imag_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows,
+                FC_fairy2i_bundle_w1_prefill_act_rows);
+            if (col_tile > 8) {
+                simdgroup_load(
+                    b_r1, act_b + act_real_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+                simdgroup_load(
+                    b_i1, act_b + act_imag_base + 24 * FC_fairy2i_bundle_w1_prefill_act_rows + 8,
+                    FC_fairy2i_bundle_w1_prefill_act_rows);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            if (col_tile > 8) {
+                simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+                simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+                simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+                simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+            }
+        }
+    }
+
+    const uint simd_coeff_metric = simd_min(min_coeff_metric);
+    const uint simd_act_metric = simd_min(min_act_metric);
+    if (simd_lane == 0) {
+        ((threadgroup uint *) out_tile)[sgitg] = simd_coeff_metric;
+        ((threadgroup uint *) out_tile)[4 + sgitg] = simd_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiitg == 0) {
+        uint tile_coeff_metric = 255U;
+        uint tile_act_metric = 255U;
+        for (int sg = 0; sg < 4; ++sg) {
+            tile_coeff_metric = min(tile_coeff_metric, ((threadgroup uint *) out_tile)[sg]);
+            tile_act_metric = min(tile_act_metric, ((threadgroup uint *) out_tile)[4 + sg]);
+        }
+        ((threadgroup uint *) out_tile)[0] = tile_coeff_metric;
+        ((threadgroup uint *) out_tile)[1] = tile_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const bool requires_software = fairy2i_product_metrics_require_software(
+        ((threadgroup uint *) out_tile)[0], ((threadgroup uint *) out_tile)[1]);
+    if (requires_software) {
+        for (uint idx = tiitg; idx < row_tile * col_tile; idx += n_threads) {
+            const int output_row_lane = (int) idx / col_tile;
+            const int col_local = (int) idx % col_tile;
+            const int row = row_base + output_row_lane;
+            const int col = col_base + col_local;
+            if (row < args.m && col < args.act_rows) {
+                uint real_bits = 0;
+                uint imag_bits = 0;
+                for (int k = 0; k < args.k; ++k) {
+                    const int wb = k / QK_FAIRY2I_TILE64;
+                    const int k_local = k & 63;
+                    const ulong block_base = (ulong) wb * 2 * act_plane_size;
+                    const ulong real_index =
+                        block_base + (ulong) k_local * (ulong) FC_fairy2i_bundle_w1_prefill_act_rows +
+                        (ulong) col;
+                    const ushort xr_bits = ((device const ushort *) act_b)[real_index];
+                    const ushort xi_bits = ((device const ushort *) act_b)[real_index + act_plane_size];
+                    const ushort4 coeff_bits =
+                        fairy2i_bundle_w1_coeff_at_bf16_exact_bits(codes, scales, blocks, row, k);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.x, xr_bits);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.y, xi_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.z, xr_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.w, xi_bits);
+                }
+
+                const int i1 = col % args.x_ne1;
+                const int i2 = (col / args.x_ne1) % args.x_ne2;
+                const int i3 = col / (args.x_ne1 * args.x_ne2);
+                ushort out_real_bits;
+                ushort out_imag_bits;
+                if (args.has_bias) {
+                    const int b0r = row % args.bias_ne0;
+                    const int b0i = (row + args.m) % args.bias_ne0;
+                    const int b1 = i1 % args.bias_ne1;
+                    const int b2 = i2 % args.bias_ne2;
+                    const int b3 = i3 % args.bias_ne3;
+                    const float bias_real = *((device const float *) (bias + (ulong) b0r * args.bias_nb0 +
+                                                                      (ulong) b1 * args.bias_nb1 +
+                                                                      (ulong) b2 * args.bias_nb2 +
+                                                                      (ulong) b3 * args.bias_nb3));
+                    const float bias_imag = *((device const float *) (bias + (ulong) b0i * args.bias_nb0 +
+                                                                      (ulong) b1 * args.bias_nb1 +
+                                                                      (ulong) b2 * args.bias_nb2 +
+                                                                      (ulong) b3 * args.bias_nb3));
+                    out_real_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(real_bits, bias_real);
+                    out_imag_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(imag_bits, bias_imag);
+                } else {
+                    out_real_bits = fairy2i_f32_to_bf16(as_type<float>(real_bits));
+                    out_imag_bits = fairy2i_f32_to_bf16(as_type<float>(imag_bits));
+                }
+                *((device uint *) (dst + (ulong) row * args.dst_nb0 + (ulong) i1 * args.dst_nb1 +
+                                   (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3)) =
+                    (uint) out_real_bits | ((uint) out_imag_bits << 16);
+            }
+        }
+        return;
+    }
+
+    const int simdgroup_out_stride = col_tile * 16;
+    const int simdgroup_out_base = (int) sgitg * simdgroup_out_stride;
+    simdgroup_store(c_r0, out_tile + simdgroup_out_base, 8);
+    simdgroup_store(c_i0, out_tile + simdgroup_out_base + 64, 8);
+    if (col_tile > 8) {
+        simdgroup_store(c_r1, out_tile + simdgroup_out_base + 128, 8);
+        simdgroup_store(c_i1, out_tile + simdgroup_out_base + 192, 8);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tiitg; idx < row_tile * col_tile; idx += n_threads) {
+        const int output_row_lane = (int) idx / col_tile;
+        const int col_local = (int) idx % col_tile;
+        const int tile = col_local >> 3;
+        const int col_lane = col_local & 7;
+        const int row = row_base + output_row_lane;
+        const int col = col_base + col_local;
+        if (row < args.m && col < args.act_rows) {
+            const int i1 = col % args.x_ne1;
+            const int i2 = (col / args.x_ne1) % args.x_ne2;
+            const int i3 = col / (args.x_ne1 * args.x_ne2);
+            const int row_group = output_row_lane >> 3;
+            const int row_in_group = output_row_lane & 7;
+            const int out_base = row_group * simdgroup_out_stride + tile * 128;
+            const float out_real = out_tile[out_base + row_in_group * 8 + col_lane];
+            const float out_imag = out_tile[out_base + 64 + row_in_group * 8 + col_lane];
+
+            ushort out_real_bits;
+            ushort out_imag_bits;
+            if (args.has_bias) {
+                const int b0r = row % args.bias_ne0;
+                const int b0i = (row + args.m) % args.bias_ne0;
+                const int b1 = i1 % args.bias_ne1;
+                const int b2 = i2 % args.bias_ne2;
+                const int b3 = i3 % args.bias_ne3;
+                const float bias_real = *((device const float *) (bias + (ulong) b0r * args.bias_nb0 +
+                                                                  (ulong) b1 * args.bias_nb1 +
+                                                                  (ulong) b2 * args.bias_nb2 +
+                                                                  (ulong) b3 * args.bias_nb3));
+                const float bias_imag = *((device const float *) (bias + (ulong) b0i * args.bias_nb0 +
+                                                                  (ulong) b1 * args.bias_nb1 +
+                                                                  (ulong) b2 * args.bias_nb2 +
+                                                                  (ulong) b3 * args.bias_nb3));
+                out_real_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(out_real, bias_real);
+                out_imag_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(out_imag, bias_imag);
+            } else {
+                out_real_bits = fairy2i_f32_to_bf16(out_real);
+                out_imag_bits = fairy2i_f32_to_bf16(out_imag);
+            }
+            *((device uint *) (dst + (ulong) row * args.dst_nb0 + (ulong) i1 * args.dst_nb1 +
+                               (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3)) =
+                (uint) out_real_bits | ((uint) out_imag_bits << 16);
+        }
+    }
+}
+
+kernel void kernel_fairy2i_bundle_w2_bfloat_bf16scale_exact_mma32x16(
+        constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
+        device const uchar * codes                              [[buffer(1)]],
+        device const ushort * scales                            [[buffer(2)]],
+        device const bfloat * act_b                             [[buffer(3)]],
+        device const char * bias                                [[buffer(4)]],
+        device char * dst                                       [[buffer(5)]],
+        threadgroup bfloat * coeff_real_from_real               [[threadgroup(0)]],
+        threadgroup bfloat * coeff_real_from_imag               [[threadgroup(1)]],
+        threadgroup bfloat * coeff_imag_from_real               [[threadgroup(2)]],
+        threadgroup bfloat * coeff_imag_from_imag               [[threadgroup(3)]],
+        threadgroup bfloat * act_real_tile0                     [[threadgroup(4)]],
+        threadgroup bfloat * act_imag_tile0                     [[threadgroup(5)]],
+        threadgroup bfloat * act_real_tile1                     [[threadgroup(6)]],
+        threadgroup bfloat * act_imag_tile1                     [[threadgroup(7)]],
+        threadgroup float * out_tile                            [[threadgroup(8)]],
+        uint2 tgpig                                             [[threadgroup_position_in_grid]],
+        uint tiitg                                              [[thread_index_in_threadgroup]],
+        uint sgitg                                              [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile = 32;
+    constexpr int k_tile = 8;
+    constexpr int n_threads = 128;
+
+    const int row_base = (int) tgpig.x * row_tile;
+    const int col_base = (int) tgpig.y * 16;
+    const int blocks = args.k / QK_FAIRY2I_TILE64;
+    const int physical_m_tile = row_base / QK_FAIRY2I_TILE64;
+    const int coeff_base = (int) sgitg * 64;
+    const int coeff_row = (int) tiitg & 31;
+    const int q4_local = (int) tiitg >> 5;
+    const int row_in_m64 = (row_base + coeff_row) & 63;
+    const int m16 = row_in_m64 >> 4;
+    const int row_lane = row_in_m64 & 15;
+    const int simd_lane       = (int) tiitg & 31;
+
+    simdgroup_bfloat8x8 a_rr;
+    simdgroup_bfloat8x8 a_ri;
+    simdgroup_bfloat8x8 a_ir;
+    simdgroup_bfloat8x8 a_ii;
+    simdgroup_bfloat8x8 b_r0;
+    simdgroup_bfloat8x8 b_i0;
+    simdgroup_bfloat8x8 b_r1;
+    simdgroup_bfloat8x8 b_i1;
+    simdgroup_float8x8 c_r0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_r1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 c_i1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    uint min_coeff_metric = 255U;
+    uint min_act_metric = 255U;
+    threadgroup ushort4 * coeff_lut = (threadgroup ushort4 *) out_tile;
+    threadgroup ushort * scale_staging = ((threadgroup ushort *) out_tile) + 1024;
+
+    for (int wb = 0; wb < blocks; ++wb) {
+        const int physical_tile = physical_m_tile * blocks + wb;
+        if (tiitg == 0) {
+            const int scale_base = physical_tile * 8;
+            *((threadgroup ushort4 *) scale_staging) =
+                *((device const ushort4 *) (scales + scale_base));
+            *((threadgroup ushort4 *) (scale_staging + 4)) =
+                *((device const ushort4 *) (scales + scale_base + 4));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const ushort4 scale01 = *((threadgroup ushort4 *) scale_staging);
+        const ushort4 scale23 = *((threadgroup ushort4 *) (scale_staging + 4));
+        const ushort4 scale_real = ushort4(scale01.x, scale01.z, scale23.x, scale23.z);
+        const ushort4 scale_imag = ushort4(scale01.y, scale01.w, scale23.y, scale23.w);
+        if (sgitg == 0U) {
+            uint stage_metric       = 255U;
+            uint stage_max_exponent = 0U;
+            if (simd_lane < 8) {
+                const uint branch = (uint) simd_lane >> 1;
+                const ushort scale = (simd_lane & 1) == 0 ? scale_real[branch] : scale_imag[branch];
+                stage_metric       = fairy2i_bf16_product_metric(scale);
+                stage_max_exponent = stage_metric == 255U ? 0U : stage_metric;
+            }
+            const uint min_stage_metric   = simd_min(stage_metric);
+            const uint max_stage_exponent = simd_max(stage_max_exponent);
+            if (simd_lane == 0) {
+                const uint block_coeff_metric =
+                    fairy2i_bf16_two_add_coefficient_metric_bound(min_stage_metric, max_stage_exponent);
+                min_coeff_metric = min(min_coeff_metric, block_coeff_metric);
+            }
+        }
+        fairy2i_build_bundle_w2_coeff_lut_bf16_exact(
+            coeff_lut, scale_real, scale_imag, tiitg, n_threads,
+            args.strict_staged_reconstruction != 0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        device const uchar * code_ptr =
+            codes + (ulong) physical_tile * 64 * 4 * 16 +
+            (ulong) (m16 * 16 + q4_local) * 4 * 16 + (ulong) row_lane;
+
+        for (int k_chunk = 0; k_chunk < QK_FAIRY2I_TILE64; k_chunk += k_tile) {
+            if (tiitg < 64) {
+                const uint4 packed_codes = uint4(
+                    (uint) code_ptr[0],
+                    (uint) code_ptr[16],
+                    (uint) code_ptr[32],
+                    (uint) code_ptr[48]);
+
+                FOR_UNROLL (int part = 0; part < 4; ++part) {
+                    const uint4 code = (packed_codes >> uint4(2 * part)) & uint4(3);
+                    const ushort4 coeff = coeff_lut[fairy2i_bundle_w2_coeff_lut_index(code)];
+                    const int coeff_index = coeff_row * k_tile + q4_local * 4 + part;
+                    ((threadgroup ushort *) coeff_real_from_real)[coeff_index] = coeff.x;
+                    ((threadgroup ushort *) coeff_real_from_imag)[coeff_index] = coeff.y;
+                    ((threadgroup ushort *) coeff_imag_from_real)[coeff_index] = coeff.z;
+                    ((threadgroup ushort *) coeff_imag_from_imag)[coeff_index] = coeff.w;
+                }
+                code_ptr += 2 * 4 * 16;
+            }
+
+            for (uint idx = tiitg; idx < 16 * k_tile; idx += n_threads) {
+                const int col_local = (int) idx / k_tile;
+                const int k_local = (int) idx % k_tile;
+                const int tile = col_local >> 3;
+                const int col_lane = col_local & 7;
+                const int col = col_base + col_local;
+
+                ushort xb_real_bits = 0;
+                ushort xb_imag_bits = 0;
+                if (col < args.act_rows) {
+                    const int act_index = col * blocks + wb;
+                    const int act_base = act_index * (2 * QK_FAIRY2I_ACT_Q16_64);
+                    xb_real_bits = ((device const ushort *) act_b)[act_base + k_chunk + k_local];
+                    xb_imag_bits =
+                        ((device const ushort *) act_b)[act_base + QK_FAIRY2I_ACT_Q16_64 + k_chunk + k_local];
+                }
+
+                const int act_tile_idx = k_local * 8 + col_lane;
+                if (tile == 0) {
+                    ((threadgroup ushort *) act_real_tile0)[act_tile_idx] = xb_real_bits;
+                    ((threadgroup ushort *) act_imag_tile0)[act_tile_idx] = xb_imag_bits;
+                } else {
+                    ((threadgroup ushort *) act_real_tile1)[act_tile_idx] = xb_real_bits;
+                    ((threadgroup ushort *) act_imag_tile1)[act_tile_idx] = xb_imag_bits;
+                }
+                min_act_metric = min(min_act_metric, fairy2i_bf16_product_metric(xb_real_bits));
+                min_act_metric = min(min_act_metric, fairy2i_bf16_product_metric(xb_imag_bits));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_load(a_rr, coeff_real_from_real + coeff_base);
+            simdgroup_load(a_ri, coeff_real_from_imag + coeff_base);
+            simdgroup_load(a_ir, coeff_imag_from_real + coeff_base);
+            simdgroup_load(a_ii, coeff_imag_from_imag + coeff_base);
+            simdgroup_load(b_r0, act_real_tile0);
+            simdgroup_load(b_i0, act_imag_tile0);
+            simdgroup_load(b_r1, act_real_tile1);
+            simdgroup_load(b_i1, act_imag_tile1);
+
+            // Once every SIMD-group has loaded the shared A/B tiles into its matrix registers, the
+            // threadgroup staging can be reused by the next K8 chunk while slower groups finish MMA.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_multiply_accumulate(c_r0, a_rr, b_r0, c_r0);
+            simdgroup_multiply_accumulate(c_r0, a_ri, b_i0, c_r0);
+            simdgroup_multiply_accumulate(c_i0, a_ir, b_r0, c_i0);
+            simdgroup_multiply_accumulate(c_i0, a_ii, b_i0, c_i0);
+            simdgroup_multiply_accumulate(c_r1, a_rr, b_r1, c_r1);
+            simdgroup_multiply_accumulate(c_r1, a_ri, b_i1, c_r1);
+            simdgroup_multiply_accumulate(c_i1, a_ir, b_r1, c_i1);
+            simdgroup_multiply_accumulate(c_i1, a_ii, b_i1, c_i1);
+        }
+    }
+
+    const uint simd_coeff_metric = simd_min(min_coeff_metric);
+    const uint simd_act_metric = simd_min(min_act_metric);
+    if (simd_lane == 0) {
+        ((threadgroup uint *) out_tile)[sgitg] = simd_coeff_metric;
+        ((threadgroup uint *) out_tile)[4 + sgitg] = simd_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiitg == 0) {
+        uint tile_coeff_metric = 255U;
+        uint tile_act_metric = 255U;
+        for (int sg = 0; sg < 4; ++sg) {
+            tile_coeff_metric = min(tile_coeff_metric, ((threadgroup uint *) out_tile)[sg]);
+            tile_act_metric = min(tile_act_metric, ((threadgroup uint *) out_tile)[4 + sg]);
+        }
+        ((threadgroup uint *) out_tile)[0] = tile_coeff_metric;
+        ((threadgroup uint *) out_tile)[1] = tile_act_metric;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const bool requires_software = fairy2i_product_metrics_require_software(
+        ((threadgroup uint *) out_tile)[0], ((threadgroup uint *) out_tile)[1]);
+    if (requires_software) {
+        for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
+            const int output_row_lane = (int) idx / 16;
+            const int col_local = (int) idx & 15;
+            const int row = row_base + output_row_lane;
+            const int col = col_base + col_local;
+            if (row < args.m && col < args.act_rows) {
+                uint real_bits = 0;
+                uint imag_bits = 0;
+                for (int k = 0; k < args.k; ++k) {
+                    const int wb = k / QK_FAIRY2I_TILE64;
+                    const int k_local = k & 63;
+                    const int act_index = col * blocks + wb;
+                    const int act_base = act_index * (2 * QK_FAIRY2I_TILE64);
+                    const ushort xr_bits = ((device const ushort *) act_b)[act_base + k_local];
+                    const ushort xi_bits =
+                        ((device const ushort *) act_b)[act_base + QK_FAIRY2I_TILE64 + k_local];
+                    const ushort4 coeff_bits =
+                        args.strict_staged_reconstruction != 0 ?
+                            fairy2i_bundle_w2_coeff_at_bf16_exact_bits(
+                                codes, scales, blocks, row, k) :
+                            fairy2i_bundle_w2_coeff_at_bf16_collapsed_f32_bits(
+                                codes, scales, blocks, row, k);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.x, xr_bits);
+                    real_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(real_bits, coeff_bits.y, xi_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.z, xr_bits);
+                    imag_bits = fairy2i_accumulate_bf16_product_f32_bits_rne(imag_bits, coeff_bits.w, xi_bits);
+                }
+
+                const int i1 = col % args.x_ne1;
+                const int i2 = (col / args.x_ne1) % args.x_ne2;
+                const int i3 = col / (args.x_ne1 * args.x_ne2);
+                ushort out_real_bits;
+                ushort out_imag_bits;
+                if (args.has_bias) {
+                    const int b0r = row % args.bias_ne0;
+                    const int b0i = (row + args.m) % args.bias_ne0;
+                    const int b1 = i1 % args.bias_ne1;
+                    const int b2 = i2 % args.bias_ne2;
+                    const int b3 = i3 % args.bias_ne3;
+                    const float bias_real = *((device const float *) (bias + (ulong) b0r * args.bias_nb0 +
+                                                                      (ulong) b1 * args.bias_nb1 +
+                                                                      (ulong) b2 * args.bias_nb2 +
+                                                                      (ulong) b3 * args.bias_nb3));
+                    const float bias_imag = *((device const float *) (bias + (ulong) b0i * args.bias_nb0 +
+                                                                      (ulong) b1 * args.bias_nb1 +
+                                                                      (ulong) b2 * args.bias_nb2 +
+                                                                      (ulong) b3 * args.bias_nb3));
+                    out_real_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(real_bits, bias_real);
+                    out_imag_bits = fairy2i_add_f32_bits_f32_bias_to_bf16_bits_rne(imag_bits, bias_imag);
+                } else {
+                    out_real_bits = fairy2i_f32_to_bf16(as_type<float>(real_bits));
+                    out_imag_bits = fairy2i_f32_to_bf16(as_type<float>(imag_bits));
+                }
+                *((device uint *) (dst + (ulong) row * args.dst_nb0 + (ulong) i1 * args.dst_nb1 +
+                                   (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3)) =
+                    (uint) out_real_bits | ((uint) out_imag_bits << 16);
+            }
+        }
+        return;
+    }
+
+    const int simdgroup_out_base = (int) sgitg * 256;
+    simdgroup_store(c_r0, out_tile + simdgroup_out_base, 8);
+    simdgroup_store(c_i0, out_tile + simdgroup_out_base + 64, 8);
+    simdgroup_store(c_r1, out_tile + simdgroup_out_base + 128, 8);
+    simdgroup_store(c_i1, out_tile + simdgroup_out_base + 192, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tiitg; idx < row_tile * 16; idx += n_threads) {
+        const int output_row_lane = (int) idx / 16;
+        const int col_local = (int) idx & 15;
+        const int tile = col_local >> 3;
+        const int col_lane = col_local & 7;
+        const int row = row_base + output_row_lane;
+        const int col = col_base + col_local;
+        if (row < args.m && col < args.act_rows) {
+            const int i1 = col % args.x_ne1;
+            const int i2 = (col / args.x_ne1) % args.x_ne2;
+            const int i3 = col / (args.x_ne1 * args.x_ne2);
+            const int row_group = output_row_lane >> 3;
+            const int row_in_group = output_row_lane & 7;
+            const int out_base = row_group * 256 + tile * 128;
+            float out_real = out_tile[out_base + row_in_group * 8 + col_lane];
+            float out_imag = out_tile[out_base + 64 + row_in_group * 8 + col_lane];
+
+            ushort out_real_bits;
+            ushort out_imag_bits;
+            if (args.has_bias) {
+                const int b0r = row % args.bias_ne0;
+                const int b0i = (row + args.m) % args.bias_ne0;
+                const int b1 = i1 % args.bias_ne1;
+                const int b2 = i2 % args.bias_ne2;
+                const int b3 = i3 % args.bias_ne3;
+                const float bias_real = *((device const float *) (bias + (ulong) b0r * args.bias_nb0 +
+                                                                  (ulong) b1 * args.bias_nb1 +
+                                                                  (ulong) b2 * args.bias_nb2 +
+                                                                  (ulong) b3 * args.bias_nb3));
+                const float bias_imag = *((device const float *) (bias + (ulong) b0i * args.bias_nb0 +
+                                                                  (ulong) b1 * args.bias_nb1 +
+                                                                  (ulong) b2 * args.bias_nb2 +
+                                                                  (ulong) b3 * args.bias_nb3));
+                out_real_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(out_real, bias_real);
+                out_imag_bits = fairy2i_add_f32_bias_to_bf16_bits_rne(out_imag, bias_imag);
+            } else {
+                out_real_bits = fairy2i_f32_to_bf16(out_real);
+                out_imag_bits = fairy2i_f32_to_bf16(out_imag);
+            }
+
+            *((device uint *) (dst + (ulong) row * args.dst_nb0 + (ulong) i1 * args.dst_nb1 +
+                               (ulong) i2 * args.dst_nb2 + (ulong) i3 * args.dst_nb3)) =
+                (uint) out_real_bits | ((uint) out_imag_bits << 16);
+        }
+    }
+}
+
+#endif
 
 template<int row_tile, int k_tile>
 kernel void kernel_fairy2i_wide_linear_w2_half_w64scale_mma_rows(
@@ -4448,6 +7500,325 @@ template [[host_name("kernel_rms_norm_f32")]]         kernel kernel_rms_norm_fus
 template [[host_name("kernel_rms_norm_mul_f32")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<2>;
 template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<3>;
 
+static inline uint fairy2i_mul_f32_bits_rne_ftz_safe(uint a, uint b) {
+    const uint abs_a = a & 0x7fffffffU;
+    const uint abs_b = b & 0x7fffffffU;
+    const uint exp_a = abs_a >> 23;
+    const uint exp_b = abs_b >> 23;
+    if (exp_a == 0xffU || exp_b == 0xffU) {
+        return fairy2i_mul_f32_bits_rne(a, b);
+    }
+    if (abs_a == 0U || abs_b == 0U) {
+        return ((a ^ b) >> 31) << 31;
+    }
+
+    if (exp_a > 0U && exp_b > 0U && exp_a + exp_b >= 128U) {
+        return as_type<uint>(as_type<float>(a) * as_type<float>(b));
+    }
+    return fairy2i_mul_f32_bits_rne(a, b);
+}
+
+static inline uint fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(ushort a, ushort b) {
+    const uint abs_a = (uint) a & 0x7fffU;
+    const uint abs_b = (uint) b & 0x7fffU;
+    const uint exp_a = abs_a >> 7;
+    const uint exp_b = abs_b >> 7;
+    if (exp_a == 0xffU || exp_b == 0xffU) {
+        return fairy2i_mul_bf16_to_f32_bits_rne(a, b);
+    }
+    if (abs_a == 0U || abs_b == 0U) {
+        return ((((uint) a ^ (uint) b) >> 15) & 1U) << 31;
+    }
+
+    if (exp_a > 0U && exp_b > 0U && exp_a + exp_b >= 128U) {
+        return as_type<uint>(fairy2i_bf16_to_f32(a) * fairy2i_bf16_to_f32(b));
+    }
+    return fairy2i_mul_bf16_to_f32_bits_rne(a, b);
+}
+
+kernel void kernel_fairy2i_silu_exact_f32(
+        constant ulong & ne,
+        device const uint * src0,
+        device       uint * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= ne) {
+        return;
+    }
+
+    const ushort value_bits = (ushort) (src0[gid] >> 16);
+    const uint    abs_bits   = (uint) value_bits & 0x7fffU;
+    const uint    exponent   = abs_bits >> 7;
+
+    ushort result_bits;
+    if (exponent <= 1U) {
+        // For BF16 subnormals and the smallest normal bin, SiLU rounds as x*0.5.
+        // Construct that product from payload bits because Apple GPUs flush an F32
+        // subnormal produced by native arithmetic.
+        const uint product_bits = fairy2i_mul_bf16_to_f32_bits_rne(value_bits, (ushort) 0x3f00U);
+        result_bits             = fairy2i_f32_bits_to_bf16_rne(product_bits);
+    } else {
+        const float value = fairy2i_bf16_to_f32(value_bits);
+        if ((value_bits & 0x8000U) == 0) {
+            result_bits = fairy2i_f32_to_bf16(value / (1.0f + exp(-value)));
+        } else if (value < -80.0f) {
+            // exp(value) is F32-subnormal in the part of the negative tail that
+            // can still round to a non-zero BF16 SiLU result. Build it from two
+            // normal factors and keep the product as payload bits. At this scale,
+            // 1 + exp(value) rounds exactly to 1 in F32.
+            const uint exp_bits = fairy2i_mul_f32_bits_rne(
+                as_type<uint>(exp(value + 64.0f)),
+                as_type<uint>(exp(-64.0f)));
+            const uint numerator_bits =
+                fairy2i_mul_f32_bits_rne(((uint) value_bits) << 16, exp_bits);
+            result_bits = fairy2i_f32_bits_to_bf16_rne(numerator_bits);
+        } else {
+            const float exp_value = exp(value);
+            result_bits = fairy2i_f32_to_bf16((value * exp_value) / (1.0f + exp_value));
+        }
+    }
+
+    dst[gid] = (uint) result_bits << 16;
+}
+
+kernel void kernel_fairy2i_silu_qat_f32(
+        constant ulong & ne,
+        device const uint * src0,
+        device       uint * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= ne) {
+        return;
+    }
+
+    const ushort value_bits = (ushort) (src0[gid] >> 16);
+    const float value = fairy2i_bf16_to_f32(value_bits);
+    const float result = value >= 0.0f ? value / (1.0f + exp(-value)) :
+                                         value * exp(value) / (1.0f + exp(value));
+    dst[gid] = (uint) fairy2i_f32_to_bf16(result) << 16;
+}
+
+kernel void kernel_fairy2i_mul_exact_f32(
+        constant ulong & ne,
+        device const uint * src0,
+        device const uint * src1,
+        device       uint * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= ne) {
+        return;
+    }
+
+    const ushort lhs_bits     = (ushort) (src0[gid] >> 16);
+    const ushort rhs_bits     = (ushort) (src1[gid] >> 16);
+    const uint    product_bits = fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(lhs_bits, rhs_bits);
+    dst[gid]                   = (uint) fairy2i_f32_bits_to_bf16_rne(product_bits) << 16;
+}
+
+kernel void kernel_fairy2i_mul_qat_f32(
+        constant ulong & ne,
+        device const uint * src0,
+        device const uint * src1,
+        device       uint * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= ne) {
+        return;
+    }
+
+    const float lhs = fairy2i_bf16_to_f32((ushort) (src0[gid] >> 16));
+    const float rhs = fairy2i_bf16_to_f32((ushort) (src1[gid] >> 16));
+    dst[gid] = (uint) fairy2i_f32_to_bf16(lhs * rhs) << 16;
+}
+
+kernel void kernel_fairy2i_pack_bf16_exact(
+        constant ulong & ne,
+        device const uint * src0,
+        device     ushort * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < ne) {
+        dst[gid] = (ushort) (src0[gid] >> 16);
+    }
+}
+
+kernel void kernel_fairy2i_round_bf16_f32(
+        constant ulong & ne,
+        device const float * src0,
+        device       uint * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < ne) {
+        dst[gid] = (uint) fairy2i_f32_to_bf16(src0[gid]) << 16;
+    }
+}
+
+// RMSNorm squares are non-negative, so an F32 accumulator can only be subnormal
+// when the first non-zero square is subnormal. BF16 exponent 52 is the
+// round-to-zero/subnormal boundary and exponent 64 starts the normal F32 range.
+// Non-finite values also use the bit-domain helper to preserve canonical NaNs.
+static inline bool fairy2i_rms_square_requires_software_fma(ushort value) {
+    const uint abs_value = (uint) value & 0x7fffU;
+    const uint exponent  = abs_value >> 7;
+    return exponent == 0xffU ||
+           (exponent >= 52U && exponent < 64U);
+}
+
+static inline bool fairy2i_rms_accumulator_requires_software_fma(uint value) {
+    const uint abs_value = value & 0x7fffffffU;
+    const uint exponent  = abs_value >> 23;
+    return (abs_value != 0U && exponent == 0U) || exponent == 0xffU;
+}
+
+kernel void kernel_fairy2i_rms_norm_exact_f32(
+        constant ggml_metal_kargs_fairy2i_rms_norm_exact & args,
+        device const char * src0,
+        device const char * weight,
+        device       char * dst,
+        threadgroup float * inv_rms_shared [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int i1 = (int) tgpig.x;
+    const int i2 = (int) tgpig.y;
+    const int i3 = (int) tgpig.z;
+
+    device const float * x = (device const float *)
+        (src0 + (ulong) i1 * args.nb01 + (ulong) i2 * args.nb02 + (ulong) i3 * args.nb03);
+    device float * y = (device float *)
+        (dst + (ulong) i1 * args.nb1 + (ulong) i2 * args.nb2 + (ulong) i3 * args.nb3);
+
+    const int w1 = i1 % args.ne11;
+    const int w2 = i2 % args.ne12;
+    const int w3 = i3 % args.ne13;
+    device const char * w_row =
+        weight + (ulong) w1 * args.nb11 + (ulong) w2 * args.nb12 + (ulong) w3 * args.nb13;
+
+    float fast_sum = 0.0f;
+    uint lane_requires_fallback = 0U;
+    for (int i0 = tiitg; i0 < args.ne00; i0 += ntg.x) {
+        const ushort x_bits = fairy2i_f32_to_bf16(x[i0]);
+        if (fairy2i_rms_square_requires_software_fma(x_bits)) {
+            lane_requires_fallback = 1U;
+            continue;
+        }
+
+        const float value = fairy2i_bf16_to_f32(x_bits);
+        fast_sum = precise::fma(value, value, fast_sum);
+        if (fairy2i_rms_accumulator_requires_software_fma(as_type<uint>(fast_sum))) {
+            lane_requires_fallback = 1U;
+        }
+    }
+
+    const float row_fast_sum = simd_sum(fast_sum);
+    const bool row_requires_fallback =
+        simd_max(lane_requires_fallback) != 0U ||
+        fairy2i_rms_accumulator_requires_software_fma(as_type<uint>(row_fast_sum));
+
+    if (tiitg == 0) {
+        uint sum_bits = as_type<uint>(row_fast_sum);
+        if (row_requires_fallback) {
+            sum_bits = 0;
+            for (int i0 = 0; i0 < args.ne00; ++i0) {
+                const ushort x_bits = fairy2i_f32_to_bf16(x[i0]);
+                if (fairy2i_rms_square_requires_software_fma(x_bits) ||
+                    fairy2i_rms_accumulator_requires_software_fma(sum_bits)) {
+                    sum_bits = fairy2i_fma_bf16_bf16_f32_bits_rne(x_bits, x_bits, sum_bits);
+                } else {
+                    const float value = fairy2i_bf16_to_f32(x_bits);
+                    sum_bits = as_type<uint>(
+                        precise::fma(value, value, as_type<float>(sum_bits)));
+                }
+            }
+        }
+        const uint mean_bits =
+            fairy2i_div_f32_by_positive_int_bits_rne(sum_bits, (uint) args.ne00);
+        const uint denominator_bits = fairy2i_add_f32_bits_rne(mean_bits, as_type<uint>(args.eps));
+        const uint denominator_exp = (denominator_bits & 0x7fffffffU) >> 23;
+        if ((denominator_bits & 0x7fffffffU) != 0 && denominator_exp == 0) {
+            const uint scaled_bits = fairy2i_mul_f32_bits_rne(denominator_bits, as_type<uint>(0x1p126f));
+            const float root = precise::sqrt(as_type<float>(scaled_bits));
+            const uint reciprocal_bits =
+                fairy2i_reciprocal_positive_normal_f32_bits_rne(as_type<uint>(root));
+            inv_rms_shared[0] = as_type<float>(
+                fairy2i_mul_f32_bits_rne(reciprocal_bits, as_type<uint>(0x1p63f)));
+        } else {
+            const float root = precise::sqrt(as_type<float>(denominator_bits));
+            inv_rms_shared[0] = as_type<float>(
+                fairy2i_reciprocal_positive_normal_f32_bits_rne(as_type<uint>(root)));
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float inv_rms = inv_rms_shared[0];
+    for (int i0 = tiitg; i0 < args.ne00; i0 += ntg.x) {
+        const ushort x_bits = fairy2i_f32_to_bf16(x[i0]);
+        const uint normalized_f32_bits =
+            fairy2i_mul_f32_bits_rne_ftz_safe(((uint) x_bits) << 16, as_type<uint>(inv_rms));
+        const ushort normalized_bits = fairy2i_f32_to_bf16(as_type<float>(normalized_f32_bits));
+        const float w = *((device const float *) (w_row + (ulong) (i0 % args.ne10) * args.nb10));
+        const ushort w_bits = fairy2i_f32_to_bf16(w);
+        const uint result_f32_bits =
+            fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(normalized_bits, w_bits);
+        const ushort result_bits = fairy2i_f32_to_bf16(as_type<float>(result_f32_bits));
+        ((device uint *) y)[i0] = ((uint) result_bits) << 16;
+    }
+}
+
+kernel void kernel_fairy2i_rms_norm_qat_f32(
+        constant ggml_metal_kargs_fairy2i_rms_norm_exact & args,
+        device const char * src0,
+        device const char * weight,
+        device       char * dst,
+        threadgroup float * inv_rms_shared [[threadgroup(0)]],
+        uint3   tgpig [[threadgroup_position_in_grid]],
+        ushort  tiitg [[thread_index_in_threadgroup]],
+        ushort3 ntg   [[threads_per_threadgroup]]) {
+    const int i1 = (int) tgpig.x;
+    const int i2 = (int) tgpig.y;
+    const int i3 = (int) tgpig.z;
+
+    device const float * x = (device const float *)
+        (src0 + (ulong) i1 * args.nb01 + (ulong) i2 * args.nb02 + (ulong) i3 * args.nb03);
+    device float * y = (device float *)
+        (dst + (ulong) i1 * args.nb1 + (ulong) i2 * args.nb2 + (ulong) i3 * args.nb3);
+
+    const int w1 = i1 % args.ne11;
+    const int w2 = i2 % args.ne12;
+    const int w3 = i3 % args.ne13;
+    device const char * w_row =
+        weight + (ulong) w1 * args.nb11 + (ulong) w2 * args.nb12 + (ulong) w3 * args.nb13;
+
+    float sum = 0.0f;
+    for (int i0 = tiitg; i0 < args.ne00; i0 += ntg.x) {
+        const float value = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(x[i0]));
+        sum = precise::fma(value, value, sum);
+    }
+    sum = simd_sum(sum);
+
+    const ushort tiisg = tiitg % N_SIMDWIDTH;
+    const ushort sgitg = tiitg / N_SIMDWIDTH;
+    if (tiisg == 0) {
+        inv_rms_shared[sgitg] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg == 0) {
+        float row_sum = 0.0f;
+        for (ushort isg = 0; isg < ntg.x / N_SIMDWIDTH; ++isg) {
+            row_sum = precise::fma(1.0f, inv_rms_shared[isg], row_sum);
+        }
+        inv_rms_shared[0] = 1.0f / precise::sqrt(row_sum / (float) args.ne00 + args.eps);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float inv_rms = inv_rms_shared[0];
+    for (int i0 = tiitg; i0 < args.ne00; i0 += ntg.x) {
+        const float value = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(x[i0]));
+        const float normalized = fairy2i_round_to_bf16_f32(value * inv_rms);
+        const float w = *((device const float *) (w_row + (ulong) (i0 % args.ne10) * args.nb10));
+        const float w_bf16 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(w));
+        ((device uint *) y)[i0] = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
+    }
+}
+
 kernel void kernel_l2_norm_f32(
         constant ggml_metal_kargs_l2_norm & args,
         device const char * src0,
@@ -5804,6 +9175,185 @@ template [[host_name("kernel_rope_multi_f16")]] kernel kernel_rope_multi_t kerne
 template [[host_name("kernel_rope_vision_f32")]] kernel kernel_rope_vision_t kernel_rope_vision<float>;
 template [[host_name("kernel_rope_vision_f16")]] kernel kernel_rope_vision_t kernel_rope_vision<half>;
 
+kernel void kernel_fairy2i_rope_neox_exact_f32(
+        constant ggml_metal_kargs_rope & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        threadgroup float * trig [[threadgroup(0)]],
+        ushort  tiitg [[thread_index_in_threadgroup]],
+        ushort3 tptg  [[threads_per_threadgroup]],
+        uint3   tgpig [[threadgroup_position_in_grid]]) {
+    const int i3 = (int) tgpig.z;
+    const int i2 = (int) tgpig.y;
+
+    device const int32_t * pos = (device const int32_t *) src1;
+
+    // Match the scalar oracle's recurrence instead of independently evaluating
+    // pow() for each lane. Trig values remain F32 until the explicit BF16 barrier.
+    if (tiitg == 0) {
+        float corr_dims[2];
+        rope_yarn_corr_dims(
+            args.n_dims,
+            args.n_ctx_orig,
+            args.freq_base,
+            args.beta_fast,
+            args.beta_slow,
+            corr_dims);
+
+        float theta = (float) pos[i2];
+        const float theta_scale = pow(args.freq_base, -2.0f / (float) args.n_dims);
+        for (int i0 = 0; i0 < args.n_dims; i0 += 2) {
+            const int ic = i0 / 2;
+            const float freq_factor = src2 != src0 ? ((device const float *) src2)[ic] : 1.0f;
+            float cos_theta;
+            float sin_theta;
+            rope_yarn(
+                theta / freq_factor,
+                args.freq_scale,
+                corr_dims,
+                i0,
+                args.ext_factor,
+                args.attn_factor,
+                &cos_theta,
+                &sin_theta);
+            trig[i0 + 0] = fairy2i_round_to_bf16_f32(cos_theta);
+            trig[i0 + 1] = fairy2i_round_to_bf16_f32(sin_theta);
+            theta *= theta_scale;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The trig sequence depends only on token/batch, not on the attention head.
+    // Flatten all heads into this threadgroup so it is generated exactly once.
+    const int n_pairs = args.n_dims / 2;
+    const int n_rotated = args.ne01 * n_pairs;
+    for (int linear = tiitg; linear < n_rotated; linear += tptg.x) {
+        const int i1 = linear / n_pairs;
+        const int ic = linear - i1 * n_pairs;
+        device const char * src_row =
+            src0 + (ulong) i3 * args.nb03 + (ulong) i2 * args.nb02 + (ulong) i1 * args.nb01;
+        device char * dst_row =
+            dst + (ulong) i3 * args.nb3 + (ulong) i2 * args.nb2 + (ulong) i1 * args.nb1;
+        const ushort x0_bits = fairy2i_f32_to_bf16(
+            *((device const float *) (src_row + (ulong) ic * args.nb00)));
+        const ushort x1_bits = fairy2i_f32_to_bf16(
+            *((device const float *) (src_row + (ulong) (ic + args.n_dims / 2) * args.nb00)));
+        const ushort cos_bits = fairy2i_f32_to_bf16(trig[2 * ic + 0]);
+        const ushort sin_bits = fairy2i_f32_to_bf16(trig[2 * ic + 1]);
+
+        const ushort x0_cos_bits =
+            fairy2i_f32_to_bf16(as_type<float>(fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(x0_bits, cos_bits)));
+        const ushort x1_sin_bits =
+            fairy2i_f32_to_bf16(as_type<float>(fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(x1_bits, sin_bits)));
+        const ushort x0_sin_bits =
+            fairy2i_f32_to_bf16(as_type<float>(fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(x0_bits, sin_bits)));
+        const ushort x1_cos_bits =
+            fairy2i_f32_to_bf16(as_type<float>(fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(x1_bits, cos_bits)));
+
+        const ushort out0_bits =
+            fairy2i_add_bf16_bits_rne(x0_cos_bits, (ushort) ((uint) x1_sin_bits ^ 0x8000U));
+        const ushort out1_bits = fairy2i_add_bf16_bits_rne(x0_sin_bits, x1_cos_bits);
+        *((device uint *) (dst_row + (ulong) ic * args.nb0)) = ((uint) out0_bits) << 16;
+        *((device uint *) (dst_row + (ulong) (ic + args.n_dims / 2) * args.nb0)) =
+            ((uint) out1_bits) << 16;
+    }
+
+    const int n_tail = args.ne00 - args.n_dims;
+    if (n_tail > 0) {
+        const int n_passthrough = args.ne01 * n_tail;
+        for (int linear = tiitg; linear < n_passthrough; linear += tptg.x) {
+            const int i1 = linear / n_tail;
+            const int i0 = args.n_dims + linear - i1 * n_tail;
+            device const char * src_row =
+                src0 + (ulong) i3 * args.nb03 + (ulong) i2 * args.nb02 + (ulong) i1 * args.nb01;
+            device char * dst_row =
+                dst + (ulong) i3 * args.nb3 + (ulong) i2 * args.nb2 + (ulong) i1 * args.nb1;
+            const float x = *((device const float *) (src_row + (ulong) i0 * args.nb00));
+            *((device uint *) (dst_row + (ulong) i0 * args.nb0)) =
+                ((uint) fairy2i_f32_to_bf16(x)) << 16;
+        }
+    }
+}
+
+kernel void kernel_fairy2i_rope_neox_qat_f32(
+        constant ggml_metal_kargs_rope & args,
+        device const char * src0,
+        device const char * src1,
+        device const char * src2,
+        device       char * dst,
+        ushort  tiitg [[thread_index_in_threadgroup]],
+        ushort3 tptg  [[threads_per_threadgroup]],
+        uint3   tgpig [[threadgroup_position_in_grid]]) {
+    const int i3 = (int) tgpig.z;
+    const int i2 = (int) tgpig.y;
+    const int i1 = (int) tgpig.x;
+
+    float corr_dims[2];
+    rope_yarn_corr_dims(
+        args.n_dims,
+        args.n_ctx_orig,
+        args.freq_base,
+        args.beta_fast,
+        args.beta_slow,
+        corr_dims);
+
+    device const int32_t * pos = (device const int32_t *) src1;
+    const float theta_base = (float) pos[i2];
+    const float inv_ndims = -1.0f / (float) args.n_dims;
+
+    for (int i0 = 2 * tiitg; i0 < args.ne0; i0 += 2 * tptg.x) {
+        device const char * src_row =
+            src0 + (ulong) i3 * args.nb03 + (ulong) i2 * args.nb02 + (ulong) i1 * args.nb01;
+        device char * dst_row =
+            dst + (ulong) i3 * args.nb3 + (ulong) i2 * args.nb2 + (ulong) i1 * args.nb1;
+
+        if (i0 < args.n_dims) {
+            const int ic = i0 / 2;
+            const float theta = theta_base * pow(args.freq_base, inv_ndims * (float) i0);
+            const float freq_factor = src2 != src0 ? ((device const float *) src2)[ic] : 1.0f;
+
+            float cos_theta;
+            float sin_theta;
+            rope_yarn(
+                theta / freq_factor,
+                args.freq_scale,
+                corr_dims,
+                i0,
+                args.ext_factor,
+                args.attn_factor,
+                &cos_theta,
+                &sin_theta);
+
+            const float x0 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(
+                *((device const float *) (src_row + (ulong) ic * args.nb00))));
+            const float x1 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(
+                *((device const float *) (src_row + (ulong) (ic + args.n_dims / 2) * args.nb00))));
+            const float cos_bf16 = fairy2i_round_to_bf16_f32(cos_theta);
+            const float sin_bf16 = fairy2i_round_to_bf16_f32(sin_theta);
+
+            const float x0_cos = fairy2i_round_to_bf16_f32(x0 * cos_bf16);
+            const float x1_sin = fairy2i_round_to_bf16_f32(x1 * sin_bf16);
+            const float x0_sin = fairy2i_round_to_bf16_f32(x0 * sin_bf16);
+            const float x1_cos = fairy2i_round_to_bf16_f32(x1 * cos_bf16);
+
+            *((device uint *) (dst_row + (ulong) ic * args.nb0)) =
+                (uint) fairy2i_f32_to_bf16(x0_cos - x1_sin) << 16;
+            *((device uint *) (dst_row + (ulong) (ic + args.n_dims / 2) * args.nb0)) =
+                (uint) fairy2i_f32_to_bf16(x0_sin + x1_cos) << 16;
+        } else {
+            const float x0 = *((device const float *) (src_row + (ulong) i0 * args.nb00));
+            const float x1 = *((device const float *) (src_row + (ulong) (i0 + 1) * args.nb00));
+            *((device uint *) (dst_row + (ulong) i0 * args.nb0)) =
+                (uint) fairy2i_f32_to_bf16(x0) << 16;
+            *((device uint *) (dst_row + (ulong) (i0 + 1) * args.nb0)) =
+                (uint) fairy2i_f32_to_bf16(x1) << 16;
+        }
+    }
+}
+
 // TODO: obolete -- remove
 //typedef void (im2col_t)(
 //        constant ggml_metal_kargs_im2col & args,
@@ -6193,6 +9743,699 @@ constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT 
 constant int32_t FC_flash_attn_ext_ns10 [[function_constant(FC_FLASH_ATTN_EXT + 20)]];
 constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 21)]];
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
+
+#if defined(GGML_METAL_HAS_BF16)
+template<short DK>
+static inline void fairy2i_flash_attn_exact_qk_tile(
+        threadgroup const bfloat * q,
+        device const bfloat * k,
+        int k_stride,
+        int key_base,
+        threadgroup float * scores,
+        ushort lane) {
+    uint q_metric = 255U;
+    uint k_metric = 255U;
+    for (int i = lane; i < 8 * DK; i += N_SIMDWIDTH) {
+        q_metric = min(q_metric, fairy2i_bf16_product_metric(((threadgroup const ushort *) q)[i]));
+        k_metric = min(
+            k_metric,
+            fairy2i_bf16_product_metric(
+                ((device const ushort *) k)[key_base * k_stride + (i / DK) * k_stride + i % DK]));
+    }
+    q_metric = simd_min(q_metric);
+    k_metric = simd_min(k_metric);
+
+    if (fairy2i_product_metrics_require_software(q_metric, k_metric)) {
+        for (int i = lane; i < 8 * 8; i += N_SIMDWIDTH) {
+            const int query = i / 8;
+            const int key = i % 8;
+            uint acc_bits = 0;
+            for (short d = 0; d < DK; ++d) {
+                const ushort q_bits = ((threadgroup const ushort *) q)[query * DK + d];
+                const ushort k_bits =
+                    ((device const ushort *) k)[(key_base + key) * k_stride + d];
+                acc_bits = fairy2i_fma_bf16_bf16_f32_bits_rne(q_bits, k_bits, acc_bits);
+            }
+            ((threadgroup uint *) scores)[i] = acc_bits;
+        }
+        return;
+    }
+
+    simdgroup_float8x8 qk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (short d = 0; d < DK; d += 8) {
+        simdgroup_bfloat8x8 mq;
+        simdgroup_bfloat8x8 mk;
+
+        simdgroup_barrier(mem_flags::mem_none);
+        simdgroup_load(mq, q + d, DK);
+        simdgroup_load(mk, k + key_base * k_stride + d, k_stride, 0, true);
+        simdgroup_barrier(mem_flags::mem_none);
+
+        simdgroup_multiply_accumulate(qk, mq, mk, qk);
+    }
+
+    simdgroup_store(qk, scores, 8);
+}
+
+static inline float fairy2i_flash_attn_exact_logit(
+        float qk,
+        float scale,
+        float mask) {
+    const uint scaled_f32_bits =
+        fairy2i_mul_f32_bits_rne_ftz_safe(as_type<uint>(qk), as_type<uint>(scale));
+    const ushort scaled_bits = fairy2i_f32_to_bf16(as_type<float>(scaled_f32_bits));
+    const uint logit_f32_bits =
+        fairy2i_add_f32_bits_rne(((uint) scaled_bits) << 16, as_type<uint>(mask));
+    return fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(as_type<float>(logit_f32_bits)));
+}
+
+static inline ushort fairy2i_flash_attn_exact_probability_bits(
+        float logit,
+        float row_max,
+        float row_sum,
+        float row_log_sum) {
+    if (row_sum == 0.0f) {
+        return (ushort) 0;
+    }
+
+    const uint delta_bits =
+        fairy2i_add_f32_bits_rne(as_type<uint>(logit), as_type<uint>(row_max) ^ 0x80000000U);
+    const float delta = as_type<float>(delta_bits);
+    uint probability_bits;
+    if (delta - row_log_sum < -80.0f) {
+        const float shifted = exp(delta + 64.0f) / row_sum;
+        probability_bits =
+            fairy2i_mul_f32_bits_rne_ftz_safe(as_type<uint>(shifted), as_type<uint>(exp(-64.0f)));
+    } else {
+        probability_bits = as_type<uint>(exp(delta) / row_sum);
+    }
+    return fairy2i_f32_to_bf16(as_type<float>(probability_bits));
+}
+
+template<short Q, short KV>
+static inline bool fairy2i_flash_attn_exact_block_all_masked(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * mask,
+        int iq1,
+        int iq2,
+        int iq3,
+        int key_base,
+        bool decode_gqa,
+        int gqa_ratio,
+        ushort lane) {
+    bool query_block_masked = true;
+    const bool query_valid =
+        lane < Q && (decode_gqa ? lane < gqa_ratio : iq1 + lane < args.ne01);
+    if (query_valid) {
+        const int query_index = decode_gqa ? 0 : iq1 + lane;
+        const int head_index = decode_gqa ? iq2 + lane : iq2;
+        device const float * mask_row = (device const float *)
+            (mask + (ulong) query_index * args.nb31 +
+             (ulong) (head_index % args.ne32) * args.nb32 +
+             (ulong) (iq3 % args.ne33) * args.nb33);
+        for (short c = 0; c < KV; ++c) {
+            query_block_masked =
+                query_block_masked && mask_row[key_base + c] == -INFINITY;
+        }
+    }
+    return simd_all(query_block_masked);
+}
+
+template<short DK, short DV, short Q = 8>
+kernel void kernel_fairy2i_flash_attn_ext_exact_bf16(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device       char * dst,
+        threadgroup uchar * smem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr short KV = 8;
+
+    const int iq3 = (int) tgpig.z;
+    const int gqa_ratio = args.ne02 / args.ne_12_2;
+    const bool decode_gqa =
+        args.ne01 == 1 && args.ne02 > args.ne_12_2 &&
+        args.ne02 % args.ne_12_2 == 0 && gqa_ratio <= Q;
+    const int iq2 = decode_gqa ? (int) tgpig.y * gqa_ratio : (int) tgpig.y;
+    const int iq1 = decode_gqa ? 0 : (int) tgpig.x * Q;
+
+    threadgroup bfloat * q_shared = (threadgroup bfloat *) smem;
+    threadgroup float * scores =
+        (threadgroup float *) (q_shared + Q * DK);
+    threadgroup bfloat * probabilities =
+        (threadgroup bfloat *) (scores + Q * KV);
+    threadgroup float * stats =
+        (threadgroup float *) (probabilities + Q * KV);
+    threadgroup float * output =
+        stats + 3 * Q;
+
+    device const char * q_base =
+        q + (ulong) iq1 * args.nb01 + (ulong) iq2 * args.nb02 + (ulong) iq3 * args.nb03;
+
+    const int ikv2 = iq2 / (args.ne02 / args.ne_12_2);
+    const int ikv3 = iq3 / (args.ne03 / args.ne_12_3);
+    device const bfloat * k_base = (device const bfloat *)
+        (k + (ulong) ikv2 * args.nb12 + (ulong) ikv3 * args.nb13);
+    device const bfloat * v_base = (device const bfloat *)
+        (v + (ulong) ikv2 * args.nb22 + (ulong) ikv3 * args.nb23);
+
+    for (int i = tiisg; i < Q * DK; i += N_SIMDWIDTH) {
+        const int query = i / DK;
+        const int d = i % DK;
+        float value = 0.0f;
+        const bool query_valid =
+            decode_gqa ? query < gqa_ratio : iq1 + query < args.ne01;
+        if (query_valid) {
+            const ulong query_offset =
+                decode_gqa ? (ulong) query * args.nb02 : (ulong) query * args.nb01;
+            value = *((device const float *) (q_base + query_offset) + d);
+        }
+        ((threadgroup ushort *) q_shared)[i] = fairy2i_f32_to_bf16(value);
+    }
+
+    for (int i = tiisg; i < Q * DV; i += N_SIMDWIDTH) {
+        output[i] = 0.0f;
+    }
+    if (tiisg < Q) {
+        stats[tiisg] = -INFINITY;
+        stats[Q + tiisg] = 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 1: obtain the global F32 softmax maximum and sum. Scores are
+    // reconstructed in row-major key order so probabilities can be normalized
+    // before their mandatory BF16 conversion in pass 2.
+    for (int key_base = 0; key_base < args.ne11; key_base += KV) {
+        if (fairy2i_flash_attn_exact_block_all_masked<Q, KV>(
+                args, mask, iq1, iq2, iq3, key_base, decode_gqa, gqa_ratio, tiisg)) {
+            continue;
+        }
+
+        fairy2i_flash_attn_exact_qk_tile<DK>(
+            q_shared, k_base, args.ns10, key_base, scores, tiisg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const bool query_valid =
+            tiisg < Q && (decode_gqa ? tiisg < gqa_ratio : iq1 + tiisg < args.ne01);
+        if (query_valid) {
+            const int query_index = decode_gqa ? 0 : iq1 + tiisg;
+            const int head_index = decode_gqa ? iq2 + tiisg : iq2;
+            device const float * mask_row = (device const float *)
+                (mask + (ulong) query_index * args.nb31 +
+                 (ulong) (head_index % args.ne32) * args.nb32 +
+                 (ulong) (iq3 % args.ne33) * args.nb33);
+
+            float row_max = stats[tiisg];
+            float row_sum = stats[Q + tiisg];
+            for (short c = 0; c < KV; ++c) {
+                const float mask_value = mask_row[key_base + c];
+                if (mask_value == -INFINITY) {
+                    continue;
+                }
+                const float logit = fairy2i_flash_attn_exact_logit(
+                    scores[tiisg * KV + c],
+                    args.scale,
+                    mask_value);
+                if (logit > -INFINITY) {
+                    if (row_sum == 0.0f) {
+                        row_max = logit;
+                        row_sum = 1.0f;
+                    } else {
+                        const float next_max = max(row_max, logit);
+                        row_sum = row_sum * exp(row_max - next_max) + exp(logit - next_max);
+                        row_max = next_max;
+                    }
+                }
+            }
+            stats[tiisg] = row_max;
+            stats[Q + tiisg] = row_sum;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tiisg < Q) {
+        stats[2 * Q + tiisg] = log(stats[Q + tiisg]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pass 2: reconstruct the same BF16 logits, normalize in F32, cast each
+    // probability to BF16, then use native BF16 MMA with an F32 accumulator.
+    // Once a block requires the bit-domain path, keep all following blocks there
+    // so a preserved subnormal accumulator is never fed back through native MMA.
+    bool pv_software_mode = false;
+    for (int key_base = 0; key_base < args.ne11; key_base += KV) {
+        if (fairy2i_flash_attn_exact_block_all_masked<Q, KV>(
+                args, mask, iq1, iq2, iq3, key_base, decode_gqa, gqa_ratio, tiisg)) {
+            continue;
+        }
+
+        fairy2i_flash_attn_exact_qk_tile<DK>(
+            q_shared, k_base, args.ns10, key_base, scores, tiisg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tiisg < Q) {
+            const bool query_valid =
+                decode_gqa ? tiisg < gqa_ratio : iq1 + tiisg < args.ne01;
+            if (query_valid) {
+                const int query_index = decode_gqa ? 0 : iq1 + tiisg;
+                const int head_index = decode_gqa ? iq2 + tiisg : iq2;
+                device const float * mask_row = (device const float *)
+                    (mask + (ulong) query_index * args.nb31 +
+                     (ulong) (head_index % args.ne32) * args.nb32 +
+                     (ulong) (iq3 % args.ne33) * args.nb33);
+                const float row_max = stats[tiisg];
+                const float row_sum = stats[Q + tiisg];
+                const float row_log_sum = stats[2 * Q + tiisg];
+                for (short c = 0; c < KV; ++c) {
+                    const float mask_value = mask_row[key_base + c];
+                    if (mask_value == -INFINITY) {
+                        ((threadgroup ushort *) probabilities)[tiisg * KV + c] = (ushort) 0;
+                        continue;
+                    }
+                    const float logit = fairy2i_flash_attn_exact_logit(
+                        scores[tiisg * KV + c],
+                        args.scale,
+                        mask_value);
+                    ((threadgroup ushort *) probabilities)[tiisg * KV + c] =
+                        fairy2i_flash_attn_exact_probability_bits(
+                            logit, row_max, row_sum, row_log_sum);
+                }
+            } else {
+                for (short c = 0; c < KV; ++c) {
+                    ((threadgroup ushort *) probabilities)[tiisg * KV + c] = (ushort) 0;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint probability_metric = 255U;
+        uint value_metric = 255U;
+        for (int i = tiisg; i < Q * KV; i += N_SIMDWIDTH) {
+            probability_metric = min(
+                probability_metric,
+                fairy2i_bf16_product_metric(((threadgroup const ushort *) probabilities)[i]));
+        }
+        for (int i = tiisg; i < KV * DV; i += N_SIMDWIDTH) {
+            value_metric = min(
+                value_metric,
+                fairy2i_bf16_product_metric(
+                    ((device const ushort *) v_base)[(key_base + i / DV) * args.ns20 + i % DV]));
+        }
+        probability_metric = simd_min(probability_metric);
+        value_metric = simd_min(value_metric);
+        pv_software_mode =
+            pv_software_mode ||
+            fairy2i_product_metrics_require_software(probability_metric, value_metric);
+
+        if (pv_software_mode) {
+            for (int i = tiisg; i < Q * DV; i += N_SIMDWIDTH) {
+                const int query = i / DV;
+                const int d = i % DV;
+                uint acc_bits = as_type<uint>(output[i]);
+                for (short c = 0; c < KV; ++c) {
+                    const ushort probability_bits =
+                        ((threadgroup const ushort *) probabilities)[query * KV + c];
+                    const ushort value_bits =
+                        ((device const ushort *) v_base)[(key_base + c) * args.ns20 + d];
+                    acc_bits = fairy2i_fma_bf16_bf16_f32_bits_rne(
+                        probability_bits, value_bits, acc_bits);
+                }
+                ((threadgroup uint *) output)[i] = acc_bits;
+            }
+        } else {
+            simdgroup_bfloat8x8 mp;
+            simdgroup_load(mp, probabilities, KV);
+
+            for (short d = 0; d < DV; d += 8) {
+                simdgroup_bfloat8x8 mv;
+                simdgroup_float8x8 mo;
+
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_load(mv, v_base + key_base * args.ns20 + d, args.ns20);
+                simdgroup_load(mo, output + d, DV);
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_multiply_accumulate(mo, mp, mv, mo);
+                simdgroup_store(mo, output + d, DV);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = tiisg; i < Q * DV; i += N_SIMDWIDTH) {
+        const int query = i / DV;
+        const int d = i % DV;
+        const bool query_valid =
+            decode_gqa ? query < gqa_ratio : iq1 + query < args.ne01;
+        if (query_valid) {
+            const int query_index = decode_gqa ? 0 : iq1 + query;
+            const int head_index = decode_gqa ? iq2 + query : iq2;
+            device float * dst_row = (device float *) dst +
+                ((ulong) iq3 * args.ne2 * args.ne1 +
+                 (ulong) query_index * args.ne1 + (ulong) head_index) * DV;
+            ((device uint *) dst_row)[d] = ((uint) fairy2i_f32_to_bf16(output[i])) << 16;
+        }
+    }
+
+    (void) sinks;
+}
+
+kernel void kernel_fairy2i_flash_attn_ext_exact_bf16_decode_vec_logits_dk128_dv128(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * q,
+        device const char * k,
+        device const char * mask,
+        device       char * tmp,
+        threadgroup uchar * smem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr short DK  = 128;
+    constexpr short Q   = 8;
+    constexpr short KV  = 8;
+    constexpr short NWG = 32;
+
+    const int iwg        = (int) tgpig.x;
+    const int kv_head    = (int) tgpig.y;
+    const int batch      = (int) tgpig.z;
+    const int gqa_ratio  = args.ne02 / args.ne_12_2;
+    const int q_head_base = kv_head * gqa_ratio;
+
+    const int n_blocks        = args.ne11 / KV;
+    const int blocks_per_wg   = (n_blocks + NWG - 1) / NWG;
+    const int block_begin     = iwg * blocks_per_wg;
+    const int block_end       = min(block_begin + blocks_per_wg, n_blocks);
+
+    threadgroup bfloat * q_shared = (threadgroup bfloat *) smem;
+    threadgroup float * scores = (threadgroup float *) (q_shared + Q * DK);
+
+    device const char * q_base =
+        q + (ulong) q_head_base * args.nb02 + (ulong) batch * args.nb03;
+    const int ikv3 = batch / (args.ne03 / args.ne_12_3);
+    device const bfloat * k_base = (device const bfloat *)
+        (k + (ulong) kv_head * args.nb12 + (ulong) ikv3 * args.nb13);
+
+    device ushort * logits = (device ushort *) tmp;
+
+    for (int i = tiisg; i < Q * DK; i += N_SIMDWIDTH) {
+        const int query = i / DK;
+        const int d = i % DK;
+        float value = 0.0f;
+        if (query < gqa_ratio && q_head_base + query < args.ne02) {
+            value = *((device const float *)
+                (q_base + (ulong) query * args.nb02) + d);
+        }
+        ((threadgroup ushort *) q_shared)[i] = fairy2i_f32_to_bf16(value);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int block = block_begin; block < block_end; ++block) {
+        const int key_base = block * KV;
+        fairy2i_flash_attn_exact_qk_tile<DK>(
+            q_shared, k_base, args.ns10, key_base, scores, tiisg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = tiisg; i < Q * KV; i += N_SIMDWIDTH) {
+            const int query = i / KV;
+            const int key_offset = i % KV;
+            if (query >= gqa_ratio || q_head_base + query >= args.ne02) {
+                continue;
+            }
+
+            const int q_head = q_head_base + query;
+            const int row = batch * args.ne02 + q_head;
+            device const float * mask_row = (device const float *)
+                (mask + (ulong) (q_head % args.ne32) * args.nb32 +
+                 (ulong) (batch % args.ne33) * args.nb33);
+            const float mask_value = mask_row[key_base + key_offset];
+            const ushort logit_bits =
+                mask_value == -INFINITY ?
+                    (ushort) 0xff80U :
+                    fairy2i_f32_to_bf16(fairy2i_flash_attn_exact_logit(
+                        scores[query * KV + key_offset], args.scale, mask_value));
+            logits[(ulong) row * args.ne11 + key_base + key_offset] = logit_bits;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void kernel_fairy2i_flash_attn_ext_exact_bf16_decode_vec_softmax_dk128_dv128(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device       char * tmp,
+        threadgroup float * stats [[threadgroup(0)]],
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short NSG = 8;
+
+    const int row = (int) tgpig;
+    const int nrows = args.ne01 * args.ne02 * args.ne03;
+    if (row >= nrows) {
+        return;
+    }
+
+    device ushort * logits = (device ushort *) tmp;
+    device ushort * probabilities = logits + (ulong) nrows * args.ne11;
+    device const ushort * row_logits = logits + (ulong) row * args.ne11;
+    device ushort * row_probabilities = probabilities + (ulong) row * args.ne11;
+
+    float lane_max = -INFINITY;
+    for (int key = tid; key < args.ne11; key += NSG * N_SIMDWIDTH) {
+        lane_max = max(lane_max, fairy2i_bf16_to_f32(row_logits[key]));
+    }
+    lane_max = simd_max(lane_max);
+    if (tiisg == 0) {
+        stats[sgitg] = lane_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        const float group_max = tiisg < NSG ? stats[tiisg] : -INFINITY;
+        const float row_max = simd_max(group_max);
+        if (tiisg == 0) {
+            stats[0] = row_max;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float lane_sum = 0.0f;
+    for (int key = tid; key < args.ne11; key += NSG * N_SIMDWIDTH) {
+        const float logit = fairy2i_bf16_to_f32(row_logits[key]);
+        if (logit != -INFINITY) {
+            lane_sum += exp(logit - stats[0]);
+        }
+    }
+    lane_sum = simd_sum(lane_sum);
+    if (tiisg == 0) {
+        stats[NSG + sgitg] = lane_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0) {
+        const float group_sum = tiisg < NSG ? stats[NSG + tiisg] : 0.0f;
+        const float row_sum = simd_sum(group_sum);
+        if (tiisg == 0) {
+            stats[1] = row_sum;
+            stats[2] = log(row_sum);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int key = tid; key < args.ne11; key += NSG * N_SIMDWIDTH) {
+        const float logit = fairy2i_bf16_to_f32(row_logits[key]);
+        row_probabilities[key] =
+            logit == -INFINITY ?
+                (ushort) 0 :
+                fairy2i_flash_attn_exact_probability_bits(
+                    logit, stats[0], stats[1], stats[2]);
+    }
+}
+
+kernel void kernel_fairy2i_flash_attn_ext_exact_bf16_decode_vec_output_partial_dk128_dv128(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * v,
+        device       char * tmp,
+        threadgroup uchar * smem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr short DV = 128;
+    constexpr short Q = 8;
+    constexpr short KV = 8;
+    constexpr short NWG = 32;
+
+    const int iwg = (int) tgpig.x;
+    const int kv_head = (int) tgpig.y;
+    const int batch = (int) tgpig.z;
+    const int gqa_ratio = args.ne02 / args.ne_12_2;
+    const int q_head_base = kv_head * gqa_ratio;
+    const int nrows = args.ne01 * args.ne02 * args.ne03;
+    if (iwg >= NWG) {
+        return;
+    }
+
+    const int ikv3 = batch / (args.ne03 / args.ne_12_3);
+    device const bfloat * v_base = (device const bfloat *)
+        (v + (ulong) kv_head * args.nb22 + (ulong) ikv3 * args.nb23);
+    device const ushort * logits = (device const ushort *) tmp;
+    device const ushort * probabilities =
+        logits + (ulong) nrows * args.ne11;
+    device uint * partials = (device uint *)
+        (logits + (ulong) 2 * nrows * args.ne11);
+
+    threadgroup bfloat * probabilities_shared = (threadgroup bfloat *) smem;
+    threadgroup float * output = (threadgroup float *) (probabilities_shared + Q * KV);
+
+    for (int i = tiisg; i < Q * DV; i += N_SIMDWIDTH) {
+        output[i] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int n_blocks = args.ne11 / KV;
+    const int blocks_per_wg = (n_blocks + NWG - 1) / NWG;
+    const int block_begin = iwg * blocks_per_wg;
+    const int block_end = min(block_begin + blocks_per_wg, n_blocks);
+    bool pv_software_mode = false;
+
+    for (int block = block_begin; block < block_end; ++block) {
+        const int key_base = block * KV;
+        for (int i = tiisg; i < Q * KV; i += N_SIMDWIDTH) {
+            const int query = i / KV;
+            const int key_offset = i % KV;
+            ushort probability_bits = 0;
+            if (query < gqa_ratio && q_head_base + query < args.ne02) {
+                const int row = batch * args.ne02 + q_head_base + query;
+                probability_bits =
+                    probabilities[(ulong) row * args.ne11 + key_base + key_offset];
+            }
+            ((threadgroup ushort *) probabilities_shared)[i] = probability_bits;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint probability_metric = 255U;
+        uint value_metric = 255U;
+        for (int i = tiisg; i < Q * KV; i += N_SIMDWIDTH) {
+            probability_metric = min(
+                probability_metric,
+                fairy2i_bf16_product_metric(
+                    ((threadgroup const ushort *) probabilities_shared)[i]));
+        }
+        for (int i = tiisg; i < KV * DV; i += N_SIMDWIDTH) {
+            value_metric = min(
+                value_metric,
+                fairy2i_bf16_product_metric(
+                    ((device const ushort *) v_base)[
+                        (ulong) (key_base + i / DV) * args.ns20 + i % DV]));
+        }
+        probability_metric = simd_min(probability_metric);
+        value_metric = simd_min(value_metric);
+        pv_software_mode =
+            pv_software_mode ||
+            fairy2i_product_metrics_require_software(probability_metric, value_metric);
+
+        if (pv_software_mode) {
+            for (int i = tiisg; i < Q * DV; i += N_SIMDWIDTH) {
+                const int query = i / DV;
+                const int d = i % DV;
+                uint acc_bits = as_type<uint>(output[i]);
+                for (short c = 0; c < KV; ++c) {
+                    const ushort probability_bits =
+                        ((threadgroup const ushort *) probabilities_shared)[query * KV + c];
+                    const ushort value_bits =
+                        ((device const ushort *) v_base)[
+                            (ulong) (key_base + c) * args.ns20 + d];
+                    acc_bits = fairy2i_fma_bf16_bf16_f32_bits_rne(
+                        probability_bits, value_bits, acc_bits);
+                }
+                ((threadgroup uint *) output)[i] = acc_bits;
+            }
+        } else {
+            simdgroup_bfloat8x8 mp;
+            simdgroup_load(mp, probabilities_shared, KV);
+
+            for (short d = 0; d < DV; d += 8) {
+                simdgroup_bfloat8x8 mv;
+                simdgroup_float8x8 mo;
+
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_load(mv, v_base + key_base * args.ns20 + d, args.ns20);
+                simdgroup_load(mo, output + d, DV);
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_multiply_accumulate(mo, mp, mv, mo);
+                simdgroup_store(mo, output + d, DV);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int i = tiisg; i < gqa_ratio * DV; i += N_SIMDWIDTH) {
+        const int query = i / DV;
+        const int d = i % DV;
+        const int row = batch * args.ne02 + q_head_base + query;
+        partials[((ulong) row * NWG + iwg) * DV + d] =
+            ((threadgroup const uint *) output)[i];
+    }
+}
+
+kernel void kernel_fairy2i_flash_attn_ext_exact_bf16_decode_vec_output_reduce_dk128_dv128(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * tmp,
+        device       char * dst,
+        uint   tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr short DV = 128;
+    constexpr short NWG = 32;
+
+    const int row = (int) tgpig;
+    const int nrows = args.ne01 * args.ne02 * args.ne03;
+    if (row >= nrows || tid >= DV) {
+        return;
+    }
+
+    device const ushort * logits = (device const ushort *) tmp;
+    device const uint * partials = (device const uint *)
+        (logits + (ulong) 2 * nrows * args.ne11);
+    uint acc_bits = 0;
+    for (short iwg = 0; iwg < NWG; ++iwg) {
+        acc_bits = fairy2i_add_f32_bits_rne(
+            acc_bits,
+            partials[((ulong) row * NWG + iwg) * DV + tid]);
+    }
+
+    ((device uint *) dst)[(ulong) row * DV + tid] =
+        ((uint) fairy2i_f32_to_bf16(as_type<float>(acc_bits))) << 16;
+}
+
+typedef decltype(kernel_fairy2i_flash_attn_ext_exact_bf16<64, 64>) fairy2i_flash_attn_ext_exact_t;
+
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk40_dv40")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<40, 40>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk64_dv64")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<64, 64>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk80_dv80")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<80, 80>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk96_dv96")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<96, 96>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk112_dv112")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<112, 112>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk128_dv128")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<128, 128>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk192_dv192")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<192, 192>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk192_dv128")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<192, 128>;
+template [[host_name("kernel_fairy2i_flash_attn_ext_exact_bf16_dk256_dv256")]]
+kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<256, 256>;
+#endif
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
 template<
@@ -6721,7 +10964,13 @@ void kernel_flash_attn_ext_impl(
             FOR_UNROLL (short ii = 0; ii < DV4/NW; ++ii) {
                 const short i = ii*NW + tiisg;
 
-                dst4[i] = (float4) so4[j*PV4 + i]*scale;
+                float4 result = (float4) so4[j*PV4 + i]*scale;
+#if defined(GGML_METAL_HAS_BF16)
+                if (is_same<q_t, bfloat>::value && is_same<o_t, float>::value) {
+                    result = fairy2i_round_to_bf16_f32(result);
+                }
+#endif
+                dst4[i] = result;
             }
         } else {
             for (short i = tiisg; i < DV4; i += NW) {
@@ -6807,6 +11056,14 @@ kernel void kernel_flash_attn_ext(
     half,   half4,     simdgroup_half8x8
     //float,  float4,    simdgroup_float8x8
 
+#define FA_TYPES_FAIRY_BF \
+    bfloat, bfloat4,   simdgroup_bfloat8x8, \
+    bfloat, bfloat4x4, simdgroup_bfloat8x8, \
+    bfloat, bfloat4x4, simdgroup_bfloat8x8, \
+    float,             simdgroup_float8x8,  \
+    float,  float2,    simdgroup_float8x8,  \
+    float,  float4,    simdgroup_float8x8
+
 typedef decltype(kernel_flash_attn_ext<FA_TYPES, half4x4, 1, dequantize_f16, half4x4, 1, dequantize_f16, 64, 64>) flash_attn_ext_t;
 
 template [[host_name("kernel_flash_attn_ext_f16_dk40_dv40"  )]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  40,  40>;
@@ -6821,6 +11078,7 @@ template [[host_name("kernel_flash_attn_ext_f16_dk256_dv256")]]  kernel flash_at
 template [[host_name("kernel_flash_attn_ext_f16_dk576_dv512")]]  kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    half4x4,    1, dequantize_f16,  half4x4,    1, dequantize_f16,  576, 512>;
 
 #if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_flash_attn_ext_fairy_bf16_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_FAIRY_BF, bfloat4x4, 1, dequantize_bf16, bfloat4x4, 1, dequantize_bf16, 128, 128>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk40_dv40"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 40,  40>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 64,  64>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 80,  80>;
@@ -6890,6 +11148,7 @@ template [[host_name("kernel_flash_attn_ext_q8_0_dk576_dv512")]] kernel flash_at
 
 #undef FA_TYPES
 #undef FA_TYPES_BF
+#undef FA_TYPES_FAIRY_BF
 
 constant bool FC_flash_attn_ext_vec_has_mask  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 0)]];
 constant bool FC_flash_attn_ext_vec_has_sinks [[function_constant(FC_FLASH_ATTN_EXT_VEC + 1)]];
@@ -6996,7 +11255,7 @@ void kernel_flash_attn_ext_vec_impl(
         if (iq1 < args.ne01 && i < DK4) {
             sq4[i] = (q4_t) q4[i];
         } else {
-            sq4[i] = (q4_t) 0.0f;
+            sq4[i] = (q4_t) float4(0.0f);
         }
     }
 
@@ -7309,7 +11568,13 @@ void kernel_flash_attn_ext_vec_impl(
 
         // interleave the workgroup data
         for (short i = tiisg; i < DV4; i += NW) {
-            dst4[rid*DV4*NWG + NWG*i + iwg] = (float4) so4[i]*S;
+            float4 result = (float4) so4[i]*S;
+#if defined(GGML_METAL_HAS_BF16)
+            if (NWG == 1 && is_same<q4_t, bfloat4>::value && is_same<o4_t, float4>::value) {
+                result = fairy2i_round_to_bf16_f32(result);
+            }
+#endif
+            dst4[rid*DV4*NWG + NWG*i + iwg] = result;
         }
 
         // store S and M
@@ -7383,6 +11648,14 @@ kernel void kernel_flash_attn_ext_vec(
     float, float4, \
            float4
 
+#define FA_TYPES_FAIRY_BF \
+         bfloat4,  \
+         bfloat4,  \
+         bfloat4,  \
+    float,         \
+    float, float4, \
+           float4
+
 typedef decltype(kernel_flash_attn_ext_vec<FA_TYPES, half4, 1, dequantize_f16_t4, half4, 1, dequantize_f16_t4, 128, 128, 4>) flash_attn_ext_vec_t;
 
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk64_dv64")]]    kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, half4,      1, dequantize_f16_t4,  half4,       1, dequantize_f16_t4,  64, 64, 2>;
@@ -7407,6 +11680,7 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk96_dv96")]]   kernel flas
 
 template [[host_name("kernel_flash_attn_ext_vec_f16_dk128_dv128")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, half4,      1, dequantize_f16_t4,  half4,       1, dequantize_f16_t4,  128, 128, 1>;
 #if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_flash_attn_ext_vec_fairy_bf16_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_FAIRY_BF, bfloat4, 1, dequantize_bf16_t4, bfloat4, 1, dequantize_bf16_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_bf16_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, bfloat4,    1, dequantize_bf16_t4, bfloat4,     1, dequantize_bf16_t4, 128, 128, 1>;
 #endif
 template [[host_name("kernel_flash_attn_ext_vec_q4_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q4_0, 8, dequantize_q4_0_t4, block_q4_0,  8, dequantize_q4_0_t4, 128, 128, 1>;
@@ -7456,9 +11730,11 @@ template [[host_name("kernel_flash_attn_ext_vec_q5_1_dk576_dv512")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q8_0,  8, dequantize_q8_0_t4, 576, 512, 2>;
 
 #undef FA_TYPES
+#undef FA_TYPES_FAIRY_BF
 
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
+constant bool FC_flash_attn_ext_vec_reduce_round_bf16 [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 2)]];
 
 kernel void kernel_flash_attn_ext_vec_reduce(
         constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
@@ -7493,7 +11769,8 @@ kernel void kernel_flash_attn_ext_vec_reduce(
         const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
 
         if (iwg == 0) {
-            dst4[i] = v*S;
+            const float4 result = v*S;
+            dst4[i] = FC_flash_attn_ext_vec_reduce_round_bf16 ? fairy2i_round_to_bf16_f32(result) : result;
         }
     }
 
@@ -7855,12 +12132,42 @@ kernel void kernel_complex_add(
         const uint a = *((device const uint *) (src0_row + i0 * args.nb00));
         const uint b = *((device const uint *) (src1_row + i10 * args.nb10));
 
-        const float ar = fairy2i_bf16_to_f32((ushort) (a & 0xffffU));
-        const float ai = fairy2i_bf16_to_f32((ushort) (a >> 16));
-        const float br = fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
-        const float bi = fairy2i_bf16_to_f32((ushort) (b >> 16));
+        const ushort real = fairy2i_add_bf16_bits_rne((ushort) (a & 0xffffU), (ushort) (b & 0xffffU));
+        const ushort imag = fairy2i_add_bf16_bits_rne((ushort) (a >> 16), (ushort) (b >> 16));
+        *((device uint *) (dst_row + i0 * args.nb0)) = (uint) real | ((uint) imag << 16);
+    }
+}
 
-        *((device uint *) (dst_row + i0 * args.nb0)) = fairy2i_pack_bf16_pair(ar + br, ai + bi);
+kernel void kernel_complex_add_qat(
+    constant ggml_metal_kargs_bin & args,
+    device  const char * src0,
+    device  const char * src1,
+    device        char * dst,
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    ushort3 tpitg[[thread_position_in_threadgroup]],
+    ushort3   ntg[[threads_per_threadgroup]]) {
+    const int i03 = tgpig.z;
+    const int i02 = tgpig.y;
+    const int i01 = tgpig.x;
+
+    const int i13 = i03 % args.ne13;
+    const int i12 = i02 % args.ne12;
+    const int i11 = i01 % args.ne11;
+
+    device const char * src0_row = src0 + i03 * args.nb03 + i02 * args.nb02 + i01 * args.nb01;
+    device const char * src1_row = src1 + i13 * args.nb13 + i12 * args.nb12 + i11 * args.nb11;
+    device       char * dst_row  = dst  + i03 * args.nb3  + i02 * args.nb2  + i01 * args.nb1;
+
+    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+        const int i10 = i0 % args.ne10;
+        const uint a = *((device const uint *) (src0_row + i0 * args.nb00));
+        const uint b = *((device const uint *) (src1_row + i10 * args.nb10));
+
+        const float real = fairy2i_bf16_to_f32((ushort) (a & 0xffffU)) +
+                           fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
+        const float imag = fairy2i_bf16_to_f32((ushort) (a >> 16)) +
+                           fairy2i_bf16_to_f32((ushort) (b >> 16));
+        *((device uint *) (dst_row + i0 * args.nb0)) = fairy2i_pack_bf16_pair(real, imag);
     }
 }
 
@@ -9697,6 +14004,39 @@ kernel void kernel_set_rows_f(
 
     for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
         dst_row[ind] = (T) src_row[ind];
+    }
+}
+
+kernel void kernel_set_rows_bf16_raw(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device        void * dst,
+        uint3                tgpig [[threadgroup_position_in_grid]],
+        uint                 tiitg [[thread_index_in_threadgroup]],
+        uint3                tptg  [[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+
+    const int32_t i12 = i03 % args.ne12;
+    const int32_t i11 = i02 % args.ne11;
+
+    const int32_t i01 = tgpig.x * tptg.y + tiitg / tptg.x;
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    const int64_t i1 = ((const device int64_t *) ((const device char *) src1 +
+                                                  i01 * args.nb10 + i11 * args.nb11 + i12 * args.nb12))[0];
+
+    device ushort * dst_row =
+        (device ushort *) ((device char *) dst + i1 * args.nb1 + i02 * args.nb2 + i03 * args.nb3);
+    const device ushort * src_row =
+        (const device ushort *) ((const device char *) src0 +
+                                 i01 * args.nb01 + i02 * args.nb02 + i03 * args.nb03);
+
+    for (int ind = tiitg % tptg.x; ind < args.nk0; ind += tptg.x) {
+        dst_row[ind] = src_row[ind];
     }
 }
 

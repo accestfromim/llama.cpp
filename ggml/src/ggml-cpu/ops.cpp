@@ -13,6 +13,17 @@
 
 #include <algorithm>
 
+static inline uint32_t fairy2i_load_packed_bf16_pair(const void * src) {
+    uint32_t bits;
+    memcpy(&bits, src, sizeof(bits));
+    return bits;
+}
+
+static inline void fairy2i_store_packed_bf16_pair(void * dst, ggml_bf16_t real, ggml_bf16_t imag) {
+    const uint32_t bits = (uint32_t) real.bits | ((uint32_t) imag.bits << 16);
+    memcpy(dst, &bits, sizeof(bits));
+}
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -3615,9 +3626,9 @@ static void ggml_compute_forward_rms_norm_complex(const ggml_compute_params * pa
 
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    const ggml_bf16_t * p  = (const ggml_bf16_t *) &x[i00];
-                    const float         xr = GGML_BF16_TO_FP32(p[0]);
-                    const float         xi = GGML_BF16_TO_FP32(p[1]);
+                    const uint32_t bits = fairy2i_load_packed_bf16_pair(&x[i00]);
+                    const float    xr   = GGML_BF16_TO_FP32({ (uint16_t) bits });
+                    const float    xi   = GGML_BF16_TO_FP32({ (uint16_t) (bits >> 16) });
                     sum += (ggml_float) (xr * xr + xi * xi);
                 }
 
@@ -3628,12 +3639,10 @@ static void ggml_compute_forward_rms_norm_complex(const ggml_compute_params * pa
                 const float scale = 1.0f / sqrtf(mean + eps);
 
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    const ggml_bf16_t * p  = (const ggml_bf16_t *) &x[i00];
-                    const float         xr = GGML_BF16_TO_FP32(p[0]) * scale;
-                    const float         xi = GGML_BF16_TO_FP32(p[1]) * scale;
-                    ggml_bf16_t *       q  = (ggml_bf16_t *) &y[i00];
-                    q[0]                   = GGML_FP32_TO_BF16(xr);
-                    q[1]                   = GGML_FP32_TO_BF16(xi);
+                    const uint32_t bits = fairy2i_load_packed_bf16_pair(&x[i00]);
+                    const float    xr   = GGML_BF16_TO_FP32({ (uint16_t) bits }) * scale;
+                    const float    xi   = GGML_BF16_TO_FP32({ (uint16_t) (bits >> 16) }) * scale;
+                    fairy2i_store_packed_bf16_pair(&y[i00], GGML_FP32_TO_BF16(xr), GGML_FP32_TO_BF16(xi));
                 }
             }
         }
@@ -3646,6 +3655,269 @@ void ggml_compute_forward_complex_rmsnorm(const ggml_compute_params * params, gg
 
 void ggml_compute_forward_ifairy_rmsnorm(const ggml_compute_params * params, ggml_tensor * dst) {
     ggml_compute_forward_complex_rmsnorm(params, dst);
+}
+
+void ggml_compute_forward_fairy2i_rms_norm_exact(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0   = dst->src[0];
+    const ggml_tensor * weight = dst->src[1];
+
+    GGML_ASSERT(src0 && weight);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && weight->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(eps));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t nrows = ggml_nrows(src0);
+    const int64_t begin = nrows * params->ith / params->nth;
+    const int64_t end   = nrows * (params->ith + 1) / params->nth;
+
+    for (int64_t row = begin; row < end; ++row) {
+        const int64_t i1 = row % src0->ne[1];
+        const int64_t i2 = (row / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = row / (src0->ne[1] * src0->ne[2]);
+
+        const float * x =
+            (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float * y = (float *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        float sum = 0.0f;
+        for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+            sum = fmaf(x[i0], x[i0], sum);
+        }
+        const float inv_rms = 1.0f / sqrtf(sum / (float) src0->ne[0] + eps);
+
+        const int64_t w1   = i1 % weight->ne[1];
+        const int64_t w2   = i2 % weight->ne[2];
+        const int64_t w3   = i3 % weight->ne[3];
+        const char * w_row = (const char *) weight->data + w1 * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3];
+
+        for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+            const float normalized = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x[i0] * inv_rms));
+            const float w          = *(const float *) (w_row + (i0 % weight->ne[0]) * weight->nb[0]);
+            const float w_bf16     = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(w));
+            y[i0]                  = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(normalized * w_bf16));
+        }
+    }
+}
+
+static ggml_bf16_t fairy2i_f32_carrier_to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return { (uint16_t) (bits >> 16) };
+}
+
+static float fairy2i_bf16_to_f32_carrier(ggml_bf16_t value) {
+    const uint32_t bits = (uint32_t) value.bits << 16;
+    float          result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+void ggml_compute_forward_fairy2i_silu_exact(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int64_t nrows = ggml_nrows(src0);
+    const int64_t begin = nrows * params->ith / params->nth;
+    const int64_t end   = nrows * (params->ith + 1) / params->nth;
+
+    for (int64_t row = begin; row < end; ++row) {
+        const int64_t i1 = row % src0->ne[1];
+        const int64_t i2 = (row / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = row / (src0->ne[1] * src0->ne[2]);
+
+        const float * x =
+            (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float * y = (float *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+            const float value = GGML_BF16_TO_FP32(fairy2i_f32_carrier_to_bf16(x[i0]));
+            float       silu;
+            if (signbit(value)) {
+                const float exp_value = expf(value);
+                const float numerator = value * exp_value;
+                silu                  = numerator / (1.0f + exp_value);
+            } else {
+                silu = value / (1.0f + expf(-value));
+            }
+            y[i0] = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(silu));
+        }
+    }
+}
+
+void ggml_compute_forward_fairy2i_mul_exact(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0 && src1);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int64_t nrows = ggml_nrows(src0);
+    const int64_t begin = nrows * params->ith / params->nth;
+    const int64_t end   = nrows * (params->ith + 1) / params->nth;
+
+    for (int64_t row = begin; row < end; ++row) {
+        const int64_t i1 = row % src0->ne[1];
+        const int64_t i2 = (row / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = row / (src0->ne[1] * src0->ne[2]);
+
+        const float * x =
+            (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        const float * z =
+            (const float *) ((const char *) src1->data + i1 * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3]);
+        float * y = (float *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+            const double lhs = GGML_BF16_TO_FP32(fairy2i_f32_carrier_to_bf16(x[i0]));
+            const double rhs = GGML_BF16_TO_FP32(fairy2i_f32_carrier_to_bf16(z[i0]));
+            y[i0]            = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16((float) (lhs * rhs)));
+        }
+    }
+}
+
+void ggml_compute_forward_fairy2i_pack_bf16_exact(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && (dst->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_F32));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+
+    const int64_t nrows = ggml_nrows(src0);
+    const int64_t begin = nrows * params->ith / params->nth;
+    const int64_t end   = nrows * (params->ith + 1) / params->nth;
+
+    for (int64_t row = begin; row < end; ++row) {
+        const int64_t i1 = row % src0->ne[1];
+        const int64_t i2 = (row / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = row / (src0->ne[1] * src0->ne[2]);
+
+        const float * x =
+            (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        char * y = (char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
+
+        if (dst->type == GGML_TYPE_BF16) {
+            GGML_ASSERT(dst->nb[0] == sizeof(ggml_bf16_t));
+            for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+                ((ggml_bf16_t *) y)[i0] = fairy2i_f32_carrier_to_bf16(x[i0]);
+            }
+        } else {
+            GGML_ASSERT(dst->nb[0] == sizeof(float));
+            for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+                ((float *) y)[i0] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x[i0]));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_fairy2i_attn_exact_cpu(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(q && k && v && mask);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16 && mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(q, dst));
+    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[0] == v->ne[1]);
+    GGML_ASSERT(k->ne[1] == v->ne[0] && k->ne[1] == mask->ne[0]);
+    GGML_ASSERT(k->ne[2] == v->ne[2] && q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3] && q->ne[3] == mask->ne[3]);
+    GGML_ASSERT(mask->ne[1] >= q->ne[1] && mask->ne[2] == 1);
+    GGML_ASSERT(q->nb[0] == sizeof(float) && k->nb[0] == sizeof(ggml_bf16_t));
+    GGML_ASSERT(v->nb[0] == sizeof(ggml_bf16_t) && mask->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(scale));
+    GGML_ASSERT(isfinite(scale));
+
+    const int64_t n_dims     = q->ne[0];
+    const int64_t n_queries  = q->ne[1];
+    const int64_t n_q_heads  = q->ne[2];
+    const int64_t n_kv       = k->ne[1];
+    const int64_t n_kv_heads = k->ne[2];
+    const int64_t n_seq      = q->ne[3];
+    const int64_t gqa_ratio  = n_q_heads / n_kv_heads;
+
+    const size_t work_stride = GGML_PAD((size_t) n_kv * sizeof(float), CACHE_LINE_SIZE) / sizeof(float);
+    GGML_ASSERT(params->wdata && params->wsize >= (params->ith + 1) * work_stride * sizeof(float));
+    float * probability = (float *) params->wdata + params->ith * work_stride;
+
+    const int64_t jobs  = n_queries * n_q_heads * n_seq;
+    const int64_t begin = jobs * params->ith / params->nth;
+    const int64_t end   = jobs * (params->ith + 1) / params->nth;
+
+    for (int64_t job = begin; job < end; ++job) {
+        const int64_t query   = job % n_queries;
+        const int64_t q_head  = (job / n_queries) % n_q_heads;
+        const int64_t seq     = job / (n_queries * n_q_heads);
+        const int64_t kv_head = q_head / gqa_ratio;
+
+        float row_max = -INFINITY;
+        float row_sum = 0.0f;
+        for (int64_t key = 0; key < n_kv; ++key) {
+            const float mask_value = *(const float *) ((const char *) mask->data + key * mask->nb[0] +
+                                                       query * mask->nb[1] + seq * mask->nb[3]);
+            if (mask_value == -INFINITY) {
+                probability[key] = -INFINITY;
+                continue;
+            }
+
+            float dot = 0.0f;
+            for (int64_t d = 0; d < n_dims; ++d) {
+                const float q_carrier = *(const float *) ((const char *) q->data + d * q->nb[0] + query * q->nb[1] +
+                                                          q_head * q->nb[2] + seq * q->nb[3]);
+                const ggml_bf16_t k_value =
+                    *(const ggml_bf16_t *) ((const char *) k->data + d * k->nb[0] + key * k->nb[1] +
+                                            kv_head * k->nb[2] + seq * k->nb[3]);
+                const float q_value = GGML_BF16_TO_FP32(fairy2i_f32_carrier_to_bf16(q_carrier));
+                dot                 = fmaf(q_value, GGML_BF16_TO_FP32(k_value), dot);
+            }
+
+            const float scaled = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(dot * scale));
+            const float logit  = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(scaled + mask_value));
+            probability[key]   = logit;
+            if (logit > -INFINITY) {
+                if (row_sum == 0.0f) {
+                    row_max = logit;
+                    row_sum = 1.0f;
+                } else {
+                    const float next_max = std::max(row_max, logit);
+                    row_sum              = row_sum * expf(row_max - next_max) + expf(logit - next_max);
+                    row_max              = next_max;
+                }
+            }
+        }
+
+        for (int64_t key = 0; key < n_kv; ++key) {
+            const float value = row_sum == 0.0f ? 0.0f : expf(probability[key] - row_max) / row_sum;
+            probability[key]  = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(value));
+        }
+
+        for (int64_t d = 0; d < n_dims; ++d) {
+            float value = 0.0f;
+            for (int64_t key = 0; key < n_kv; ++key) {
+                const ggml_bf16_t v_value = *(const ggml_bf16_t *) ((const char *) v->data + key * v->nb[0] +
+                                                                    d * v->nb[1] + kv_head * v->nb[2] + seq * v->nb[3]);
+                value                     = fmaf(probability[key], GGML_BF16_TO_FP32(v_value), value);
+            }
+
+            float * output = (float *) ((char *) dst->data + d * dst->nb[0] + query * dst->nb[1] + q_head * dst->nb[2] +
+                                        seq * dst->nb[3]);
+            *output        = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(value));
+        }
+    }
 }
 
 static void ggml_compute_forward_rms_norm_back_f32(
@@ -4850,6 +5122,45 @@ static void ggml_compute_forward_set_rows_f32(
     }
 }
 
+static void ggml_compute_forward_set_rows_bf16(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ne01;
+
+    assert(ne0 == nc);
+    assert(ne2 == ne02);
+    assert(ne3 == ne03);
+    assert(src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16);
+    assert(ne02 % ne11 == 0);
+    assert(ne03 % ne12 == 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i = ir0; i < ir1; ++i) {
+                const int64_t i12 = i03 % ne12;
+                const int64_t i11 = i02 % ne11;
+                const int64_t i1  = *(int64_t *) ((char *) src1->data + i * nb10 + i11 * nb11 + i12 * nb12);
+
+                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                memcpy((char *) dst->data + i1 * nb1 + i02 * nb2 + i03 * nb3,
+                       (const char *) src0->data + i * nb01 + i02 * nb02 + i03 * nb03, nc * sizeof(ggml_bf16_t));
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -4861,6 +5172,12 @@ void ggml_compute_forward_set_rows(
             {
                 ggml_compute_forward_set_rows_f32(params, dst);
             } break;
+        case GGML_TYPE_BF16:
+            {
+                GGML_ASSERT(dst->type == GGML_TYPE_BF16);
+                ggml_compute_forward_set_rows_bf16(params, dst);
+            }
+            break;
         default:
             {
                 GGML_ABORT("src0->type = %d (%s) not supported", src0->type, ggml_type_name(src0->type));
@@ -5780,6 +6097,85 @@ static void ggml_compute_forward_rope_f32(
     }
 }
 
+void ggml_compute_forward_fairy2i_rope_exact(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+    memcpy(&freq_base, (int32_t *) dst->op_params + 5, sizeof(float));
+    memcpy(&freq_scale, (int32_t *) dst->op_params + 6, sizeof(float));
+    memcpy(&ext_factor, (int32_t *) dst->op_params + 7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) dst->op_params + 8, sizeof(float));
+    memcpy(&beta_fast, (int32_t *) dst->op_params + 9, sizeof(float));
+    memcpy(&beta_slow, (int32_t *) dst->op_params + 10, sizeof(float));
+
+    const int n_dims     = ((const int32_t *) dst->op_params)[1];
+    const int mode       = ((const int32_t *) dst->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) dst->op_params)[4];
+
+    GGML_ASSERT(src0 && src1);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_NEOX) != 0);
+    GGML_ASSERT((mode & GGML_ROPE_TYPE_MROPE) == 0 && mode != GGML_ROPE_TYPE_VISION);
+    GGML_ASSERT(n_dims > 0 && n_dims <= src0->ne[0] && n_dims % 2 == 0);
+
+    const float * freq_factors = nullptr;
+    if (src2) {
+        GGML_ASSERT(src2->type == GGML_TYPE_F32 && src2->ne[0] >= n_dims / 2);
+        freq_factors = (const float *) src2->data;
+    }
+
+    const float theta_scale  = powf(freq_base, -2.0f / n_dims);
+    float       corr_dims[2] = { 0.0f, 0.0f };
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+
+    const int64_t   nr    = ggml_nrows(dst);
+    const int64_t   begin = nr * params->ith / params->nth;
+    const int64_t   end   = nr * (params->ith + 1) / params->nth;
+    const int32_t * pos   = (const int32_t *) src1->data;
+
+    for (int64_t row = begin; row < end; ++row) {
+        const int64_t i1 = row % src0->ne[1];
+        const int64_t i2 = (row / src0->ne[1]) % src0->ne[2];
+        const int64_t i3 = row / (src0->ne[1] * src0->ne[2]);
+
+        float * cache = (float *) params->wdata + (src0->ne[0] + CACHE_LINE_SIZE_F32) * params->ith;
+        ggml_rope_cache_init(pos[i2], freq_scale, freq_factors, corr_dims, n_dims, ext_factor, attn_factor, cache, 1.0f,
+                             theta_scale);
+
+        const float * x =
+            (const float *) ((const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float * y = (float *) ((char *) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+            const int64_t ic       = i0 / 2;
+            const float   cos_bf16 = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(cache[i0 + 0]));
+            const float   sin_bf16 = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(cache[i0 + 1]));
+            const float   x0       = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x[ic]));
+            const float   x1       = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x[ic + n_dims / 2]));
+
+            const float x0_cos = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x0 * cos_bf16));
+            const float x1_sin = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x1 * sin_bf16));
+            const float x0_sin = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x0 * sin_bf16));
+            const float x1_cos = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x1 * cos_bf16));
+
+            y[ic]              = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x0_cos - x1_sin));
+            y[ic + n_dims / 2] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x0_sin + x1_cos));
+        }
+
+        for (int64_t i0 = n_dims; i0 < src0->ne[0]; ++i0) {
+            y[i0] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(x[i0]));
+        }
+    }
+}
+
 // TODO: deduplicate f16/f32 code
 static void ggml_compute_forward_rope_f16(
         const ggml_compute_params * params,
@@ -6141,8 +6537,9 @@ static void ggml_compute_forward_rope_complex(const ggml_compute_params * params
                         (float *) ((char *) src0->data + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00);
                     float * dst_data = (float *) ((char *) dst->data + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0);
 
-                    const float x0 = GGML_BF16_TO_FP32(((const ggml_bf16_t *) (src))[0]);  //real
-                    const float x1 = GGML_BF16_TO_FP32(((const ggml_bf16_t *) (src))[1]);  //imag
+                    const uint32_t bits = fairy2i_load_packed_bf16_pair(src);
+                    const float    x0   = GGML_BF16_TO_FP32({ (uint16_t) bits });          // real
+                    const float    x1   = GGML_BF16_TO_FP32({ (uint16_t) (bits >> 16) });  // imag
 
                     dst_data[0]      = x0 * cos_theta - x1 * sin_theta;
                     dst_data[n_dims] = x0 * sin_theta + x1 * cos_theta;
@@ -6192,8 +6589,9 @@ static void ggml_compute_forward_complex_split_impl(const ggml_compute_params * 
                         (float *) ((char *) src0->data + i3 * nb03 + i2 * nb02 + i1 * nb01 + i0 * nb00);
                     float * dst_data = (float *) ((char *) dst->data + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * nb0);
 
-                    const float x0 = GGML_BF16_TO_FP32(((const ggml_bf16_t *) (src))[0]);  //real
-                    const float x1 = GGML_BF16_TO_FP32(((const ggml_bf16_t *) (src))[1]);  //imag
+                    const uint32_t bits = fairy2i_load_packed_bf16_pair(src);
+                    const float    x0   = GGML_BF16_TO_FP32({ (uint16_t) bits });          // real
+                    const float    x1   = GGML_BF16_TO_FP32({ (uint16_t) (bits >> 16) });  // imag
 
                     if (!isfinite(x0) || !isfinite(x1)) {
                         ggml_abort(__FILE__, __LINE__, "ifairy_split: non-finite input (row=%lld idx=%lld src_op=%s)",
@@ -6262,8 +6660,7 @@ static void ggml_compute_forward_complex_merge_impl(const ggml_compute_params * 
                     const ggml_bf16_t x0 = GGML_FP32_TO_BF16(src[0]);           //real
                     const ggml_bf16_t x1 = GGML_FP32_TO_BF16(src[n_dims / 2]);  //imag
 
-                    ((ggml_bf16_t *) dst_data)[0] = x0;
-                    ((ggml_bf16_t *) dst_data)[1] = x1;
+                    fairy2i_store_packed_bf16_pair(dst_data, x0, x1);
                 }
             }
         }
@@ -8555,6 +8952,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    GGML_ASSERT(!ggml_flash_attn_ext_get_fairy2i_exact(dst) &&
+                "Fairy2i exact Flash Attention is implemented only by the Metal backend");
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
