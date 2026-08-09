@@ -37,6 +37,10 @@ static size_t align_cache_line(size_t n) {
     return (n + row4_cache_line - 1) & ~(row4_cache_line - 1);
 }
 
+static int64_t align_panel_tokens(int64_t tokens) {
+    return (tokens + 7) & ~INT64_C(7);
+}
+
 static bool env_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
@@ -75,11 +79,12 @@ static void log_path_marker_once(const struct ggml_compute_params * params,
     }
 
     const char * layout = dst->op == GGML_OP_ROW4_LINEAR ? "m16k128_split8_v1" : "s8_m16k128_rowmajor_v1";
+    const char * aqpack = panel ? "bf16_rne_a8_away_pairk8_v1" : "bf16_rne_a8_away_v1";
     GGML_LOG_INFO(
         "row4_cpu: op=%s path=%s layout=%s B=%lld O=%lld K=%lld nth=%d "
-        "aqpack=bf16_rne_a8_away_v1 panel=%d prepack=0\n",
+        "aqpack=%s panel=%d prepack=0\n",
         dst->op == GGML_OP_ROW4_LINEAR ? "row4" : "w8a8", path_name(path), layout, (long long) tokens,
-        (long long) dst->ne[0], (long long) k, params->nth, panel ? 1 : 0);
+        (long long) dst->ne[0], (long long) k, params->nth, aqpack, panel ? 1 : 0);
 }
 
 static bool has_dotprod() {
@@ -158,6 +163,31 @@ static void quantize_activation_row(const float * src, int8_t * dst, int64_t k, 
     *scale = std::max(amax / 127.0f, 1.0e-8f);
     for (int64_t i = 0; i < k; ++i) {
         dst[i] = quantize_activation(bf16_round_trip(src[i]), *scale);
+    }
+}
+
+static void quantize_activation_panel_row(const float * src, int8_t * dst, int64_t token, int64_t k, float * scale) {
+    float amax = 0.0f;
+    for (int64_t i = 0; i < k; ++i) {
+        amax = std::max(amax, std::fabs(bf16_round_trip(src[i])));
+    }
+
+    *scale                  = std::max(amax / 127.0f, 1.0e-8f);
+    int8_t *      pair      = dst + (token / 2) * (2 * k);
+    const int64_t token_off = (token % 2) * 8;
+    for (int64_t ik = 0; ik < k; ik += 8) {
+        int8_t * packed = pair + (ik / 8) * 16 + token_off;
+        for (int lane = 0; lane < 8; ++lane) {
+            packed[lane] = quantize_activation(bf16_round_trip(src[ik + lane]), *scale);
+        }
+    }
+}
+
+static void zero_activation_panel_row(int8_t * dst, int64_t token, int64_t k) {
+    int8_t *      pair      = dst + (token / 2) * (2 * k);
+    const int64_t token_off = (token % 2) * 8;
+    for (int64_t ik = 0; ik < k; ik += 8) {
+        std::memset(pair + (ik / 8) * 16 + token_off, 0, 8);
     }
 }
 
@@ -438,19 +468,24 @@ static void compute_i8mm_direct(const struct ggml_compute_params * params,
 }
 
 static void expand_four_rows(const struct ggml_tensor * codes, bool row4, int64_t row0, int64_t k, int8_t * panel) {
-    if (row4) {
-        for (int64_t ik = 0; ik < k; ik += 16) {
-            int8x16_t decoded[4];
-            decode_row4_group_16(codes, row0, ik, decoded);
+    for (int64_t ik = 0; ik < k; ik += 16) {
+        int8x16_t weights[4];
+        if (row4) {
+            decode_row4_group_16(codes, row0, ik, weights);
+        } else {
             for (int row = 0; row < 4; ++row) {
-                vst1q_s8(panel + row * k + ik, decoded[row]);
+                weights[row] = load_w8_row_16(codes, row0 + row, ik);
             }
         }
-    } else {
-        for (int row = 0; row < 4; ++row) {
-            for (int64_t ik = 0; ik < k; ik += 16) {
-                vst1q_s8(panel + row * k + ik, load_w8_row_16(codes, row0 + row, ik));
-            }
+
+        for (int half = 0; half < 2; ++half) {
+            const int64_t  panel_offset = ((ik / 8) + half) * 32;
+            const int8x8_t weight0      = half == 0 ? vget_low_s8(weights[0]) : vget_high_s8(weights[0]);
+            const int8x8_t weight1      = half == 0 ? vget_low_s8(weights[1]) : vget_high_s8(weights[1]);
+            const int8x8_t weight2      = half == 0 ? vget_low_s8(weights[2]) : vget_high_s8(weights[2]);
+            const int8x8_t weight3      = half == 0 ? vget_low_s8(weights[3]) : vget_high_s8(weights[3]);
+            vst1q_s8(panel + panel_offset, vcombine_s8(weight0, weight1));
+            vst1q_s8(panel + panel_offset + 16, vcombine_s8(weight2, weight3));
         }
     }
 }
@@ -486,26 +521,23 @@ static void compute_i8mm_panel(struct ggml_tensor *               dst,
                 }
 
                 for (int64_t ik = 0; ik < k; ik += 8) {
-                    const int8x8_t weight0   = vld1_s8(panel + 0 * k + ik);
-                    const int8x8_t weight1   = vld1_s8(panel + 1 * k + ik);
-                    const int8x8_t weight2   = vld1_s8(panel + 2 * k + ik);
-                    const int8x8_t weight3   = vld1_s8(panel + 3 * k + ik);
-                    const int8x16_t weights01 = vcombine_s8(weight0, weight1);
-                    const int8x16_t weights23 = vcombine_s8(weight2, weight3);
+                    const int64_t   k8_offset = (ik / 8) * 16;
+                    const int8x16_t weights01 = vld1q_s8(panel + (ik / 8) * 32);
+                    const int8x16_t weights23 = vld1q_s8(panel + (ik / 8) * 32 + 16);
+                    const int8_t *  inputs    = activations + (token0 / 2) * (2 * k) + k8_offset;
+                    const int8x16_t input01   = vld1q_s8(inputs + 0 * (2 * k));
+                    const int8x16_t input23   = vld1q_s8(inputs + 1 * (2 * k));
+                    const int8x16_t input45   = vld1q_s8(inputs + 2 * (2 * k));
+                    const int8x16_t input67   = vld1q_s8(inputs + 3 * (2 * k));
 
-                    for (int pair = 0; pair < 4; ++pair) {
-                        const int64_t token = token0 + 2 * pair;
-                        if (token >= tokens) {
-                            break;
-                        }
-                        const int8x8_t input0 = vld1_s8(activations + token * k + ik);
-                        const int8x8_t input1 = token + 1 < tokens ?
-                                                    vld1_s8(activations + (token + 1) * k + ik) :
-                                                    vdup_n_s8(0);
-                        const int8x16_t inputs = vcombine_s8(input0, input1);
-                        sums[pair][0]          = vmmlaq_s32(sums[pair][0], inputs, weights01);
-                        sums[pair][1]          = vmmlaq_s32(sums[pair][1], inputs, weights23);
-                    }
+                    sums[0][0] = vmmlaq_s32(sums[0][0], input01, weights01);
+                    sums[0][1] = vmmlaq_s32(sums[0][1], input01, weights23);
+                    sums[1][0] = vmmlaq_s32(sums[1][0], input23, weights01);
+                    sums[1][1] = vmmlaq_s32(sums[1][1], input23, weights23);
+                    sums[2][0] = vmmlaq_s32(sums[2][0], input45, weights01);
+                    sums[2][1] = vmmlaq_s32(sums[2][1], input45, weights23);
+                    sums[3][0] = vmmlaq_s32(sums[3][0], input67, weights01);
+                    sums[3][1] = vmmlaq_s32(sums[3][1], input67, weights23);
                 }
 
                 for (int pair = 0; pair < 4; ++pair) {
@@ -625,10 +657,11 @@ extern "C" size_t ggml_row4_cpu_work_size(const struct ggml_tensor * dst, int n_
 
     const int64_t tokens      = ggml_nrows(dst->src[0]);
     const int64_t k           = dst->src[0]->ne[0];
-    const size_t  q_bytes     = align_cache_line((size_t) tokens * k);
+    const bool    uses_panel    = path == row4_path::i8mm && tokens >= 8;
+    const int64_t q_tokens      = uses_panel ? align_panel_tokens(tokens) : tokens;
+    const size_t  q_bytes       = align_cache_line((size_t) q_tokens * k);
     const size_t  scale_bytes = align_cache_line((size_t) tokens * sizeof(float));
-    const size_t  panel_bytes =
-        path == row4_path::i8mm && tokens >= 8 ? (size_t) n_tasks * align_cache_line((size_t) 4 * k) : 0;
+    const size_t  panel_bytes   = uses_panel ? (size_t) n_tasks * align_cache_line((size_t) 4 * k) : 0;
     const size_t counter_bytes = align_cache_line(sizeof(std::atomic<int64_t>));
     return q_bytes + scale_bytes + panel_bytes + counter_bytes;
 }
@@ -646,10 +679,11 @@ extern "C" bool ggml_row4_cpu_compute(const struct ggml_compute_params * params,
     const struct ggml_tensor * x             = dst->src[0];
     const int64_t              tokens        = ggml_nrows(x);
     const int64_t              k             = x->ne[0];
-    const size_t               q_bytes       = align_cache_line((size_t) tokens * k);
+    const bool                 uses_panel    = path == row4_path::i8mm && tokens >= 8;
+    const int64_t              q_tokens      = uses_panel ? align_panel_tokens(tokens) : tokens;
+    const size_t               q_bytes       = align_cache_line((size_t) q_tokens * k);
     const size_t               scale_bytes   = align_cache_line((size_t) tokens * sizeof(float));
     const size_t               panel_stride  = align_cache_line((size_t) 4 * k);
-    const bool                 uses_panel    = path == row4_path::i8mm && tokens >= 8;
     const size_t               panel_bytes   = uses_panel ? (size_t) params->nth * panel_stride : 0;
     const size_t               counter_bytes = align_cache_line(sizeof(std::atomic<int64_t>));
     const size_t               required      = q_bytes + scale_bytes + panel_bytes + counter_bytes;
@@ -677,7 +711,16 @@ extern "C" bool ggml_row4_cpu_compute(const struct ggml_compute_params * params,
 
     for (int64_t token = token_begin; token < token_end; ++token) {
         const float * src = (const float *) x->data + token * k;
-        quantize_activation_row(src, activations + token * k, k, activation_scales + token);
+        if (uses_panel) {
+            quantize_activation_panel_row(src, activations, token, k, activation_scales + token);
+        } else {
+            quantize_activation_row(src, activations + token * k, k, activation_scales + token);
+        }
+    }
+    if (uses_panel && params->ith == 0) {
+        for (int64_t token = tokens; token < q_tokens; ++token) {
+            zero_activation_panel_row(activations, token, k);
+        }
     }
     ggml_barrier(params->threadpool);
 
