@@ -840,10 +840,16 @@ kernel void kernel_row4_quantize_activation_i8(
     const uint simd_group = tid >> 5;
     const ulong row_base  = (ulong) token * (ulong) args.k;
 
+    // ROW4/W8A8 require K to be a multiple of 128, so every row and loop
+    // iteration is naturally aligned for four-wide loads. Max reduction is
+    // exact for the finite BF16 carriers accepted by the numeric profile.
     float thread_max = 0.0f;
-    for (uint i = tid; i < (uint) args.k; i += 256U) {
-        const float xb = fairy2i_round_to_bf16_f32(x[row_base + i]);
-        thread_max = max(thread_max, fabs(xb));
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const float4 xb     = fairy2i_round_to_bf16_f32(*(device const float4 *) (x + row_base + i));
+        const float4 abs_xb = fabs(xb);
+        const float max_01  = max(abs_xb.x, abs_xb.y);
+        const float max_23  = max(abs_xb.z, abs_xb.w);
+        thread_max = max(thread_max, max(max_01, max_23));
     }
 
     const float group_max = simd_max(thread_max);
@@ -864,12 +870,12 @@ kernel void kernel_row4_quantize_activation_i8(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const float sx = simd_maxima[0];
-    for (uint i = tid; i < (uint) args.k; i += 256U) {
-        const float xb        = fairy2i_round_to_bf16_f32(x[row_base + i]);
-        const float magnitude = floor(fabs(precise::divide(xb, sx)) + 0.5f);
-        int q = (int) magnitude;
-        q = xb < 0.0f ? -q : q;
-        act_q[row_base + i] = (char) clamp(q, -127, 127);
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const float4 xb = fairy2i_round_to_bf16_f32(*(device const float4 *) (x + row_base + i));
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
+        int4 q = int4(magnitude);
+        q = select(q, -q, xb < float4(0.0f));
+        *(device char4 *) (act_q + row_base + i) = char4(clamp(q, int4(-127), int4(127)));
     }
 }
 
