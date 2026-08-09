@@ -2054,7 +2054,8 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                                                ggml_tensor *        op,
                                                ggml_metal_buffer_id x_buffer,
                                                bool                 x_packed_bf16,
-                                               ggml_tensor *        qat_residual_add) {
+                                               ggml_tensor *        qat_residual_add,
+                                               bool                 act_q_ready = false) {
     GGML_ASSERT(op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR);
     GGML_ASSERT(op->src[0] && op->src[1] && op->src[2]);
     GGML_ASSERT(!x_packed_bf16 || op->op == GGML_OP_ROW4_LINEAR);
@@ -2089,7 +2090,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     ggml_metal_buffer_id act_h = act_q;
     act_h.offs += GGML_PAD((size_t) act_rows * (size_t) k * sizeof(int8_t) + (size_t) act_rows * sizeof(float), 64);
 
-    {
+    if (!act_q_ready) {
         const char * pipeline_name =
             x_packed_bf16 ? "kernel_row4_quantize_activation_i8_packed_bf16" : "kernel_row4_quantize_activation_i8";
         ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
@@ -2107,11 +2108,11 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_buffer(enc, act_scales, 3);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, 8 * sizeof(float), 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, act_rows, 1, 1, nth, 1, 1);
-    }
 
-    // Publish token-major I8 and scales before the optional coalesced K-major
-    // half transpose or the linear dispatch.
-    ggml_metal_encoder_memory_barrier(enc);
+        // Publish token-major I8 and scales before the optional coalesced
+        // K-major half transpose or the linear dispatch.
+        ggml_metal_encoder_memory_barrier(enc);
+    }
 
     if (row4_direct_act) {
         constexpr const char * pipeline_name = "kernel_row4_transpose_activation_i8_kmajor_half";
@@ -4156,6 +4157,76 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
     };
 
     const bool qat = ggml_fairy2i_exact_get_qat(op);
+
+    // Decode-only Qwen3 fusion. Preserve the exact RMS destination for graph
+    // callbacks, but form the following Row4 activation quantization in the
+    // same dispatch. All other RMS and row-quant shapes keep their independent
+    // kernels.
+    if (ctx->use_fusion && qat && idx + 1 < ctx->idx_end && ggml_node_has_n_uses(ctx->gf, idx, 1) &&
+        ggml_nrows(op) == 1 && op->ne[0] == 4096 && ggml_is_contiguous(src0) && ggml_is_contiguous(weight) &&
+        ggml_is_contiguous(op) && weight->ne[0] == 4096 && weight->ne[1] == 1 && weight->ne[2] == 1 &&
+        weight->ne[3] == 1) {
+        ggml_tensor * linear = ggml_graph_node(ctx->gf, idx + 1);
+
+        const bool row4_linear = linear->op == GGML_OP_ROW4_LINEAR && linear->src[0] == op &&
+                                 ggml_nrows(linear->src[0]) == 1 && ggml_get_op_params_i32(linear, 2) == 4096 &&
+                                 ggml_metal_device_supports_op(ctx->dev, linear);
+
+        if (row4_linear) {
+            const size_t linear_pad = GGML_PAD(ggml_nbytes(linear), 64) - ggml_nbytes(linear);
+
+            ggml_metal_buffer_id act_q = ggml_metal_get_buffer_id(linear);
+            act_q.offs += ggml_nbytes(linear) + linear_pad;
+
+            const ggml_metal_buffer_id rms_dst       = ggml_metal_get_buffer_id(op);
+            const ggml_metal_buffer_id src0_buffer   = ggml_metal_get_buffer_id(src0);
+            const ggml_metal_buffer_id weight_buffer = ggml_metal_get_buffer_id(weight);
+            const size_t               quant_bytes   = (size_t) linear->src[0]->ne[0] * sizeof(int8_t) + sizeof(float);
+            const bool                 scratch_isolated =
+                rms_dst.metal && src0_buffer.metal && weight_buffer.metal && act_q.metal &&
+                !ggml_metal_buffer_ranges_overlap(rms_dst, ggml_nbytes(op), act_q, quant_bytes) &&
+                !ggml_metal_buffer_ranges_overlap(src0_buffer, ggml_nbytes(src0), act_q, quant_bytes) &&
+                !ggml_metal_buffer_ranges_overlap(weight_buffer, ggml_nbytes(weight), act_q, quant_bytes);
+
+            if (scratch_isolated) {
+                ggml_metal_buffer_id act_scales = act_q;
+                act_scales.offs += (size_t) linear->src[0]->ne[0] * sizeof(int8_t);
+
+                if (!ggml_metal_op_concurrency_check(ctx, linear)) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
+
+                constexpr const char * pipeline_name =
+                    "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096";
+                ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(ctx->lib, pipeline_name);
+                if (!pipeline) {
+                    pipeline = ggml_metal_library_compile_pipeline(ctx->lib, pipeline_name, pipeline_name, nullptr);
+                }
+
+                constexpr int nth = 256;
+                GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+                ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+                ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(src0), 1);
+                ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(weight), 2);
+                ggml_metal_encoder_set_buffer(ctx->enc, rms_dst, 3);
+                ggml_metal_encoder_set_buffer(ctx->enc, act_q, 4);
+                ggml_metal_encoder_set_buffer(ctx->enc, act_scales, 5);
+                ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 8 * sizeof(float), 0);
+                ggml_metal_encoder_dispatch_threadgroups(ctx->enc, 1, 1, 1, nth, 1, 1);
+
+                ggml_metal_encoder_memory_barrier(ctx->enc);
+                ggml_metal_op_row_quant_linear_impl(ctx, linear, ggml_metal_get_buffer_id(op), false, nullptr, true);
+
+                if (ctx->debug_fusion > 1) {
+                    GGML_LOG_DEBUG(
+                        "%s: fuse QAT FAIRY2I_RMS_NORM_EXACT + ROW4_LINEAR activation quantization (B=1 K=4096)\n",
+                        __func__);
+                }
+                return 2;
+            }
+        }
+    }
 
     ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ctx->lib, qat);
 
