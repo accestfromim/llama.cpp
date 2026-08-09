@@ -3087,7 +3087,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FAIRY2I_ATTN_EXACT_CPU:
                     {
-                        cur = GGML_PAD((size_t) node->src[1]->ne[1] * sizeof(float), CACHE_LINE_SIZE) * n_tasks;
+                        const size_t probability_bytes =
+                            GGML_PAD((size_t) node->src[1]->ne[1] * sizeof(float), CACHE_LINE_SIZE);
+                        const size_t q_bytes = (size_t) node->src[0]->ne[0] * sizeof(float);
+                        cur                  = GGML_PAD(probability_bytes + q_bytes, CACHE_LINE_SIZE) * n_tasks;
                     }
                     break;
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:

@@ -3850,9 +3850,13 @@ void ggml_compute_forward_fairy2i_attn_exact_cpu(const ggml_compute_params * par
     const int64_t n_seq      = q->ne[3];
     const int64_t gqa_ratio  = n_q_heads / n_kv_heads;
 
-    const size_t work_stride = GGML_PAD((size_t) n_kv * sizeof(float), CACHE_LINE_SIZE) / sizeof(float);
+    const size_t probability_stride = GGML_PAD((size_t) n_kv * sizeof(float), CACHE_LINE_SIZE) / sizeof(float);
+    const size_t work_stride =
+        GGML_PAD((probability_stride + (size_t) n_dims) * sizeof(float), CACHE_LINE_SIZE) / sizeof(float);
     GGML_ASSERT(params->wdata && params->wsize >= (params->ith + 1) * work_stride * sizeof(float));
-    float * probability = (float *) params->wdata + params->ith * work_stride;
+    float * thread_work = (float *) params->wdata + params->ith * work_stride;
+    float * probability = thread_work;
+    float * q_widened   = thread_work + probability_stride;
 
     const int64_t jobs  = n_queries * n_q_heads * n_seq;
     const int64_t begin = jobs * params->ith / params->nth;
@@ -3863,6 +3867,12 @@ void ggml_compute_forward_fairy2i_attn_exact_cpu(const ggml_compute_params * par
         const int64_t q_head  = (job / n_queries) % n_q_heads;
         const int64_t seq     = job / (n_queries * n_q_heads);
         const int64_t kv_head = q_head / gqa_ratio;
+
+        for (int64_t d = 0; d < n_dims; ++d) {
+            const float q_carrier = *(const float *) ((const char *) q->data + d * q->nb[0] + query * q->nb[1] +
+                                                      q_head * q->nb[2] + seq * q->nb[3]);
+            q_widened[d]          = GGML_BF16_TO_FP32(fairy2i_f32_carrier_to_bf16(q_carrier));
+        }
 
         float   row_max          = -INFINITY;
         float   row_sum          = 0.0f;
@@ -3878,13 +3888,10 @@ void ggml_compute_forward_fairy2i_attn_exact_cpu(const ggml_compute_params * par
 
             float dot = 0.0f;
             for (int64_t d = 0; d < n_dims; ++d) {
-                const float q_carrier = *(const float *) ((const char *) q->data + d * q->nb[0] + query * q->nb[1] +
-                                                          q_head * q->nb[2] + seq * q->nb[3]);
                 const ggml_bf16_t k_value =
                     *(const ggml_bf16_t *) ((const char *) k->data + d * k->nb[0] + key * k->nb[1] +
                                             kv_head * k->nb[2] + seq * k->nb[3]);
-                const float q_value = GGML_BF16_TO_FP32(fairy2i_f32_carrier_to_bf16(q_carrier));
-                dot                 = fmaf(q_value, GGML_BF16_TO_FP32(k_value), dot);
+                dot = fmaf(q_widened[d], GGML_BF16_TO_FP32(k_value), dot);
             }
 
             const float scaled = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(dot * scale));

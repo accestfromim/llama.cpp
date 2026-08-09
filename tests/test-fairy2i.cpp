@@ -1865,12 +1865,15 @@ static std::vector<float> fairy2i_exact_cpu_attn_oracle(const std::vector<float>
 }
 
 static bool test_fairy2i_exact_cpu_attention() {
-    constexpr int64_t n_dims     = 128;
+    constexpr int64_t n_dims     = 129;
     constexpr int64_t n_queries  = 3;
     constexpr int64_t n_q_heads  = 4;
     constexpr int64_t n_kv       = 32;
     constexpr int64_t n_kv_heads = 2;
     constexpr float   scale      = 0.125f;
+
+    constexpr int64_t q_storage_dims = n_dims + 3;
+    constexpr int64_t q_offset       = 1;
 
     std::vector<float>       q((size_t) n_dims * n_queries * n_q_heads);
     std::vector<ggml_bf16_t> k((size_t) n_dims * n_kv * n_kv_heads);
@@ -1935,7 +1938,11 @@ static bool test_fairy2i_exact_cpu_attention() {
     if (!ctx) {
         return false;
     }
-    ggml_tensor * q_tensor    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_dims, n_queries, n_q_heads, 1);
+    ggml_tensor * q_storage_tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q_storage_dims, n_queries, n_q_heads, 1);
+    ggml_tensor * q_tensor =
+        ggml_view_4d(ctx, q_storage_tensor, n_dims, n_queries, n_q_heads, 1, q_storage_dims * sizeof(float),
+                     q_storage_dims * n_queries * sizeof(float), q_storage_dims * n_queries * n_q_heads * sizeof(float),
+                     q_offset * sizeof(float));
     ggml_tensor * k_tensor    = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, n_dims, n_kv, n_kv_heads, 1);
     ggml_tensor * v_tensor    = ggml_new_tensor_4d(ctx, GGML_TYPE_BF16, n_kv, n_dims, n_kv_heads, 1);
     ggml_tensor * mask_tensor = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_queries, 1, 1);
@@ -1956,7 +1963,15 @@ static bool test_fairy2i_exact_cpu_attention() {
         return false;
     }
 
-    ggml_backend_tensor_set(q_tensor, q.data(), 0, q.size() * sizeof(float));
+    std::vector<float> q_storage((size_t) q_storage_dims * n_queries * n_q_heads, bf16_round(-1.25f));
+    for (int64_t q_head = 0; q_head < n_q_heads; ++q_head) {
+        for (int64_t query = 0; query < n_queries; ++query) {
+            const size_t src = (size_t) n_dims * (query + n_queries * q_head);
+            const size_t dst = (size_t) q_storage_dims * (query + n_queries * q_head) + q_offset;
+            std::copy_n(q.data() + src, n_dims, q_storage.data() + dst);
+        }
+    }
+    ggml_backend_tensor_set(q_storage_tensor, q_storage.data(), 0, q_storage.size() * sizeof(float));
     ggml_backend_tensor_set(k_tensor, k.data(), 0, k.size() * sizeof(ggml_bf16_t));
     ggml_backend_tensor_set(v_tensor, v.data(), 0, v.size() * sizeof(ggml_bf16_t));
     ggml_backend_tensor_set(mask_tensor, mask.data(), 0, mask.size() * sizeof(float));
@@ -1995,7 +2010,14 @@ static bool test_fairy2i_exact_cpu_attention() {
         ok = false;
     }
 
-    ggml_backend_tensor_set(q_tensor, overflow_q.data(), 0, overflow_q.size() * sizeof(float));
+    for (int64_t q_head = 0; q_head < n_q_heads; ++q_head) {
+        for (int64_t query = 0; query < n_queries; ++query) {
+            const size_t src = (size_t) n_dims * (query + n_queries * q_head);
+            const size_t dst = (size_t) q_storage_dims * (query + n_queries * q_head) + q_offset;
+            std::copy_n(overflow_q.data() + src, n_dims, q_storage.data() + dst);
+        }
+    }
+    ggml_backend_tensor_set(q_storage_tensor, q_storage.data(), 0, q_storage.size() * sizeof(float));
     ggml_backend_tensor_set(k_tensor, overflow_k.data(), 0, overflow_k.size() * sizeof(ggml_bf16_t));
     ggml_backend_tensor_set(v_tensor, overflow_v.data(), 0, overflow_v.size() * sizeof(ggml_bf16_t));
     ggml_backend_tensor_set(mask_tensor, overflow_mask.data(), 0, overflow_mask.size() * sizeof(float));
@@ -2014,7 +2036,8 @@ static bool test_fairy2i_exact_cpu_attention() {
     ggml_backend_free(cpu);
     ggml_free(ctx);
 
-    printf("  Fairy2i exact CPU Attention F32 accumulation/GQA/masked overflow: %s\n", ok ? "PASS" : "FAIL");
+    printf("  Fairy2i exact CPU Attention dynamic-Q/strided-Q/F32 accumulation/GQA/masked overflow: %s\n",
+           ok ? "PASS" : "FAIL");
     return ok;
 }
 
