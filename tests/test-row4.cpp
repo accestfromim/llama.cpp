@@ -1325,6 +1325,244 @@ static bool test_metal_row4_swiglu_down_fusion() {
     return ok;
 }
 
+struct row4_residual_outputs {
+    std::vector<float> row4;
+    std::vector<float> add;
+};
+
+struct row4_residual_case {
+    int64_t tokens         = 1;
+    bool    qat            = true;
+    bool    reverse        = false;
+    bool    row4_output    = false;
+    bool    extra_consumer = false;
+    bool    graph_gap      = false;
+};
+
+static bool run_row4_residual_backend(row4_residual_outputs &       output,
+                                      ggml_backend_t                backend,
+                                      const std::vector<float> &    input,
+                                      const std::vector<uint8_t> &  codes_data,
+                                      const std::vector<uint16_t> & scales_data,
+                                      const std::vector<float> &    residual_data,
+                                      int64_t                       o,
+                                      int64_t                       k,
+                                      const row4_residual_case &    test_case) {
+    const ggml_init_params params = {
+        /*.mem_size   =*/4 * 1024 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, test_case.tokens);
+    ggml_tensor * codes    = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, k / ROW4_TILE_K, o / ROW4_TILE_O);
+    ggml_tensor * scales   = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
+    ggml_tensor * row4     = ggml_row4_linear(ctx, x, codes, scales, o, k);
+    ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, o, test_case.tokens);
+    ggml_tensor * add =
+        test_case.reverse ? ggml_complex_add(ctx, residual, row4) : ggml_complex_add(ctx, row4, residual);
+    ggml_complex_add_set_qat(add, test_case.qat);
+    if (test_case.row4_output) {
+        ggml_set_output(row4);
+    }
+
+    ggml_tensor * extra = test_case.extra_consumer ? ggml_dup(ctx, row4) : nullptr;
+    ggml_tensor * gap   = test_case.graph_gap ? ggml_dup(ctx, residual) : nullptr;
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    if (gap) {
+        ggml_build_forward_expand(graph, row4);
+        ggml_build_forward_expand(graph, gap);
+    }
+    ggml_build_forward_expand(graph, add);
+    if (extra) {
+        ggml_build_forward_expand(graph, extra);
+    }
+
+    bool ok = ggml_backend_supports_op(backend, row4) && ggml_backend_supports_op(backend, add) &&
+              (!extra || ggml_backend_supports_op(backend, extra)) && (!gap || ggml_backend_supports_op(backend, gap));
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+    ggml_backend_tensor_set(codes, codes_data.data(), 0, codes_data.size());
+    ggml_backend_tensor_set(scales, scales_data.data(), 0, scales_data.size() * sizeof(uint16_t));
+    ggml_backend_tensor_set(residual, residual_data.data(), 0, residual_data.size() * sizeof(float));
+
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (status == GGML_STATUS_SUCCESS) {
+        output.row4.resize((size_t) o * (size_t) test_case.tokens);
+        output.add.resize((size_t) o * (size_t) test_case.tokens);
+        ggml_backend_tensor_get(row4, output.row4.data(), 0, output.row4.size() * sizeof(float));
+        ggml_backend_tensor_get(add, output.add.data(), 0, output.add.size() * sizeof(float));
+    } else {
+        fprintf(stderr, "Row4 residual graph compute failed: %s\n", ggml_status_to_string(status));
+        ok = false;
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return status == GGML_STATUS_SUCCESS && ok;
+}
+
+static std::vector<float> make_residual_carriers(const std::vector<float> & row4) {
+    std::vector<float> residual(row4.size());
+    for (size_t i = 0; i < row4.size(); ++i) {
+        const uint16_t row4_imag = (uint16_t) (f32_bits(row4[i]) >> 16);
+        uint16_t       real;
+        uint16_t       imag;
+        switch (i % 4) {
+            case 0:
+                real = 0x8000u;
+                imag = row4_imag ^ 0x8000u;
+                break;
+            case 1:
+                real = 0x0000u;
+                imag = ((row4_imag & 0x7f80u) >= 0x0400u && (row4_imag & 0x7f80u) < 0x7f80u) ? 0x0001u : 0x0000u;
+                break;
+            case 2:
+                real = 0x7f7fu;
+                imag = 0xff7fu;
+                break;
+            default:
+                real = 0x0000u;
+                imag = 0x8000u;
+                break;
+        }
+        residual[i] = f32_from_bits((uint32_t) real | ((uint32_t) imag << 16));
+    }
+    return residual;
+}
+
+static std::vector<uint16_t> make_row4_residual_scales(int64_t o) {
+    constexpr uint16_t    profiles[] = { 0x3d80u, 0xbd80u, 0x3f80u, 0xbf80u };
+    std::vector<uint16_t> scales((size_t) o);
+    for (int64_t row = 0; row < o; ++row) {
+        scales[(size_t) row] = profiles[row % 4];
+    }
+    return scales;
+}
+
+static bool test_metal_row4_decode_residual_fusion() {
+    ggml_backend_dev_t dev = find_metal_device();
+    if (!dev) {
+        const char * required = getenv("LLAMA_ROW4_REQUIRE_METAL_TESTS");
+        if (required && strcmp(required, "0") != 0) {
+            fprintf(stderr, "Row4 decode residual fusion test requires Metal, but no Metal device is available\n");
+            return false;
+        }
+        printf("  Metal Row4 decode QAT residual fusion: SKIP (Metal backend unavailable)\n");
+        return true;
+    }
+
+    constexpr int64_t O = 128;
+    scoped_env_var    fusion_disable("GGML_METAL_FUSION_DISABLE");
+    scoped_env_var    fusion_debug("GGML_METAL_FUSION_DEBUG");
+    bool              ok = true;
+
+    for (int64_t k : { 4096, 12288 }) {
+        const std::vector<float>    input       = make_input(k, 1);
+        const std::vector<uint8_t>  codes       = make_row4_codes(O, k);
+        const std::vector<uint16_t> scales      = make_row4_residual_scales(O);
+        const std::vector<float>    row4_oracle = oracle_row4_linear(input, codes, scales, O, k, 1);
+        const std::vector<float>    residual    = make_residual_carriers(row4_oracle);
+        const row4_residual_case    test_case;
+
+        ggml_backend_t cpu = ggml_backend_cpu_init();
+        if (!cpu) {
+            return false;
+        }
+        ggml_backend_cpu_set_n_threads(cpu, 4);
+        row4_residual_outputs expected;
+        ok = run_row4_residual_backend(expected, cpu, input, codes, scales, residual, O, k, test_case) &&
+             compare_exact(("Row4 residual CPU/oracle K=" + std::to_string(k)).c_str(), expected.row4, row4_oracle) &&
+             ok;
+        ggml_backend_free(cpu);
+
+        fusion_disable.set("1");
+        fusion_debug.unset();
+        ggml_backend_t        metal_unfused = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs unfused;
+        ok =
+            metal_unfused &&
+            run_row4_residual_backend(unfused, metal_unfused, input, codes, scales, residual, O, k, test_case) &&
+            compare_exact(("Row4 residual unfused row4 K=" + std::to_string(k)).c_str(), unfused.row4, expected.row4) &&
+            compare_exact(("Row4 residual unfused add K=" + std::to_string(k)).c_str(), unfused.add, expected.add) &&
+            ok;
+        if (metal_unfused) {
+            ggml_backend_free(metal_unfused);
+        }
+
+        fusion_disable.unset();
+        fusion_debug.set("2");
+        ggml_backend_t        metal_fused = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs fused;
+        ok = metal_fused &&
+             run_row4_residual_backend(fused, metal_fused, input, codes, scales, residual, O, k, test_case) &&
+             compare_exact(("Row4 residual fused row4 K=" + std::to_string(k)).c_str(), fused.row4, expected.row4) &&
+             compare_exact(("Row4 residual fused add K=" + std::to_string(k)).c_str(), fused.add, expected.add) &&
+             compare_exact(("Row4 residual fused/unfused K=" + std::to_string(k)).c_str(), fused.add, unfused.add) &&
+             ok;
+        if (metal_fused) {
+            ggml_backend_free(metal_fused);
+        }
+    }
+
+    // Every condition below must retain the ordinary two-dispatch path.
+    const int64_t                         k          = 4096;
+    const std::vector<uint8_t>            codes      = make_row4_codes(O, k);
+    const std::vector<uint16_t>           scales     = make_row4_residual_scales(O);
+    const std::vector<float>              input_1    = make_input(k, 1);
+    const std::vector<float>              row4_1     = oracle_row4_linear(input_1, codes, scales, O, k, 1);
+    const std::vector<float>              residual_1 = make_residual_carriers(row4_1);
+    const std::vector<row4_residual_case> gates      = {
+        { 9, true,  false, false, false, false },
+        { 1, false, false, false, false, false },
+        { 1, true,  true,  false, false, false },
+        { 1, true,  false, true,  false, false },
+        { 1, true,  false, false, true,  false },
+        { 1, true,  false, false, false, true  },
+    };
+    for (size_t i = 0; i < gates.size(); ++i) {
+        const row4_residual_case & test_case = gates[i];
+        const std::vector<float>   input     = test_case.tokens == 1 ? input_1 : make_input(k, test_case.tokens);
+        const std::vector<float>   residual =
+            test_case.tokens == 1 ?
+                residual_1 :
+                make_residual_carriers(oracle_row4_linear(input, codes, scales, O, k, test_case.tokens));
+
+        fusion_disable.set("1");
+        fusion_debug.unset();
+        ggml_backend_t        metal_unfused = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs unfused;
+        ok = metal_unfused &&
+             run_row4_residual_backend(unfused, metal_unfused, input, codes, scales, residual, O, k, test_case) && ok;
+        if (metal_unfused) {
+            ggml_backend_free(metal_unfused);
+        }
+
+        fusion_disable.unset();
+        fusion_debug.set("2");
+        ggml_backend_t        metal_gated = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs gated;
+        ok = metal_gated &&
+             run_row4_residual_backend(gated, metal_gated, input, codes, scales, residual, O, k, test_case) &&
+             compare_exact(("Row4 residual negative gate " + std::to_string(i)).c_str(), gated.add, unfused.add) && ok;
+        if (metal_gated) {
+            ggml_backend_free(metal_gated);
+        }
+    }
+
+    printf("  Metal Row4 decode QAT residual fusion/gates - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool test_metal_operator_matrix() {
     ggml_backend_dev_t dev = find_metal_device();
     if (!dev) {
@@ -1635,6 +1873,7 @@ int main() {
     failed += !test_cpu_operator_matrix();
     failed += !test_metal_row4_swiglu_fusion();
     failed += !test_metal_row4_swiglu_down_fusion();
+    failed += !test_metal_row4_decode_residual_fusion();
     failed += !test_metal_operator_matrix();
     failed += !test_metal_real_shape_matrix();
 

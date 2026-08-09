@@ -1358,6 +1358,95 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act(
     }
 }
 
+kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        device const uint * residual                      [[buffer(6)]],
+        device uint * add_dst                             [[buffer(7)]],
+        threadgroup char * act_tg                         [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
+    constexpr int output_tiles_per_tg = 2;
+    constexpr int groups_per_tile     = 4;
+    constexpr int rows_per_group      = 4;
+    constexpr int k_tile              = 128;
+    constexpr int code_tile_bytes     = 256;
+    constexpr int copy_bytes          = 16;
+    constexpr int threads_per_tg      = 256;
+
+    for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
+         byte_offset += threads_per_tg * copy_bytes) {
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint split = simd_lane >> 2;
+    const uint j     = (simd_lane & 3U) * 2U;
+    const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) (output_group >> 2);
+    const int output_group_in_tile = (int) (output_group & 3U);
+    const int k_tiles = args.k / k_tile;
+    device const uchar * code_ptr = codes +
+        (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes +
+        (ulong) output_group_in_tile * 64UL + (ulong) simd_lane * 2UL;
+    threadgroup const char * act_ptr = act_tg + (ulong) split * 16UL + (ulong) j;
+
+    int u_real = 0;
+    int u_imag = 0;
+    int v_real = 0;
+    int v_imag = 0;
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const uchar2 packed = *((device const uchar2 *) code_ptr);
+        const char2 activation_low = *((threadgroup const char2 *) act_ptr);
+        const char2 activation_high = *((threadgroup const char2 *) (act_ptr + 8));
+        row4_accumulate_basis_branchless(
+            (uint) (packed.x & 0x0fU), (int) activation_low.x, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.y & 0x0fU), (int) activation_low.y, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.x >> 4), (int) activation_high.x, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.y >> 4), (int) activation_high.y, u_real, u_imag, v_real, v_imag);
+        code_ptr += code_tile_bytes;
+        act_ptr += k_tile;
+    }
+
+    const int sum_u_real = simd_sum(u_real);
+    const int sum_u_imag = simd_sum(u_imag);
+    const int sum_v_real = simd_sum(v_real);
+    const int sum_v_imag = simd_sum(v_imag);
+    if (simd_lane == 0U) {
+        const int output = output_tile * groups_per_tile * rows_per_group + output_group_in_tile * rows_per_group;
+        const float sx = act_scales[0];
+        const float4 value = {
+            row4_finish_i32(sum_u_real + sum_v_real, sx, scales[output + 0]),
+            row4_finish_i32(-sum_u_imag + sum_v_imag, sx, scales[output + 1]),
+            row4_finish_i32(sum_u_imag + sum_v_imag, sx, scales[output + 2]),
+            row4_finish_i32(sum_u_real - sum_v_real, sx, scales[output + 3]),
+        };
+        *((device float4 *) (dst + output)) = value;
+
+        for (int i = 0; i < rows_per_group; ++i) {
+            // Reload the published carrier through volatile device memory. In
+            // addition to preserving callback-visible ROW4 output, this is the
+            // same optimization boundary as the standalone QAT add dispatch
+            // for signed-zero behavior.
+            const uint a = *((device volatile uint *) (dst + output + i));
+            const uint b = residual[output + i];
+            const float real = fairy2i_bf16_to_f32((ushort) (a & 0xffffU)) +
+                               fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
+            const float imag = fairy2i_bf16_to_f32((ushort) (a >> 16)) +
+                               fairy2i_bf16_to_f32((ushort) (b >> 16));
+            add_dst[output + i] = fairy2i_pack_bf16_pair(real, imag);
+        }
+    }
+}
+
 
 ROW4_REDUCED_KERNEL(kernel_row4_w1a8_small_batch, tgpig.y)
 

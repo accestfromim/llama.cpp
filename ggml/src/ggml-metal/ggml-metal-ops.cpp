@@ -2010,10 +2010,30 @@ size_t ggml_metal_op_row_quant_linear_extra_act_q(const ggml_tensor * op) {
            (direct_act ? GGML_PAD(quant_bytes, 64) - quant_bytes + act_rows * k * sizeof(ggml_fp16_t) : 0);
 }
 
+static ggml_tensor * ggml_metal_row4_decode_qat_residual_add(ggml_metal_op_t ctx, int idx, ggml_tensor * op) {
+    if (!ctx->use_fusion || op->op != GGML_OP_ROW4_LINEAR || idx + 1 >= ctx->idx_end || ggml_nrows(op->src[0]) != 1 ||
+        ggml_get_op_params_i32(op, 1) % 32 != 0 ||
+        (ggml_get_op_params_i32(op, 2) != 4096 && ggml_get_op_params_i32(op, 2) != 12288) ||
+        !ggml_node_has_n_uses(ctx->gf, idx, 1) || (op->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return nullptr;
+    }
+
+    ggml_tensor * add = ggml_graph_node(ctx->gf, idx + 1);
+    if (add->op != GGML_OP_COMPLEX_ADD || !ggml_complex_add_get_qat(add) || add->src[0] != op || !add->src[1] ||
+        op->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(op, add->src[1]) || !ggml_are_same_shape(op, add) || !ggml_is_contiguous(op) ||
+        !ggml_is_contiguous(add->src[1]) || !ggml_is_contiguous(add) || !ggml_metal_device_supports_op(ctx->dev, add)) {
+        return nullptr;
+    }
+
+    return add;
+}
+
 static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                                                ggml_tensor *        op,
                                                ggml_metal_buffer_id x_buffer,
-                                               bool                 x_packed_bf16) {
+                                               bool                 x_packed_bf16,
+                                               ggml_tensor *        qat_residual_add) {
     GGML_ASSERT(op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR);
     GGML_ASSERT(op->src[0] && op->src[1] && op->src[2]);
     GGML_ASSERT(!x_packed_bf16 || op->op == GGML_OP_ROW4_LINEAR);
@@ -2112,18 +2132,19 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const bool      w8_decode_o64_rows8           = !row4 && path == PATH_DECODE && !w8_decode_o128_rows16;
     const bool      row4_prefill_m64n32_native_layout_dualw_direct_act = row4_direct_act;
     const bool      row4_prefill_m64n32_native_layout_dualw = row4 && path == PATH_PREFILL && !row4_direct_act;
-    const char *    pipeline_name = row4_prefill_m64n32_native_layout_dualw_direct_act ?
-                                        "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act" :
-                                    row4_prefill_m64n32_native_layout_dualw ?
-                                        "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw" :
-                                    row4_decode_o32_o4_staged_act     ? "kernel_row4_w1a8_decode_o32_o4_staged_act" :
-                                    row4_decode_o32_segmented16       ? "kernel_row4_w1a8_decode_o32_segmented16" :
-                                    w8_decode_o128_rows16             ? "kernel_row8_w8a8_decode_o128_rows16" :
-                                    w8_decode_o64_rows8               ? "kernel_row8_w8a8_decode_o64_rows8" :
-                                    row4 && path == PATH_SMALL_BATCH  ? "kernel_row4_w1a8_small_batch" :
-                                    !row4 && path == PATH_SMALL_BATCH ? "kernel_row8_w8a8_small_batch" :
-                                    row4                              ? "kernel_row4_w1a8_prefill" :
-                                                                        "kernel_row8_w8a8_prefill";
+    const char *    pipeline_name =
+        qat_residual_add ? "kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual" :
+        row4_prefill_m64n32_native_layout_dualw_direct_act ?
+                           "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act" :
+        row4_prefill_m64n32_native_layout_dualw ? "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw" :
+        row4_decode_o32_o4_staged_act           ? "kernel_row4_w1a8_decode_o32_o4_staged_act" :
+        row4_decode_o32_segmented16             ? "kernel_row4_w1a8_decode_o32_segmented16" :
+        w8_decode_o128_rows16                   ? "kernel_row8_w8a8_decode_o128_rows16" :
+        w8_decode_o64_rows8                     ? "kernel_row8_w8a8_decode_o64_rows8" :
+        row4 && path == PATH_SMALL_BATCH        ? "kernel_row4_w1a8_small_batch" :
+        !row4 && path == PATH_SMALL_BATCH       ? "kernel_row8_w8a8_small_batch" :
+        row4                                    ? "kernel_row4_w1a8_prefill" :
+                                                  "kernel_row8_w8a8_prefill";
     const char *    row4_path_detail =
         row4_decode_o32_o4_staged_act ?
             "A8/I32 O32 one-O4-per-SIMDgroup staged-act" :
@@ -2184,6 +2205,10 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     ggml_metal_encoder_set_buffer(enc, act_q, 3);
     ggml_metal_encoder_set_buffer(enc, act_scales, 4);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 5);
+    if (qat_residual_add) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(qat_residual_add->src[1]), 6);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(qat_residual_add), 7);
+    }
     if (row4_prefill_m64n32_native_layout_dualw_direct_act) {
         ggml_metal_encoder_set_buffer(enc, act_h, 6);
     }
@@ -2263,7 +2288,16 @@ int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ggml_graph_node(ctx->gf, idx);
     GGML_ASSERT(op->src[0]);
 
-    return ggml_metal_op_row_quant_linear_impl(ctx, op, ggml_metal_get_buffer_id(op->src[0]), false);
+    ggml_tensor * qat_residual_add = ggml_metal_row4_decode_qat_residual_add(ctx, idx, op);
+    if (qat_residual_add && !ggml_metal_op_concurrency_check(ctx, qat_residual_add)) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+    ggml_metal_op_row_quant_linear_impl(ctx, op, ggml_metal_get_buffer_id(op->src[0]), false, qat_residual_add);
+
+    if (qat_residual_add && ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("%s: fuse Row4 decode staged epilogue + QAT COMPLEX_ADD residual\n", __func__);
+    }
+    return qat_residual_add ? 2 : 1;
 }
 
 int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
@@ -4006,14 +4040,25 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
                 // otherwise-dead MUL allocation. Publish them before the down
                 // projection widens and quantizes those exact payloads.
                 ggml_metal_encoder_memory_barrier(ctx->enc);
-                ggml_metal_op_row_quant_linear_impl(ctx, down, ggml_metal_get_buffer_id(mul), true);
+                ggml_tensor * qat_residual_add = ggml_metal_row4_decode_qat_residual_add(ctx, idx + 3, down);
+                if (qat_residual_add && !ggml_metal_op_concurrency_check(ctx, qat_residual_add)) {
+                    ggml_metal_op_concurrency_reset(ctx);
+                }
+                ggml_metal_op_row_quant_linear_impl(ctx, down, ggml_metal_get_buffer_id(mul), true, qat_residual_add);
 
                 if (ctx->debug_fusion > 1) {
-                    GGML_LOG_DEBUG(
-                        "%s: fuse Row4 QAT SILU_EXACT + VIEW + MUL_EXACT + ROW4_LINEAR (packed BF16 handoff)\n",
-                        __func__);
+                    if (qat_residual_add) {
+                        GGML_LOG_DEBUG(
+                            "%s: fuse Row4 QAT SILU_EXACT + VIEW + MUL_EXACT + ROW4_LINEAR + QAT COMPLEX_ADD "
+                            "(packed BF16 handoff and residual epilogue)\n",
+                            __func__);
+                    } else {
+                        GGML_LOG_DEBUG(
+                            "%s: fuse Row4 QAT SILU_EXACT + VIEW + MUL_EXACT + ROW4_LINEAR (packed BF16 handoff)\n",
+                            __func__);
+                    }
                 }
-                return 4;
+                return qat_residual_add ? 5 : 4;
             }
 
             if (ctx->debug_fusion > 1) {
