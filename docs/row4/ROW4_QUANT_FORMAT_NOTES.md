@@ -342,7 +342,7 @@ CPU 实现位于 dedicated Row4 runtime，提供：
 
 - `scalar`：只用于 oracle/测试强制路径；不是生产 fallback。
 - `dotprod`：单 token decode 的默认 ARM path。
-- `i8mm`：可用时用于多 token；`B>=8` 使用临时 four-row panel，较小 batch 使用 direct path。
+- `i8mm`：可用时用于多 token；`B>=8` 使用按 token-pair/K8 排列的临时 eight-row panel，使一次 activation load 同时服务八个输出行，较小 batch 使用 direct path。
 
 测试可用：
 
@@ -356,14 +356,15 @@ GGML_ROW4_CPU_DEBUG=1
 ```text
 row4_cpu: op=<row4|w8a8> path=<scalar|dotprod|i8mm> \
 layout=<m16k128_split8_v1|s8_m16k128_rowmajor_v1> \
-B=<B> O=<O> K=<K> nth=<threads> aqpack=bf16_rne_a8_away_v1 panel=<0|1> prepack=0
+B=<B> O=<O> K=<K> nth=<threads> \
+aqpack=<bf16_rne_a8_away_v1|bf16_rne_a8_away_pairk8_v1> panel=<0|1> prepack=0
 ```
 
 当前实现每次 op 量化 activation；没有持久化 weight prepack，marker 固定 `prepack=0`。
 
 ### 8.2 Metal
 
-Metal 首先运行：
+未被 producer fusion 覆盖的 Metal linear 首先运行：
 
 ```text
 kernel_row4_quantize_activation_i8
@@ -379,7 +380,9 @@ kernel_row4_quantize_activation_i8
 
 decode/small-batch 使用 A8/I32。本 profile 的 Row4 decode 以 O32 threadgroup 为单位，8 个 SIMDgroup 各处理一个 O4，并把 K4096/K12288 activation 一次性 staged 到 threadgroup memory。W8 decode 每个 O128 threadgroup 使用 8 个 SIMDgroup，每组计算一个 canonical O16 tile，即每个 SIMDgroup 处理 16 行。
 
-pp512 的 Row4 production path 先把 token-major INT8 activation 用 32x32 coalesced transpose 转为 K-major half，再用 `kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act`。该 kernel 每个 threadgroup 计算 M64N32，直接消费 transpose 后的 activation，避免原有的 token tile 重复 staging。非 32 倍数的 prefill rows 保留同族 native-layout fallback。Row4 prefill 用 half MMA/F32 exact accumulation；在当前最大 `K=12288` 下极值 `2*127*K=3,121,152 < 2^24`。W8 prefill 以 K1024 分段做 F32 exact accumulation，再转/合并为 I32；完整 `K=4096` 极值为 66,064,384，不能用单个 F32 accumulator 冒充全 K 精确 INT32。
+pp512 的 Row4 production path 先把 token-major INT8 activation 用 32x32 coalesced transpose 转为 K-major half，再用 `kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act_simd_localw`。该 kernel 每个 threadgroup 计算 M64N32；每个 SIMDgroup 只 staging 自己消费的 16-row weight slice，并直接消费 transpose 后的 activation，避免 token tile 重复 staging 和跨 SIMDgroup 的 weight barrier。gate/up 的专用 producer kernel 保持相同 MMA/舍入顺序，顺序计算配对的 gate 与 up，执行 exact QAT SiLU/multiply 后把 packed BF16 直接交给 down projection。非 32 倍数的 prefill rows 保留同族 native-layout fallback。Row4 prefill 用 half MMA/F32 exact accumulation；在当前最大 `K=12288` 下极值 `2*127*K=3,121,152 < 2^24`。W8 prefill 以 K1024 分段做 F32 exact accumulation，再转/合并为 I32；完整 `K=4096` 极值为 66,064,384，不能用单个 F32 accumulator 冒充全 K 精确 INT32。
+
+单 token production graph 还保留三组严格门控的逐 bit fusion：72 个 QAT RMSNorm→Row4 activation-quant 链共享一个 dispatch，同时仍物化原 RMS carrier；35 个 attention output 和 36 个 down projection 把 QAT residual add 合入 Row4 epilogue；36 个 QAT SwiGLU→down 链使用 packed BF16 handoff。任一节点有额外 consumer、被标记为 output、shape/layout 不匹配或 scratch 与输入/输出 allocation 重叠时都回退到分离路径。
 
 这些 kernel 与 `s8_m16k128_rowmajor_v1` / `m16k128_split8_v1` 物理布局直接对应。Row4/W8 host 使用静态 pipeline 名，不在每个 op 重复格式化；pipeline cache 用 allocation-free 的 64-bit hash lookup，并在碰撞桶内比较完整名称。path marker 先查 thread-local shape cache，只有首见 shape 才进全局 mutex/set，避免 decode 热路径反复分配或串行化。
 
@@ -540,27 +543,27 @@ perf/scripts/run_row4_bench.sh metal tg /path/to/model.gguf row4-v1
 
 默认 workload 是 `pp512` / `tg128`；CPU 使用 8 threads、3 repetitions，Metal 使用 5 repetitions并执行 cooldown，K/V cache 都显式设为 BF16。harness 会核对 reference code-plane physical shape 和期望 path marker，并保存 JSON、stderr、host/runtime path 和环境 metadata。
 
-冻结版本在 Apple M4 上的正式结果如下。“历史 production”是用户指定的上一代 8B Qwen3 量化速度目标；“严格 legacy”是同一当前 runtime 下重测的 legacy Metal 比较器。
+冻结版本在 Apple M4 上的正式结果如下。“历史 production”是用户指定的上一代 8B Qwen3 量化速度目标；“严格 legacy”是同一 runtime 下重测并保留为验收目标的 legacy Metal 比较器。严格 legacy artifact 来自当时未归档完整 dirty source snapshot 的 build，因此不是可独立重建的 clean baseline；下表 Row4 final 则全部来自 clean commit `72b7164db`，四份 metadata 都记录 `git_dirty=0`，模型 SHA-256 为 `306b3086b28251cf662c462e0bc2d4e153b2a517593a651cf95f3887a62b5deb`。
 
 | backend | workload | Row4 final tok/s | 历史 production tok/s | 相对历史 | 严格 legacy tok/s | 相对严格 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| ARM CPU M4 | pp512 | 52.265618 | 43.582466 | +19.923% | — | — |
-| ARM CPU M4 | tg128 | 30.277095 | 20.465132 | +47.945% | — | — |
-| Metal M4 | pp512 | 229.649411 | 226.7049 | +1.299% | 229.304120 | +0.151% |
-| Metal M4 | tg128 | 29.057094 | 29.0203 | +0.127% | 29.065789 | -0.030% |
+| ARM CPU M4 | pp512 | 71.762123 | 43.582466 | +64.658% | — | — |
+| ARM CPU M4 | tg128 | 28.823771 | 20.465132 | +40.843% | — | — |
+| Metal M4 | pp512 | 232.310440 | 226.7049 | +2.473% | 229.304120 | +1.311% |
+| Metal M4 | tg128 | 29.510607 | 29.0203 | +1.690% | 29.065789 | +1.530% |
 
-因此用户给定的四个历史 production 目标全部达成。Metal pp512 同时超过当前 runtime 的严格 legacy comparator；Metal tg128 超过历史目标，但仍比严格 comparator 低约 `0.030%`，不应把它误报为严格 decode 超越。
+因此用户给定的四个历史 production 目标全部达成，两项 Metal workload 也都超过保留的严格 legacy comparator。
 
 正式 raw artifact prefix 为：
 
 | backend | workload | production path marker | artifact prefix |
 | --- | --- | --- | --- |
-| ARM CPU M4 | pp512 | Row4 `i8mm` prefill | `/Users/a1806/llama/tmp/row4-bench/optimization-final/row4-cpu-current-final.cpu.pp.20260808T213720Z` |
-| ARM CPU M4 | tg128 | Row4/W8 `dotprod` decode | `/Users/a1806/llama/tmp/row4-bench/optimization-final/row4-cpu-current-final.cpu.tg.20260808T213803Z` |
-| Metal M4 | pp512 | Row4 M64N32 native-layout dual-W direct-act | `/Users/a1806/llama/tmp/row4-bench/optimization-final/row4-metal-host-cache-final.metal.pp.20260808T213320Z` |
-| Metal M4 | tg128 | Row4 O32 staged-act; W8 O128/16 rows per SIMDgroup | `/Users/a1806/llama/tmp/row4-bench/optimization-final/row4-metal-host-cache-final.metal.tg.20260808T213154Z` |
+| ARM CPU M4 | pp512 | Row4 `i8mm` pairk8/eight-row panel | `/Users/a1806/llama/tmp/row4-bench/final-clean-72b/row4-final-72b.cpu.pp.20260809T090829Z` |
+| ARM CPU M4 | tg128 | Row4/W8 `dotprod` decode | `/Users/a1806/llama/tmp/row4-bench/final-clean-72b/row4-final-72b.cpu.tg.20260809T090920Z` |
+| Metal M4 | pp512 | Row4 M64N32 direct-act SIMD-local-W; fused gate/up SwiGLU producer | `/Users/a1806/llama/tmp/row4-bench/final-clean-72b/row4-final-72b.metal.pp.20260809T091012Z` |
+| Metal M4 | tg128 | fused RMS→quant/residual/SwiGLU; Row4 O32 staged-act; W8 O128 | `/Users/a1806/llama/tmp/row4-bench/final-clean-72b/row4-final-72b.metal.tg.20260809T091105Z` |
 
-这些 artifact 不属于模型或仓库资产，不得提交。Metal prefill 的主要收益来自 M64N32 direct-act kernel、移除 graph 中的 K/V pack/cont 和 gate/up cont，以及 strided QAT SwiGLU；Metal decode 的主要收益来自 Row4 O32 staged activation 和 W8 O128/16-rows-per-SIMDgroup。静态 pipeline 名、allocation-free cache lookup 与 TLS marker fastpath 进一步减少了 host 侧 decode 开销。所有结果都保留 canonical Row4/W8 path-marker 证据；性能结论不改变第 9.4 节的 full-model blocker。
+这些 artifact 不属于模型或仓库资产，不得提交。CPU prefill 的主要收益来自 pairk8 activation packing 和八行共享 panel。Metal prefill 的主要收益来自 M64N32 direct-act SIMD-local weight staging、gate/up SwiGLU producer fusion，以及移除 graph 中的 K/V pack/cont。Metal decode 的主要收益来自 Row4 O32 staged activation、W8 O128、72 个 RMS→quant fusion、71 个 residual epilogue fusion 和 36 个 packed SwiGLU/down handoff。静态 pipeline 名、allocation-free cache lookup 与 TLS marker fastpath 进一步减少了 host 侧 decode 开销。所有结果都保留 canonical Row4/W8 path-marker 证据；性能结论不改变第 9.4 节的 full-model blocker。
 
 ## 11. 与已有量化方式的区别
 
@@ -590,4 +593,4 @@ Row4 与 Fairy2i 共享“两个复数轴选择”的代数来源，但 4 数的
 - **整模正确性**：CPU eager attention 与 Metal FA3 已观察到 KLD 分歧，logits、NLL、PPL 尚未签收。
 - **生成质量**：BOS 修复后 CPU/Metal 均能生成连贯语言，32-token greedy code prompt 逐 byte 相同；但默认 reasoning 在 512 tokens 内仍未输出最终答案，chat UX 尚未完全签收。
 - **拒绝的融合**：Q/K RMSNorm→RoPE 候选因真模型非确定性已完全回退，v1 不允许把该候选当作 production path。
-- **性能**：冻结版 pp512/tg128 的 CPU/Metal 四项均达到历史 production 目标；Metal tg128 仍比同 runtime 严格 legacy comparator 低约 `0.030%`。后续结果仍必须保留 raw artifact 和 path marker，且性能提升不能替代 full-model logits/NLL/PPL 验收。
+- **性能**：clean commit `72b7164db` 的 pp512/tg128 CPU/Metal 四项均达到历史 production 目标，两项 Metal workload 也超过保留的严格 legacy comparator。后续结果仍必须保留 raw artifact 和 path marker，且性能提升不能替代 full-model logits/NLL/PPL 验收。
