@@ -5161,9 +5161,84 @@ static void ggml_compute_forward_set_rows_bf16(const ggml_compute_params * param
     }
 }
 
+static inline uint16_t ggml_bf16_carrier_payload(const void * src) {
+    uint32_t bits;
+    memcpy(&bits, src, sizeof(bits));
+    return (uint16_t) (bits >> 16);
+}
+
+static void ggml_compute_forward_set_rows_bf16_carrier_rows(
+        const ggml_compute_params * params,
+              ggml_tensor         * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I64);
+    GGML_ASSERT(dst->ne[0] == src0->ne[0]);
+
+    const int64_t n_dims = src0->ne[0];
+    const int64_t n_rows = src0->ne[1];
+    const int64_t dr     = (n_rows + params->nth - 1) / params->nth;
+    const int64_t ir0    = dr * params->ith;
+    const int64_t ir1    = std::min(ir0 + dr, n_rows);
+
+    for (int64_t row = ir0; row < ir1; ++row) {
+        const int64_t dst_row = *(const int64_t *) ((const char *) src1->data + row * src1->nb[0]);
+        GGML_ASSERT(dst_row >= 0 && dst_row < dst->ne[1]);
+
+        const char * src_row = (const char *) src0->data + row * src0->nb[1];
+        char *       out_row = (char *) dst->data + dst_row * dst->nb[1];
+        for (int64_t i = 0; i < n_dims; ++i) {
+            ggml_bf16_t value = { ggml_bf16_carrier_payload(src_row + i * src0->nb[0]) };
+            memcpy(out_row + i * dst->nb[0], &value, sizeof(value));
+        }
+    }
+}
+
+static void ggml_compute_forward_set_rows_bf16_carrier_elements(
+        const ggml_compute_params * params,
+              ggml_tensor         * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_BF16 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I64);
+    GGML_ASSERT(dst->ne[0] == 1);
+
+    const int64_t n_elements = ggml_nelements(src0);
+    const int64_t dr         = (n_elements + params->nth - 1) / params->nth;
+    const int64_t ir0        = dr * params->ith;
+    const int64_t ir1        = std::min(ir0 + dr, n_elements);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i0 = i % src0->ne[0];
+        const int64_t i1 = (i / src0->ne[0]) % src0->ne[1];
+        const int64_t i2 = (i / (src0->ne[0] * src0->ne[1])) % src0->ne[2];
+        const int64_t i3 = i / (src0->ne[0] * src0->ne[1] * src0->ne[2]);
+
+        const char * src = (const char *) src0->data +
+                           i0 * src0->nb[0] + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
+        const int64_t dst_element = *(const int64_t *) ((const char *) src1->data + i * src1->nb[0]);
+        GGML_ASSERT(dst_element >= 0 && dst_element < dst->ne[1]);
+
+        ggml_bf16_t value = { ggml_bf16_carrier_payload(src) };
+        memcpy((char *) dst->data + dst_element * dst->nb[1], &value, sizeof(value));
+    }
+}
+
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+
+    const int32_t mode = ggml_get_op_params_i32(dst, 0);
+    if (mode == GGML_SET_ROWS_BF16_CARRIER_ROWS) {
+        ggml_compute_forward_set_rows_bf16_carrier_rows(params, dst);
+        return;
+    }
+    if (mode == GGML_SET_ROWS_BF16_CARRIER_ELEMENTS) {
+        ggml_compute_forward_set_rows_bf16_carrier_elements(params, dst);
+        return;
+    }
+    GGML_ASSERT(mode == 0);
 
     const ggml_tensor * src0 = dst->src[0];
 
@@ -5805,6 +5880,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_FAIRY2I_TILE64_V2:
         case GGML_TYPE_FAIRY2I_ACT_Q16_64:
         case GGML_TYPE_FAIRY2I_BUNDLE_CODES:
+        case GGML_TYPE_ROW4_CODES:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");

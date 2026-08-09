@@ -1,18 +1,20 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
+#include "ggml-cpu.h"
+
+#include "binary-ops.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
-#include "traits.h"
 #include "ggml-cpu-impl.h"
-#include "ggml-cpu.h"
 #include "ggml-impl.h"
-#include "quants.h"
 #include "ggml-threading.h"
-#include "unary-ops.h"
-#include "binary-ops.h"
-#include "vec.h"
 #include "ops.h"
+#include "quants.h"
+#include "row4/row4-cpu.h"
+#include "traits.h"
+#include "unary-ops.h"
+#include "vec.h"
 #ifdef GGML_USE_FAIRY2I_CPU
 #    include "fairy2i/fairy2i-cpu.h"
 #endif
@@ -1738,6 +1740,13 @@ static void ggml_compute_forward_mul_mat_id(
 /////////////////////////////////
 
 static bool ggml_cpu_extension_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+    if (ggml_row4_cpu_supports_op(tensor)) {
+        if (!ggml_row4_cpu_compute(params, tensor)) {
+            GGML_ABORT("%s failed", ggml_op_name(tensor->op));
+        }
+        return true;
+    }
+
 #ifdef GGML_USE_FAIRY2I_CPU
     if (ggml_fairy2i_cpu_supports_op(tensor)) {
         if (!ggml_fairy2i_cpu_compute(params, tensor)) {
@@ -1762,6 +1771,11 @@ static bool ggml_cpu_extension_compute_forward(struct ggml_compute_params * para
 }
 
 static bool ggml_cpu_extension_n_tasks(struct ggml_tensor * node, int n_threads, int * n_tasks) {
+    if (ggml_row4_cpu_supports_op(node)) {
+        *n_tasks = ggml_row4_cpu_n_tasks(node, n_threads);
+        return true;
+    }
+
 #ifdef GGML_USE_FAIRY2I_CPU
     if (ggml_fairy2i_cpu_supports_op(node)) {
         *n_tasks = ggml_fairy2i_cpu_n_tasks(node, n_threads);
@@ -1783,6 +1797,11 @@ static bool ggml_cpu_extension_n_tasks(struct ggml_tensor * node, int n_threads,
 }
 
 static bool ggml_cpu_extension_work_size(struct ggml_tensor * node, int n_tasks, size_t * work_size) {
+    if (ggml_row4_cpu_supports_op(node)) {
+        *work_size = ggml_row4_cpu_work_size(node, n_tasks);
+        return true;
+    }
+
 #ifdef GGML_USE_FAIRY2I_CPU
     if (ggml_fairy2i_cpu_supports_op(node)) {
         *work_size = ggml_fairy2i_cpu_work_size(node, n_tasks);
@@ -2100,6 +2119,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("%s requires GGML_FAIRY2I_CPU", ggml_op_name(tensor->op));
             }
             break;
+        case GGML_OP_ROW4_LINEAR:
+        case GGML_OP_W8A8_LINEAR:
+            {
+                GGML_ABORT("%s has invalid Row4/W8A8 operands", ggml_op_name(tensor->op));
+            }
         case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
             {
                 GGML_ABORT("%s requires GGML_LEGACY_IFAIRY_CPU", ggml_op_name(tensor->op));

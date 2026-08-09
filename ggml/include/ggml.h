@@ -422,7 +422,8 @@ extern "C" {
         GGML_TYPE_FAIRY2I_TILE64_V2    = 44,  // Fairy2i tile64_v2 weights
         GGML_TYPE_FAIRY2I_ACT_Q16_64   = 45,  // Fairy2i 64-value complex activation block
         GGML_TYPE_FAIRY2I_BUNDLE_CODES = 46,  // opaque Fairy2i M64xK64 bundle code plane
-        GGML_TYPE_COUNT                = 47,
+        GGML_TYPE_ROW4_CODES           = 47,  // opaque Row4 M16xK128 split8 code plane
+        GGML_TYPE_COUNT                = 48,
     };
 
     // precision
@@ -584,6 +585,8 @@ extern "C" {
         GGML_OP_FAIRY2I_MUL_EXACT,
         GGML_OP_FAIRY2I_PACK_BF16_EXACT,
         GGML_OP_FAIRY2I_ATTN_EXACT_CPU,
+        GGML_OP_ROW4_LINEAR,
+        GGML_OP_W8A8_LINEAR,
 
         GGML_OP_COUNT,
     };
@@ -1598,6 +1601,21 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // Private SET_ROWS modes used to store an F32 BF16 carrier into a BF16 KV
+    // cache without a floating-point conversion. The payload written for every
+    // source element is the high 16 bits of its raw F32 storage.
+    enum ggml_set_rows_bf16_carrier_mode {
+        GGML_SET_ROWS_BF16_CARRIER_ROWS    = 1,
+        GGML_SET_ROWS_BF16_CARRIER_ELEMENTS = 2,
+    };
+
+    GGML_API struct ggml_tensor * ggml_set_rows_bf16_carrier(
+            struct ggml_context                  * ctx,
+            struct ggml_tensor                   * a,  // BF16 destination
+            struct ggml_tensor                   * b,  // F32 BF16 carrier
+            struct ggml_tensor                   * c,  // I64 destination indices
+            enum ggml_set_rows_bf16_carrier_mode   mode);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -1743,6 +1761,24 @@ extern "C" {
     GGML_API void ggml_fairy2i_wide_linear_set_qat(struct ggml_tensor * a, bool qat);
 
     GGML_API bool ggml_fairy2i_wide_linear_get_qat(const struct ggml_tensor * a);
+
+    // Row4/W8A8 deployment linear operators. Both operators consume an F32
+    // activation carrier in src[0], packed codes in src[1], and row scales in
+    // src[2]. op_params contain int32 { layout_version = 1, logical_o,
+    // logical_k }. The result is an F32 carrier with a BF16 output boundary.
+    GGML_API struct ggml_tensor * ggml_row4_linear(struct ggml_context * ctx,
+                                                   struct ggml_tensor *  x,
+                                                   struct ggml_tensor *  codes,
+                                                   struct ggml_tensor *  scales,
+                                                   int64_t               logical_o,
+                                                   int64_t               logical_k);
+
+    GGML_API struct ggml_tensor * ggml_w8a8_linear(struct ggml_context * ctx,
+                                                   struct ggml_tensor *  x,
+                                                   struct ggml_tensor *  codes,
+                                                   struct ggml_tensor *  scales,
+                                                   int64_t               logical_o,
+                                                   int64_t               logical_k);
 
     GGML_API struct ggml_tensor * ggml_complex_rms_norm(struct ggml_context * ctx, struct ggml_tensor * a, float eps);
 
