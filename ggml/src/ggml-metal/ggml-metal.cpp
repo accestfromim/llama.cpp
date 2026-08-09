@@ -204,6 +204,12 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(tensor);
             }
             break;
+        case GGML_OP_ROW4_LINEAR:
+        case GGML_OP_W8A8_LINEAR:
+            {
+                res += ggml_metal_op_row_quant_linear_extra_act_q(tensor);
+            }
+            break;
         default:
             break;
     }

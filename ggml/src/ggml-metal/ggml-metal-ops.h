@@ -36,6 +36,9 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const struct ggml_tensor * op);
 
 size_t ggml_metal_op_fairy2i_wide_linear_w2_extra_act_q(const struct ggml_tensor * op);
 
+// Per-token signed-int8 activations followed by one float scale per token.
+size_t ggml_metal_op_row_quant_linear_extra_act_q(const struct ggml_tensor * op);
+
 // return true if we should use the FA vector kernel for this op
 bool ggml_metal_op_flash_attn_ext_use_vec(const struct ggml_tensor * op);
 
@@ -60,6 +63,7 @@ int ggml_metal_op_pool_2d           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_mul_mat_id        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_complex(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_add_id            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_flash_attn_ext    (ggml_metal_op_t ctx, int idx);
