@@ -14,7 +14,19 @@ import sys
 from enum import IntEnum
 from pathlib import Path
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ContextManager,
+    Iterable,
+    Iterator,
+    Literal,
+    Mapping,
+    Sequence,
+    TypeVar,
+    cast,
+)
 from itertools import chain
 from transformers import AutoConfig
 
@@ -9063,6 +9075,65 @@ def get_model_architecture(hparams: dict[str, Any], model_type: ModelType) -> st
     return arch
 
 
+def is_qwen3_row4_checkpoint(dir_model: Path, hparams: Mapping[str, Any]) -> bool:
+    """Detect checkpoints that require the dedicated Row4 converter.
+
+    This stays self-contained so existing ``NO_LOCAL_GGUF=1`` installations
+    do not need the optional Row4 helper package merely to run the generic
+    converter on an unrelated model.
+    """
+
+    architectures = hparams.get("architectures")
+    is_qwen3 = hparams.get("model_type") == "qwen3" or (
+        isinstance(architectures, list)
+        and any(isinstance(arch, str) and arch.startswith("Qwen3") for arch in architectures)
+    )
+    if not is_qwen3:
+        return False
+    auto_map = hparams.get("auto_map")
+    if isinstance(auto_map, dict) and any(
+        isinstance(target, str) and "row4" in target.lower()
+        for target in auto_map.values()
+    ):
+        return True
+    index_path = dir_model / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        return isinstance(weight_map, dict) and any(
+            isinstance(name, str) and name.endswith(".weight_scale")
+            for name in weight_map
+        )
+
+    single_file = dir_model / "model.safetensors"
+    if not single_file.is_file():
+        return False
+    try:
+        with single_file.open("rb") as file:
+            header_size_bytes = file.read(8)
+            if len(header_size_bytes) != 8:
+                return False
+            header_size = int.from_bytes(header_size_bytes, "little")
+            if header_size <= 0 or header_size > 100_000_000:
+                return False
+            header = json.loads(file.read(header_size))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(header, dict) and any(
+        isinstance(name, str) and name.endswith(".weight_scale")
+        for name in header
+    )
+
+
+def should_reject_qwen3_row4_checkpoint(*, detected: bool, vocab_only: bool) -> bool:
+    """The dedicated tensor path is required, but vocabulary-only export is safe."""
+
+    return detected and not vocab_only
+
+
 def main() -> None:
     args = parse_args()
 
@@ -9128,6 +9199,19 @@ def main() -> None:
         output_type = ftype_map[args.outtype]
         model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
+        row4_checkpoint = (
+            not is_mistral_format
+            and is_qwen3_row4_checkpoint(dir_model, hparams)
+        )
+        if should_reject_qwen3_row4_checkpoint(
+            detected=row4_checkpoint,
+            vocab_only=args.vocab_only,
+        ):
+            raise ValueError(
+                "detected a Qwen3 Row4 INT8 checkpoint; the generic converter would "
+                "serialize its latent BF16 weights incorrectly. Use "
+                "gguf-py/convert_row4_qwen3.py instead"
+            )
         if not is_mistral_format:
             model_architecture = get_model_architecture(hparams, model_type)
             logger.info(f"Model architecture: {model_architecture}")

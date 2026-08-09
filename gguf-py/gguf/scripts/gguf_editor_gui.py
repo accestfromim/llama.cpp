@@ -27,7 +27,7 @@ if "NO_LOCAL_GGUF" not in os.environ and (Path(__file__).parent.parent.parent.pa
 
 import gguf
 from gguf import GGUFReader, GGUFWriter, GGUFValueType, ReaderField
-from gguf.constants import TokenType, RopeScalingType, PoolingType, GGMLQuantizationType
+from gguf.constants import TokenType, RopeScalingType, PoolingType, LlamaFileType
 
 logger = logging.getLogger("gguf-editor-gui")
 
@@ -36,7 +36,7 @@ KEY_TO_ENUM_TYPE = {
     gguf.Keys.Tokenizer.TOKEN_TYPE: TokenType,
     gguf.Keys.Rope.SCALING_TYPE: RopeScalingType,
     gguf.Keys.LLM.POOLING_TYPE: PoolingType,
-    gguf.Keys.General.FILE_TYPE: GGMLQuantizationType,
+    gguf.Keys.General.FILE_TYPE: LlamaFileType,
 }
 
 # Define the tokenizer keys that should be edited together
