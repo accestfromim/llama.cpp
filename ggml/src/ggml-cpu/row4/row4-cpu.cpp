@@ -18,6 +18,7 @@ namespace {
 constexpr int64_t row4_layout_version = 1;
 constexpr int64_t row4_tile_k         = 128;
 constexpr int64_t row4_tile_o         = 16;
+constexpr int64_t row4_panel_rows     = 8;
 constexpr size_t  row4_cache_line     = 64;
 
 enum class row4_path {
@@ -506,24 +507,29 @@ static void compute_i8mm_panel(struct ggml_tensor *               dst,
     GGML_ASSERT(next_job != nullptr);
     for (int64_t ot = next_job->fetch_add(1, std::memory_order_relaxed); ot < o_tiles;
          ot         = next_job->fetch_add(1, std::memory_order_relaxed)) {
-        for (int group = 0; group < 4; ++group) {
+        for (int group = 0; group < 4; group += 2) {
             const int64_t row0 = ot * row4_tile_o + group * 4;
+            int8_t *      panel_hi = panel + 4 * k;
             expand_four_rows(codes, row4, row0, k, panel);
+            expand_four_rows(codes, row4, row0 + 4, k, panel_hi);
 
             // Keep every accumulator's K traversal unchanged, but interleave four
-            // token pairs so the expanded weight panel is loaded only once for
-            // eight tokens. Both row pairs share the activation loads as well.
+            // token pairs and four row pairs so each activation panel load feeds
+            // eight output rows.
             for (int64_t token0 = 0; token0 < tokens; token0 += 8) {
-                int32x4_t sums[4][2];
+                int32x4_t sums[4][4];
                 for (int pair = 0; pair < 4; ++pair) {
-                    sums[pair][0] = vdupq_n_s32(0);
-                    sums[pair][1] = vdupq_n_s32(0);
+                    for (int row_pair = 0; row_pair < 4; ++row_pair) {
+                        sums[pair][row_pair] = vdupq_n_s32(0);
+                    }
                 }
 
                 for (int64_t ik = 0; ik < k; ik += 8) {
                     const int64_t   k8_offset = (ik / 8) * 16;
                     const int8x16_t weights01 = vld1q_s8(panel + (ik / 8) * 32);
                     const int8x16_t weights23 = vld1q_s8(panel + (ik / 8) * 32 + 16);
+                    const int8x16_t weights45 = vld1q_s8(panel_hi + (ik / 8) * 32);
+                    const int8x16_t weights67 = vld1q_s8(panel_hi + (ik / 8) * 32 + 16);
                     const int8_t *  inputs    = activations + (token0 / 2) * (2 * k) + k8_offset;
                     const int8x16_t input01   = vld1q_s8(inputs + 0 * (2 * k));
                     const int8x16_t input23   = vld1q_s8(inputs + 1 * (2 * k));
@@ -532,12 +538,20 @@ static void compute_i8mm_panel(struct ggml_tensor *               dst,
 
                     sums[0][0] = vmmlaq_s32(sums[0][0], input01, weights01);
                     sums[0][1] = vmmlaq_s32(sums[0][1], input01, weights23);
+                    sums[0][2] = vmmlaq_s32(sums[0][2], input01, weights45);
+                    sums[0][3] = vmmlaq_s32(sums[0][3], input01, weights67);
                     sums[1][0] = vmmlaq_s32(sums[1][0], input23, weights01);
                     sums[1][1] = vmmlaq_s32(sums[1][1], input23, weights23);
+                    sums[1][2] = vmmlaq_s32(sums[1][2], input23, weights45);
+                    sums[1][3] = vmmlaq_s32(sums[1][3], input23, weights67);
                     sums[2][0] = vmmlaq_s32(sums[2][0], input45, weights01);
                     sums[2][1] = vmmlaq_s32(sums[2][1], input45, weights23);
+                    sums[2][2] = vmmlaq_s32(sums[2][2], input45, weights45);
+                    sums[2][3] = vmmlaq_s32(sums[2][3], input45, weights67);
                     sums[3][0] = vmmlaq_s32(sums[3][0], input67, weights01);
                     sums[3][1] = vmmlaq_s32(sums[3][1], input67, weights23);
+                    sums[3][2] = vmmlaq_s32(sums[3][2], input67, weights45);
+                    sums[3][3] = vmmlaq_s32(sums[3][3], input67, weights67);
                 }
 
                 for (int pair = 0; pair < 4; ++pair) {
@@ -545,7 +559,7 @@ static void compute_i8mm_panel(struct ggml_tensor *               dst,
                     if (token >= tokens) {
                         break;
                     }
-                    for (int row_pair = 0; row_pair < 2; ++row_pair) {
+                    for (int row_pair = 0; row_pair < 4; ++row_pair) {
                         const int row = 2 * row_pair;
                         store_result(dst, scales, activation_scales, token, row0 + row,
                                      vgetq_lane_s32(sums[pair][row_pair], 0));
@@ -661,7 +675,7 @@ extern "C" size_t ggml_row4_cpu_work_size(const struct ggml_tensor * dst, int n_
     const int64_t q_tokens      = uses_panel ? align_panel_tokens(tokens) : tokens;
     const size_t  q_bytes       = align_cache_line((size_t) q_tokens * k);
     const size_t  scale_bytes = align_cache_line((size_t) tokens * sizeof(float));
-    const size_t  panel_bytes   = uses_panel ? (size_t) n_tasks * align_cache_line((size_t) 4 * k) : 0;
+    const size_t  panel_bytes   = uses_panel ? (size_t) n_tasks * align_cache_line((size_t) row4_panel_rows * k) : 0;
     const size_t counter_bytes = align_cache_line(sizeof(std::atomic<int64_t>));
     return q_bytes + scale_bytes + panel_bytes + counter_bytes;
 }
@@ -683,7 +697,7 @@ extern "C" bool ggml_row4_cpu_compute(const struct ggml_compute_params * params,
     const int64_t              q_tokens      = uses_panel ? align_panel_tokens(tokens) : tokens;
     const size_t               q_bytes       = align_cache_line((size_t) q_tokens * k);
     const size_t               scale_bytes   = align_cache_line((size_t) tokens * sizeof(float));
-    const size_t               panel_stride  = align_cache_line((size_t) 4 * k);
+    const size_t               panel_stride  = align_cache_line((size_t) row4_panel_rows * k);
     const size_t               panel_bytes   = uses_panel ? (size_t) params->nth * panel_stride : 0;
     const size_t               counter_bytes = align_cache_line(sizeof(std::atomic<int64_t>));
     const size_t               required      = q_bytes + scale_bytes + panel_bytes + counter_bytes;
