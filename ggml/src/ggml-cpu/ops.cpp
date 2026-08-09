@@ -3864,8 +3864,9 @@ void ggml_compute_forward_fairy2i_attn_exact_cpu(const ggml_compute_params * par
         const int64_t seq     = job / (n_queries * n_q_heads);
         const int64_t kv_head = q_head / gqa_ratio;
 
-        float row_max = -INFINITY;
-        float row_sum = 0.0f;
+        float   row_max          = -INFINITY;
+        float   row_sum          = 0.0f;
+        int64_t last_unmasked_key = 0;
         for (int64_t key = 0; key < n_kv; ++key) {
             const float mask_value = *(const float *) ((const char *) mask->data + key * mask->nb[0] +
                                                        query * mask->nb[1] + seq * mask->nb[3]);
@@ -3873,6 +3874,7 @@ void ggml_compute_forward_fairy2i_attn_exact_cpu(const ggml_compute_params * par
                 probability[key] = -INFINITY;
                 continue;
             }
+            last_unmasked_key = key + 1;
 
             float dot = 0.0f;
             for (int64_t d = 0; d < n_dims; ++d) {
@@ -3900,22 +3902,48 @@ void ggml_compute_forward_fairy2i_attn_exact_cpu(const ggml_compute_params * par
             }
         }
 
-        for (int64_t key = 0; key < n_kv; ++key) {
+        for (int64_t key = 0; key < last_unmasked_key; ++key) {
             const float value = row_sum == 0.0f ? 0.0f : expf(probability[key] - row_max) / row_sum;
             probability[key]  = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(value));
         }
 
-        for (int64_t d = 0; d < n_dims; ++d) {
-            float value = 0.0f;
-            for (int64_t key = 0; key < n_kv; ++key) {
-                const ggml_bf16_t v_value = *(const ggml_bf16_t *) ((const char *) v->data + key * v->nb[0] +
-                                                                    d * v->nb[1] + kv_head * v->nb[2] + seq * v->nb[3]);
-                value                     = fmaf(probability[key], GGML_BF16_TO_FP32(v_value), value);
+        int64_t d = 0;
+        for (; d + 3 < n_dims; d += 4) {
+            float value0 = 0.0f;
+            float value1 = 0.0f;
+            float value2 = 0.0f;
+            float value3 = 0.0f;
+            const char * v0 = (const char *) v->data + (d + 0) * v->nb[1] + kv_head * v->nb[2] + seq * v->nb[3];
+            const char * v1 = (const char *) v->data + (d + 1) * v->nb[1] + kv_head * v->nb[2] + seq * v->nb[3];
+            const char * v2 = (const char *) v->data + (d + 2) * v->nb[1] + kv_head * v->nb[2] + seq * v->nb[3];
+            const char * v3 = (const char *) v->data + (d + 3) * v->nb[1] + kv_head * v->nb[2] + seq * v->nb[3];
+            for (int64_t key = 0; key < last_unmasked_key; ++key) {
+                const float probability_value = probability[key];
+                value0 = fmaf(probability_value, GGML_BF16_TO_FP32(*(const ggml_bf16_t *) (v0 + key * v->nb[0])), value0);
+                value1 = fmaf(probability_value, GGML_BF16_TO_FP32(*(const ggml_bf16_t *) (v1 + key * v->nb[0])), value1);
+                value2 = fmaf(probability_value, GGML_BF16_TO_FP32(*(const ggml_bf16_t *) (v2 + key * v->nb[0])), value2);
+                value3 = fmaf(probability_value, GGML_BF16_TO_FP32(*(const ggml_bf16_t *) (v3 + key * v->nb[0])), value3);
             }
 
-            float * output = (float *) ((char *) dst->data + d * dst->nb[0] + query * dst->nb[1] + q_head * dst->nb[2] +
-                                        seq * dst->nb[3]);
-            *output        = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(value));
+            float * output = (float *) ((char *) dst->data + d * dst->nb[0] + query * dst->nb[1] +
+                                        q_head * dst->nb[2] + seq * dst->nb[3]);
+            output[0]      = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(value0));
+            output[1]      = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(value1));
+            output[2]      = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(value2));
+            output[3]      = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(value3));
+        }
+        for (; d < n_dims; ++d) {
+            float value = 0.0f;
+            const char * v_row =
+                (const char *) v->data + d * v->nb[1] + kv_head * v->nb[2] + seq * v->nb[3];
+            for (int64_t key = 0; key < last_unmasked_key; ++key) {
+                value = fmaf(probability[key],
+                             GGML_BF16_TO_FP32(*(const ggml_bf16_t *) (v_row + key * v->nb[0])), value);
+            }
+
+            float * output = (float *) ((char *) dst->data + d * dst->nb[0] + query * dst->nb[1] +
+                                        q_head * dst->nb[2] + seq * dst->nb[3]);
+            *output = fairy2i_bf16_to_f32_carrier(GGML_FP32_TO_BF16(value));
         }
     }
 }
