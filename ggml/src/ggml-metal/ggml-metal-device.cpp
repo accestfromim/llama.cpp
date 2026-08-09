@@ -1,13 +1,14 @@
 #include "ggml-metal-device.h"
 
+#include "ggml-impl.h"
 #include "ggml-metal-impl.h"
 
-#include "ggml-impl.h"
-
 #include <cassert>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 struct ggml_metal_device_deleter {
     void operator()(ggml_metal_device_t ctx) {
@@ -23,8 +24,22 @@ ggml_metal_device_t ggml_metal_device_get(void) {
     return ctx.get();
 }
 
+struct ggml_metal_pipeline_entry {
+    std::string           name;
+    ggml_metal_pipeline_t pipeline;
+};
+
+static uint64_t ggml_metal_pipeline_name_hash(const char * name) {
+    uint64_t hash = 14695981039346656037ULL;
+    while (*name) {
+        hash ^= (uint8_t) *name++;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 struct ggml_metal_pipelines {
-    std::unordered_map<std::string, ggml_metal_pipeline_t> data;
+    std::unordered_map<uint64_t, std::vector<ggml_metal_pipeline_entry>> data;
 };
 
 ggml_metal_pipelines_t ggml_metal_pipelines_init(void) {
@@ -38,23 +53,40 @@ void ggml_metal_pipelines_free(ggml_metal_pipelines_t ppls) {
         return;
     }
 
-    for (auto it = ppls->data.begin(); it != ppls->data.end(); ++it) {
-        ggml_metal_pipeline_free(it->second);
+    for (const auto & bucket : ppls->data) {
+        for (const auto & entry : bucket.second) {
+            ggml_metal_pipeline_free(entry.pipeline);
+        }
     }
 
     delete ppls;
 }
 
 void ggml_metal_pipelines_add(ggml_metal_pipelines_t ppls, const char * name, ggml_metal_pipeline_t pipeline) {
-    ppls->data[name] = pipeline;
+    auto & bucket = ppls->data[ggml_metal_pipeline_name_hash(name)];
+    for (auto & entry : bucket) {
+        if (entry.name == name) {
+            entry.pipeline = pipeline;
+            return;
+        }
+    }
+
+    bucket.push_back({ name, pipeline });
 }
 
 ggml_metal_pipeline_t ggml_metal_pipelines_get(ggml_metal_pipelines_t ppls, const char * name) {
-    if  (ppls->data.find(name) == ppls->data.end()) {
+    const auto it = ppls->data.find(ggml_metal_pipeline_name_hash(name));
+    if (it == ppls->data.end()) {
         return nullptr;
     }
 
-    return ppls->data[name];
+    for (const auto & entry : it->second) {
+        if (entry.name == name) {
+            return entry.pipeline;
+        }
+    }
+
+    return nullptr;
 }
 
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_base(ggml_metal_library_t lib, ggml_op op) {
