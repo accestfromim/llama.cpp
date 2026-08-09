@@ -879,6 +879,68 @@ kernel void kernel_row4_quantize_activation_i8(
     }
 }
 
+// Packed-BF16 entry point for the fused QAT SwiGLU -> Row4 down path. The
+// producer already materialized the checkpoint BF16 payload, so widening it by
+// placing the payload in the high 16 bits is exact and must not round again.
+kernel void kernel_row4_quantize_activation_i8_packed_bf16(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const ushort * x                           [[buffer(1)]],
+        device char * act_q                               [[buffer(2)]],
+        device float * act_scales                         [[buffer(3)]],
+        threadgroup float * simd_maxima                   [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]]) {
+    const uint token      = tgpig.x;
+    const uint simd_lane  = tid & 31U;
+    const uint simd_group = tid >> 5;
+    const ulong row_base  = (ulong) token * (ulong) args.k;
+
+    float thread_max = 0.0f;
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const ushort4 bits = *(device const ushort4 *) (x + row_base + i);
+        const float4 xb    = float4(
+            as_type<float>((uint) bits.x << 16U),
+            as_type<float>((uint) bits.y << 16U),
+            as_type<float>((uint) bits.z << 16U),
+            as_type<float>((uint) bits.w << 16U));
+        const float4 abs_xb = fabs(xb);
+        const float max_01  = max(abs_xb.x, abs_xb.y);
+        const float max_23  = max(abs_xb.z, abs_xb.w);
+        thread_max = max(thread_max, max(max_01, max_23));
+    }
+
+    const float group_max = simd_max(thread_max);
+    if (simd_lane == 0U) {
+        simd_maxima[simd_group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0U) {
+        float value = simd_lane < 8U ? simd_maxima[simd_lane] : 0.0f;
+        value = simd_max(value);
+        if (simd_lane == 0U) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(value), 127U);
+            simd_maxima[0] = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[token] = simd_maxima[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float sx = simd_maxima[0];
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const ushort4 bits = *(device const ushort4 *) (x + row_base + i);
+        const float4 xb    = float4(
+            as_type<float>((uint) bits.x << 16U),
+            as_type<float>((uint) bits.y << 16U),
+            as_type<float>((uint) bits.z << 16U),
+            as_type<float>((uint) bits.w << 16U));
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
+        int4 q = int4(magnitude);
+        q = select(q, -q, xb < float4(0.0f));
+        *(device char4 *) (act_q + row_base + i) = char4(clamp(q, int4(-127), int4(127)));
+    }
+}
+
 
 kernel void kernel_row4_transpose_activation_i8_kmajor_half(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
@@ -8839,6 +8901,29 @@ kernel void kernel_fairy2i_swiglu_qat_f32(constant ggml_metal_kargs_fairy2i_elem
     const ushort silu_bits            = fairy2i_silu_qat_bf16(gate_bits);
     const ushort out_bits             = fairy2i_mul_qat_bf16(silu_bits, up_bits);
     dst[(ulong) row * args.ne0 + col] = (uint) out_bits << 16;
+}
+
+kernel void kernel_fairy2i_swiglu_qat_packed_bf16(
+        constant ggml_metal_kargs_fairy2i_elementwise_exact & args [[buffer(0)]],
+        const device uint * gate                                     [[buffer(1)]],
+        const device uint * up                                       [[buffer(2)]],
+        device ushort * dst                                          [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint row = gid.y;
+    if (col >= args.ne0 || (ulong) row * args.ne0 >= args.ne) {
+        return;
+    }
+
+    const device uint * gate_row  = (const device uint *) ((const device uchar *) gate + (ulong) row * args.src0_nb1);
+    const device uint * up_row    = (const device uint *) ((const device uchar *) up + (ulong) row * args.src1_nb1);
+    const ushort        gate_bits = (ushort) (gate_row[col] >> 16);
+    const ushort        up_bits   = (ushort) (up_row[col] >> 16);
+
+    // Keep both QAT boundaries in their original order, but only publish the
+    // final BF16 payload needed by the following activation quantizer.
+    const ushort silu_bits            = fairy2i_silu_qat_bf16(gate_bits);
+    dst[(ulong) row * args.ne0 + col] = fairy2i_mul_qat_bf16(silu_bits, up_bits);
 }
 
 kernel void kernel_fairy2i_pack_bf16_exact(constant ulong &    ne,

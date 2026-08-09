@@ -252,8 +252,8 @@ static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_elementwise_exact(g
     return pipeline;
 }
 
-static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_swiglu_qat(ggml_metal_library_t lib) {
-    constexpr const char * name = "kernel_fairy2i_swiglu_qat_f32";
+static ggml_metal_pipeline_t ggml_metal_get_pipeline_fairy2i_swiglu_qat(ggml_metal_library_t lib, bool packed_bf16) {
+    const char * name = packed_bf16 ? "kernel_fairy2i_swiglu_qat_packed_bf16" : "kernel_fairy2i_swiglu_qat_f32";
 
     ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
     if (!pipeline) {
@@ -2010,11 +2010,13 @@ size_t ggml_metal_op_row_quant_linear_extra_act_q(const ggml_tensor * op) {
            (direct_act ? GGML_PAD(quant_bytes, 64) - quant_bytes + act_rows * k * sizeof(ggml_fp16_t) : 0);
 }
 
-int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ggml_graph_node(ctx->gf, idx);
-
+static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
+                                               ggml_tensor *        op,
+                                               ggml_metal_buffer_id x_buffer,
+                                               bool                 x_packed_bf16) {
     GGML_ASSERT(op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR);
     GGML_ASSERT(op->src[0] && op->src[1] && op->src[2]);
+    GGML_ASSERT(!x_packed_bf16 || op->op == GGML_OP_ROW4_LINEAR);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -2047,8 +2049,9 @@ int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
     act_h.offs += GGML_PAD((size_t) act_rows * (size_t) k * sizeof(int8_t) + (size_t) act_rows * sizeof(float), 64);
 
     {
-        constexpr const char * pipeline_name = "kernel_row4_quantize_activation_i8";
-        ggml_metal_pipeline_t  pipeline      = ggml_metal_library_get_pipeline(lib, pipeline_name);
+        const char * pipeline_name =
+            x_packed_bf16 ? "kernel_row4_quantize_activation_i8_packed_bf16" : "kernel_row4_quantize_activation_i8";
+        ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
         if (!pipeline) {
             pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
         }
@@ -2058,7 +2061,7 @@ int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x), 1);
+        ggml_metal_encoder_set_buffer(enc, x_buffer, 1);
         ggml_metal_encoder_set_buffer(enc, act_q, 2);
         ggml_metal_encoder_set_buffer(enc, act_scales, 3);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, 8 * sizeof(float), 0);
@@ -2254,6 +2257,13 @@ int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
     }
 
     return 1;
+}
+
+int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ggml_graph_node(ctx->gf, idx);
+    GGML_ASSERT(op->src[0]);
+
+    return ggml_metal_op_row_quant_linear_impl(ctx, op, ggml_metal_get_buffer_id(op->src[0]), false);
 }
 
 int ggml_metal_op_fairy2i_wide_linear_w2(ggml_metal_op_t ctx, int idx) {
@@ -3940,8 +3950,11 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
     //   SILU_EXACT(gate-view), VIEW(up), MUL_EXACT(silu, up-view)
     //
     // Preserve the QAT BF16 boundary inside the fused kernel and consume all
-    // three graph nodes. Keep this deliberately specific to the Row4 gate/up
-    // layout so non-QAT and non-Row4 exact operations retain their old path.
+    // three graph nodes. When the sole consumer is a supported Row4 down
+    // projection, hand its BF16 payloads directly to activation quantization
+    // and consume that fourth node as well. Keep this deliberately specific to
+    // the Row4 gate/up layout so all other exact operations retain their old
+    // path.
     if (ctx->use_fusion && op->op == GGML_OP_FAIRY2I_SILU_EXACT && idx + 2 < ctx->idx_end &&
         ggml_fairy2i_exact_get_qat(op) && ggml_node_has_n_uses(ctx->gf, idx, 1)) {
         ggml_tensor * up   = ggml_graph_node(ctx->gf, idx + 1);
@@ -3963,9 +3976,14 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
                                 ggml_is_contiguous_1(gate) && ggml_is_contiguous_1(up) && ggml_is_contiguous(mul);
 
         if (row4_gate_up && exact_mul && f32_layout) {
-            const uint64_t                             ne   = (uint64_t) ggml_nelements(mul);
-            const uint64_t                             ne0  = (uint64_t) mul->ne[0];
-            const uint64_t                             rows = ne / ne0;
+            ggml_tensor *  down       = idx + 3 < ctx->idx_end ? ggml_graph_node(ctx->gf, idx + 3) : nullptr;
+            const bool     fused_down = down && down->op == GGML_OP_ROW4_LINEAR && down->src[0] == mul &&
+                                        ggml_node_has_n_uses(ctx->gf, idx + 2, 1) &&
+                                        ggml_metal_device_supports_op(ctx->dev, mul) &&
+                                        ggml_metal_device_supports_op(ctx->dev, down);
+            const uint64_t ne         = (uint64_t) ggml_nelements(mul);
+            const uint64_t ne0        = (uint64_t) mul->ne[0];
+            const uint64_t rows       = ne / ne0;
             ggml_metal_kargs_fairy2i_elementwise_exact args = {
                 /*.ne       =*/ne,
                 /*.ne0      =*/ne0,
@@ -3973,7 +3991,7 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
                 /*.src1_nb1 =*/up->nb[1],
             };
 
-            ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_swiglu_qat(ctx->lib);
+            ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_swiglu_qat(ctx->lib, fused_down);
             const int             nth      = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
             ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
@@ -3982,6 +4000,21 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(up), 2);
             ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(mul), 3);
             ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (ne0 + nth - 1) / nth, rows, 1, nth, 1, 1);
+
+            if (fused_down) {
+                // The producer writes tightly packed BF16 payloads into the
+                // otherwise-dead MUL allocation. Publish them before the down
+                // projection widens and quantizes those exact payloads.
+                ggml_metal_encoder_memory_barrier(ctx->enc);
+                ggml_metal_op_row_quant_linear_impl(ctx, down, ggml_metal_get_buffer_id(mul), true);
+
+                if (ctx->debug_fusion > 1) {
+                    GGML_LOG_DEBUG(
+                        "%s: fuse Row4 QAT SILU_EXACT + VIEW + MUL_EXACT + ROW4_LINEAR (packed BF16 handoff)\n",
+                        __func__);
+                }
+                return 4;
+            }
 
             if (ctx->debug_fusion > 1) {
                 GGML_LOG_DEBUG("%s: fuse Row4 QAT SILU_EXACT + VIEW + MUL_EXACT\n", __func__);
