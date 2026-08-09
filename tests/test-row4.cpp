@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -859,13 +860,26 @@ static ggml_backend_dev_t find_metal_device() {
     return nullptr;
 }
 
+struct gate_up_fusion_log_marker {
+    std::atomic<bool> hit = false;
+};
+
+static void gate_up_fusion_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    constexpr const char * marker = "fuse Row4 gate_up + VIEW + QAT SILU_EXACT + VIEW + QAT MUL_EXACT + ROW4_LINEAR";
+    if (strstr(text, marker)) {
+        static_cast<gate_up_fusion_log_marker *>(user_data)->hit.store(true, std::memory_order_relaxed);
+    }
+}
+
 static bool run_row4_swiglu_backend(std::vector<float> &          output,
                                     ggml_backend_t                backend,
                                     const std::vector<float> &    input,
                                     const std::vector<uint8_t> &  codes,
                                     const std::vector<uint16_t> & scales,
                                     int64_t                       tokens,
-                                    bool                          qat) {
+                                    bool                          qat,
+                                    bool *                        gate_up_fusion_hit = nullptr) {
     constexpr int64_t K         = 128;
     constexpr int64_t N_FF      = 128;
     constexpr int64_t GATE_UP_O = 2 * N_FF;
@@ -920,7 +934,15 @@ static bool run_row4_swiglu_backend(std::vector<float> &          output,
     ggml_backend_tensor_set(row4_codes, codes.data(), 0, codes.size());
     ggml_backend_tensor_set(row4_scales, scales.data(), 0, scales.size() * sizeof(uint16_t));
 
+    gate_up_fusion_log_marker marker;
+    if (gate_up_fusion_hit != nullptr) {
+        ggml_log_set(gate_up_fusion_log_callback, &marker);
+    }
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (gate_up_fusion_hit != nullptr) {
+        *gate_up_fusion_hit = marker.hit.load(std::memory_order_relaxed);
+        ggml_log_set(nullptr, nullptr);
+    }
     if (status == GGML_STATUS_SUCCESS) {
         output.resize((size_t) N_FF * (size_t) tokens);
         ggml_backend_tensor_get(swiglu, output.data(), 0, output.size() * sizeof(float));
@@ -974,7 +996,9 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
                                          int64_t                       tokens,
                                          bool                          qat,
                                          bool                          mark_mul_output,
-                                         bool                          w8_down = false) {
+                                         bool                          w8_down             = false,
+                                         bool *                        gate_up_fusion_hit  = nullptr,
+                                         bool                          mark_gate_up_output = false) {
     constexpr int64_t INPUT_K   = 128;
     constexpr int64_t N_FF      = 128;
     constexpr int64_t GATE_UP_O = 2 * N_FF;
@@ -995,6 +1019,9 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
         ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, INPUT_K / ROW4_TILE_K, GATE_UP_O / ROW4_TILE_O);
     ggml_tensor * gate_up_scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, GATE_UP_O);
     ggml_tensor * gate_up        = ggml_row4_linear(ctx, x, gate_up_codes, gate_up_scales, GATE_UP_O, INPUT_K);
+    if (mark_gate_up_output) {
+        ggml_set_output(gate_up);
+    }
     ggml_tensor * gate           = ggml_view_2d(ctx, gate_up, N_FF, tokens, gate_up->nb[1], 0);
     ggml_tensor * up             = ggml_view_2d(ctx, gate_up, N_FF, tokens, gate_up->nb[1], N_FF * sizeof(float));
     ggml_tensor * silu           = ggml_fairy2i_silu_exact(ctx, gate);
@@ -1058,7 +1085,15 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
         ggml_backend_tensor_set(down_scales, down_scales_data.data(), 0, down_scales_data.size() * sizeof(uint16_t));
     }
 
+    gate_up_fusion_log_marker marker;
+    if (gate_up_fusion_hit != nullptr) {
+        ggml_log_set(gate_up_fusion_log_callback, &marker);
+    }
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (gate_up_fusion_hit != nullptr) {
+        *gate_up_fusion_hit = marker.hit.load(std::memory_order_relaxed);
+        ggml_log_set(nullptr, nullptr);
+    }
     if (status == GGML_STATUS_SUCCESS) {
         output.resize((size_t) DOWN_O * (size_t) tokens);
         ggml_backend_tensor_get(down, output.data(), 0, output.size() * sizeof(float));
@@ -1119,9 +1154,16 @@ static bool test_metal_row4_swiglu_fusion() {
         fusion_debug.set("2");
         ggml_backend_t     metal_fused = ggml_backend_dev_init(dev, nullptr);
         std::vector<float> fused;
-        ok = metal_fused && run_row4_swiglu_backend(fused, metal_fused, input, codes, scales, tokens, true) &&
+        bool               gate_up_fusion_hit = false;
+        ok = metal_fused &&
+             run_row4_swiglu_backend(fused, metal_fused, input, codes, scales, tokens, true, &gate_up_fusion_hit) &&
              compare_exact(("Row4 QAT SwiGLU fused B=" + std::to_string(tokens)).c_str(), fused, expected) &&
              compare_exact(("Row4 QAT SwiGLU fused/unfused B=" + std::to_string(tokens)).c_str(), fused, unfused) && ok;
+        if (gate_up_fusion_hit) {
+            fprintf(stderr, "Row4 gate-up producer fusion ran without an adjacent down projection at B=%lld\n",
+                    (long long) tokens);
+            ok = false;
+        }
         if (metal_fused) {
             ggml_backend_free(metal_fused);
         }
@@ -1181,7 +1223,7 @@ static bool test_metal_row4_swiglu_down_fusion() {
     scoped_env_var fusion_debug("GGML_METAL_FUSION_DEBUG");
     bool           ok = true;
 
-    for (int64_t tokens : { 1, 3, 8, 9, 32 }) {
+    for (int64_t tokens : { 1, 3, 8, 9, 32, 64 }) {
         const std::vector<float> input  = make_input(INPUT_K, tokens);
         const std::vector<float> oracle = oracle_row4_qat_swiglu_down(input, gate_up_codes, gate_up_scales, down_codes,
                                                                       down_scales, INPUT_K, N_FF, DOWN_O, tokens);
@@ -1216,22 +1258,66 @@ static bool test_metal_row4_swiglu_down_fusion() {
         fusion_debug.set("2");
         ggml_backend_t     metal_fused = ggml_backend_dev_init(dev, nullptr);
         std::vector<float> fused;
+        bool               gate_up_fusion_hit = false;
         ok =
             metal_fused &&
             run_row4_swiglu_down_backend(fused, metal_fused, input, gate_up_codes, gate_up_scales, down_codes,
-                                         down_scales, tokens, true, false) &&
+                                         down_scales, tokens, true, false, false, &gate_up_fusion_hit) &&
             compare_exact(("Row4 QAT SwiGLU-down fused/oracle B=" + std::to_string(tokens)).c_str(), fused, oracle) &&
             compare_exact(("Row4 QAT SwiGLU-down fused/unfused B=" + std::to_string(tokens)).c_str(), fused, unfused) &&
             ok;
+        const bool expect_gate_up_fusion = tokens > 8 && tokens % 32 == 0;
+        if (gate_up_fusion_hit != expect_gate_up_fusion) {
+            fprintf(stderr, "Row4 gate-up producer fusion hit mismatch B=%lld: actual=%d expected=%d\n",
+                    (long long) tokens, (int) gate_up_fusion_hit, (int) expect_gate_up_fusion);
+            ok = false;
+        }
         if (metal_fused) {
             ggml_backend_free(metal_fused);
+        }
+    }
+
+    // A requested gate-up result must preserve the F32 materialization. The
+    // legacy SiLU-start fusion may still consume the later QAT/down chain.
+    {
+        constexpr int64_t        TOKENS = 32;
+        const std::vector<float> input  = make_input(INPUT_K, TOKENS);
+
+        fusion_disable.set("1");
+        fusion_debug.unset();
+        ggml_backend_t     metal_unfused = ggml_backend_dev_init(dev, nullptr);
+        std::vector<float> unfused;
+        ok = metal_unfused &&
+             run_row4_swiglu_down_backend(unfused, metal_unfused, input, gate_up_codes, gate_up_scales, down_codes,
+                                          down_scales, TOKENS, true, false) &&
+             ok;
+        if (metal_unfused) {
+            ggml_backend_free(metal_unfused);
+        }
+
+        fusion_disable.unset();
+        fusion_debug.set("2");
+        ggml_backend_t     metal_gate_up_output = ggml_backend_dev_init(dev, nullptr);
+        std::vector<float> gate_up_output;
+        bool               gate_up_fusion_hit = false;
+        ok = metal_gate_up_output &&
+             run_row4_swiglu_down_backend(gate_up_output, metal_gate_up_output, input, gate_up_codes, gate_up_scales,
+                                          down_codes, down_scales, TOKENS, true, false, false, &gate_up_fusion_hit,
+                                          true) &&
+             compare_exact("Row4 QAT gate-up-output producer fusion gate", gate_up_output, unfused) && ok;
+        if (gate_up_fusion_hit) {
+            fprintf(stderr, "Row4 gate-up producer fusion ignored requested gate-up output\n");
+            ok = false;
+        }
+        if (metal_gate_up_output) {
+            ggml_backend_free(metal_gate_up_output);
         }
     }
 
     // An explicitly requested MUL output must block the four-node handoff and
     // leave the existing three-node F32-carrier fusion as the fallback.
     {
-        constexpr int64_t        TOKENS = 3;
+        constexpr int64_t        TOKENS = 32;
         const std::vector<float> input  = make_input(INPUT_K, TOKENS);
 
         fusion_disable.set("1");
@@ -1250,10 +1336,15 @@ static bool test_metal_row4_swiglu_down_fusion() {
         fusion_debug.set("2");
         ggml_backend_t     metal_mul_output = ggml_backend_dev_init(dev, nullptr);
         std::vector<float> mul_output;
+        bool               gate_up_fusion_hit = false;
         ok = metal_mul_output &&
              run_row4_swiglu_down_backend(mul_output, metal_mul_output, input, gate_up_codes, gate_up_scales,
-                                          down_codes, down_scales, TOKENS, true, true) &&
+                                          down_codes, down_scales, TOKENS, true, true, false, &gate_up_fusion_hit) &&
              compare_exact("Row4 QAT SwiGLU-down MUL-output fusion gate", mul_output, unfused) && ok;
+        if (gate_up_fusion_hit) {
+            fprintf(stderr, "Row4 gate-up producer fusion ignored requested MUL output\n");
+            ok = false;
+        }
         if (metal_mul_output) {
             ggml_backend_free(metal_mul_output);
         }
@@ -1263,7 +1354,7 @@ static bool test_metal_row4_swiglu_down_fusion() {
     // Row4-only packed handoff. It must retain the three-node producer fusion
     // and the ordinary W8A8 activation quantizer.
     {
-        constexpr int64_t        TOKENS = 3;
+        constexpr int64_t        TOKENS = 32;
         const std::vector<float> input  = make_input(INPUT_K, TOKENS);
 
         fusion_disable.set("1");
@@ -1282,10 +1373,15 @@ static bool test_metal_row4_swiglu_down_fusion() {
         fusion_debug.set("2");
         ggml_backend_t     metal_w8_down = ggml_backend_dev_init(dev, nullptr);
         std::vector<float> w8_down;
+        bool               gate_up_fusion_hit = false;
         ok = metal_w8_down &&
              run_row4_swiglu_down_backend(w8_down, metal_w8_down, input, gate_up_codes, gate_up_scales, down_codes,
-                                          down_scales, TOKENS, true, false, true) &&
+                                          down_scales, TOKENS, true, false, true, &gate_up_fusion_hit) &&
              compare_exact("Row4 QAT SwiGLU W8A8-down fusion gate", w8_down, unfused) && ok;
+        if (gate_up_fusion_hit) {
+            fprintf(stderr, "Row4 gate-up producer fusion accepted a W8A8 down projection\n");
+            ok = false;
+        }
         if (metal_w8_down) {
             ggml_backend_free(metal_w8_down);
         }
@@ -1293,7 +1389,7 @@ static bool test_metal_row4_swiglu_down_fusion() {
 
     // Non-QAT exact operations must not enter either specialized QAT route.
     {
-        constexpr int64_t        TOKENS = 3;
+        constexpr int64_t        TOKENS = 32;
         const std::vector<float> input  = make_input(INPUT_K, TOKENS);
 
         fusion_disable.set("1");
@@ -1312,10 +1408,15 @@ static bool test_metal_row4_swiglu_down_fusion() {
         fusion_debug.set("2");
         ggml_backend_t     metal_nonqat = ggml_backend_dev_init(dev, nullptr);
         std::vector<float> nonqat;
+        bool               gate_up_fusion_hit = false;
         ok = metal_nonqat &&
              run_row4_swiglu_down_backend(nonqat, metal_nonqat, input, gate_up_codes, gate_up_scales, down_codes,
-                                          down_scales, TOKENS, false, false) &&
+                                          down_scales, TOKENS, false, false, false, &gate_up_fusion_hit) &&
              compare_exact("Row4 non-QAT SwiGLU-down fusion gate", nonqat, unfused) && ok;
+        if (gate_up_fusion_hit) {
+            fprintf(stderr, "Row4 gate-up producer fusion accepted non-QAT elementwise operations\n");
+            ok = false;
+        }
         if (metal_nonqat) {
             ggml_backend_free(metal_nonqat);
         }

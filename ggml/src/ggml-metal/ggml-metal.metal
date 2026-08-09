@@ -1215,6 +1215,302 @@ kernel void NAME(                                                               
     w8a8_linear_reduced(args, codes, scales, act_q, act_scales, dst, partials, tgpig.x, TOKEN_EXPR, tid); \
 }
 
+static inline ushort fairy2i_silu_qat_bf16(ushort value_bits);
+static inline ushort fairy2i_mul_qat_bf16(ushort lhs_bits, ushort rhs_bits);
+
+static inline void row4_stage_prefill_m64n32_simd_localw(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        threadgroup half * weight_tile,
+        uint output_tile,
+        int k_base,
+        uint simd_lane,
+        uint sgitg) {
+    constexpr int k_tile = 32;
+    const int canonical_k_tile = k_base >> 7;
+    const int split_base       = (k_base & 127) >> 4;
+    const int k_tiles          = args.k / 128;
+
+    if (simd_lane < 16U) {
+        const uint group       = simd_lane >> 2;
+        const uint local_split = (simd_lane >> 1) & 1U;
+        const uint jblock      = simd_lane & 1U;
+        const ulong code_offset =
+            ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+            (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
+        const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+
+        const half4 low0  = row4_decode4((uint) (packed.x & 0x0fU));
+        const half4 low1  = row4_decode4((uint) (packed.y & 0x0fU));
+        const half4 low2  = row4_decode4((uint) (packed.z & 0x0fU));
+        const half4 low3  = row4_decode4((uint) (packed.w & 0x0fU));
+        const half4 high0 = row4_decode4((uint) (packed.x >> 4));
+        const half4 high1 = row4_decode4((uint) (packed.y >> 4));
+        const half4 high2 = row4_decode4((uint) (packed.z >> 4));
+        const half4 high3 = row4_decode4((uint) (packed.w >> 4));
+        const uint output_base = sgitg * 16U + group * 4U;
+        const uint k_low       = local_split * 16U + jblock * 4U;
+        const uint k_high      = k_low + 8U;
+
+        *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_low)) =
+            half4(low0.x, low1.x, low2.x, low3.x);
+        *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_low)) =
+            half4(low0.y, low1.y, low2.y, low3.y);
+        *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_low)) =
+            half4(low0.z, low1.z, low2.z, low3.z);
+        *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_low)) =
+            half4(low0.w, low1.w, low2.w, low3.w);
+        *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_high)) =
+            half4(high0.x, high1.x, high2.x, high3.x);
+        *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_high)) =
+            half4(high0.y, high1.y, high2.y, high3.y);
+        *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_high)) =
+            half4(high0.z, high1.z, high2.z, high3.z);
+        *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_high)) =
+            half4(high0.w, high1.w, high2.w, high3.w);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const ushort * scales,
+        device const float * act_scales,
+        threadgroup float * out_tile,
+        threadgroup ushort * gate_tile,
+        int row_base,
+        int col_base,
+        int col_block,
+        int row_half,
+        uint simd_lane,
+        uint sgitg) {
+    constexpr uint matrix_elems = 64U;
+    constexpr uint row_tile     = 64U;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint item = 0U; item < 2U; ++item) {
+        const uint local        = simd_lane + item * 32U;
+        const uint col          = local >> 3;
+        const uint row          = local & 7U;
+        const uint output_local = sgitg * 16U + (uint) row_half * 8U + row;
+        const uint output       = (uint) row_base + output_local;
+        const uint token_local  = (uint) col_block * 8U + col;
+        const uint token        = (uint) col_base + token_local;
+        if (token < (uint) args.act_rows) {
+            const int exact_acc = (int) out_tile[sgitg * matrix_elems + local];
+            const float gate = row4_finish_i32(exact_acc, act_scales[token], scales[output]);
+            gate_tile[token_local * row_tile + output_local] =
+                fairy2i_silu_qat_bf16(fairy2i_f32_to_bf16(gate));
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void row4_finish_up_mul_prefill_m64n32_simd_stripe(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const ushort * scales,
+        device const float * act_scales,
+        device ushort * dst,
+        threadgroup float * out_tile,
+        threadgroup const ushort * gate_tile,
+        int row_base,
+        int col_base,
+        int col_block,
+        int row_half,
+        uint simd_lane,
+        uint sgitg) {
+    constexpr uint matrix_elems = 64U;
+    constexpr uint row_tile     = 64U;
+    const uint n_ff             = (uint) args.m / 2U;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint item = 0U; item < 2U; ++item) {
+        const uint local        = simd_lane + item * 32U;
+        const uint col          = local >> 3;
+        const uint row          = local & 7U;
+        const uint output_local = sgitg * 16U + (uint) row_half * 8U + row;
+        const uint output       = (uint) row_base + output_local;
+        const uint token_local  = (uint) col_block * 8U + col;
+        const uint token        = (uint) col_base + token_local;
+        if (token < (uint) args.act_rows) {
+            const int exact_acc = (int) out_tile[sgitg * matrix_elems + local];
+            const float up = row4_finish_i32(exact_acc, act_scales[token], scales[n_ff + output]);
+            const ushort silu_bits = gate_tile[token_local * row_tile + output_local];
+            dst[(ulong) token * (ulong) n_ff + (ulong) output] =
+                fairy2i_mul_qat_bf16(silu_bits, fairy2i_f32_to_bf16(up));
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Strict Qwen3 QAT gate-up producer. Each 128-thread group retains the proven
+// four-SIMDgroup local-W mapping and K32 MMA order, but computes one M64 gate
+// tile to its BF16/SiLU checkpoint before computing the paired M64 up tile.
+// Only the final MUL BF16 payload is published for the following Row4 down.
+kernel void kernel_row4_w1a8_gate_up_swiglu_qat_packed_bf16_prefill_m64n32_sequential_simd_localw(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device ushort * dst                               [[buffer(5)]],
+        device const half * act_h                         [[buffer(6)]],
+        threadgroup half * weight_tile                    [[threadgroup(0)]],
+        threadgroup float * out_tile                      [[threadgroup(2)]],
+        threadgroup ushort * gate_tile                    [[threadgroup(3)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint sgitg                                        [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile = 64;
+    constexpr int col_tile = 32;
+    constexpr int k_tile   = 32;
+    const int n_ff         = args.m / 2;
+    const int row_base     = (int) tgpig.x * row_tile;
+    const int col_base     = (int) tgpig.y * col_tile;
+    const int row_block    = (int) sgitg * 16;
+    const uint simd_lane   = tid & 31U;
+
+    {
+        simdgroup_half8x8  weights0;
+        simdgroup_half8x8  weights1;
+        simdgroup_half8x8  activations0;
+        simdgroup_half8x8  activations1;
+        simdgroup_half8x8  activations2;
+        simdgroup_half8x8  activations3;
+        simdgroup_float8x8 accum00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum02 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum03 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+        for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+            const uint output_tile = (uint) tgpig.x * 4U + sgitg;
+            row4_stage_prefill_m64n32_simd_localw(
+                args, codes, weight_tile, output_tile, k_base, simd_lane, sgitg);
+
+            for (int ik = 0; ik < k_tile; ik += 8) {
+                simdgroup_load(weights0, weight_tile + row_block * k_tile + ik, k_tile);
+                simdgroup_load(weights1, weight_tile + (row_block + 8) * k_tile + ik, k_tile);
+                const int act_base = (k_base + ik) * args.reserved + col_base;
+                simdgroup_load(activations0, act_h + act_base, args.reserved);
+                simdgroup_load(activations1, act_h + act_base + 8, args.reserved);
+                simdgroup_load(activations2, act_h + act_base + 16, args.reserved);
+                simdgroup_load(activations3, act_h + act_base + 24, args.reserved);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(accum00, weights0, activations0, accum00);
+                simdgroup_multiply_accumulate(accum01, weights0, activations1, accum01);
+                simdgroup_multiply_accumulate(accum02, weights0, activations2, accum02);
+                simdgroup_multiply_accumulate(accum03, weights0, activations3, accum03);
+                simdgroup_multiply_accumulate(accum10, weights1, activations0, accum10);
+                simdgroup_multiply_accumulate(accum11, weights1, activations1, accum11);
+                simdgroup_multiply_accumulate(accum12, weights1, activations2, accum12);
+                simdgroup_multiply_accumulate(accum13, weights1, activations3, accum13);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float * simd_out = out_tile + sgitg * 64U;
+        simdgroup_store(accum00, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 0, 0, simd_lane, sgitg);
+        simdgroup_store(accum10, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 0, 1, simd_lane, sgitg);
+        simdgroup_store(accum01, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 1, 0, simd_lane, sgitg);
+        simdgroup_store(accum11, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 1, 1, simd_lane, sgitg);
+        simdgroup_store(accum02, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 2, 0, simd_lane, sgitg);
+        simdgroup_store(accum12, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 2, 1, simd_lane, sgitg);
+        simdgroup_store(accum03, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 3, 0, simd_lane, sgitg);
+        simdgroup_store(accum13, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 3, 1, simd_lane, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        simdgroup_half8x8  weights0;
+        simdgroup_half8x8  weights1;
+        simdgroup_half8x8  activations0;
+        simdgroup_half8x8  activations1;
+        simdgroup_half8x8  activations2;
+        simdgroup_half8x8  activations3;
+        simdgroup_float8x8 accum00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum02 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum03 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+        for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+            const uint output_tile = (uint) (n_ff / 16) + (uint) tgpig.x * 4U + sgitg;
+            row4_stage_prefill_m64n32_simd_localw(
+                args, codes, weight_tile, output_tile, k_base, simd_lane, sgitg);
+
+            for (int ik = 0; ik < k_tile; ik += 8) {
+                simdgroup_load(weights0, weight_tile + row_block * k_tile + ik, k_tile);
+                simdgroup_load(weights1, weight_tile + (row_block + 8) * k_tile + ik, k_tile);
+                const int act_base = (k_base + ik) * args.reserved + col_base;
+                simdgroup_load(activations0, act_h + act_base, args.reserved);
+                simdgroup_load(activations1, act_h + act_base + 8, args.reserved);
+                simdgroup_load(activations2, act_h + act_base + 16, args.reserved);
+                simdgroup_load(activations3, act_h + act_base + 24, args.reserved);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(accum00, weights0, activations0, accum00);
+                simdgroup_multiply_accumulate(accum01, weights0, activations1, accum01);
+                simdgroup_multiply_accumulate(accum02, weights0, activations2, accum02);
+                simdgroup_multiply_accumulate(accum03, weights0, activations3, accum03);
+                simdgroup_multiply_accumulate(accum10, weights1, activations0, accum10);
+                simdgroup_multiply_accumulate(accum11, weights1, activations1, accum11);
+                simdgroup_multiply_accumulate(accum12, weights1, activations2, accum12);
+                simdgroup_multiply_accumulate(accum13, weights1, activations3, accum13);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float * simd_out = out_tile + sgitg * 64U;
+        simdgroup_store(accum00, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 0, 0, simd_lane, sgitg);
+        simdgroup_store(accum10, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 0, 1, simd_lane, sgitg);
+        simdgroup_store(accum01, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 1, 0, simd_lane, sgitg);
+        simdgroup_store(accum11, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 1, 1, simd_lane, sgitg);
+        simdgroup_store(accum02, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 2, 0, simd_lane, sgitg);
+        simdgroup_store(accum12, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 2, 1, simd_lane, sgitg);
+        simdgroup_store(accum03, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 3, 0, simd_lane, sgitg);
+        simdgroup_store(accum13, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 3, 1, simd_lane, sgitg);
+    }
+}
+
+
 
 
 kernel void kernel_row4_w1a8_decode_o32_segmented16(
