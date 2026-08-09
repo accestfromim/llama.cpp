@@ -344,7 +344,7 @@ if (( bench_status != 0 )); then
     exit "$bench_status"
 fi
 
-runtime_marker_regex='row4_cpu: op=(row4|w8a8)|ROW(4 Metal W1A8|8 Metal W8A8 lm_head) path:'
+runtime_marker_regex='row4_cpu: op=(row4|w8a8)|ROW(4 Metal W1A8|8 Metal W8A8 lm_head) path:|kernel_row4_w1a8_gate_up_swiglu_qat_packed_bf16_prefill'
 cp "$prefix.host_paths.log" "$prefix.paths.log"
 grep -E "$runtime_marker_regex" "$prefix.stderr.log" >> "$prefix.paths.log" || true
 if [[ $require_markers != 0 ]]; then
@@ -375,16 +375,18 @@ if [[ $require_markers != 0 ]]; then
             w8_cpu_path=$force_path
         fi
         row4_cpu_panel=0
+        row4_cpu_aqpack=bf16_rne_a8_away_v1
         if [[ $mode == pp && $row4_cpu_path == i8mm ]]; then
             row4_cpu_panel=1
+            row4_cpu_aqpack=bf16_rne_a8_away_pairk8_v1
         fi
         row4_cpu_prefix="row4_cpu: op=row4 path=$row4_cpu_path layout=m16k128_split8_v1 B=$row4_cpu_batch"
         w8_cpu_prefix="row4_cpu: op=w8a8 path=$w8_cpu_path layout=s8_m16k128_rowmajor_v1 B=1"
         required_runtime_markers=(
-            "$row4_cpu_prefix O=6144 K=4096 nth=$threads aqpack=bf16_rne_a8_away_v1 panel=$row4_cpu_panel prepack=0"
-            "$row4_cpu_prefix O=4096 K=4096 nth=$threads aqpack=bf16_rne_a8_away_v1 panel=$row4_cpu_panel prepack=0"
-            "$row4_cpu_prefix O=24576 K=4096 nth=$threads aqpack=bf16_rne_a8_away_v1 panel=$row4_cpu_panel prepack=0"
-            "$row4_cpu_prefix O=4096 K=12288 nth=$threads aqpack=bf16_rne_a8_away_v1 panel=$row4_cpu_panel prepack=0"
+            "$row4_cpu_prefix O=6144 K=4096 nth=$threads aqpack=$row4_cpu_aqpack panel=$row4_cpu_panel prepack=0"
+            "$row4_cpu_prefix O=4096 K=4096 nth=$threads aqpack=$row4_cpu_aqpack panel=$row4_cpu_panel prepack=0"
+            "$row4_cpu_prefix O=24576 K=4096 nth=$threads aqpack=$row4_cpu_aqpack panel=$row4_cpu_panel prepack=0"
+            "$row4_cpu_prefix O=4096 K=12288 nth=$threads aqpack=$row4_cpu_aqpack panel=$row4_cpu_panel prepack=0"
             "$w8_cpu_prefix O=151936 K=4096 nth=$threads aqpack=bf16_rne_a8_away_v1 panel=0 prepack=0"
         )
     else
@@ -396,10 +398,14 @@ if [[ $require_markers != 0 ]]; then
         fi
         row4_metal_prefix="ROW4 Metal W1A8 path: $row4_dispatch layout=m16k128_split8_v1 act_rows=$row4_act_rows"
         w8_metal_prefix='ROW8 Metal W8A8 lm_head path: decode layout=s8_m16k128_rowmajor_v1 act_rows=1'
+        gate_up_metal_marker="$row4_metal_prefix O=24576 K=4096 "
+        if [[ $mode == pp ]]; then
+            gate_up_metal_marker="($gate_up_metal_marker|kernel_row4_w1a8_gate_up_swiglu_qat_packed_bf16_prefill)"
+        fi
         required_runtime_markers=(
             "$row4_metal_prefix O=6144 K=4096 "
             "$row4_metal_prefix O=4096 K=4096 "
-            "$row4_metal_prefix O=24576 K=4096 "
+            "$gate_up_metal_marker"
             "$row4_metal_prefix O=4096 K=12288 "
             "$w8_metal_prefix O=151936 K=4096 "
         )
