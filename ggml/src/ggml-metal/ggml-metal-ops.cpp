@@ -2135,7 +2135,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const char *    pipeline_name =
         qat_residual_add ? "kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual" :
         row4_prefill_m64n32_native_layout_dualw_direct_act ?
-                           "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act" :
+                           "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act_simd_localw" :
         row4_prefill_m64n32_native_layout_dualw ? "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw" :
         row4_decode_o32_o4_staged_act           ? "kernel_row4_w1a8_decode_o32_o4_staged_act" :
         row4_decode_o32_segmented16             ? "kernel_row4_w1a8_decode_o32_segmented16" :
@@ -2153,7 +2153,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         path != PATH_PREFILL ?
             "A8/I32" :
         row4_prefill_m64n32_native_layout_dualw_direct_act ?
-            "half MMA/F32 exact accumulate M64N32 native-layout dual-W direct-act transpose32x32 SIMD-striped" :
+            "half MMA/F32 exact accumulate M64N32 native-layout dual-W direct-act transpose32x32 SIMD-local-W" :
             "half MMA/F32 exact accumulate M64N32 native-layout dual-W SIMD-striped";
 
     ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, pipeline_name);
