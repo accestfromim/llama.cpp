@@ -572,6 +572,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2:
             default_type = GGML_TYPE_FAIRY2I_TILE64_V2;
             break;
+        case LLAMA_FTYPE_MOSTLY_ROW4:
+            throw std::runtime_error("Qwen3 Row4 is a converter-only fused format; use gguf-py/convert_row4_qwen3.py");
         case LLAMA_FTYPE_MOSTLY_IQ2_XXS: default_type = GGML_TYPE_IQ2_XXS; break;
         case LLAMA_FTYPE_MOSTLY_IQ2_XS:  default_type = GGML_TYPE_IQ2_XS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ2_S:   default_type = GGML_TYPE_IQ2_XS;  break;
@@ -610,6 +612,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<std::string> splits = {};
     llama_model_loader ml(fname_inp, splits, use_mmap, /*check_tensors*/ true, kv_overrides, nullptr);
     ml.init_mappings(false); // no prefetching
+
+    if ((ml.ftype & ~LLAMA_FTYPE_GUESSED) == LLAMA_FTYPE_MOSTLY_ROW4) {
+        throw std::runtime_error(
+            "Qwen3 Row4 GGUF files cannot be requantized or copied by llama-quantize; reconvert the original "
+            "checkpoint with gguf-py/convert_row4_qwen3.py");
+    }
 
     llama_model model(llama_model_default_params());
 

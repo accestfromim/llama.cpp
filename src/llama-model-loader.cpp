@@ -11,6 +11,11 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static uint64_t llama_tensor_logical_nelements(const ggml_tensor * tensor) {
+    const uint64_t n_elements = ggml_nelements(tensor);
+    return tensor->type == GGML_TYPE_ROW4_CODES ? n_elements * 8 : n_elements;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -66,6 +71,8 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
             return "Fairy2i tile64_v2";
         case LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1:
             return "Fairy2i bundle_v1";
+        case LLAMA_FTYPE_MOSTLY_ROW4:
+            return "Row4 W1A8";
 
         default: return "unknown, may not work";
     }
@@ -519,7 +526,7 @@ llama_model_loader::llama_model_loader(
         if (weights_map.find(tensor_name) != weights_map.end()) {
             throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
         }
-        n_elements += ggml_nelements(cur);
+        n_elements += llama_tensor_logical_nelements(cur);
         n_bytes    += ggml_nbytes(cur);
         weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
     }
@@ -585,7 +592,7 @@ llama_model_loader::llama_model_loader(
                 if (weights_map.find(tensor_name) != weights_map.end()) {
                     throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                 }
-                n_elements += ggml_nelements(cur);
+                n_elements += llama_tensor_logical_nelements(cur);
                 n_bytes    += ggml_nbytes(cur);
                 weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
             }
@@ -675,6 +682,9 @@ llama_model_loader::llama_model_loader(
                 break;
             case GGML_TYPE_FAIRY2I_BUNDLE_CODES:
                 ftype = LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1;
+                break;
+            case GGML_TYPE_ROW4_CODES:
+                ftype = LLAMA_FTYPE_MOSTLY_ROW4;
                 break;
             default:
                 {

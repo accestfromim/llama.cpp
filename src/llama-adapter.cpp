@@ -147,6 +147,12 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
 }
 
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
+    if (model.row4_enabled) {
+        throw std::runtime_error(
+            "Qwen3 Row4 schema v1 does not support LoRA adapters; packed projection tensors have no dense "
+            "weight target for the adapter");
+    }
+
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
     ggml_context * ctx_init;

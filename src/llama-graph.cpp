@@ -1316,18 +1316,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
     const auto n_kv = k->ne[1];
 
     ggml_tensor * cur;
+    const bool    exact_bf16_arch = arch == LLM_ARCH_FAIRY2I || arch == LLM_ARCH_QWEN3;
 
     if (fairy2i_exact && !cparams.flash_attn) {
-        if (arch != LLM_ARCH_FAIRY2I || kq_b != nullptr || sinks != nullptr || v_mla != nullptr ||
+        if (!exact_bf16_arch || kq_b != nullptr || sinks != nullptr || v_mla != nullptr ||
             hparams.f_max_alibi_bias != 0.0f || hparams.attn_soft_cap) {
             throw std::runtime_error(
-                "FAIRY2I script_f32reduce_bf16scale_v1 CPU Attention does not support bias, sinks, ALiBi, "
+                "BF16 exact CPU Attention does not support this architecture, bias, sinks, ALiBi, "
                 "logit soft-capping, or MLA");
         }
         if (!v_trans || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_BF16 || v->type != GGML_TYPE_BF16 ||
             kq_mask == nullptr || kq_mask->type != GGML_TYPE_F32) {
             throw std::runtime_error(
-                "FAIRY2I script_f32reduce_bf16scale_v1 CPU reference requires F32 BF16-valued Q, BF16 K/V in the "
+                "BF16 exact CPU Attention requires F32 BF16-valued Q, BF16 K/V in the "
                 "transposed non-Flash cache layout, and an F32 mask");
         }
 
@@ -1340,8 +1341,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
     }
 
     if (fairy2i_exact && cparams.flash_attn && !fairy2i_flash3 && n_kv % 32 != 0) {
-        throw std::runtime_error(
-            "FAIRY2I script_f32reduce_bf16scale_v1 Metal Flash Attention requires the KV length padded to 32");
+        throw std::runtime_error("BF16 exact Metal Flash Attention requires the KV length padded to 32");
     }
 
     // TODO: replace hardcoded padding with ggml-provided padding
@@ -1365,10 +1365,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
             v = ggml_cast(ctx0, v, fairy2i_exact ? GGML_TYPE_BF16 : GGML_TYPE_F16);
         }
 
-        if (fairy2i_exact && (arch != LLM_ARCH_FAIRY2I || sinks != nullptr || v_mla != nullptr ||
+        if (fairy2i_exact && (!exact_bf16_arch || sinks != nullptr || v_mla != nullptr ||
                               hparams.f_max_alibi_bias != 0.0f || hparams.attn_soft_cap)) {
             throw std::runtime_error(
-                "FAIRY2I script_f32reduce_bf16scale_v1 Flash Attention does not support sinks, ALiBi, logit "
+                "BF16 exact Flash Attention does not support this architecture, sinks, ALiBi, logit "
                 "soft-capping, "
                 "or MLA");
         }
@@ -1376,7 +1376,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
             (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_BF16 || v->type != GGML_TYPE_BF16 || kq_mask == nullptr ||
              kq_mask->type != (fairy2i_flash3 ? GGML_TYPE_F16 : GGML_TYPE_F32))) {
             throw std::runtime_error(
-                "FAIRY2I BF16 Flash Attention requires F32 BF16-valued Q, BF16 K/V, and the profile-specific mask "
+                "BF16 exact Flash Attention requires F32 BF16-valued Q, BF16 K/V, and the profile-specific mask "
                 "type");
         }
 
@@ -1423,10 +1423,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
-        if (fairy2i_exact && (arch != LLM_ARCH_FAIRY2I || kq_b != nullptr || sinks != nullptr || v_mla != nullptr ||
+        if (fairy2i_exact && (!exact_bf16_arch || kq_b != nullptr || sinks != nullptr || v_mla != nullptr ||
                               hparams.f_max_alibi_bias != 0.0f || hparams.attn_soft_cap)) {
             throw std::runtime_error(
-                "FAIRY2I script_f32reduce_bf16scale_v1 non-Flash Attention does not support bias, sinks, ALiBi, "
+                "BF16 exact non-Flash Attention does not support this architecture, bias, sinks, ALiBi, "
                 "logit soft-capping, or MLA");
         }
 
@@ -1694,7 +1694,8 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
                                             float                     kq_scale,
                                             int                       il,
                                             bool                      fairy2i_exact,
-                                            bool                      fairy2i_flash3) const {
+                                            bool                      fairy2i_flash3,
+                                            bool                      exact_carrier_kv_store) const {
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     ggml_build_forward_expand(gf, q_cur);
@@ -1708,11 +1709,15 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(
+            gf, exact_carrier_kv_store ? mctx_cur->cpy_k_bf16_carrier(ctx0, k_cur, k_idxs, il) :
+                                         mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        ggml_build_forward_expand(
+            gf, exact_carrier_kv_store ? mctx_cur->cpy_v_bf16_carrier(ctx0, v_cur, v_idxs, il) :
+                                         mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    const auto & kq_mask = inp->get_kq_mask(fairy2i_exact && !fairy2i_flash3);
+    const auto & kq_mask = inp->get_kq_mask(fairy2i_exact && (!fairy2i_flash3 || !cparams.flash_attn));
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);

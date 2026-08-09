@@ -154,6 +154,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_IFAIRY            = 40,  // except 1d tensors
         LLAMA_FTYPE_MOSTLY_FAIRY2I_TILE64_V2 = 41,  // except 1d tensors
         LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1 = 42,  // opaque M64xK64 Fairy2i bundles
+        LLAMA_FTYPE_MOSTLY_ROW4              = 43,  // Qwen3 Row4 W1A8 + W8A8 output
 
         LLAMA_FTYPE_GUESSED = 1024,                 // not specified in the model file
     };

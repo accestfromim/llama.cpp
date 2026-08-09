@@ -446,6 +446,13 @@ static int prepare_imatrix(const std::string & imatrix_file,
 }
 
 static ggml_type parse_ggml_type(const char * arg) {
+    if (striequals(ggml_type_name(GGML_TYPE_ROW4_CODES), arg)) {
+        fprintf(stderr,
+                "\n%s: row4_codes is opaque converter output and cannot be selected as a generic tensor type\n\n",
+                __func__);
+        return GGML_TYPE_COUNT;
+    }
+
     for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
         auto type = (ggml_type)i;
         const auto * name = ggml_type_name(type);

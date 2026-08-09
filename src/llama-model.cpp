@@ -44,6 +44,8 @@ static bool llama_backend_dev_is_metal(ggml_backend_dev_t dev) {
     return reg_name && strcmp(reg_name, "Metal") == 0;
 }
 
+static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev);
+
 enum llama_fairy2i_env_policy {
     LLAMA_FAIRY2I_ENV_POLICY_AUTO,
     LLAMA_FAIRY2I_ENV_POLICY_DISABLED,
@@ -557,6 +559,84 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
+
+    {
+        bool has_row4_marker = false;
+        for (int i = 0; i < gguf_get_n_kv(ctx); ++i) {
+            const char * key = gguf_get_key(ctx, i);
+            if (strncmp(key, "row4.", 5) == 0) {
+                has_row4_marker = true;
+                if (strcmp(key, "row4.schema_version") != 0 && strcmp(key, "row4.weight_layout") != 0 &&
+                    strcmp(key, "row4.codebook") != 0 && strcmp(key, "row4.numeric_profile") != 0 &&
+                    strcmp(key, "row4.qkv_order") != 0 && strcmp(key, "row4.ffn_order") != 0 &&
+                    strcmp(key, "row4.lm_head_layout") != 0) {
+                    throw std::runtime_error(format("unsupported Row4 metadata key: %s", key));
+                }
+            }
+        }
+        if (!has_row4_marker) {
+            for (const auto & weight : ml.weights_map) {
+                if (weight.first.find(".row4.") != std::string::npos ||
+                    weight.first.compare(0, strlen("output.w8."), "output.w8.") == 0) {
+                    has_row4_marker = true;
+                    break;
+                }
+            }
+        }
+
+        uint32_t    schema_version = 0;
+        std::string weight_layout;
+        std::string codebook;
+        std::string numeric_profile;
+        std::string qkv_order;
+        std::string ffn_order;
+        std::string lm_head_layout;
+
+        const bool has_schema            = ml.get_key(LLM_KV_ROW4_SCHEMA_VERSION, schema_version, false);
+        const bool has_layout            = ml.get_key(LLM_KV_ROW4_WEIGHT_LAYOUT, weight_layout, false);
+        const bool has_codebook          = ml.get_key(LLM_KV_ROW4_CODEBOOK, codebook, false);
+        const bool has_numeric           = ml.get_key(LLM_KV_ROW4_NUMERIC_PROFILE, numeric_profile, false);
+        const bool has_qkv               = ml.get_key(LLM_KV_ROW4_QKV_ORDER, qkv_order, false);
+        const bool has_ffn               = ml.get_key(LLM_KV_ROW4_FFN_ORDER, ffn_order, false);
+        const bool has_lm_head           = ml.get_key(LLM_KV_ROW4_LM_HEAD_LAYOUT, lm_head_layout, false);
+        uint32_t   general_file_type     = 0;
+        const bool has_general_file_type = ml.get_key(LLM_KV_GENERAL_FILE_TYPE, general_file_type, false);
+
+        const bool any_row4 = has_row4_marker || has_schema || has_layout || has_codebook || has_numeric || has_qkv ||
+                              has_ffn || has_lm_head ||
+                              (has_general_file_type && general_file_type == LLAMA_FTYPE_MOSTLY_ROW4);
+        if (any_row4) {
+            if (arch != LLM_ARCH_QWEN3) {
+                throw std::runtime_error("Row4 schema v1 requires general.architecture=qwen3");
+            }
+            if (!(has_schema && has_layout && has_codebook && has_numeric && has_qkv && has_ffn && has_lm_head)) {
+                throw std::runtime_error(
+                    "incomplete Row4 descriptor: row4.schema_version, weight_layout, codebook, numeric_profile, "
+                    "qkv_order, ffn_order, and lm_head_layout are all required");
+            }
+
+            uint32_t general_alignment = 0;
+            if (!has_general_file_type || general_file_type != LLAMA_FTYPE_MOSTLY_ROW4) {
+                throw std::runtime_error(
+                    format("Row4 schema v1 requires general.file_type=%u", (unsigned) LLAMA_FTYPE_MOSTLY_ROW4));
+            }
+            if (!ml.get_key(LLM_KV_GENERAL_ALIGNMENT, general_alignment, false) || general_alignment != 64) {
+                throw std::runtime_error("Row4 schema v1 requires general.alignment=64");
+            }
+            if (schema_version != 1 || weight_layout != "m16k128_split8_v1" || codebook != "uv_axis_v1" ||
+                numeric_profile != "bf16_a8_away_i32_bf16_v1" || qkv_order != "q_k_v" || ffn_order != "gate_up" ||
+                lm_head_layout != "s8_m16k128_rowmajor_v1") {
+                throw std::runtime_error(
+                    format("unsupported Row4 descriptor: schema=%u layout=%s codebook=%s numeric=%s qkv=%s ffn=%s "
+                           "lm_head=%s",
+                           schema_version, weight_layout.c_str(), codebook.c_str(), numeric_profile.c_str(),
+                           qkv_order.c_str(), ffn_order.c_str(), lm_head_layout.c_str()));
+            }
+
+            row4_enabled        = true;
+            row4_schema_version = schema_version;
+        }
+    }
 
     // everything past this point is not vocab-related
     if (hparams.vocab_only) {
@@ -2516,14 +2596,37 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // For a fully Metal-offloaded Bundle model, keep the embedding lookup on Metal as well
     // so an otherwise unnecessary CPU split is not introduced at the start of the graph.
-    if (arch == LLM_ARCH_FAIRY2I && fairy2i_weight_layout == LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1 &&
-        n_gpu_layers > n_layer && !pimpl->dev_layer.empty() && llama_backend_dev_is_metal(pimpl->dev_layer[0].dev)) {
+    const bool fully_offloaded_metal_input =
+        n_gpu_layers > n_layer && !pimpl->dev_layer.empty() && llama_backend_dev_is_metal(pimpl->dev_layer[0].dev);
+    if (((arch == LLM_ARCH_FAIRY2I && fairy2i_weight_layout == LLAMA_FAIRY2I_WEIGHT_LAYOUT_BUNDLE_V1) ||
+         row4_enabled) &&
+        fully_offloaded_metal_input) {
         pimpl->dev_input = pimpl->dev_layer[0];
-        LLAMA_LOG_INFO("%s: preferring Metal for the Fairy2i bundle input layer\n", __func__);
+        LLAMA_LOG_INFO("%s: preferring Metal for the quantized input layer\n", __func__);
     }
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
+
+    if (row4_enabled) {
+        std::vector<ggml_backend_dev_t> row4_devs;
+        for (const auto & layer_dev : pimpl->dev_layer) {
+            if (std::find(row4_devs.begin(), row4_devs.end(), layer_dev.dev) == row4_devs.end()) {
+                row4_devs.push_back(layer_dev.dev);
+            }
+        }
+        if (std::find(row4_devs.begin(), row4_devs.end(), pimpl->dev_output.dev) == row4_devs.end()) {
+            row4_devs.push_back(pimpl->dev_output.dev);
+        }
+        for (ggml_backend_dev_t dev : row4_devs) {
+            if (!llama_backend_dev_supports_row4(dev)) {
+                throw std::runtime_error(format(
+                    "Qwen3 Row4 requires a native ARM CPU or Metal backend with ROW4_LINEAR and W8A8_LINEAR support; "
+                    "device %s is unsupported",
+                    dev ? ggml_backend_dev_name(dev) : "none"));
+            }
+        }
+    }
 
     // one ggml context per buffer type
     int max_n_tensors = ml.n_tensors;
@@ -2634,6 +2737,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             } else {
                 op = info.op;
             }
+            const bool row4_storage = row4_enabled && tn.suffix != nullptr &&
+                                      (strcmp(tn.suffix, "row4.codes") == 0 || strcmp(tn.suffix, "row4.scales") == 0 ||
+                                       strcmp(tn.suffix, "w8.codes") == 0 || strcmp(tn.suffix, "w8.scales") == 0);
+            if (row4_storage) {
+                // These tensors are opaque inputs to ROW4_LINEAR/W8A8_LINEAR, not generic matrix weights.
+                op = GGML_OP_NONE;
+            }
             const bool fairy2i_bundle_codes = t_meta->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES;
             if (fairy2i_bundle_codes) {
                 // Bundle codes are opaque inputs to the dedicated Fairy2i wide-linear ops.
@@ -2700,6 +2810,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 ggml_backend_buft_name(buft));
                         break;
                     }
+                }
+            }
+
+            if (row4_storage) {
+                if (buft && ggml_backend_buft_get_device(buft) != target_dev) {
+                    throw std::runtime_error(
+                        format("Row4 tensor override for %s would split a codes/scales bundle across devices",
+                               tn.str().c_str()));
+                }
+                // Codes and scales use the same target device and its ordinary storage. No persistent prepack exists.
+                buft = ggml_backend_dev_buffer_type(target_dev);
+                if (!buft) {
+                    throw std::runtime_error(format("target device %s has no buffer for Row4 tensor %s",
+                                                    ggml_backend_dev_name(target_dev), tn.str().c_str()));
                 }
             }
 
@@ -3621,33 +3745,158 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 } break;
             case LLM_ARCH_QWEN3:
                 {
-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    if (!row4_enabled) {
+                        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
-                    // output
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
-                    // if output is NULL, init from the input tok embed
-                    if (output == NULL) {
-                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                        // output
+                        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+                        output =
+                            create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+                        // if output is NULL, init from the input tok embed
+                        if (output == NULL) {
+                            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab },
+                                                   TENSOR_DUPLICATED);
+                        }
+
+                        for (int i = 0; i < n_layer; ++i) {
+                            auto & layer = layers[i];
+
+                            layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
+
+                            layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i),
+                                                     { n_embd, n_embd_head_k * n_head }, 0);
+                            layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), { n_embd, n_embd_gqa }, 0);
+                            layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), { n_embd, n_embd_gqa }, 0);
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i),
+                                                     { n_embd_head_k * n_head, n_embd }, 0);
+
+                            layer.attn_k_norm =
+                                create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+                            layer.attn_q_norm =
+                                create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
+
+                            layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), { n_embd, n_ff }, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), { n_ff, n_embd }, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", i), { n_embd, n_ff }, 0);
+                        }
+                        break;
                     }
 
+                    auto require_type = [](const ggml_tensor * tensor, ggml_type expected) {
+                        if (tensor->type != expected) {
+                            throw std::runtime_error(format("invalid Row4 tensor type for %s: expected %s, got %s",
+                                                            tensor->name, ggml_type_name(expected),
+                                                            ggml_type_name(tensor->type)));
+                        }
+                    };
+                    auto reject_tensor = [&](llm_tensor tensor, const char * suffix, int bid = -1) {
+                        const auto name = tn(tensor, suffix, bid).str();
+                        if (ml.get_tensor_meta(name.c_str())) {
+                            throw std::runtime_error(format("Row4 schema v1 forbids tensor %s", name.c_str()));
+                        }
+                    };
+                    auto create_row4_linear = [&](llama_row_quant_linear & linear, llm_tensor tensor, int bid,
+                                                  int64_t logical_k, int64_t logical_o) {
+                        if (logical_k % 128 != 0 || logical_o % 128 != 0) {
+                            throw std::runtime_error(
+                                format("Row4 schema v1 requires K/O multiples of 128 for %s: K=%lld O=%lld",
+                                       tn(tensor, bid).str().c_str(), (long long) logical_k, (long long) logical_o));
+                        }
+
+                        const auto codes_name  = tn(tensor, "row4.codes", bid);
+                        const auto scales_name = tn(tensor, "row4.scales", bid);
+                        const auto codes_meta  = ml.get_tensor_meta(codes_name.str().c_str());
+                        const auto scales_meta = ml.get_tensor_meta(scales_name.str().c_str());
+                        if (!codes_meta || !scales_meta) {
+                            throw std::runtime_error(format("incomplete Row4 tensor pair for %s: expected %s and %s",
+                                                            tn(tensor, bid).str().c_str(), codes_name.str().c_str(),
+                                                            scales_name.str().c_str()));
+                        }
+                        if (codes_meta->type != GGML_TYPE_ROW4_CODES || scales_meta->type != GGML_TYPE_BF16) {
+                            throw std::runtime_error(format(
+                                "invalid Row4 tensor types for %s: codes must be ROW4_CODES and scales must be BF16; "
+                                "got %s/%s",
+                                tn(tensor, bid).str().c_str(), ggml_type_name(codes_meta->type),
+                                ggml_type_name(scales_meta->type)));
+                        }
+
+                        linear.codes     = create_tensor(codes_name, { 64, 4, logical_k / 128, logical_o / 16 }, 0);
+                        linear.scales    = create_tensor(scales_name, { logical_o }, 0);
+                        linear.logical_k = logical_k;
+                        linear.logical_o = logical_o;
+                    };
+                    auto create_w8_linear = [&](llama_row_quant_linear & linear, int64_t logical_k, int64_t logical_o) {
+                        if (logical_k % 128 != 0 || logical_o % 128 != 0) {
+                            throw std::runtime_error(
+                                format("Row4 W8A8 output requires K/O multiples of 128: K=%lld O=%lld",
+                                       (long long) logical_k, (long long) logical_o));
+                        }
+
+                        const auto codes_name  = tn(LLM_TENSOR_OUTPUT, "w8.codes");
+                        const auto scales_name = tn(LLM_TENSOR_OUTPUT, "w8.scales");
+                        const auto codes_meta  = ml.get_tensor_meta(codes_name.str().c_str());
+                        const auto scales_meta = ml.get_tensor_meta(scales_name.str().c_str());
+                        if (!codes_meta || !scales_meta) {
+                            throw std::runtime_error(format("incomplete Row4 W8A8 output pair: expected %s and %s",
+                                                            codes_name.str().c_str(), scales_name.str().c_str()));
+                        }
+                        if (codes_meta->type != GGML_TYPE_I8 || scales_meta->type != GGML_TYPE_F32) {
+                            throw std::runtime_error(format(
+                                "invalid Row4 W8A8 output types: codes must be I8 and scales must be F32; got %s/%s",
+                                ggml_type_name(codes_meta->type), ggml_type_name(scales_meta->type)));
+                        }
+
+                        linear.codes     = create_tensor(codes_name, { 128, 16, logical_k / 128, logical_o / 16 }, 0);
+                        linear.scales    = create_tensor(scales_name, { logical_o }, 0);
+                        linear.logical_k = logical_k;
+                        linear.logical_o = logical_o;
+                    };
+
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+                    require_type(tok_embd, GGML_TYPE_BF16);
+                    require_type(output_norm, GGML_TYPE_BF16);
+
+                    reject_tensor(LLM_TENSOR_OUTPUT, "weight");
+                    reject_tensor(LLM_TENSOR_OUTPUT, "bias");
+                    create_w8_linear(output_w8, n_embd, n_vocab);
+
+                    const int64_t q_dim   = n_embd_head_k * n_head;
+                    const int64_t qkv_dim = q_dim + n_embd_k_gqa + n_embd_v_gqa;
                     for (int i = 0; i < n_layer; ++i) {
                         auto & layer = layers[i];
 
-                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-
-                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
-                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_gqa}, 0);
-                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_gqa}, 0);
-                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
-
-                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
-                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
-
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
+                        layer.attn_k_norm =
+                            create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+                        layer.attn_q_norm =
+                            create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                        require_type(layer.attn_norm, GGML_TYPE_BF16);
+                        require_type(layer.attn_k_norm, GGML_TYPE_BF16);
+                        require_type(layer.attn_q_norm, GGML_TYPE_BF16);
+                        require_type(layer.ffn_norm, GGML_TYPE_BF16);
+
+                        for (llm_tensor separate : { LLM_TENSOR_ATTN_Q, LLM_TENSOR_ATTN_K, LLM_TENSOR_ATTN_V,
+                                                     LLM_TENSOR_FFN_GATE, LLM_TENSOR_FFN_UP }) {
+                            reject_tensor(separate, "weight", i);
+                            reject_tensor(separate, "weight_scale", i);
+                            reject_tensor(separate, "bias", i);
+                            reject_tensor(separate, "row4.codes", i);
+                            reject_tensor(separate, "row4.scales", i);
+                        }
+                        for (llm_tensor packed : { LLM_TENSOR_ATTN_QKV, LLM_TENSOR_ATTN_OUT, LLM_TENSOR_FFN_GATE_UP,
+                                                   LLM_TENSOR_FFN_DOWN }) {
+                            reject_tensor(packed, "weight", i);
+                            reject_tensor(packed, "weight_scale", i);
+                            reject_tensor(packed, "bias", i);
+                        }
+
+                        create_row4_linear(layer.wqkv_row4, LLM_TENSOR_ATTN_QKV, i, n_embd, qkv_dim);
+                        create_row4_linear(layer.wo_row4, LLM_TENSOR_ATTN_OUT, i, q_dim, n_embd);
+                        create_row4_linear(layer.ffn_gate_up_row4, LLM_TENSOR_FFN_GATE_UP, i, n_embd, 2 * n_ff);
+                        create_row4_linear(layer.ffn_down_row4, LLM_TENSOR_FFN_DOWN, i, n_ff, n_embd);
                     }
                 } break;
             case LLM_ARCH_QWEN3MOE:
@@ -7006,6 +7255,12 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: fairy2i numeric  = %s\n", __func__, fairy2i_numeric_profile_name());
     }
 
+    if (row4_enabled) {
+        LLAMA_LOG_INFO("%s: row4 schema      = %u\n", __func__, row4_schema_version);
+        LLAMA_LOG_INFO("%s: row4 layout      = m16k128_split8_v1\n", __func__);
+        LLAMA_LOG_INFO("%s: row4 numeric     = bf16_a8_away_i32_bf16_v1\n", __func__);
+    }
+
     if (arch == LLM_ARCH_DEEPSEEK) {
         LLAMA_LOG_INFO("%s: n_layer_dense_lead   = %d\n",     __func__, hparams.n_layer_dense_lead);
         LLAMA_LOG_INFO("%s: n_ff_exp             = %d\n",     __func__, hparams.n_ff_exp);
@@ -7095,6 +7350,46 @@ static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t d
     bool op_supported = ggml_backend_dev_supports_op(dev, op_tensor);
 
     return op_supported;
+}
+
+static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
+    const char *       reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    const bool         is_metal = reg_name && strcmp(reg_name, "Metal") == 0;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (!is_metal && !(reg_name && strcmp(reg_name, "CPU") == 0)) {
+        return false;
+    }
+#else
+    if (!is_metal) {
+        return false;
+    }
+#endif
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft) {
+        return false;
+    }
+
+    auto row4_probe = [](ggml_context * ctx) {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1);
+        ggml_tensor * codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, 1, 8);
+        ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 128);
+        return ggml_row4_linear(ctx, x, codes, scales, 128, 128);
+    };
+    auto w8_probe = [](ggml_context * ctx) {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1);
+        ggml_tensor * codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, 128, 16, 1, 8);
+        ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        return ggml_w8a8_linear(ctx, x, codes, scales, 128, 128);
+    };
+
+    return buft_supported(buft, dev, row4_probe) && buft_supported(buft, dev, w8_probe);
 }
 
 template<typename F>
@@ -10035,6 +10330,173 @@ struct llm_build_qwen3 : public llm_graph_context {
         cur = build_lora_mm(model.output, cur);
 
         cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
+};
+
+struct llm_build_qwen3_row4 : public llm_graph_context {
+    llm_build_qwen3_row4(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+        const int64_t n_embd_head = hparams.n_embd_head_v;
+
+        GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
+        GGML_ASSERT(n_embd_head == hparams.n_rot);
+        GGML_ASSERT(model.row4_enabled);
+
+        if (!loras->empty()) {
+            throw std::runtime_error("Qwen3 Row4 schema v1 does not support LoRA adapters");
+        }
+
+        ggml_tensor * cur;
+        ggml_tensor * inpL;
+
+        inpL = build_inp_embd(model.tok_embd);
+        // GET_ROWS widens the schema-mandated BF16 token embedding exactly, so
+        // its output already satisfies the carrier invariant. External F32
+        // embeddings still need an explicit BF16 boundary before residuals.
+        if (!ubatch.token) {
+            inpL = ggml_fairy2i_round_bf16_exact(ctx0, inpL);
+        }
+        cb(inpL, "inp_embd_bf16_exact", -1);
+
+        // inp_pos - contains the positions
+        ggml_tensor * inp_pos = build_inp_pos();
+
+        auto * inp_attn = build_attn_inp_kv();
+
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+        const int64_t q_dim = n_embd_head * n_head;
+        const int64_t k_dim = hparams.n_embd_k_gqa();
+        const int64_t v_dim = hparams.n_embd_v_gqa();
+
+        // Row4 GGUFs preserve the checkpoint BF16 norm weights bit-for-bit, while
+        // the Row4 operators deliberately keep BF16 activations in an F32 carrier.
+        // Reuse the Qwen3 QAT primitives here so CPU and Metal observe the same
+        // BF16 boundaries as the checkpoint model between quantized projections.
+        auto build_row4_norm = [&](ggml_tensor * input, ggml_tensor * weight, int il) {
+            GGML_UNUSED(il);
+            GGML_ASSERT(input->type == GGML_TYPE_F32);
+            GGML_ASSERT(weight->type == GGML_TYPE_BF16);
+            ggml_tensor * result = ggml_fairy2i_rms_norm_exact(ctx0, input, ggml_cast(ctx0, weight, GGML_TYPE_F32),
+                                                               hparams.f_norm_rms_eps);
+            ggml_fairy2i_exact_set_qat(result, true);
+            return result;
+        };
+
+        for (int il = 0; il < n_layer; ++il) {
+            ggml_tensor * inpSA = inpL;
+
+            // norm
+            cur = build_row4_norm(inpL, model.layers[il].attn_norm, il);
+            cb(cur, "attn_norm", il);
+
+            // The fused tensor preserves the original HF row order: all Q rows, then K, then V.
+            {
+                const auto &  qkv_weight = model.layers[il].wqkv_row4;
+                ggml_tensor * qkv        = ggml_row4_linear(ctx0, cur, qkv_weight.codes, qkv_weight.scales,
+                                                            qkv_weight.logical_o, qkv_weight.logical_k);
+                cb(qkv, "qkv_row4", il);
+
+                GGML_ASSERT(qkv->type == GGML_TYPE_F32);
+                GGML_ASSERT(qkv->ne[0] == q_dim + k_dim + v_dim);
+                GGML_ASSERT(qkv->ne[1] == n_tokens);
+
+                ggml_tensor * Qcur =
+                    ggml_view_3d(ctx0, qkv, n_embd_head, n_head, n_tokens, n_embd_head * sizeof(float), qkv->nb[1], 0);
+                ggml_tensor * Kcur = ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens,
+                                                  n_embd_head * sizeof(float), qkv->nb[1], q_dim * sizeof(float));
+                ggml_tensor * Vcur =
+                    ggml_view_3d(ctx0, qkv, n_embd_head, n_head_kv, n_tokens, n_embd_head * sizeof(float), qkv->nb[1],
+                                 (q_dim + k_dim) * sizeof(float));
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                Qcur = build_row4_norm(Qcur, model.layers[il].attn_q_norm, il);
+                cb(Qcur, "Qcur_normed", il);
+
+                Qcur =
+                    ggml_fairy2i_rope_ext_exact(ctx0, Qcur, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NEOX, n_ctx_orig,
+                                                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                ggml_fairy2i_exact_set_qat(Qcur, true);
+
+                Kcur = build_row4_norm(Kcur, model.layers[il].attn_k_norm, il);
+                cb(Kcur, "Kcur_normed", il);
+
+                Kcur =
+                    ggml_fairy2i_rope_ext_exact(ctx0, Kcur, inp_pos, nullptr, n_rot, LLAMA_ROPE_TYPE_NEOX, n_ctx_orig,
+                                                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                ggml_fairy2i_exact_set_qat(Kcur, true);
+
+                cb(Qcur, "Qcur", il);
+                cb(Kcur, "Kcur", il);
+                cb(Vcur, "Vcur", il);
+
+                cur = build_attn(inp_attn, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                                 1.0f / sqrtf(float(n_embd_head)), il, true, true, true);
+
+                const auto & out_weight = model.layers[il].wo_row4;
+                cur = ggml_row4_linear(ctx0, cur, out_weight.codes, out_weight.scales, out_weight.logical_o,
+                                       out_weight.logical_k);
+                cb(cur, "attn_output_row4", il);
+            }
+
+            if (il == n_layer - 1 && inp_out_ids) {
+                cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
+                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            }
+
+            ggml_tensor * ffn_inp = ggml_complex_add(ctx0, cur, inpSA);
+            ggml_complex_add_set_qat(ffn_inp, true);
+            cb(ffn_inp, "ffn_inp", il);
+
+            cur = build_row4_norm(ffn_inp, model.layers[il].ffn_norm, il);
+            cb(cur, "ffn_norm", il);
+
+            const auto &  gate_up_weight = model.layers[il].ffn_gate_up_row4;
+            ggml_tensor * gate_up        = ggml_row4_linear(ctx0, cur, gate_up_weight.codes, gate_up_weight.scales,
+                                                            gate_up_weight.logical_o, gate_up_weight.logical_k);
+            cb(gate_up, "ffn_gate_up_row4", il);
+            GGML_ASSERT(gate_up->type == GGML_TYPE_F32);
+            GGML_ASSERT(gate_up->ne[0] == 2 * hparams.n_ff(il));
+
+            const int64_t n_ff = hparams.n_ff(il);
+            ggml_tensor * gate = ggml_view_2d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], 0);
+            ggml_tensor * up = ggml_view_2d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], n_ff * sizeof(float));
+            gate             = ggml_fairy2i_silu_exact(ctx0, gate);
+            ggml_fairy2i_exact_set_qat(gate, true);
+            cur = ggml_fairy2i_mul_exact(ctx0, gate, up);
+            ggml_fairy2i_exact_set_qat(cur, true);
+            cb(cur, "ffn_swiglu", il);
+
+            const auto & down_weight = model.layers[il].ffn_down_row4;
+            cur = ggml_row4_linear(ctx0, cur, down_weight.codes, down_weight.scales, down_weight.logical_o,
+                                   down_weight.logical_k);
+            cb(cur, "ffn_down_row4", il);
+
+            cur = ggml_complex_add(ctx0, cur, ffn_inp);
+            ggml_complex_add_set_qat(cur, true);
+
+            if (cvec->tensor_for(il) != nullptr) {
+                throw std::runtime_error(
+                    "Qwen3 Row4 schema v1 does not support control-vector adapters outside its BF16 contract");
+            }
+            cur = build_cvec(cur, il);
+            cb(cur, "l_out", il);
+
+            inpL = cur;
+        }
+
+        cur = build_row4_norm(inpL, model.output_norm, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        const auto & output_weight = model.output_w8;
+        cur = ggml_w8a8_linear(ctx0, cur, output_weight.codes, output_weight.scales, output_weight.logical_o,
+                               output_weight.logical_k);
+        cb(cur, "result_output_w8a8", -1);
         res->t_logits = cur;
 
         ggml_build_forward_expand(gf, cur);
@@ -20507,7 +20969,11 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_QWEN3:
             {
-                llm = std::make_unique<llm_build_qwen3>(*this, params);
+                if (row4_enabled) {
+                    llm = std::make_unique<llm_build_qwen3_row4>(*this, params);
+                } else {
+                    llm = std::make_unique<llm_build_qwen3>(*this, params);
+                }
             } break;
         case LLM_ARCH_QWEN3MOE:
             {
