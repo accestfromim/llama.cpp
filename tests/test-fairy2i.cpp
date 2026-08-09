@@ -2223,6 +2223,166 @@ static bool test_fairy2i_exact_mlp_residual_logits() {
     return ok;
 }
 
+struct fairy2i_strided_exact_outputs {
+    std::vector<float> silu_direct;
+    std::vector<float> silu_contiguous;
+    std::vector<float> swiglu_direct;
+    std::vector<float> swiglu_contiguous;
+    std::vector<float> mul_direct;
+    std::vector<float> mul_contiguous;
+};
+
+static bool run_fairy2i_strided_exact_backend(fairy2i_strided_exact_outputs & out,
+                                              ggml_backend_t                  backend,
+                                              const std::vector<float> &      gate_up_data,
+                                              int64_t                         n_ff,
+                                              int64_t                         n_tokens,
+                                              bool                            qat) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * gate_up         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2 * n_ff, n_tokens);
+    ggml_tensor * gate            = ggml_view_2d(ctx, gate_up, n_ff, n_tokens, gate_up->nb[1], 0);
+    ggml_tensor * up              = ggml_view_2d(ctx, gate_up, n_ff, n_tokens, gate_up->nb[1], n_ff * sizeof(float));
+    ggml_tensor * gate_contiguous = ggml_cont(ctx, gate);
+    ggml_tensor * up_contiguous   = ggml_cont(ctx, up);
+
+    ggml_tensor * silu_direct       = ggml_fairy2i_silu_exact(ctx, gate);
+    ggml_tensor * silu_contiguous   = ggml_fairy2i_silu_exact(ctx, gate_contiguous);
+    ggml_tensor * swiglu_direct     = ggml_fairy2i_mul_exact(ctx, silu_direct, up);
+    ggml_tensor * swiglu_contiguous = ggml_fairy2i_mul_exact(ctx, silu_contiguous, up_contiguous);
+    ggml_tensor * mul_direct        = ggml_fairy2i_mul_exact(ctx, gate, up);
+    ggml_tensor * mul_contiguous    = ggml_fairy2i_mul_exact(ctx, gate_contiguous, up_contiguous);
+    for (ggml_tensor * exact :
+         { silu_direct, silu_contiguous, swiglu_direct, swiglu_contiguous, mul_direct, mul_contiguous }) {
+        ggml_fairy2i_exact_set_qat(exact, qat);
+    }
+
+    const bool supported = ggml_backend_supports_op(backend, silu_direct) &&
+                           ggml_backend_supports_op(backend, swiglu_direct) &&
+                           ggml_backend_supports_op(backend, mul_direct);
+    if (!supported) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    for (ggml_tensor * output :
+         { silu_direct, silu_contiguous, swiglu_direct, swiglu_contiguous, mul_direct, mul_contiguous }) {
+        ggml_build_forward_expand(gf, output);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_set(gate_up, gate_up_data.data(), 0, gate_up_data.size() * sizeof(float));
+    const ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status == GGML_STATUS_SUCCESS) {
+        const size_t ne   = (size_t) n_ff * (size_t) n_tokens;
+        auto         read = [&](ggml_tensor * tensor, std::vector<float> & values) {
+            values.resize(ne);
+            ggml_backend_tensor_get(tensor, values.data(), 0, ne * sizeof(float));
+        };
+        read(silu_direct, out.silu_direct);
+        read(silu_contiguous, out.silu_contiguous);
+        read(swiglu_direct, out.swiglu_direct);
+        read(swiglu_contiguous, out.swiglu_contiguous);
+        read(mul_direct, out.mul_direct);
+        read(mul_contiguous, out.mul_contiguous);
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return status == GGML_STATUS_SUCCESS;
+}
+
+static bool compare_fairy2i_strided_exact_outputs(const char * label, const fairy2i_strided_exact_outputs & out) {
+    return compare_bf16_value_bits((std::string(label) + " SiLU").c_str(), out.silu_direct, out.silu_contiguous) &&
+           compare_bf16_value_bits((std::string(label) + " SwiGLU").c_str(), out.swiglu_direct,
+                                   out.swiglu_contiguous) &&
+           compare_bf16_value_bits((std::string(label) + " MUL").c_str(), out.mul_direct, out.mul_contiguous);
+}
+
+static bool test_fairy2i_strided_exact_mlp() {
+    constexpr int64_t        n_ff     = 13;
+    const std::vector<float> boundary = {
+        0.0f,
+        -0.0f,
+        bf16_from_bits(0x0001),
+        bf16_from_bits(0x8002),
+        bf16_from_bits(0x0080),
+        bf16_from_bits(0x8081),
+        1.0f,
+        -1.0f,
+        2.0f,
+        -2.0f,
+        80.0f,
+        -90.0f,
+        bf16_from_bits(0x7f7f),
+        bf16_from_bits(0xff7f),
+    };
+
+    bool               ok        = true;
+    ggml_backend_dev_t metal_dev = find_metal_test_device();
+    for (int64_t n_tokens : { INT64_C(2), INT64_C(3) }) {
+        std::vector<float> gate_up((size_t) 2 * (size_t) n_ff * (size_t) n_tokens);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t i = 0; i < 2 * n_ff; ++i) {
+                gate_up[(size_t) token * (size_t) 2 * (size_t) n_ff + (size_t) i] =
+                    boundary[((size_t) token * 5u + (size_t) i) % boundary.size()];
+            }
+        }
+
+        for (bool qat : { false, true }) {
+            ggml_backend_t                cpu = ggml_backend_cpu_init();
+            fairy2i_strided_exact_outputs cpu_out;
+            const std::string             cpu_label =
+                "Fairy2i strided exact T=" + std::to_string(n_tokens) + (qat ? " QAT CPU" : " CPU");
+            const bool cpu_ok = cpu && run_fairy2i_strided_exact_backend(cpu_out, cpu, gate_up, n_ff, n_tokens, qat) &&
+                                compare_fairy2i_strided_exact_outputs(cpu_label.c_str(), cpu_out);
+            if (cpu) {
+                ggml_backend_free(cpu);
+            }
+            ok = cpu_ok && ok;
+
+            if (metal_dev) {
+                ggml_backend_t                metal = ggml_backend_dev_init(metal_dev, nullptr);
+                fairy2i_strided_exact_outputs metal_out;
+                const std::string             metal_label =
+                    "Fairy2i strided exact T=" + std::to_string(n_tokens) + (qat ? " QAT Metal" : " Metal");
+                const bool metal_ok =
+                    metal && run_fairy2i_strided_exact_backend(metal_out, metal, gate_up, n_ff, n_tokens, qat) &&
+                    compare_fairy2i_strided_exact_outputs(metal_label.c_str(), metal_out);
+                if (!qat && metal_ok) {
+                    ok = compare_bf16_value_bits((metal_label + " CPU equality SiLU").c_str(), metal_out.silu_direct,
+                                                 cpu_out.silu_direct) &&
+                         compare_bf16_value_bits((metal_label + " CPU equality SwiGLU").c_str(),
+                                                 metal_out.swiglu_direct, cpu_out.swiglu_direct) &&
+                         compare_bf16_value_bits((metal_label + " CPU equality MUL").c_str(), metal_out.mul_direct,
+                                                 cpu_out.mul_direct) &&
+                         ok;
+                }
+                if (metal) {
+                    ggml_backend_free(metal);
+                }
+                ok = metal_ok && ok;
+            }
+        }
+    }
+
+    printf("  Fairy2i exact strided MLP T=2/3 CPU%s: %s\n", metal_dev ? "+Metal" : "", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool run_fairy2i_bf16_set_rows_backend(const char * label, ggml_backend_t backend) {
     constexpr int64_t n_dims = 5;
     constexpr int64_t n_rows = 3;
@@ -2311,6 +2471,224 @@ static bool test_fairy2i_exact_bf16_set_rows() {
     }
 
     printf("  Fairy2i exact BF16 SET_ROWS raw payload CPU%s: %s\n", metal_dev ? "+Metal" : "", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool run_bf16_carrier_set_rows_rows_backend(const char * label, ggml_backend_t backend) {
+    constexpr int64_t n_dims      = 6;
+    constexpr int64_t n_tokens    = 4;
+    constexpr int64_t src_stride  = 13;
+    constexpr int64_t src_offset  = 5;
+    constexpr int64_t cache_rows  = 10;
+    const int64_t     row_idxs[n_tokens] = { 7, 1, 9, 4 };
+    const uint16_t    payloads[] = { 0x0001, 0x8001, 0x0000, 0x8000, 0x7fc1, 0xff81, 0x3f80, 0xbf80 };
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/1024 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * src_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, src_stride, n_tokens);
+    ggml_tensor * src = ggml_view_2d(
+        ctx, src_storage, n_dims, n_tokens, src_storage->nb[1], src_offset * sizeof(float));
+    ggml_tensor * idx         = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+    ggml_tensor * exact_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_dims, cache_rows);
+    ggml_tensor * ref_cache   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, n_dims, cache_rows);
+
+    ggml_tensor * exact = ggml_set_rows_bf16_carrier(
+        ctx, exact_cache, src, idx, GGML_SET_ROWS_BF16_CARRIER_ROWS);
+    ggml_tensor * packed = ggml_fairy2i_pack_bf16_exact(ctx, ggml_cont(ctx, src));
+    ggml_tensor * ref    = ggml_set_rows(ctx, ref_cache, packed, idx);
+
+    bool ok = ggml_backend_supports_op(backend, exact) && ggml_backend_supports_op(backend, ref);
+    if (!ok) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, exact);
+    ggml_build_forward_expand(gf, ref);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<uint32_t> src_data((size_t) src_stride * n_tokens, 0x3f800001U);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t d = 0; d < n_dims; ++d) {
+            const uint16_t payload = payloads[(token * n_dims + d) % (int64_t) (sizeof(payloads) / sizeof(payloads[0]))];
+            src_data[(size_t) token * src_stride + src_offset + d] = ((uint32_t) payload << 16) | (uint32_t) (0x0101 + 17 * d + token);
+        }
+    }
+    std::vector<ggml_bf16_t> initial((size_t) n_dims * cache_rows);
+    for (size_t i = 0; i < initial.size(); ++i) {
+        initial[i].bits = (uint16_t) (0x4100U + i);
+    }
+
+    ggml_backend_tensor_set(src_storage, src_data.data(), 0, src_data.size() * sizeof(uint32_t));
+    ggml_backend_tensor_set(idx, row_idxs, 0, sizeof(row_idxs));
+    ggml_backend_tensor_set(exact_cache, initial.data(), 0, initial.size() * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(ref_cache, initial.data(), 0, initial.size() * sizeof(ggml_bf16_t));
+
+    ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    std::vector<ggml_bf16_t> actual(initial.size());
+    std::vector<ggml_bf16_t> reference(initial.size());
+    if (ok) {
+        ggml_backend_tensor_get(exact, actual.data(), 0, actual.size() * sizeof(ggml_bf16_t));
+        ggml_backend_tensor_get(ref, reference.data(), 0, reference.size() * sizeof(ggml_bf16_t));
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t d = 0; d < n_dims; ++d) {
+                const size_t   pos = (size_t) row_idxs[token] * n_dims + d;
+                const uint16_t expected = (uint16_t) (src_data[(size_t) token * src_stride + src_offset + d] >> 16);
+                if (actual[pos].bits != expected || reference[pos].bits != expected) {
+                    fprintf(stderr,
+                            "%s rows mismatch token=%lld d=%lld direct=0x%04x old=0x%04x expected=0x%04x\n",
+                            label, (long long) token, (long long) d, (unsigned) actual[pos].bits,
+                            (unsigned) reference[pos].bits, (unsigned) expected);
+                    ok = false;
+                }
+            }
+        }
+        if (memcmp(actual.data(), reference.data(), actual.size() * sizeof(ggml_bf16_t)) != 0) {
+            fprintf(stderr, "%s rows direct cache differs from old CONT+PACK+SET_ROWS cache\n", label);
+            ok = false;
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
+static bool run_bf16_carrier_set_rows_elements_backend(const char * label, ggml_backend_t backend) {
+    constexpr int64_t head_dim    = 3;
+    constexpr int64_t n_heads     = 2;
+    constexpr int64_t n_dims      = head_dim * n_heads;
+    constexpr int64_t n_tokens    = 4;
+    constexpr int64_t src_stride  = 17;
+    constexpr int64_t src_offset  = 7;
+    constexpr int64_t kv_size     = 5;
+    constexpr int64_t n_stream    = 2;
+    constexpr int64_t cache_size  = n_dims * kv_size * n_stream;
+    const int64_t     cells[n_tokens]   = { 3, 0, 4, 1 };
+    const int64_t     streams[n_tokens] = { 0, 0, 1, 1 };
+    const uint16_t    payloads[] = { 0x0001, 0x8001, 0x0000, 0x8000, 0x7fc1, 0xff81, 0x3f80, 0xbf80 };
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/1024 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * src_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, src_stride, n_tokens);
+    ggml_tensor * src = ggml_view_3d(ctx, src_storage, head_dim, n_heads, n_tokens, head_dim * sizeof(float),
+                                     src_storage->nb[1], src_offset * sizeof(float));
+    ggml_tensor * idx         = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_dims * n_tokens);
+    ggml_tensor * exact_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 1, cache_size);
+    ggml_tensor * ref_cache   = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 1, cache_size);
+
+    ggml_tensor * exact = ggml_set_rows_bf16_carrier(
+        ctx, exact_cache, src, idx, GGML_SET_ROWS_BF16_CARRIER_ELEMENTS);
+    ggml_tensor * packed = ggml_fairy2i_pack_bf16_exact(ctx, ggml_cont_2d(ctx, src, n_dims, n_tokens));
+    packed              = ggml_reshape_2d(ctx, packed, 1, n_dims * n_tokens);
+    ggml_tensor * ref   = ggml_set_rows(ctx, ref_cache, packed, idx);
+
+    bool ok = ggml_backend_supports_op(backend, exact) && ggml_backend_supports_op(backend, ref);
+    if (!ok) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, exact);
+    ggml_build_forward_expand(gf, ref);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<uint32_t> src_data((size_t) src_stride * n_tokens, 0x3f800001U);
+    std::vector<int64_t>  idx_data((size_t) n_dims * n_tokens);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t d = 0; d < n_dims; ++d) {
+            const uint16_t payload = payloads[(token * n_dims + d) % (int64_t) (sizeof(payloads) / sizeof(payloads[0]))];
+            src_data[(size_t) token * src_stride + src_offset + d] = ((uint32_t) payload << 16) | (uint32_t) (0x1010 + 13 * d + token);
+            idx_data[(size_t) token * n_dims + d] = streams[token] * n_dims * kv_size + d * kv_size + cells[token];
+        }
+    }
+    std::vector<ggml_bf16_t> initial(cache_size);
+    for (size_t i = 0; i < initial.size(); ++i) {
+        initial[i].bits = (uint16_t) (0x4200U + i);
+    }
+
+    ggml_backend_tensor_set(src_storage, src_data.data(), 0, src_data.size() * sizeof(uint32_t));
+    ggml_backend_tensor_set(idx, idx_data.data(), 0, idx_data.size() * sizeof(int64_t));
+    ggml_backend_tensor_set(exact_cache, initial.data(), 0, initial.size() * sizeof(ggml_bf16_t));
+    ggml_backend_tensor_set(ref_cache, initial.data(), 0, initial.size() * sizeof(ggml_bf16_t));
+
+    ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+    std::vector<ggml_bf16_t> actual(initial.size());
+    std::vector<ggml_bf16_t> reference(initial.size());
+    if (ok) {
+        ggml_backend_tensor_get(exact, actual.data(), 0, actual.size() * sizeof(ggml_bf16_t));
+        ggml_backend_tensor_get(ref, reference.data(), 0, reference.size() * sizeof(ggml_bf16_t));
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t d = 0; d < n_dims; ++d) {
+                const size_t   pos = (size_t) idx_data[(size_t) token * n_dims + d];
+                const uint16_t expected = (uint16_t) (src_data[(size_t) token * src_stride + src_offset + d] >> 16);
+                if (actual[pos].bits != expected || reference[pos].bits != expected) {
+                    fprintf(stderr,
+                            "%s elements mismatch token=%lld d=%lld direct=0x%04x old=0x%04x expected=0x%04x\n",
+                            label, (long long) token, (long long) d, (unsigned) actual[pos].bits,
+                            (unsigned) reference[pos].bits, (unsigned) expected);
+                    ok = false;
+                }
+            }
+        }
+        if (memcmp(actual.data(), reference.data(), actual.size() * sizeof(ggml_bf16_t)) != 0) {
+            fprintf(stderr, "%s elements direct cache differs from old CONT+PACK+SET_ROWS cache\n", label);
+            ok = false;
+        }
+    }
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return ok;
+}
+
+static bool test_bf16_carrier_set_rows() {
+    ggml_backend_t cpu = ggml_backend_cpu_init();
+    if (!cpu) {
+        return false;
+    }
+    bool ok = run_bf16_carrier_set_rows_rows_backend("BF16 carrier SET_ROWS CPU", cpu) &&
+              run_bf16_carrier_set_rows_elements_backend("BF16 carrier SET_ROWS CPU", cpu);
+    ggml_backend_free(cpu);
+
+    ggml_backend_dev_t metal_dev = find_metal_test_device();
+    if (metal_dev) {
+        ggml_backend_t metal = ggml_backend_dev_init(metal_dev, nullptr);
+        ok = metal && run_bf16_carrier_set_rows_rows_backend("BF16 carrier SET_ROWS Metal", metal) &&
+             run_bf16_carrier_set_rows_elements_backend("BF16 carrier SET_ROWS Metal", metal) && ok;
+        if (metal) {
+            ggml_backend_free(metal);
+        }
+    }
+
+    printf("  BF16-carrier exact SET_ROWS strided rows/elements CPU%s: %s\n",
+           metal_dev ? "+Metal" : "", ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -5653,8 +6031,16 @@ int main() {
         fprintf(stderr, "Fairy2i exact MLP/residual/logits FAILED\n");
         ++num_failed;
     }
+    if (!test_fairy2i_strided_exact_mlp()) {
+        fprintf(stderr, "Fairy2i exact strided MLP FAILED\n");
+        ++num_failed;
+    }
     if (!test_fairy2i_exact_bf16_set_rows()) {
         fprintf(stderr, "Fairy2i exact BF16 SET_ROWS FAILED\n");
+        ++num_failed;
+    }
+    if (!test_bf16_carrier_set_rows()) {
+        fprintf(stderr, "BF16-carrier exact SET_ROWS FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_arm_accumulate_neon()) {

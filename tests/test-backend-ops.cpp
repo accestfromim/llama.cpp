@@ -3144,6 +3144,93 @@ struct test_fairy2i_wide_linear_bundle : public test_case {
     double max_abs_err() override { return scale_type == GGML_TYPE_BF16 ? 1e-2 : INFINITY; }
 };
 
+struct test_row_quant_linear : public test_case {
+    const bool    w8a8;
+    const int64_t O;
+    const int64_t N;
+    const int64_t K;
+
+    test_row_quant_linear(bool w8a8, int64_t O, int64_t N, int64_t K) : w8a8(w8a8), O(O), N(N), K(K) {}
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override { return VARS_TO_STR4(w8a8, O, N, K); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * codes = w8a8 ? ggml_new_tensor_4d(ctx, GGML_TYPE_I8, 128, 16, K / 128, O / 16) :
+                                     ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, K / 128, O / 16);
+        ggml_set_name(codes, "codes");
+
+        ggml_tensor * scales = ggml_new_tensor_1d(ctx, w8a8 ? GGML_TYPE_F32 : GGML_TYPE_BF16, O);
+        ggml_set_name(scales, "scales");
+
+        ggml_tensor * out =
+            w8a8 ? ggml_w8a8_linear(ctx, x, codes, scales, O, K) : ggml_row4_linear(ctx, x, codes, scales, O, K);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "x") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t n = 0; n < N; ++n) {
+                    for (int64_t k = 0; k < K; ++k) {
+                        data[(size_t) n * (size_t) K + (size_t) k] =
+                            (float) (((37 * k + 53 * n + 11) % 255) - 127) / 16.0f;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else if (strcmp(t->name, "codes") == 0) {
+                if (w8a8) {
+                    std::vector<int8_t> data(ggml_nbytes(t));
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        data[i] = (int8_t) (((29 * i + 3) % 255) - 127);
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size());
+                } else {
+                    std::vector<uint8_t> data(ggml_nbytes(t));
+                    for (size_t i = 0; i < data.size(); ++i) {
+                        const uint8_t low  = (uint8_t) ((3 * i + 1) & 15);
+                        const uint8_t high = (uint8_t) ((5 * i + 7) & 15);
+                        data[i]            = (uint8_t) (low | (high << 4));
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size());
+                }
+            } else if (strcmp(t->name, "scales") == 0) {
+                if (w8a8) {
+                    std::vector<float> data((size_t) O);
+                    for (int64_t row = 0; row < O; ++row) {
+                        data[(size_t) row] = (row & 1) ? -0.001953125f : 0.00390625f;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+                } else {
+                    std::vector<ggml_bf16_t> data((size_t) O);
+                    for (int64_t row = 0; row < O; ++row) {
+                        const float scale  = (row & 1) ? -0.03125f : 0.0625f;
+                        data[(size_t) row] = ggml_fp32_to_bf16(scale);
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_bf16_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2ull * (uint64_t) O * (uint64_t) N * (uint64_t) K;
+    }
+
+    double max_nmse_err() override { return 0.0; }
+
+    double max_abs_err() override { return 0.0; }
+};
+
 // GGML_OP_ADD_ID
 struct test_add_id : public test_case {
     const ggml_type type_a;
@@ -6689,6 +6776,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 128, 17, 320, true, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_fairy2i_wide_linear_bundle(false, 64, 3, 1024, false, GGML_TYPE_BF16));
 
+    for (bool w8a8 : { false, true }) {
+        for (int64_t n : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128 }) {
+            test_cases.emplace_back(new test_row_quant_linear(w8a8, 128, n, 128));
+        }
+        test_cases.emplace_back(new test_row_quant_linear(w8a8, 128, 9, 256));
+    }
+    const char * row4_real_shapes = getenv("LLAMA_ROW4_REAL_SHAPE_TESTS");
+    if (row4_real_shapes && strcmp(row4_real_shapes, "0") != 0) {
+        const std::pair<int64_t, int64_t> row4_shapes[] = {
+            { 6144,  4096  },
+            { 4096,  4096  },
+            { 24576, 4096  },
+            { 4096,  12288 },
+        };
+        for (const std::pair<int64_t, int64_t> & shape : row4_shapes) {
+            for (int64_t n : { 1, 9, 32, 64, 96, 128 }) {
+                test_cases.emplace_back(new test_row_quant_linear(false, shape.first, n, shape.second));
+            }
+        }
+        for (int64_t n : { 9, 32 }) {
+            test_cases.emplace_back(new test_row_quant_linear(true, 256, n, 4096));
+        }
+    }
+    const char * row4_full_lm_head = getenv("LLAMA_ROW4_FULL_LM_HEAD_TESTS");
+    if (row4_full_lm_head && strcmp(row4_full_lm_head, "0") != 0) {
+        test_cases.emplace_back(new test_row_quant_linear(true, 151936, 1, 4096));
+    }
+
     // single in-place tests, especially important for WebGPU backend since kernels for in-place vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
     test_cases.emplace_back(new test_bin_bcast(ggml_mul_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
@@ -7203,6 +7318,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (bool w8a8 : { false, true }) {
+        test_cases.emplace_back(new test_row_quant_linear(w8a8, 128, 1, 4096));
+        test_cases.emplace_back(new test_row_quant_linear(w8a8, 128, 9, 4096));
+    }
+
+    const char * row4_decode_perf_shapes = getenv("LLAMA_ROW4_DECODE_PERF_SHAPES");
+    if (row4_decode_perf_shapes && strcmp(row4_decode_perf_shapes, "0") != 0) {
+        const std::pair<int64_t, int64_t> row4_shapes[] = {
+            { 6144,  4096  },
+            { 4096,  4096  },
+            { 24576, 4096  },
+            { 4096,  12288 },
+        };
+        for (const std::pair<int64_t, int64_t> & shape : row4_shapes) {
+            test_cases.emplace_back(new test_row_quant_linear(false, shape.first, 1, shape.second));
+        }
+        test_cases.emplace_back(new test_row_quant_linear(true, 151936, 1, 4096));
+    }
+
+    const char * row4_prefill_perf_shapes = getenv("LLAMA_ROW4_PREFILL_PERF_SHAPES");
+    if (row4_prefill_perf_shapes && strcmp(row4_prefill_perf_shapes, "0") != 0) {
+        const std::pair<int64_t, int64_t> row4_shapes[] = {
+            { 6144,  4096  },
+            { 4096,  4096  },
+            { 24576, 4096  },
+            { 4096,  12288 },
+        };
+        for (const std::pair<int64_t, int64_t> & shape : row4_shapes) {
+            test_cases.emplace_back(new test_row_quant_linear(false, shape.first, 512, shape.second));
+        }
+    }
 
     test_cases.emplace_back(new test_ifairy_mul({1048576, 1, 1, 1}, {1, 1, 1, 1}));
     test_cases.emplace_back(new test_ifairy_mul({1024, 1024, 1, 1}, {1, 1, 1, 1}));
