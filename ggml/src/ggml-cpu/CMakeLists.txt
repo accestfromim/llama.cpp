@@ -54,6 +54,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        ggml-cpu/row4/row4-cpu.cpp
+        ggml-cpu/row4/row4-cpu.h
         )
 
     if (GGML_FAIRY2I_CPU)

@@ -1047,6 +1047,38 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
+ggml_tensor * llama_kv_cache::cpy_k_bf16_carrier(
+        ggml_context * ctx,
+        ggml_tensor *  k_cur,
+        ggml_tensor *  k_idxs,
+        int32_t        il,
+        const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k   = layers[ikv].k;
+
+    GGML_ASSERT(k->type == GGML_TYPE_BF16 && k_cur->type == GGML_TYPE_F32);
+
+    const int64_t n_embd_head = k_cur->ne[0];
+    const int64_t n_head      = k_cur->ne[1];
+    const int64_t n_tokens    = k_cur->ne[2];
+    const int64_t n_embd_gqa  = n_embd_head * n_head;
+
+    GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+    const int64_t n_stream = k->ne[2];
+    if (n_stream > 1) {
+        const int64_t kv_size = get_size();
+        GGML_ASSERT(n_embd_gqa == k->ne[0]);
+        GGML_ASSERT(kv_size == k->ne[1]);
+        k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size * n_stream);
+    }
+
+    return ggml_set_rows_bf16_carrier(ctx, k, k_cur, k_idxs, GGML_SET_ROWS_BF16_CARRIER_ROWS);
+}
+
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -1101,6 +1133,51 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+}
+
+ggml_tensor * llama_kv_cache::cpy_v_bf16_carrier(
+        ggml_context * ctx,
+        ggml_tensor *  v_cur,
+        ggml_tensor *  v_idxs,
+        int32_t        il,
+        const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * v   = layers[ikv].v;
+
+    GGML_ASSERT(v->type == GGML_TYPE_BF16 && v_cur->type == GGML_TYPE_F32);
+
+    const int64_t n_embd_head = v_cur->ne[0];
+    const int64_t n_head      = v_cur->ne[1];
+    const int64_t n_tokens    = v_cur->ne[2];
+    const int64_t n_embd_gqa  = n_embd_head * n_head;
+
+    GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
+
+    const int64_t n_stream = v->ne[2];
+    if (!v_trans) {
+        v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+
+        if (n_stream > 1) {
+            const int64_t kv_size = get_size();
+            GGML_ASSERT(n_embd_gqa == v->ne[0]);
+            GGML_ASSERT(kv_size == v->ne[1]);
+            v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size * n_stream);
+        }
+
+        return ggml_set_rows_bf16_carrier(ctx, v, v_cur, v_idxs, GGML_SET_ROWS_BF16_CARRIER_ROWS);
+    }
+
+    // The element-mode indices already encode the transposed cache address in
+    // token-major order. Keep the original [head_dim, head, token] source
+    // strides so a fused QKV view can be stored without CONT or PACK nodes.
+    GGML_ASSERT(n_embd_gqa == v->ne[0]);
+    GGML_ASSERT(v_cur->ne[3] == 1);
+    GGML_ASSERT(v_idxs->ne[0] == n_embd_gqa * n_tokens);
+
+    ggml_tensor * v_view = ggml_reshape_2d(ctx, v, 1, ggml_nelements(v));
+    return ggml_set_rows_bf16_carrier(ctx, v_view, v_cur, v_idxs, GGML_SET_ROWS_BF16_CARRIER_ELEMENTS);
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -1983,6 +2060,16 @@ ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_bf16_carrier(
+        ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_bf16_carrier(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_v_bf16_carrier(
+        ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
+    return kv->cpy_v_bf16_carrier(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {

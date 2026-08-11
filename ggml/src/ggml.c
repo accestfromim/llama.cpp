@@ -995,6 +995,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 1,
         .is_quantized             = true,
     },
+    [GGML_TYPE_ROW4_CODES] = {
+        .type_name                = "row4_codes",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1161,6 +1167,8 @@ static const char * GGML_OP_NAME[] = {
     "FAIRY2I_MUL_EXACT",
     "FAIRY2I_PACK_BF16_EXACT",
     "FAIRY2I_ATTN_EXACT_CPU",
+    "ROW4_LINEAR",
+    "W8A8_LINEAR",
 };
 
 static_assert(sizeof(GGML_OP_NAME) / sizeof(GGML_OP_NAME[0]) == GGML_OP_COUNT, "GGML_OP_NAME must match GGML_OP_COUNT");
@@ -1287,6 +1295,8 @@ static const char * GGML_OP_SYMBOL[] = {
     "fairy2i_mul_exact(x,y)",
     "fairy2i_pack_bf16_exact(x)",
     "fairy2i_attn_exact_cpu(q,k,v,mask)",
+    "row4_linear(x,codes,scales)",
+    "w8a8_linear(x,codes,scales)",
 };
 
 static_assert(sizeof(GGML_OP_SYMBOL) / sizeof(GGML_OP_SYMBOL[0]) == GGML_OP_COUNT,
@@ -3851,6 +3861,44 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+struct ggml_tensor * ggml_set_rows_bf16_carrier(
+        struct ggml_context                  * ctx,
+        struct ggml_tensor                   * a,
+        struct ggml_tensor                   * b,
+        struct ggml_tensor                   * c,
+        enum ggml_set_rows_bf16_carrier_mode   mode) {
+    GGML_ASSERT(a->type == GGML_TYPE_BF16);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(c->type == GGML_TYPE_I64);
+    GGML_ASSERT(a->nb[0] == sizeof(ggml_bf16_t));
+    GGML_ASSERT(b->nb[0] == sizeof(float));
+    GGML_ASSERT(c->nb[0] == sizeof(int64_t));
+    GGML_ASSERT(ggml_is_contiguous_rows(a));
+
+    if (mode == GGML_SET_ROWS_BF16_CARRIER_ROWS) {
+        GGML_ASSERT(a->ne[0] == b->ne[0]);
+        GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+        GGML_ASSERT(b->ne[1] == c->ne[0]);
+        GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+        GGML_ASSERT(c->ne[1] == 1 && c->ne[2] == 1 && c->ne[3] == 1);
+    } else {
+        GGML_ASSERT(mode == GGML_SET_ROWS_BF16_CARRIER_ELEMENTS);
+        GGML_ASSERT(a->ne[0] == 1 && a->ne[2] == 1 && a->ne[3] == 1);
+        GGML_ASSERT(b->ne[3] == 1);
+        GGML_ASSERT(c->ne[0] == ggml_nelements(b));
+        GGML_ASSERT(c->ne[1] == 1 && c->ne[2] == 1 && c->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, a);
+
+    result->op     = GGML_OP_SET_ROWS;
+    result->src[0] = b;
+    result->src[1] = c;
+    ggml_set_op_params_i32(result, 0, mode);
+
+    return result;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
@@ -4427,6 +4475,63 @@ struct ggml_tensor * ggml_fairy2i_wide_linear_w2_bundle(struct ggml_context * ct
                                                         int64_t               logical_k) {
     return ggml_fairy2i_wide_linear_bundle_impl(ctx, x, codes, scales, bias, logical_m, logical_k, 4,
                                                 GGML_OP_FAIRY2I_WIDE_LINEAR_W2);
+}
+
+static struct ggml_tensor * ggml_row_quant_linear_impl(struct ggml_context * ctx,
+                                                       struct ggml_tensor *  x,
+                                                       struct ggml_tensor *  codes,
+                                                       struct ggml_tensor *  scales,
+                                                       int64_t               logical_o,
+                                                       int64_t               logical_k,
+                                                       enum ggml_op          op) {
+    GGML_ASSERT(x && codes && scales);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(logical_o > 0 && logical_o <= INT32_MAX && logical_o % 128 == 0);
+    GGML_ASSERT(logical_k > 0 && logical_k <= INT32_MAX && logical_k % 128 == 0);
+    GGML_ASSERT(x->ne[0] == logical_k);
+
+    const int64_t k_tiles = logical_k / 128;
+    const int64_t o_tiles = logical_o / 16;
+    if (op == GGML_OP_ROW4_LINEAR) {
+        GGML_ASSERT(codes->type == GGML_TYPE_ROW4_CODES);
+        GGML_ASSERT(scales->type == GGML_TYPE_BF16);
+        GGML_ASSERT(codes->ne[0] == 64 && codes->ne[1] == 4 && codes->ne[2] == k_tiles && codes->ne[3] == o_tiles);
+    } else {
+        GGML_ASSERT(op == GGML_OP_W8A8_LINEAR);
+        GGML_ASSERT(codes->type == GGML_TYPE_I8);
+        GGML_ASSERT(scales->type == GGML_TYPE_F32);
+        GGML_ASSERT(codes->ne[0] == 128 && codes->ne[1] == 16 && codes->ne[2] == k_tiles && codes->ne[3] == o_tiles);
+    }
+    GGML_ASSERT(scales->ne[0] == logical_o && scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1);
+
+    const int64_t        ne[4]  = { logical_o, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op                  = op;
+    result->src[0]              = x;
+    result->src[1]              = codes;
+    result->src[2]              = scales;
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, (int32_t) logical_o);
+    ggml_set_op_params_i32(result, 2, (int32_t) logical_k);
+    return result;
+}
+
+struct ggml_tensor * ggml_row4_linear(struct ggml_context * ctx,
+                                      struct ggml_tensor *  x,
+                                      struct ggml_tensor *  codes,
+                                      struct ggml_tensor *  scales,
+                                      int64_t               logical_o,
+                                      int64_t               logical_k) {
+    return ggml_row_quant_linear_impl(ctx, x, codes, scales, logical_o, logical_k, GGML_OP_ROW4_LINEAR);
+}
+
+struct ggml_tensor * ggml_w8a8_linear(struct ggml_context * ctx,
+                                      struct ggml_tensor *  x,
+                                      struct ggml_tensor *  codes,
+                                      struct ggml_tensor *  scales,
+                                      int64_t               logical_o,
+                                      int64_t               logical_k) {
+    return ggml_row_quant_linear_impl(ctx, x, codes, scales, logical_o, logical_k, GGML_OP_W8A8_LINEAR);
 }
 
 void ggml_fairy2i_wide_linear_set_qat(struct ggml_tensor * a, bool qat) {

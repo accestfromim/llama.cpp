@@ -185,6 +185,14 @@ struct llama_widely_linear_ifairy {
     int                          branch_count  = 0;
 };
 
+struct llama_row_quant_linear {
+    ggml_tensor * codes  = nullptr;
+    ggml_tensor * scales = nullptr;
+
+    int64_t logical_o = 0;
+    int64_t logical_k = 0;
+};
+
 enum llama_fairy2i_quant_variant {
     LLAMA_FAIRY2I_QUANT_VARIANT_LEGACY = 0,
     LLAMA_FAIRY2I_QUANT_VARIANT_TILE64_V2,
@@ -263,6 +271,8 @@ struct llama_layer {
     llama_widely_linear_ifairy wv_fairy2i;
     llama_widely_linear_ifairy wqkv_fairy2i;
     llama_widely_linear_ifairy wo_fairy2i;
+    llama_row_quant_linear     wqkv_row4;
+    llama_row_quant_linear     wo_row4;
     struct ggml_tensor * wq_enc    = nullptr;
     struct ggml_tensor * wk_enc    = nullptr;
     struct ggml_tensor * wv_enc    = nullptr;
@@ -296,6 +306,8 @@ struct llama_layer {
     llama_widely_linear_ifairy ffn_gate_fairy2i;
     llama_widely_linear_ifairy ffn_down_fairy2i;
     llama_widely_linear_ifairy ffn_up_fairy2i;
+    llama_row_quant_linear     ffn_gate_up_row4;
+    llama_row_quant_linear     ffn_down_row4;
     struct ggml_tensor * ffn_gate_enc = nullptr;
     struct ggml_tensor * ffn_down_enc = nullptr;
     struct ggml_tensor * ffn_up_enc   = nullptr;
@@ -439,6 +451,9 @@ struct llama_model {
     llama_fairy2i_numeric_profile fairy2i_numeric_profile = LLAMA_FAIRY2I_NUMERIC_PROFILE_LEGACY_F16_V1;
     uint32_t                      fairy2i_schema_version  = 1;
 
+    bool     row4_enabled        = false;
+    uint32_t row4_schema_version = 0;
+
     bool fairy2i_uses_qwen2_exact_numeric_profile() const {
         return fairy2i_numeric_profile == LLAMA_FAIRY2I_NUMERIC_PROFILE_SCRIPT_F32REDUCE_BF16SCALE_V1;
     }
@@ -481,6 +496,7 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     llama_widely_linear_ifairy output_fairy2i;
     llama_widely_linear_ifairy output_fairy2i_merged;
+    llama_row_quant_linear     output_w8;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 

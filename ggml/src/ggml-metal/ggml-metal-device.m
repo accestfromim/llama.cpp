@@ -628,6 +628,34 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
+    if (op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR) {
+        const struct ggml_tensor * x      = op->src[0];
+        const struct ggml_tensor * codes  = op->src[1];
+        const struct ggml_tensor * scales = op->src[2];
+        const int32_t              layout = ggml_get_op_params_i32(op, 0);
+        const int32_t              m      = ggml_get_op_params_i32(op, 1);
+        const int32_t              k      = ggml_get_op_params_i32(op, 2);
+
+        if (!has_simdgroup_mm || !has_simdgroup_reduction || !x || !codes || !scales || op->src[3] || layout != 1 ||
+            m <= 0 || k <= 0 || m % 128 != 0 || k % 128 != 0 || op->type != GGML_TYPE_F32 ||
+            x->type != GGML_TYPE_F32 || x->ne[0] != k || op->ne[0] != m || op->ne[1] != x->ne[1] ||
+            op->ne[2] != x->ne[2] || op->ne[3] != x->ne[3] || scales->ne[0] != m || scales->ne[1] != 1 ||
+            scales->ne[2] != 1 || scales->ne[3] != 1 || !ggml_is_contiguous(x) || !ggml_is_contiguous(codes) ||
+            !ggml_is_contiguous(scales) || !ggml_is_contiguous(op)) {
+            return false;
+        }
+
+        if (op->op == GGML_OP_ROW4_LINEAR) {
+            return codes->type == GGML_TYPE_ROW4_CODES && scales->type == GGML_TYPE_BF16 &&
+                   codes->ne[0] == 64 && codes->ne[1] == 4 && codes->ne[2] == k / 128 &&
+                   codes->ne[3] == m / 16;
+        }
+
+        return codes->type == GGML_TYPE_I8 && scales->type == GGML_TYPE_F32 &&
+               codes->ne[0] == 128 && codes->ne[1] == 16 && codes->ne[2] == k / 128 &&
+               codes->ne[3] == m / 16;
+    }
+
     if ((op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W1 || op->op == GGML_OP_FAIRY2I_WIDE_LINEAR_W2) && op->src[1] &&
         op->src[1]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES) {
         const int32_t layout   = ggml_get_op_params_i32(op, 0);
@@ -691,15 +719,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     if (op->op != GGML_OP_NONE &&
         (op->type == GGML_TYPE_IFAIRY || op->type == GGML_TYPE_IFAIRY_Q16 || op->type == GGML_TYPE_IFAIRY64 ||
          op->type == GGML_TYPE_FAIRY2I_TILE64_V2 || op->type == GGML_TYPE_FAIRY2I_ACT_Q16_64 ||
-         op->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES)) {
+         op->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES || op->type == GGML_TYPE_ROW4_CODES)) {
         return false;
     }
-    for (size_t i = 0, n = 3; i < n; ++i) {
+    for (size_t i = 0, n = GGML_MAX_SRC; i < n; ++i) {
         if (op->src[i] != NULL &&
             (op->src[i]->type == GGML_TYPE_IFAIRY || op->src[i]->type == GGML_TYPE_IFAIRY_Q16 ||
              op->src[i]->type == GGML_TYPE_IFAIRY64 || op->src[i]->type == GGML_TYPE_FAIRY2I_TILE64_V2 ||
              op->src[i]->type == GGML_TYPE_FAIRY2I_ACT_Q16_64 ||
-             op->src[i]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES)) {
+             op->src[i]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES ||
+             op->src[i]->type == GGML_TYPE_ROW4_CODES)) {
             return false;
         }
     }
@@ -801,13 +830,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_FAIRY2I_SILU_EXACT:
             return has_bfloat && op->src[0] && op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op) &&
-                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+                   op->src[0]->nb[0] == sizeof(float) && ggml_is_contiguous_1(op->src[0]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_FAIRY2I_MUL_EXACT:
             return has_bfloat && op->src[0] && op->src[1] && op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    ggml_are_same_shape(op->src[0], op->src[1]) && ggml_are_same_shape(op->src[0], op) &&
-                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
-                   ggml_is_contiguous(op);
+                   op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
+                   ggml_is_contiguous_1(op->src[0]) && ggml_is_contiguous_1(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_FAIRY2I_PACK_BF16_EXACT:
             return has_bfloat && op->src[0] && (op->type == GGML_TYPE_BF16 || op->type == GGML_TYPE_F32) &&
                    op->src[0]->type == GGML_TYPE_F32 && ggml_are_same_shape(op->src[0], op) &&
@@ -984,6 +1014,27 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_SET_ROWS:
             {
+                const int32_t mode = ggml_get_op_params_i32(op, 0);
+                if (mode == GGML_SET_ROWS_BF16_CARRIER_ROWS) {
+                    return op->type == GGML_TYPE_BF16 && op->src[0]->type == GGML_TYPE_F32 &&
+                           op->src[1]->type == GGML_TYPE_I64 && op->ne[0] == op->src[0]->ne[0] &&
+                           op->ne[2] == 1 && op->ne[3] == 1 && op->src[0]->ne[1] == op->src[1]->ne[0] &&
+                           op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 && op->src[1]->ne[1] == 1 &&
+                           op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                           op->nb[0] == sizeof(ggml_bf16_t) && op->src[0]->nb[0] == sizeof(float) &&
+                           op->src[1]->nb[0] == sizeof(int64_t) && ggml_is_contiguous_rows(op);
+                }
+                if (mode == GGML_SET_ROWS_BF16_CARRIER_ELEMENTS) {
+                    return op->type == GGML_TYPE_BF16 && op->src[0]->type == GGML_TYPE_F32 &&
+                           op->src[1]->type == GGML_TYPE_I64 && op->ne[0] == 1 && op->ne[2] == 1 && op->ne[3] == 1 &&
+                           op->src[0]->ne[3] == 1 && op->src[1]->ne[0] == ggml_nelements(op->src[0]) &&
+                           op->src[1]->ne[1] == 1 && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                           op->nb[0] == sizeof(ggml_bf16_t) && op->src[0]->nb[0] == sizeof(float) &&
+                           op->src[1]->nb[0] == sizeof(int64_t) && ggml_is_contiguous_rows(op);
+                }
+                if (mode != 0) {
+                    return false;
+                }
                 if (op->src[0]->type == GGML_TYPE_BF16) {
                     return op->type == GGML_TYPE_BF16;
                 }

@@ -1012,6 +1012,10 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
         return nullptr;
     }
+    if (tensor->op >= GGML_OP_COUNT) {
+        GGML_LOG_ERROR("[%s] invalid tensor op received: %u\n", __func__, tensor->op);
+        return nullptr;
+    }
 
     ggml_tensor * result = ggml_new_tensor_4d(ctx, (ggml_type) tensor->type,
         tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
@@ -1719,7 +1723,29 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+
+    // Row4 schema v1 is intentionally native ARM CPU/Metal only.  RPC has no
+    // capability negotiation for the new op/type ABI, so advertising these
+    // operations could send an opaque payload to an older or unsupported
+    // server. W8 codes remain GGML_TYPE_I8, so their role can only be
+    // validated by the dedicated W8A8 operator rather than by tensor shape.
+    if (op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR) {
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = op->src[i];
+        if (src == nullptr) {
+            continue;
+        }
+        if (src->type == GGML_TYPE_ROW4_CODES) {
+            return false;
+        }
+    }
+    if (op->type == GGML_TYPE_ROW4_CODES) {
+        return false;
+    }
+
     //TODO: call the remote backend and cache the results
     return true;
 }

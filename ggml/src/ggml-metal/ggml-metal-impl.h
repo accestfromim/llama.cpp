@@ -206,6 +206,16 @@ typedef struct {
     int32_t  strict_staged_reconstruction;
 } ggml_metal_kargs_fairy2i_wide_linear_w2;
 
+// ROW4/W8A8 linear operators share the same activation quantization contract and
+// launch geometry.  The tensors are required to be contiguous by
+// ggml_metal_device_supports_op(), so the kernels only need their logical sizes.
+typedef struct {
+    int32_t k;
+    int32_t m;
+    int32_t act_rows;
+    int32_t reserved;
+} ggml_metal_kargs_row_quant_linear;
+
 typedef struct {
     float min;
     float max;
@@ -505,6 +515,13 @@ typedef struct {
 } ggml_metal_kargs_fairy2i_rms_norm_exact;
 
 typedef struct {
+    uint64_t ne;
+    uint64_t ne0;
+    uint64_t src0_nb1;
+    uint64_t src1_nb1;
+} ggml_metal_kargs_fairy2i_elementwise_exact;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne00_4;
     uint64_t nb01;
@@ -660,8 +677,11 @@ typedef struct {
 } ggml_metal_kargs_get_rows;
 
 typedef struct {
+    int32_t  mode;
     int32_t  nk0;
+    int32_t  ne00;
     int32_t  ne01;
+    int32_t  ne02;
     uint64_t nb01;
     uint64_t nb02;
     uint64_t nb03;

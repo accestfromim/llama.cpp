@@ -301,6 +301,24 @@ static inline uint fairy2i_mul_f32_bits_rne(uint a, uint b) {
     return sign | (uint) fraction;
 }
 
+static inline uint fairy2i_mul_f32_bits_rne_ftz_safe(uint a, uint b) {
+    const uint abs_a = a & 0x7fffffffU;
+    const uint abs_b = b & 0x7fffffffU;
+    const uint exp_a = abs_a >> 23;
+    const uint exp_b = abs_b >> 23;
+    if (exp_a == 0xffU || exp_b == 0xffU) {
+        return fairy2i_mul_f32_bits_rne(a, b);
+    }
+    if (abs_a == 0U || abs_b == 0U) {
+        return ((a ^ b) >> 31) << 31;
+    }
+
+    if (exp_a > 0U && exp_b > 0U && exp_a + exp_b >= 128U) {
+        return as_type<uint>(as_type<float>(a) * as_type<float>(b));
+    }
+    return fairy2i_mul_f32_bits_rne(a, b);
+}
+
 // Divide a finite F32 value by a positive integer with IEEE-754 RNE semantics.
 // Metal fast-math may lower even a normal division to reciprocal-multiply (and
 // flush subnormals), so RMSNorm cannot use native `/` for its canonical mean.
@@ -803,6 +821,1857 @@ constant int FC_fairy2i_bundle_w1_prefill_act_rows [[function_constant(FC_FAIRY2
 static inline uint fairy2i_pack_bf16_pair(float real, float imag) {
     return ((uint) fairy2i_f32_to_bf16(real)) | (((uint) fairy2i_f32_to_bf16(imag)) << 16);
 }
+
+// Qwen3 ROW4/W8A8 numeric boundary:
+//   F32 -> BF16 RNE -> per-token S8 (half-away) -> I32 dot
+//       -> row scale -> BF16 RNE -> F32 carrier.
+// The packed weights are deployment layouts and must never be routed through a
+// generic MUL_MAT dequantizer.
+kernel void kernel_row4_quantize_activation_i8(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const float * x                            [[buffer(1)]],
+        device char * act_q                               [[buffer(2)]],
+        device float * act_scales                         [[buffer(3)]],
+        threadgroup float * simd_maxima                   [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]]) {
+    const uint token      = tgpig.x;
+    const uint simd_lane  = tid & 31U;
+    const uint simd_group = tid >> 5;
+    const ulong row_base  = (ulong) token * (ulong) args.k;
+
+    // ROW4/W8A8 require K to be a multiple of 128, so every row and loop
+    // iteration is naturally aligned for four-wide loads. Max reduction is
+    // exact for the finite BF16 carriers accepted by the numeric profile.
+    float thread_max = 0.0f;
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const float4 xb     = fairy2i_round_to_bf16_f32(*(device const float4 *) (x + row_base + i));
+        const float4 abs_xb = fabs(xb);
+        const float max_01  = max(abs_xb.x, abs_xb.y);
+        const float max_23  = max(abs_xb.z, abs_xb.w);
+        thread_max = max(thread_max, max(max_01, max_23));
+    }
+
+    const float group_max = simd_max(thread_max);
+    if (simd_lane == 0U) {
+        simd_maxima[simd_group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0U) {
+        float value = simd_lane < 8U ? simd_maxima[simd_lane] : 0.0f;
+        value = simd_max(value);
+        if (simd_lane == 0U) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(value), 127U);
+            simd_maxima[0] = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[token] = simd_maxima[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float sx = simd_maxima[0];
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const float4 xb = fairy2i_round_to_bf16_f32(*(device const float4 *) (x + row_base + i));
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
+        int4 q = int4(magnitude);
+        q = select(q, -q, xb < float4(0.0f));
+        *(device char4 *) (act_q + row_base + i) = char4(clamp(q, int4(-127), int4(127)));
+    }
+}
+
+// Decode-only Qwen3 checkpoint fusion. Keep the QAT RMSNorm arithmetic and
+// activation-quantization reduction order identical to their standalone
+// kernels, while publishing the original RMSNorm F32/BF16 carriers for graph
+// callbacks. The host only selects this entry point for one contiguous K=4096
+// row with a contiguous, non-repeated weight row.
+kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
+        constant ggml_metal_kargs_fairy2i_rms_norm_exact & rms_args [[buffer(0)]],
+        device const float * src0                                   [[buffer(1)]],
+        device const float * weight                                 [[buffer(2)]],
+        device uint * rms_dst                                       [[buffer(3)]],
+        device char * act_q                                         [[buffer(4)]],
+        device float * act_scales                                   [[buffer(5)]],
+        threadgroup float * shared                                  [[threadgroup(0)]],
+        ushort tiitg                                                 [[thread_index_in_threadgroup]],
+        ushort3 ntg                                                  [[threads_per_threadgroup]]) {
+    constexpr int k = 4096;
+
+    // Exact copy of the QAT RMS sum partition and reduction.
+    float sum = 0.0f;
+    for (int i0 = tiitg; i0 < k; i0 += ntg.x) {
+        const float value = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[i0]));
+        sum = precise::fma(value, value, sum);
+    }
+    sum = simd_sum(sum);
+
+    const ushort tiisg = tiitg % N_SIMDWIDTH;
+    const ushort sgitg = tiitg / N_SIMDWIDTH;
+    if (tiisg == 0) {
+        shared[sgitg] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg == 0) {
+        float row_sum = 0.0f;
+        for (ushort isg = 0; isg < ntg.x / N_SIMDWIDTH; ++isg) {
+            row_sum = precise::fma(1.0f, shared[isg], row_sum);
+        }
+        shared[0] = 1.0f / precise::sqrt(row_sum / (float) k + rms_args.eps);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float inv_rms   = shared[0];
+    const uint  simd_lane = tiitg & 31U;
+    const uint  simd_group = tiitg >> 5;
+    float       thread_max = 0.0f;
+
+    // Materialize exactly the same RMS destination bits while forming the
+    // first activation-quantization max pass from those carrier values.
+    for (uint i = (uint) tiitg * 4U; i < (uint) k; i += 256U * 4U) {
+        float4 xb;
+        for (uint j = 0; j < 4U; ++j) {
+            const uint  col        = i + j;
+            const float value      = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[col]));
+            const float normalized = fairy2i_round_to_bf16_f32(value * inv_rms);
+            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(weight[col]));
+            const uint  bits       = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
+            rms_dst[col]           = bits;
+            xb[j]                  = as_type<float>(bits);
+        }
+        const float4 abs_xb = fabs(xb);
+        const float max_01  = max(abs_xb.x, abs_xb.y);
+        const float max_23  = max(abs_xb.z, abs_xb.w);
+        thread_max = max(thread_max, max(max_01, max_23));
+    }
+
+    const float group_max = simd_max(thread_max);
+    if (simd_lane == 0U) {
+        shared[simd_group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    if (simd_group == 0U) {
+        float value = simd_lane < 8U ? shared[simd_lane] : 0.0f;
+        value = simd_max(value);
+        if (simd_lane == 0U) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(value), 127U);
+            shared[0] = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[0] = shared[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Exact copy of the activation quantizer's second pass. The device-memory
+    // barrier above makes this read observe the published RMS carrier bits.
+    const float sx = shared[0];
+    for (uint i = (uint) tiitg * 4U; i < (uint) k; i += 256U * 4U) {
+        const float4 xb = *(device const float4 *) (rms_dst + i);
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
+        int4 q = int4(magnitude);
+        q = select(q, -q, xb < float4(0.0f));
+        *(device char4 *) (act_q + i) = char4(clamp(q, int4(-127), int4(127)));
+    }
+}
+
+// Packed-BF16 entry point for the fused QAT SwiGLU -> Row4 down path. The
+// producer already materialized the checkpoint BF16 payload, so widening it by
+// placing the payload in the high 16 bits is exact and must not round again.
+kernel void kernel_row4_quantize_activation_i8_packed_bf16(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const ushort * x                           [[buffer(1)]],
+        device char * act_q                               [[buffer(2)]],
+        device float * act_scales                         [[buffer(3)]],
+        threadgroup float * simd_maxima                   [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]]) {
+    const uint token      = tgpig.x;
+    const uint simd_lane  = tid & 31U;
+    const uint simd_group = tid >> 5;
+    const ulong row_base  = (ulong) token * (ulong) args.k;
+
+    float thread_max = 0.0f;
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const ushort4 bits = *(device const ushort4 *) (x + row_base + i);
+        const float4 xb    = float4(
+            as_type<float>((uint) bits.x << 16U),
+            as_type<float>((uint) bits.y << 16U),
+            as_type<float>((uint) bits.z << 16U),
+            as_type<float>((uint) bits.w << 16U));
+        const float4 abs_xb = fabs(xb);
+        const float max_01  = max(abs_xb.x, abs_xb.y);
+        const float max_23  = max(abs_xb.z, abs_xb.w);
+        thread_max = max(thread_max, max(max_01, max_23));
+    }
+
+    const float group_max = simd_max(thread_max);
+    if (simd_lane == 0U) {
+        simd_maxima[simd_group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0U) {
+        float value = simd_lane < 8U ? simd_maxima[simd_lane] : 0.0f;
+        value = simd_max(value);
+        if (simd_lane == 0U) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(value), 127U);
+            simd_maxima[0] = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[token] = simd_maxima[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float sx = simd_maxima[0];
+    for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+        const ushort4 bits = *(device const ushort4 *) (x + row_base + i);
+        const float4 xb    = float4(
+            as_type<float>((uint) bits.x << 16U),
+            as_type<float>((uint) bits.y << 16U),
+            as_type<float>((uint) bits.z << 16U),
+            as_type<float>((uint) bits.w << 16U));
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
+        int4 q = int4(magnitude);
+        q = select(q, -q, xb < float4(0.0f));
+        *(device char4 *) (act_q + row_base + i) = char4(clamp(q, int4(-127), int4(127)));
+    }
+}
+
+
+kernel void kernel_row4_transpose_activation_i8_kmajor_half(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const char * act_q                         [[buffer(1)]],
+        device half * act_h                               [[buffer(2)]],
+        threadgroup half * tile                           [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]]) {
+    constexpr uint tile_size   = 32U;
+    constexpr uint tile_stride = 33U;
+    constexpr uint n_threads   = 256U;
+    const uint k_base          = tgpig.x * tile_size;
+    const uint token_base      = tgpig.y * tile_size;
+
+    for (uint index = tid; index < tile_size * tile_size; index += n_threads) {
+        const uint token = index >> 5;
+        const uint kk    = index & 31U;
+        tile[token * tile_stride + kk] =
+            (half) ((int) act_q[(ulong) (token_base + token) * (ulong) args.k + (ulong) (k_base + kk)]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint index = tid; index < tile_size * tile_size; index += n_threads) {
+        const uint kk    = index >> 5;
+        const uint token = index & 31U;
+        act_h[(ulong) (k_base + kk) * (ulong) args.reserved + (ulong) (token_base + token)] =
+            tile[token * tile_stride + kk];
+    }
+}
+
+static inline int row4_weight_at(
+        device const uchar * codes,
+        int k_tiles,
+        int output,
+        int k) {
+    const int output_tile = output >> 4;
+    const int output_lane = output & 15;
+    const int group       = output_lane >> 2;
+    const int row         = output_lane & 3;
+    const int k_tile      = k >> 7;
+    const int k_in_tile   = k & 127;
+    const int split       = k_in_tile >> 4;
+    const int j           = k_in_tile & 7;
+    const ulong offset =
+        ((((ulong) output_tile * (ulong) k_tiles + (ulong) k_tile) * 4UL + (ulong) group) * 64UL) +
+        (ulong) split * 8UL + (ulong) j;
+    const uchar packed = codes[offset];
+    const uint code = (k_in_tile & 8) == 0 ? (uint) (packed & 0x0fU) : (uint) (packed >> 4);
+
+    const uint u_axis = code & 3U;
+    const uint v_axis = code >> 2;
+    const int ur = (int) (u_axis == 0U) - (int) (u_axis == 1U);
+    const int ui = (int) (u_axis == 2U) - (int) (u_axis == 3U);
+    const int vr = (int) (v_axis == 0U) - (int) (v_axis == 1U);
+    const int vi = (int) (v_axis == 2U) - (int) (v_axis == 3U);
+
+    switch (row) {
+        case 0: return ur + vr;
+        case 1: return -ui + vi;
+        case 2: return ui + vi;
+        default: return ur - vr;
+    }
+}
+
+constexpr constant static half4 k_row4_prefill_codebook[16] = {
+    half4( 2.0h,  0.0h,  0.0h,  0.0h),
+    half4( 0.0h,  0.0h,  0.0h, -2.0h),
+    half4( 1.0h, -1.0h,  1.0h, -1.0h),
+    half4( 1.0h,  1.0h, -1.0h, -1.0h),
+    half4( 0.0h,  0.0h,  0.0h,  2.0h),
+    half4(-2.0h,  0.0h,  0.0h,  0.0h),
+    half4(-1.0h, -1.0h,  1.0h,  1.0h),
+    half4(-1.0h,  1.0h, -1.0h,  1.0h),
+    half4( 1.0h,  1.0h,  1.0h,  1.0h),
+    half4(-1.0h,  1.0h,  1.0h, -1.0h),
+    half4( 0.0h,  0.0h,  2.0h,  0.0h),
+    half4( 0.0h,  2.0h,  0.0h,  0.0h),
+    half4( 1.0h, -1.0h, -1.0h,  1.0h),
+    half4(-1.0h, -1.0h, -1.0h, -1.0h),
+    half4( 0.0h, -2.0h,  0.0h,  0.0h),
+    half4( 0.0h,  0.0h, -2.0h,  0.0h),
+};
+
+static inline half4 row4_decode4(uint code) {
+    return k_row4_prefill_codebook[code];
+}
+
+static inline int w8a8_weight_at(
+        device const char * codes,
+        int k_tiles,
+        int output,
+        int k) {
+    const int output_tile = output >> 4;
+    const int output_lane = output & 15;
+    const int k_tile      = k >> 7;
+    const int k_in_tile   = k & 127;
+    const ulong offset =
+        ((((ulong) output_tile * (ulong) k_tiles + (ulong) k_tile) * 16UL + (ulong) output_lane) * 128UL) +
+        (ulong) k_in_tile;
+    return (int) codes[offset];
+}
+
+static inline float row4_finish_i32(int acc, float sx, ushort row_scale) {
+    const uint activation_scaled = fairy2i_mul_f32_bits_rne_ftz_safe(as_type<uint>((float) acc), as_type<uint>(sx));
+    const uint value = fairy2i_mul_f32_bits_rne_ftz_safe(activation_scaled, (uint) row_scale << 16);
+    return fairy2i_bf16_to_f32(fairy2i_f32_bits_to_bf16_rne(value));
+}
+
+static inline float w8a8_finish_i32(int acc, float sx, float row_scale) {
+    const uint activation_scaled = fairy2i_mul_f32_bits_rne_ftz_safe(as_type<uint>((float) acc), as_type<uint>(sx));
+    const uint value = fairy2i_mul_f32_bits_rne_ftz_safe(activation_scaled, as_type<uint>(row_scale));
+    return fairy2i_bf16_to_f32(fairy2i_f32_bits_to_bf16_rne(value));
+}
+
+static inline void row4_accumulate_basis_branchless(
+        uint code,
+        int activation,
+        thread int & u_real,
+        thread int & u_imag,
+        thread int & v_real,
+        thread int & v_imag) {
+    const uint u_axis = code & 3U;
+    const uint v_axis = code >> 2;
+    const uint activation_bits = as_type<uint>(activation);
+    const uint u_sign          = u_axis & 1U;
+    const uint v_sign          = v_axis & 1U;
+    const uint u_signed_bits   = (activation_bits ^ (0U - u_sign)) + u_sign;
+    const uint v_signed_bits   = (activation_bits ^ (0U - v_sign)) + v_sign;
+    const uint u_imag_mask     = 0U - (u_axis >> 1);
+    const uint v_imag_mask     = 0U - (v_axis >> 1);
+
+    u_real += as_type<int>(u_signed_bits & ~u_imag_mask);
+    u_imag += as_type<int>(u_signed_bits & u_imag_mask);
+    v_real += as_type<int>(v_signed_bits & ~v_imag_mask);
+    v_imag += as_type<int>(v_signed_bits & v_imag_mask);
+}
+
+static inline void row4_accumulate_packed4_branchless(
+        uchar4 packed,
+        char4 activation_low,
+        char4 activation_high,
+        thread int & u_real,
+        thread int & u_imag,
+        thread int & v_real,
+        thread int & v_imag) {
+    row4_accumulate_basis_branchless(
+        (uint) (packed.x & 0x0fU), (int) activation_low.x, u_real, u_imag, v_real, v_imag);
+    row4_accumulate_basis_branchless(
+        (uint) (packed.y & 0x0fU), (int) activation_low.y, u_real, u_imag, v_real, v_imag);
+    row4_accumulate_basis_branchless(
+        (uint) (packed.z & 0x0fU), (int) activation_low.z, u_real, u_imag, v_real, v_imag);
+    row4_accumulate_basis_branchless(
+        (uint) (packed.w & 0x0fU), (int) activation_low.w, u_real, u_imag, v_real, v_imag);
+    row4_accumulate_basis_branchless(
+        (uint) (packed.x >> 4), (int) activation_high.x, u_real, u_imag, v_real, v_imag);
+    row4_accumulate_basis_branchless(
+        (uint) (packed.y >> 4), (int) activation_high.y, u_real, u_imag, v_real, v_imag);
+    row4_accumulate_basis_branchless(
+        (uint) (packed.z >> 4), (int) activation_high.z, u_real, u_imag, v_real, v_imag);
+    row4_accumulate_basis_branchless(
+        (uint) (packed.w >> 4), (int) activation_high.w, u_real, u_imag, v_real, v_imag);
+}
+
+
+static inline int row4_segmented_sum16(int value, uint segment_lane) {
+    int shuffled = simd_shuffle_down(value, 8U);
+    value += segment_lane < 8U ? shuffled : 0;
+    shuffled = simd_shuffle_down(value, 4U);
+    value += segment_lane < 4U ? shuffled : 0;
+    shuffled = simd_shuffle_down(value, 2U);
+    value += segment_lane < 2U ? shuffled : 0;
+    shuffled = simd_shuffle_down(value, 1U);
+    value += segment_lane < 1U ? shuffled : 0;
+    return value;
+}
+
+static inline void row4_linear_reduced(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        device const ushort * scales,
+        device const char * act_q,
+        device const float * act_scales,
+        device float * dst,
+        threadgroup int * partials,
+        uint output_tile,
+        uint token,
+        uint tid) {
+    constexpr uint lanes_per_row = 8U;
+    const uint output_lane = tid / lanes_per_row;
+    const uint dot_lane    = tid & (lanes_per_row - 1U);
+    const int  output      = (int) output_tile * 16 + (int) output_lane;
+    const int  k_tiles     = args.k / 128;
+    const ulong act_base   = (ulong) token * (ulong) args.k;
+
+    int acc = 0;
+    for (int k = (int) dot_lane; k < args.k; k += (int) lanes_per_row) {
+        acc += row4_weight_at(codes, k_tiles, output, k) * (int) act_q[act_base + (ulong) k];
+    }
+    partials[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (dot_lane == 0U) {
+        int sum = partials[tid];
+        for (uint lane = 1U; lane < lanes_per_row; ++lane) {
+            sum += partials[tid + lane];
+        }
+        dst[(ulong) token * (ulong) args.m + (ulong) output] =
+            row4_finish_i32(sum, act_scales[token], scales[output]);
+    }
+}
+
+static inline void w8a8_linear_reduced(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const char * codes,
+        device const float * scales,
+        device const char * act_q,
+        device const float * act_scales,
+        device float * dst,
+        threadgroup int * partials,
+        uint output_tile,
+        uint token,
+        uint tid) {
+    constexpr uint lanes_per_row = 8U;
+    const uint output_lane = tid / lanes_per_row;
+    const uint dot_lane    = tid & (lanes_per_row - 1U);
+    const int  output      = (int) output_tile * 16 + (int) output_lane;
+    const int  k_tiles     = args.k / 128;
+    const ulong act_base   = (ulong) token * (ulong) args.k;
+
+    int acc = 0;
+    for (int k = (int) dot_lane; k < args.k; k += (int) lanes_per_row) {
+        acc += w8a8_weight_at(codes, k_tiles, output, k) * (int) act_q[act_base + (ulong) k];
+    }
+    partials[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (dot_lane == 0U) {
+        int sum = partials[tid];
+        for (uint lane = 1U; lane < lanes_per_row; ++lane) {
+            sum += partials[tid + lane];
+        }
+        dst[(ulong) token * (ulong) args.m + (ulong) output] =
+            w8a8_finish_i32(sum, act_scales[token], scales[output]);
+    }
+}
+
+#define ROW4_REDUCED_KERNEL(NAME, TOKEN_EXPR)                                                        \
+kernel void NAME(                                                                                   \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],                            \
+        device const uchar * codes                        [[buffer(1)]],                            \
+        device const ushort * scales                      [[buffer(2)]],                            \
+        device const char * act_q                         [[buffer(3)]],                            \
+        device const float * act_scales                   [[buffer(4)]],                            \
+        device float * dst                                [[buffer(5)]],                            \
+        threadgroup int * partials                        [[threadgroup(0)]],                       \
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],         \
+        uint tid                                          [[thread_index_in_threadgroup]]) {        \
+    row4_linear_reduced(args, codes, scales, act_q, act_scales, dst, partials, tgpig.x, TOKEN_EXPR, tid); \
+}
+
+#define W8A8_REDUCED_KERNEL(NAME, TOKEN_EXPR)                                                        \
+kernel void NAME(                                                                                   \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],                            \
+        device const char * codes                         [[buffer(1)]],                            \
+        device const float * scales                       [[buffer(2)]],                            \
+        device const char * act_q                         [[buffer(3)]],                            \
+        device const float * act_scales                   [[buffer(4)]],                            \
+        device float * dst                                [[buffer(5)]],                            \
+        threadgroup int * partials                        [[threadgroup(0)]],                       \
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],         \
+        uint tid                                          [[thread_index_in_threadgroup]]) {        \
+    w8a8_linear_reduced(args, codes, scales, act_q, act_scales, dst, partials, tgpig.x, TOKEN_EXPR, tid); \
+}
+
+static inline ushort fairy2i_silu_qat_bf16(ushort value_bits);
+static inline ushort fairy2i_mul_qat_bf16(ushort lhs_bits, ushort rhs_bits);
+
+static inline void row4_stage_prefill_m64n32_simd_localw(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        threadgroup half * weight_tile,
+        uint output_tile,
+        int k_base,
+        uint simd_lane,
+        uint sgitg) {
+    constexpr int k_tile = 32;
+    const int canonical_k_tile = k_base >> 7;
+    const int split_base       = (k_base & 127) >> 4;
+    const int k_tiles          = args.k / 128;
+
+    if (simd_lane < 16U) {
+        const uint group       = simd_lane >> 2;
+        const uint local_split = (simd_lane >> 1) & 1U;
+        const uint jblock      = simd_lane & 1U;
+        const ulong code_offset =
+            ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+            (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
+        const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+
+        const half4 low0  = row4_decode4((uint) (packed.x & 0x0fU));
+        const half4 low1  = row4_decode4((uint) (packed.y & 0x0fU));
+        const half4 low2  = row4_decode4((uint) (packed.z & 0x0fU));
+        const half4 low3  = row4_decode4((uint) (packed.w & 0x0fU));
+        const half4 high0 = row4_decode4((uint) (packed.x >> 4));
+        const half4 high1 = row4_decode4((uint) (packed.y >> 4));
+        const half4 high2 = row4_decode4((uint) (packed.z >> 4));
+        const half4 high3 = row4_decode4((uint) (packed.w >> 4));
+        const uint output_base = sgitg * 16U + group * 4U;
+        const uint k_low       = local_split * 16U + jblock * 4U;
+        const uint k_high      = k_low + 8U;
+
+        *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_low)) =
+            half4(low0.x, low1.x, low2.x, low3.x);
+        *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_low)) =
+            half4(low0.y, low1.y, low2.y, low3.y);
+        *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_low)) =
+            half4(low0.z, low1.z, low2.z, low3.z);
+        *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_low)) =
+            half4(low0.w, low1.w, low2.w, low3.w);
+        *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_high)) =
+            half4(high0.x, high1.x, high2.x, high3.x);
+        *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_high)) =
+            half4(high0.y, high1.y, high2.y, high3.y);
+        *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_high)) =
+            half4(high0.z, high1.z, high2.z, high3.z);
+        *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_high)) =
+            half4(high0.w, high1.w, high2.w, high3.w);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const ushort * scales,
+        device const float * act_scales,
+        threadgroup float * out_tile,
+        threadgroup ushort * gate_tile,
+        int row_base,
+        int col_base,
+        int col_block,
+        int row_half,
+        uint simd_lane,
+        uint sgitg) {
+    constexpr uint matrix_elems = 64U;
+    constexpr uint row_tile     = 64U;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint item = 0U; item < 2U; ++item) {
+        const uint local        = simd_lane + item * 32U;
+        const uint col          = local >> 3;
+        const uint row          = local & 7U;
+        const uint output_local = sgitg * 16U + (uint) row_half * 8U + row;
+        const uint output       = (uint) row_base + output_local;
+        const uint token_local  = (uint) col_block * 8U + col;
+        const uint token        = (uint) col_base + token_local;
+        if (token < (uint) args.act_rows) {
+            const int exact_acc = (int) out_tile[sgitg * matrix_elems + local];
+            const float gate = row4_finish_i32(exact_acc, act_scales[token], scales[output]);
+            gate_tile[token_local * row_tile + output_local] =
+                fairy2i_silu_qat_bf16(fairy2i_f32_to_bf16(gate));
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline void row4_finish_up_mul_prefill_m64n32_simd_stripe(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const ushort * scales,
+        device const float * act_scales,
+        device ushort * dst,
+        threadgroup float * out_tile,
+        threadgroup const ushort * gate_tile,
+        int row_base,
+        int col_base,
+        int col_block,
+        int row_half,
+        uint simd_lane,
+        uint sgitg) {
+    constexpr uint matrix_elems = 64U;
+    constexpr uint row_tile     = 64U;
+    const uint n_ff             = (uint) args.m / 2U;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint item = 0U; item < 2U; ++item) {
+        const uint local        = simd_lane + item * 32U;
+        const uint col          = local >> 3;
+        const uint row          = local & 7U;
+        const uint output_local = sgitg * 16U + (uint) row_half * 8U + row;
+        const uint output       = (uint) row_base + output_local;
+        const uint token_local  = (uint) col_block * 8U + col;
+        const uint token        = (uint) col_base + token_local;
+        if (token < (uint) args.act_rows) {
+            const int exact_acc = (int) out_tile[sgitg * matrix_elems + local];
+            const float up = row4_finish_i32(exact_acc, act_scales[token], scales[n_ff + output]);
+            const ushort silu_bits = gate_tile[token_local * row_tile + output_local];
+            dst[(ulong) token * (ulong) n_ff + (ulong) output] =
+                fairy2i_mul_qat_bf16(silu_bits, fairy2i_f32_to_bf16(up));
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Strict Qwen3 QAT gate-up producer. Each 128-thread group retains the proven
+// four-SIMDgroup local-W mapping and K32 MMA order, but computes one M64 gate
+// tile to its BF16/SiLU checkpoint before computing the paired M64 up tile.
+// Only the final MUL BF16 payload is published for the following Row4 down.
+kernel void kernel_row4_w1a8_gate_up_swiglu_qat_packed_bf16_prefill_m64n32_sequential_simd_localw(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device ushort * dst                               [[buffer(5)]],
+        device const half * act_h                         [[buffer(6)]],
+        threadgroup half * weight_tile                    [[threadgroup(0)]],
+        threadgroup float * out_tile                      [[threadgroup(2)]],
+        threadgroup ushort * gate_tile                    [[threadgroup(3)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint sgitg                                        [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile = 64;
+    constexpr int col_tile = 32;
+    constexpr int k_tile   = 32;
+    const int n_ff         = args.m / 2;
+    const int row_base     = (int) tgpig.x * row_tile;
+    const int col_base     = (int) tgpig.y * col_tile;
+    const int row_block    = (int) sgitg * 16;
+    const uint simd_lane   = tid & 31U;
+
+    {
+        simdgroup_half8x8  weights0;
+        simdgroup_half8x8  weights1;
+        simdgroup_half8x8  activations0;
+        simdgroup_half8x8  activations1;
+        simdgroup_half8x8  activations2;
+        simdgroup_half8x8  activations3;
+        simdgroup_float8x8 accum00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum02 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum03 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+        for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+            const uint output_tile = (uint) tgpig.x * 4U + sgitg;
+            row4_stage_prefill_m64n32_simd_localw(
+                args, codes, weight_tile, output_tile, k_base, simd_lane, sgitg);
+
+            for (int ik = 0; ik < k_tile; ik += 8) {
+                simdgroup_load(weights0, weight_tile + row_block * k_tile + ik, k_tile);
+                simdgroup_load(weights1, weight_tile + (row_block + 8) * k_tile + ik, k_tile);
+                const int act_base = (k_base + ik) * args.reserved + col_base;
+                simdgroup_load(activations0, act_h + act_base, args.reserved);
+                simdgroup_load(activations1, act_h + act_base + 8, args.reserved);
+                simdgroup_load(activations2, act_h + act_base + 16, args.reserved);
+                simdgroup_load(activations3, act_h + act_base + 24, args.reserved);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(accum00, weights0, activations0, accum00);
+                simdgroup_multiply_accumulate(accum01, weights0, activations1, accum01);
+                simdgroup_multiply_accumulate(accum02, weights0, activations2, accum02);
+                simdgroup_multiply_accumulate(accum03, weights0, activations3, accum03);
+                simdgroup_multiply_accumulate(accum10, weights1, activations0, accum10);
+                simdgroup_multiply_accumulate(accum11, weights1, activations1, accum11);
+                simdgroup_multiply_accumulate(accum12, weights1, activations2, accum12);
+                simdgroup_multiply_accumulate(accum13, weights1, activations3, accum13);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float * simd_out = out_tile + sgitg * 64U;
+        simdgroup_store(accum00, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 0, 0, simd_lane, sgitg);
+        simdgroup_store(accum10, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 0, 1, simd_lane, sgitg);
+        simdgroup_store(accum01, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 1, 0, simd_lane, sgitg);
+        simdgroup_store(accum11, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 1, 1, simd_lane, sgitg);
+        simdgroup_store(accum02, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 2, 0, simd_lane, sgitg);
+        simdgroup_store(accum12, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 2, 1, simd_lane, sgitg);
+        simdgroup_store(accum03, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 3, 0, simd_lane, sgitg);
+        simdgroup_store(accum13, simd_out, 8, 0, true);
+        row4_finish_gate_silu_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, out_tile, gate_tile, row_base, col_base, 3, 1, simd_lane, sgitg);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        simdgroup_half8x8  weights0;
+        simdgroup_half8x8  weights1;
+        simdgroup_half8x8  activations0;
+        simdgroup_half8x8  activations1;
+        simdgroup_half8x8  activations2;
+        simdgroup_half8x8  activations3;
+        simdgroup_float8x8 accum00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum02 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum03 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+        for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+            const uint output_tile = (uint) (n_ff / 16) + (uint) tgpig.x * 4U + sgitg;
+            row4_stage_prefill_m64n32_simd_localw(
+                args, codes, weight_tile, output_tile, k_base, simd_lane, sgitg);
+
+            for (int ik = 0; ik < k_tile; ik += 8) {
+                simdgroup_load(weights0, weight_tile + row_block * k_tile + ik, k_tile);
+                simdgroup_load(weights1, weight_tile + (row_block + 8) * k_tile + ik, k_tile);
+                const int act_base = (k_base + ik) * args.reserved + col_base;
+                simdgroup_load(activations0, act_h + act_base, args.reserved);
+                simdgroup_load(activations1, act_h + act_base + 8, args.reserved);
+                simdgroup_load(activations2, act_h + act_base + 16, args.reserved);
+                simdgroup_load(activations3, act_h + act_base + 24, args.reserved);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(accum00, weights0, activations0, accum00);
+                simdgroup_multiply_accumulate(accum01, weights0, activations1, accum01);
+                simdgroup_multiply_accumulate(accum02, weights0, activations2, accum02);
+                simdgroup_multiply_accumulate(accum03, weights0, activations3, accum03);
+                simdgroup_multiply_accumulate(accum10, weights1, activations0, accum10);
+                simdgroup_multiply_accumulate(accum11, weights1, activations1, accum11);
+                simdgroup_multiply_accumulate(accum12, weights1, activations2, accum12);
+                simdgroup_multiply_accumulate(accum13, weights1, activations3, accum13);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        threadgroup float * simd_out = out_tile + sgitg * 64U;
+        simdgroup_store(accum00, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 0, 0, simd_lane, sgitg);
+        simdgroup_store(accum10, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 0, 1, simd_lane, sgitg);
+        simdgroup_store(accum01, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 1, 0, simd_lane, sgitg);
+        simdgroup_store(accum11, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 1, 1, simd_lane, sgitg);
+        simdgroup_store(accum02, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 2, 0, simd_lane, sgitg);
+        simdgroup_store(accum12, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 2, 1, simd_lane, sgitg);
+        simdgroup_store(accum03, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 3, 0, simd_lane, sgitg);
+        simdgroup_store(accum13, simd_out, 8, 0, true);
+        row4_finish_up_mul_prefill_m64n32_simd_stripe(
+            args, scales, act_scales, dst, out_tile, gate_tile, row_base, col_base, 3, 1, simd_lane, sgitg);
+    }
+}
+
+
+
+
+kernel void kernel_row4_w1a8_decode_o32_segmented16(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
+    constexpr int output_tiles_per_tg = 2;
+    constexpr int groups_per_tile     = 4;
+    constexpr int rows_per_group      = 4;
+    constexpr int k_tile              = 128;
+    constexpr int code_tile_bytes     = 256;
+
+    const uint lane_half   = simd_lane >> 4;
+    const uint local_lane  = simd_lane & 15U;
+    const uint split       = local_lane >> 1;
+    const uint jblock      = (local_lane & 1U) * 4U;
+    const int output_tile  = (int) tgpig.x * output_tiles_per_tg + (int) (output_group >> 1);
+    const int group_pair   = (int) (output_group & 1U) * 2;
+    const int output_group_in_tile = group_pair + (int) lane_half;
+    const int k_tiles      = args.k / k_tile;
+    device const uchar * code_ptr = codes +
+        (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes +
+        (ulong) output_group_in_tile * 64UL + (ulong) split * 8UL + (ulong) jblock;
+    device const char * act_ptr = act_q + (ulong) split * 16UL + (ulong) jblock;
+
+    int u_real = 0;
+    int u_imag = 0;
+    int v_real = 0;
+    int v_imag = 0;
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const uint packed_bits = *((device const uint *) code_ptr);
+        uint activation_low_bits = 0U;
+        uint activation_high_bits = 0U;
+        if (lane_half == 0U) {
+            activation_low_bits = as_type<uint>(*((device const char4 *) act_ptr));
+            activation_high_bits = as_type<uint>(*((device const char4 *) (act_ptr + 8)));
+        }
+        activation_low_bits = simd_shuffle(activation_low_bits, local_lane);
+        activation_high_bits = simd_shuffle(activation_high_bits, local_lane);
+
+        row4_accumulate_packed4_branchless(
+            as_type<uchar4>(packed_bits),
+            as_type<char4>(activation_low_bits),
+            as_type<char4>(activation_high_bits),
+            u_real,
+            u_imag,
+            v_real,
+            v_imag);
+        code_ptr += code_tile_bytes;
+        act_ptr += k_tile;
+    }
+
+    u_real = row4_segmented_sum16(u_real, local_lane);
+    u_imag = row4_segmented_sum16(u_imag, local_lane);
+    v_real = row4_segmented_sum16(v_real, local_lane);
+    v_imag = row4_segmented_sum16(v_imag, local_lane);
+    if (local_lane == 0U) {
+        const int output = output_tile * groups_per_tile * rows_per_group + output_group_in_tile * rows_per_group;
+        const float sx = act_scales[0];
+        dst[output + 0] = row4_finish_i32(u_real + v_real, sx, scales[output + 0]);
+        dst[output + 1] = row4_finish_i32(-u_imag + v_imag, sx, scales[output + 1]);
+        dst[output + 2] = row4_finish_i32(u_imag + v_imag, sx, scales[output + 2]);
+        dst[output + 3] = row4_finish_i32(u_real - v_real, sx, scales[output + 3]);
+    }
+}
+
+
+kernel void kernel_row4_w1a8_decode_o32_o4_staged_act(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        threadgroup char * act_tg                         [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
+    constexpr int output_tiles_per_tg = 2;
+    constexpr int groups_per_tile     = 4;
+    constexpr int rows_per_group      = 4;
+    constexpr int k_tile              = 128;
+    constexpr int code_tile_bytes     = 256;
+    constexpr int copy_bytes          = 16;
+    constexpr int threads_per_tg      = 256;
+
+    for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
+         byte_offset += threads_per_tg * copy_bytes) {
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint split = simd_lane >> 2;
+    const uint j     = (simd_lane & 3U) * 2U;
+    const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) (output_group >> 2);
+    const int output_group_in_tile = (int) (output_group & 3U);
+    const int k_tiles = args.k / k_tile;
+    device const uchar * code_ptr = codes +
+        (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes +
+        (ulong) output_group_in_tile * 64UL + (ulong) simd_lane * 2UL;
+    threadgroup const char * act_ptr = act_tg + (ulong) split * 16UL + (ulong) j;
+
+    int u_real = 0;
+    int u_imag = 0;
+    int v_real = 0;
+    int v_imag = 0;
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const uchar2 packed = *((device const uchar2 *) code_ptr);
+        const char2 activation_low = *((threadgroup const char2 *) act_ptr);
+        const char2 activation_high = *((threadgroup const char2 *) (act_ptr + 8));
+        row4_accumulate_basis_branchless(
+            (uint) (packed.x & 0x0fU), (int) activation_low.x, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.y & 0x0fU), (int) activation_low.y, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.x >> 4), (int) activation_high.x, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.y >> 4), (int) activation_high.y, u_real, u_imag, v_real, v_imag);
+        code_ptr += code_tile_bytes;
+        act_ptr += k_tile;
+    }
+
+    const int sum_u_real = simd_sum(u_real);
+    const int sum_u_imag = simd_sum(u_imag);
+    const int sum_v_real = simd_sum(v_real);
+    const int sum_v_imag = simd_sum(v_imag);
+    if (simd_lane == 0U) {
+        const int output = output_tile * groups_per_tile * rows_per_group + output_group_in_tile * rows_per_group;
+        const float sx = act_scales[0];
+        dst[output + 0] = row4_finish_i32(sum_u_real + sum_v_real, sx, scales[output + 0]);
+        dst[output + 1] = row4_finish_i32(-sum_u_imag + sum_v_imag, sx, scales[output + 1]);
+        dst[output + 2] = row4_finish_i32(sum_u_imag + sum_v_imag, sx, scales[output + 2]);
+        dst[output + 3] = row4_finish_i32(sum_u_real - sum_v_real, sx, scales[output + 3]);
+    }
+}
+
+kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        device const uint * residual                      [[buffer(6)]],
+        device uint * add_dst                             [[buffer(7)]],
+        threadgroup char * act_tg                         [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
+    constexpr int output_tiles_per_tg = 2;
+    constexpr int groups_per_tile     = 4;
+    constexpr int rows_per_group      = 4;
+    constexpr int k_tile              = 128;
+    constexpr int code_tile_bytes     = 256;
+    constexpr int copy_bytes          = 16;
+    constexpr int threads_per_tg      = 256;
+
+    for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
+         byte_offset += threads_per_tg * copy_bytes) {
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint split = simd_lane >> 2;
+    const uint j     = (simd_lane & 3U) * 2U;
+    const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) (output_group >> 2);
+    const int output_group_in_tile = (int) (output_group & 3U);
+    const int k_tiles = args.k / k_tile;
+    device const uchar * code_ptr = codes +
+        (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes +
+        (ulong) output_group_in_tile * 64UL + (ulong) simd_lane * 2UL;
+    threadgroup const char * act_ptr = act_tg + (ulong) split * 16UL + (ulong) j;
+
+    int u_real = 0;
+    int u_imag = 0;
+    int v_real = 0;
+    int v_imag = 0;
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const uchar2 packed = *((device const uchar2 *) code_ptr);
+        const char2 activation_low = *((threadgroup const char2 *) act_ptr);
+        const char2 activation_high = *((threadgroup const char2 *) (act_ptr + 8));
+        row4_accumulate_basis_branchless(
+            (uint) (packed.x & 0x0fU), (int) activation_low.x, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.y & 0x0fU), (int) activation_low.y, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.x >> 4), (int) activation_high.x, u_real, u_imag, v_real, v_imag);
+        row4_accumulate_basis_branchless(
+            (uint) (packed.y >> 4), (int) activation_high.y, u_real, u_imag, v_real, v_imag);
+        code_ptr += code_tile_bytes;
+        act_ptr += k_tile;
+    }
+
+    const int sum_u_real = simd_sum(u_real);
+    const int sum_u_imag = simd_sum(u_imag);
+    const int sum_v_real = simd_sum(v_real);
+    const int sum_v_imag = simd_sum(v_imag);
+    if (simd_lane == 0U) {
+        const int output = output_tile * groups_per_tile * rows_per_group + output_group_in_tile * rows_per_group;
+        const float sx = act_scales[0];
+        const float4 value = {
+            row4_finish_i32(sum_u_real + sum_v_real, sx, scales[output + 0]),
+            row4_finish_i32(-sum_u_imag + sum_v_imag, sx, scales[output + 1]),
+            row4_finish_i32(sum_u_imag + sum_v_imag, sx, scales[output + 2]),
+            row4_finish_i32(sum_u_real - sum_v_real, sx, scales[output + 3]),
+        };
+        *((device float4 *) (dst + output)) = value;
+
+        for (int i = 0; i < rows_per_group; ++i) {
+            // Reload the published carrier through volatile device memory. In
+            // addition to preserving callback-visible ROW4 output, this is the
+            // same optimization boundary as the standalone QAT add dispatch
+            // for signed-zero behavior.
+            const uint a = *((device volatile uint *) (dst + output + i));
+            const uint b = residual[output + i];
+            const float real = fairy2i_bf16_to_f32((ushort) (a & 0xffffU)) +
+                               fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
+            const float imag = fairy2i_bf16_to_f32((ushort) (a >> 16)) +
+                               fairy2i_bf16_to_f32((ushort) (b >> 16));
+            add_dst[output + i] = fairy2i_pack_bf16_pair(real, imag);
+        }
+    }
+}
+
+
+ROW4_REDUCED_KERNEL(kernel_row4_w1a8_small_batch, tgpig.y)
+
+
+static inline void w8a8_accumulate_char4(
+        char4 weights,
+        char4 activation,
+        thread int & acc) {
+    acc += (int) weights.x * (int) activation.x;
+    acc += (int) weights.y * (int) activation.y;
+    acc += (int) weights.z * (int) activation.z;
+    acc += (int) weights.w * (int) activation.w;
+}
+
+
+kernel void kernel_row8_w8a8_decode_o64_rows8(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const char * codes                         [[buffer(1)]],
+        device const float * scales                       [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
+    constexpr int output_tiles_per_tg = 4;
+    constexpr int rows_per_tile       = 16;
+    constexpr int rows_per_group      = 8;
+    constexpr int k_tile              = 128;
+    constexpr int code_tile_bytes     = rows_per_tile * k_tile;
+
+    const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) (output_group >> 1);
+    const int row0        = (int) (output_group & 1U) * rows_per_group;
+    const int k_tiles     = args.k / k_tile;
+    device const char * weight_ptr = codes +
+        (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes +
+        (ulong) row0 * (ulong) k_tile + (ulong) simd_lane * 4UL;
+    device const char * act_ptr = act_q + simd_lane * 4U;
+
+    int acc0 = 0;
+    int acc1 = 0;
+    int acc2 = 0;
+    int acc3 = 0;
+    int acc4 = 0;
+    int acc5 = 0;
+    int acc6 = 0;
+    int acc7 = 0;
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const char4 activation = *((device const char4 *) act_ptr);
+        const char4 weights0 = *((device const char4 *) (weight_ptr + 0 * k_tile));
+        w8a8_accumulate_char4(weights0, activation, acc0);
+        const char4 weights1 = *((device const char4 *) (weight_ptr + 1 * k_tile));
+        w8a8_accumulate_char4(weights1, activation, acc1);
+        const char4 weights2 = *((device const char4 *) (weight_ptr + 2 * k_tile));
+        w8a8_accumulate_char4(weights2, activation, acc2);
+        const char4 weights3 = *((device const char4 *) (weight_ptr + 3 * k_tile));
+        w8a8_accumulate_char4(weights3, activation, acc3);
+        const char4 weights4 = *((device const char4 *) (weight_ptr + 4 * k_tile));
+        w8a8_accumulate_char4(weights4, activation, acc4);
+        const char4 weights5 = *((device const char4 *) (weight_ptr + 5 * k_tile));
+        w8a8_accumulate_char4(weights5, activation, acc5);
+        const char4 weights6 = *((device const char4 *) (weight_ptr + 6 * k_tile));
+        w8a8_accumulate_char4(weights6, activation, acc6);
+        const char4 weights7 = *((device const char4 *) (weight_ptr + 7 * k_tile));
+        w8a8_accumulate_char4(weights7, activation, acc7);
+        weight_ptr += code_tile_bytes;
+        act_ptr += k_tile;
+    }
+
+    const int sum0 = simd_sum(acc0);
+    const int sum1 = simd_sum(acc1);
+    const int sum2 = simd_sum(acc2);
+    const int sum3 = simd_sum(acc3);
+    const int sum4 = simd_sum(acc4);
+    const int sum5 = simd_sum(acc5);
+    const int sum6 = simd_sum(acc6);
+    const int sum7 = simd_sum(acc7);
+    if (simd_lane == 0U) {
+        const int output = output_tile * rows_per_tile + row0;
+        const float sx = act_scales[0];
+        dst[output + 0] = w8a8_finish_i32(sum0, sx, scales[output + 0]);
+        dst[output + 1] = w8a8_finish_i32(sum1, sx, scales[output + 1]);
+        dst[output + 2] = w8a8_finish_i32(sum2, sx, scales[output + 2]);
+        dst[output + 3] = w8a8_finish_i32(sum3, sx, scales[output + 3]);
+        dst[output + 4] = w8a8_finish_i32(sum4, sx, scales[output + 4]);
+        dst[output + 5] = w8a8_finish_i32(sum5, sx, scales[output + 5]);
+        dst[output + 6] = w8a8_finish_i32(sum6, sx, scales[output + 6]);
+        dst[output + 7] = w8a8_finish_i32(sum7, sx, scales[output + 7]);
+    }
+}
+
+kernel void kernel_row8_w8a8_decode_o128_rows16(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const char * codes                         [[buffer(1)]],
+        device const float * scales                       [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
+    constexpr int output_tiles_per_tg = 8;
+    constexpr int rows_per_tile       = 16;
+    constexpr int k_tile              = 128;
+    constexpr int code_tile_bytes     = rows_per_tile * k_tile;
+
+    const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) output_group;
+    const int k_tiles     = args.k / k_tile;
+    device const char * weight_ptr = codes +
+        (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes + (ulong) simd_lane * 4UL;
+    device const char * act_ptr = act_q + simd_lane * 4U;
+
+    int acc0  = 0;
+    int acc1  = 0;
+    int acc2  = 0;
+    int acc3  = 0;
+    int acc4  = 0;
+    int acc5  = 0;
+    int acc6  = 0;
+    int acc7  = 0;
+    int acc8  = 0;
+    int acc9  = 0;
+    int acc10 = 0;
+    int acc11 = 0;
+    int acc12 = 0;
+    int acc13 = 0;
+    int acc14 = 0;
+    int acc15 = 0;
+    for (int kt = 0; kt < k_tiles; ++kt) {
+        const char4 activation = *((device const char4 *) act_ptr);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  0 * k_tile)), activation, acc0);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  1 * k_tile)), activation, acc1);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  2 * k_tile)), activation, acc2);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  3 * k_tile)), activation, acc3);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  4 * k_tile)), activation, acc4);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  5 * k_tile)), activation, acc5);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  6 * k_tile)), activation, acc6);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  7 * k_tile)), activation, acc7);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  8 * k_tile)), activation, acc8);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr +  9 * k_tile)), activation, acc9);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr + 10 * k_tile)), activation, acc10);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr + 11 * k_tile)), activation, acc11);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr + 12 * k_tile)), activation, acc12);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr + 13 * k_tile)), activation, acc13);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr + 14 * k_tile)), activation, acc14);
+        w8a8_accumulate_char4(*((device const char4 *) (weight_ptr + 15 * k_tile)), activation, acc15);
+        weight_ptr += code_tile_bytes;
+        act_ptr += k_tile;
+    }
+
+    acc0  = simd_sum(acc0);
+    acc1  = simd_sum(acc1);
+    acc2  = simd_sum(acc2);
+    acc3  = simd_sum(acc3);
+    acc4  = simd_sum(acc4);
+    acc5  = simd_sum(acc5);
+    acc6  = simd_sum(acc6);
+    acc7  = simd_sum(acc7);
+    acc8  = simd_sum(acc8);
+    acc9  = simd_sum(acc9);
+    acc10 = simd_sum(acc10);
+    acc11 = simd_sum(acc11);
+    acc12 = simd_sum(acc12);
+    acc13 = simd_sum(acc13);
+    acc14 = simd_sum(acc14);
+    acc15 = simd_sum(acc15);
+    if (simd_lane == 0U) {
+        const int output = output_tile * rows_per_tile;
+        const float sx = act_scales[0];
+        dst[output +  0] = w8a8_finish_i32(acc0,  sx, scales[output +  0]);
+        dst[output +  1] = w8a8_finish_i32(acc1,  sx, scales[output +  1]);
+        dst[output +  2] = w8a8_finish_i32(acc2,  sx, scales[output +  2]);
+        dst[output +  3] = w8a8_finish_i32(acc3,  sx, scales[output +  3]);
+        dst[output +  4] = w8a8_finish_i32(acc4,  sx, scales[output +  4]);
+        dst[output +  5] = w8a8_finish_i32(acc5,  sx, scales[output +  5]);
+        dst[output +  6] = w8a8_finish_i32(acc6,  sx, scales[output +  6]);
+        dst[output +  7] = w8a8_finish_i32(acc7,  sx, scales[output +  7]);
+        dst[output +  8] = w8a8_finish_i32(acc8,  sx, scales[output +  8]);
+        dst[output +  9] = w8a8_finish_i32(acc9,  sx, scales[output +  9]);
+        dst[output + 10] = w8a8_finish_i32(acc10, sx, scales[output + 10]);
+        dst[output + 11] = w8a8_finish_i32(acc11, sx, scales[output + 11]);
+        dst[output + 12] = w8a8_finish_i32(acc12, sx, scales[output + 12]);
+        dst[output + 13] = w8a8_finish_i32(acc13, sx, scales[output + 13]);
+        dst[output + 14] = w8a8_finish_i32(acc14, sx, scales[output + 14]);
+        dst[output + 15] = w8a8_finish_i32(acc15, sx, scales[output + 15]);
+    }
+}
+
+
+W8A8_REDUCED_KERNEL(kernel_row8_w8a8_small_batch, tgpig.y)
+
+template<int col_tile>
+static inline void row4_w1a8_prefill_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        device const ushort * scales,
+        device const char * act_q,
+        device const float * act_scales,
+        device float * dst,
+        threadgroup half * weight_tile,
+        threadgroup half * act_tile,
+        threadgroup float * out_tile,
+        uint3 tgpig,
+        uint tid,
+        uint sgitg) {
+    constexpr int row_tile   = 16;
+    constexpr int k_tile     = 32;
+    constexpr int n_threads  = col_tile * 8;
+    const int row_base       = (int) tgpig.x * row_tile;
+    const int col_base       = (int) tgpig.y * col_tile;
+    const int k_tiles        = args.k / 128;
+    const int row_block      = (int) (sgitg & 1U);
+    const int col_block      = (int) (sgitg >> 1);
+
+    simdgroup_half8x8  weights;
+    simdgroup_half8x8  activations;
+    simdgroup_float8x8 accum = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+        const int canonical_k_tile = k_base >> 7;
+        const int split_base       = (k_base & 127) >> 4;
+        for (uint packed_index = tid; packed_index < 64U; packed_index += n_threads) {
+            const uint group       = packed_index >> 4;
+            const uint byte        = packed_index & 15U;
+            const uint local_split = byte >> 3;
+            const uint j           = byte & 7U;
+            const ulong code_offset =
+                ((((ulong) tgpig.x * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+                (ulong) (split_base + (int) local_split) * 8UL + (ulong) j;
+            const uchar packed = codes[code_offset];
+            const uint k_low   = local_split * 16U + j;
+            const uint k_high  = k_low + 8U;
+
+            *((threadgroup half4 *) (weight_tile + k_low * row_tile + group * 4U)) =
+                row4_decode4((uint) (packed & 0x0fU));
+            *((threadgroup half4 *) (weight_tile + k_high * row_tile + group * 4U)) =
+                row4_decode4((uint) (packed >> 4));
+        }
+
+        for (uint index = tid; index < (uint) (col_tile * k_tile); index += n_threads) {
+            const uint col   = index / (uint) k_tile;
+            const uint kk    = index % (uint) k_tile;
+            const uint token = (uint) col_base + col;
+            act_tile[index] = token < (uint) args.act_rows ?
+                (half) ((int) act_q[(ulong) token * (ulong) args.k + (ulong) k_base + (ulong) kk]) : (half) 0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int ik = 0; ik < k_tile; ik += 8) {
+            simdgroup_load(weights, weight_tile + ik * row_tile + row_block * 8, row_tile, 0, true);
+            simdgroup_load(activations, act_tile + col_block * 8 * k_tile + ik, k_tile, 0, true);
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(accum, weights, activations, accum);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(accum, out_tile + col_block * 8 * row_tile + row_block * 8, row_tile, 0, true);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint index = tid; index < (uint) (col_tile * row_tile); index += n_threads) {
+        const uint col       = index / (uint) row_tile;
+        const uint row       = index % (uint) row_tile;
+        const uint output    = (uint) row_base + row;
+        const uint token     = (uint) col_base + col;
+        if (token < (uint) args.act_rows) {
+            const int exact_acc = (int) out_tile[index];
+            dst[(ulong) token * (ulong) args.m + (ulong) output] =
+                row4_finish_i32(exact_acc, act_scales[token], scales[output]);
+        }
+    }
+}
+
+kernel void kernel_row4_w1a8_prefill(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        threadgroup half * weight_tile                    [[threadgroup(0)]],
+        threadgroup half * act_tile                       [[threadgroup(1)]],
+        threadgroup float * out_tile                      [[threadgroup(2)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint sgitg                                        [[simdgroup_index_in_threadgroup]]) {
+    row4_w1a8_prefill_impl<16>(
+        args, codes, scales, act_q, act_scales, dst, weight_tile, act_tile, out_tile, tgpig, tid, sgitg);
+}
+
+
+
+
+
+
+
+
+
+
+static inline void row4_finish_prefill_m64n32_simd_stripe(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const ushort * scales,
+        device const float * act_scales,
+        device float * dst,
+        threadgroup float * out_tile,
+        int row_base,
+        int col_base,
+        int col_block,
+        int row_half,
+        uint simd_lane,
+        uint sgitg) {
+    constexpr uint matrix_elems = 64U;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint item = 0U; item < 2U; ++item) {
+        const uint local  = simd_lane + item * 32U;
+        const uint col    = local >> 3;
+        const uint row    = local & 7U;
+        const uint output = (uint) row_base + sgitg * 16U + (uint) row_half * 8U + row;
+        const uint token  = (uint) col_base + (uint) col_block * 8U + col;
+        if (token < (uint) args.act_rows) {
+            const int exact_acc = (int) out_tile[sgitg * matrix_elems + local];
+            dst[(ulong) token * (ulong) args.m + (ulong) output] =
+                row4_finish_i32(exact_acc, act_scales[token], scales[output]);
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+
+
+
+kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        threadgroup half * weight_tile                    [[threadgroup(0)]],
+        threadgroup half * act_tile                       [[threadgroup(1)]],
+        threadgroup float * out_tile                      [[threadgroup(2)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint sgitg                                        [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile  = 64;
+    constexpr int col_tile  = 32;
+    constexpr int k_tile    = 32;
+    constexpr int n_threads = 128;
+    const int row_base      = (int) tgpig.x * row_tile;
+    const int col_base      = (int) tgpig.y * col_tile;
+    const int k_tiles       = args.k / 128;
+    const int row_block     = (int) sgitg * 16;
+    const uint simd_lane    = tid & 31U;
+
+    simdgroup_half8x8  weights0;
+    simdgroup_half8x8  weights1;
+    simdgroup_half8x8  activations0;
+    simdgroup_half8x8  activations1;
+    simdgroup_half8x8  activations2;
+    simdgroup_half8x8  activations3;
+    simdgroup_float8x8 accum00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum02 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum03 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+        const int canonical_k_tile = k_base >> 7;
+        const int split_base       = (k_base & 127) >> 4;
+        for (uint work = tid; work < 64U; work += n_threads) {
+            const uint output_quarter = work >> 4;
+            const uint tile_work      = work & 15U;
+            const uint group          = tile_work >> 2;
+            const uint local_split    = (tile_work >> 1) & 1U;
+            const uint jblock         = tile_work & 1U;
+            const uint output_tile    = (uint) tgpig.x * 4U + output_quarter;
+            const ulong code_offset =
+                ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+                (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
+            const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+
+            const half4 low0 = row4_decode4((uint) (packed.x & 0x0fU));
+            const half4 low1 = row4_decode4((uint) (packed.y & 0x0fU));
+            const half4 low2 = row4_decode4((uint) (packed.z & 0x0fU));
+            const half4 low3 = row4_decode4((uint) (packed.w & 0x0fU));
+            const half4 high0 = row4_decode4((uint) (packed.x >> 4));
+            const half4 high1 = row4_decode4((uint) (packed.y >> 4));
+            const half4 high2 = row4_decode4((uint) (packed.z >> 4));
+            const half4 high3 = row4_decode4((uint) (packed.w >> 4));
+            const uint output_base = (output_quarter * 4U + group) * 4U;
+            const uint k_low       = local_split * 16U + jblock * 4U;
+            const uint k_high      = k_low + 8U;
+
+            *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_low)) =
+                half4(low0.x, low1.x, low2.x, low3.x);
+            *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_low)) =
+                half4(low0.y, low1.y, low2.y, low3.y);
+            *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_low)) =
+                half4(low0.z, low1.z, low2.z, low3.z);
+            *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_low)) =
+                half4(low0.w, low1.w, low2.w, low3.w);
+            *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_high)) =
+                half4(high0.x, high1.x, high2.x, high3.x);
+            *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_high)) =
+                half4(high0.y, high1.y, high2.y, high3.y);
+            *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_high)) =
+                half4(high0.z, high1.z, high2.z, high3.z);
+            *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_high)) =
+                half4(high0.w, high1.w, high2.w, high3.w);
+        }
+
+        for (uint index = tid; index < (uint) (col_tile * k_tile); index += n_threads) {
+            const uint col   = index / (uint) k_tile;
+            const uint kk    = index % (uint) k_tile;
+            const uint token = (uint) col_base + col;
+            act_tile[kk * (uint) col_tile + col] = token < (uint) args.act_rows ?
+                (half) ((int) act_q[(ulong) token * (ulong) args.k + (ulong) k_base + (ulong) kk]) : (half) 0.0h;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int ik = 0; ik < k_tile; ik += 8) {
+            simdgroup_load(weights0, weight_tile + row_block * k_tile + ik, k_tile);
+            simdgroup_load(weights1, weight_tile + (row_block + 8) * k_tile + ik, k_tile);
+            simdgroup_load(activations0, act_tile + ik * col_tile, col_tile);
+            simdgroup_load(activations1, act_tile + ik * col_tile + 8, col_tile);
+            simdgroup_load(activations2, act_tile + ik * col_tile + 16, col_tile);
+            simdgroup_load(activations3, act_tile + ik * col_tile + 24, col_tile);
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(accum00, weights0, activations0, accum00);
+            simdgroup_multiply_accumulate(accum01, weights0, activations1, accum01);
+            simdgroup_multiply_accumulate(accum02, weights0, activations2, accum02);
+            simdgroup_multiply_accumulate(accum03, weights0, activations3, accum03);
+            simdgroup_multiply_accumulate(accum10, weights1, activations0, accum10);
+            simdgroup_multiply_accumulate(accum11, weights1, activations1, accum11);
+            simdgroup_multiply_accumulate(accum12, weights1, activations2, accum12);
+            simdgroup_multiply_accumulate(accum13, weights1, activations3, accum13);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float * simd_out = out_tile + sgitg * 64U;
+    simdgroup_store(accum00, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 0, 0, simd_lane, sgitg);
+    simdgroup_store(accum10, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 0, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum01, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 1, 0, simd_lane, sgitg);
+    simdgroup_store(accum11, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 1, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum02, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 2, 0, simd_lane, sgitg);
+    simdgroup_store(accum12, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 2, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum03, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 3, 0, simd_lane, sgitg);
+    simdgroup_store(accum13, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 3, 1, simd_lane, sgitg);
+}
+
+kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        device const half * act_h                         [[buffer(6)]],
+        threadgroup half * weight_tile                    [[threadgroup(0)]],
+        threadgroup float * out_tile                      [[threadgroup(2)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint sgitg                                        [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile  = 64;
+    constexpr int col_tile  = 32;
+    constexpr int k_tile    = 32;
+    constexpr int n_threads = 128;
+    const int row_base      = (int) tgpig.x * row_tile;
+    const int col_base      = (int) tgpig.y * col_tile;
+    const int k_tiles       = args.k / 128;
+    const int row_block     = (int) sgitg * 16;
+    const uint simd_lane    = tid & 31U;
+
+    simdgroup_half8x8  weights0;
+    simdgroup_half8x8  weights1;
+    simdgroup_half8x8  activations0;
+    simdgroup_half8x8  activations1;
+    simdgroup_half8x8  activations2;
+    simdgroup_half8x8  activations3;
+    simdgroup_float8x8 accum00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum02 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum03 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+        const int canonical_k_tile = k_base >> 7;
+        const int split_base       = (k_base & 127) >> 4;
+        for (uint work = tid; work < 64U; work += n_threads) {
+            const uint output_quarter = work >> 4;
+            const uint tile_work      = work & 15U;
+            const uint group          = tile_work >> 2;
+            const uint local_split    = (tile_work >> 1) & 1U;
+            const uint jblock         = tile_work & 1U;
+            const uint output_tile    = (uint) tgpig.x * 4U + output_quarter;
+            const ulong code_offset =
+                ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+                (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
+            const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+
+            const half4 low0 = row4_decode4((uint) (packed.x & 0x0fU));
+            const half4 low1 = row4_decode4((uint) (packed.y & 0x0fU));
+            const half4 low2 = row4_decode4((uint) (packed.z & 0x0fU));
+            const half4 low3 = row4_decode4((uint) (packed.w & 0x0fU));
+            const half4 high0 = row4_decode4((uint) (packed.x >> 4));
+            const half4 high1 = row4_decode4((uint) (packed.y >> 4));
+            const half4 high2 = row4_decode4((uint) (packed.z >> 4));
+            const half4 high3 = row4_decode4((uint) (packed.w >> 4));
+            const uint output_base = (output_quarter * 4U + group) * 4U;
+            const uint k_low       = local_split * 16U + jblock * 4U;
+            const uint k_high      = k_low + 8U;
+
+            *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_low)) =
+                half4(low0.x, low1.x, low2.x, low3.x);
+            *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_low)) =
+                half4(low0.y, low1.y, low2.y, low3.y);
+            *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_low)) =
+                half4(low0.z, low1.z, low2.z, low3.z);
+            *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_low)) =
+                half4(low0.w, low1.w, low2.w, low3.w);
+            *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_high)) =
+                half4(high0.x, high1.x, high2.x, high3.x);
+            *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_high)) =
+                half4(high0.y, high1.y, high2.y, high3.y);
+            *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_high)) =
+                half4(high0.z, high1.z, high2.z, high3.z);
+            *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_high)) =
+                half4(high0.w, high1.w, high2.w, high3.w);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int ik = 0; ik < k_tile; ik += 8) {
+            simdgroup_load(weights0, weight_tile + row_block * k_tile + ik, k_tile);
+            simdgroup_load(weights1, weight_tile + (row_block + 8) * k_tile + ik, k_tile);
+            const int act_base = (k_base + ik) * args.reserved + col_base;
+            simdgroup_load(activations0, act_h + act_base, args.reserved);
+            simdgroup_load(activations1, act_h + act_base + 8, args.reserved);
+            simdgroup_load(activations2, act_h + act_base + 16, args.reserved);
+            simdgroup_load(activations3, act_h + act_base + 24, args.reserved);
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(accum00, weights0, activations0, accum00);
+            simdgroup_multiply_accumulate(accum01, weights0, activations1, accum01);
+            simdgroup_multiply_accumulate(accum02, weights0, activations2, accum02);
+            simdgroup_multiply_accumulate(accum03, weights0, activations3, accum03);
+            simdgroup_multiply_accumulate(accum10, weights1, activations0, accum10);
+            simdgroup_multiply_accumulate(accum11, weights1, activations1, accum11);
+            simdgroup_multiply_accumulate(accum12, weights1, activations2, accum12);
+            simdgroup_multiply_accumulate(accum13, weights1, activations3, accum13);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float * simd_out = out_tile + sgitg * 64U;
+    simdgroup_store(accum00, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 0, 0, simd_lane, sgitg);
+    simdgroup_store(accum10, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 0, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum01, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 1, 0, simd_lane, sgitg);
+    simdgroup_store(accum11, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 1, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum02, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 2, 0, simd_lane, sgitg);
+    simdgroup_store(accum12, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 2, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum03, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 3, 0, simd_lane, sgitg);
+    simdgroup_store(accum13, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 3, 1, simd_lane, sgitg);
+}
+
+kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act_simd_localw(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        device const half * act_h                         [[buffer(6)]],
+        threadgroup half * weight_tile                    [[threadgroup(0)]],
+        threadgroup float * out_tile                      [[threadgroup(2)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint sgitg                                        [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile = 64;
+    constexpr int col_tile = 32;
+    constexpr int k_tile   = 32;
+    const int row_base     = (int) tgpig.x * row_tile;
+    const int col_base     = (int) tgpig.y * col_tile;
+    const int k_tiles      = args.k / 128;
+    const int row_block    = (int) sgitg * 16;
+    const uint simd_lane   = tid & 31U;
+
+    simdgroup_half8x8  weights0;
+    simdgroup_half8x8  weights1;
+    simdgroup_half8x8  activations0;
+    simdgroup_half8x8  activations1;
+    simdgroup_half8x8  activations2;
+    simdgroup_half8x8  activations3;
+    simdgroup_float8x8 accum00 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum01 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum02 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum03 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum10 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum11 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum12 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+    for (int k_base = 0; k_base < args.k; k_base += k_tile) {
+        const int canonical_k_tile = k_base >> 7;
+        const int split_base       = (k_base & 127) >> 4;
+        if (simd_lane < 16U) {
+            const uint group       = simd_lane >> 2;
+            const uint local_split = (simd_lane >> 1) & 1U;
+            const uint jblock      = simd_lane & 1U;
+            const uint output_tile = (uint) tgpig.x * 4U + sgitg;
+            const ulong code_offset =
+                ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+                (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
+            const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+
+            const half4 low0  = row4_decode4((uint) (packed.x & 0x0fU));
+            const half4 low1  = row4_decode4((uint) (packed.y & 0x0fU));
+            const half4 low2  = row4_decode4((uint) (packed.z & 0x0fU));
+            const half4 low3  = row4_decode4((uint) (packed.w & 0x0fU));
+            const half4 high0 = row4_decode4((uint) (packed.x >> 4));
+            const half4 high1 = row4_decode4((uint) (packed.y >> 4));
+            const half4 high2 = row4_decode4((uint) (packed.z >> 4));
+            const half4 high3 = row4_decode4((uint) (packed.w >> 4));
+            const uint output_base = (sgitg * 16U + group * 4U);
+            const uint k_low       = local_split * 16U + jblock * 4U;
+            const uint k_high      = k_low + 8U;
+
+            *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_low)) =
+                half4(low0.x, low1.x, low2.x, low3.x);
+            *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_low)) =
+                half4(low0.y, low1.y, low2.y, low3.y);
+            *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_low)) =
+                half4(low0.z, low1.z, low2.z, low3.z);
+            *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_low)) =
+                half4(low0.w, low1.w, low2.w, low3.w);
+            *((threadgroup half4 *) (weight_tile + (output_base + 0U) * k_tile + k_high)) =
+                half4(high0.x, high1.x, high2.x, high3.x);
+            *((threadgroup half4 *) (weight_tile + (output_base + 1U) * k_tile + k_high)) =
+                half4(high0.y, high1.y, high2.y, high3.y);
+            *((threadgroup half4 *) (weight_tile + (output_base + 2U) * k_tile + k_high)) =
+                half4(high0.z, high1.z, high2.z, high3.z);
+            *((threadgroup half4 *) (weight_tile + (output_base + 3U) * k_tile + k_high)) =
+                half4(high0.w, high1.w, high2.w, high3.w);
+        }
+
+        // This SIMDgroup produces and consumes only its own 16-row / 1 KiB
+        // weight slice, so neither fence requires synchronization with the
+        // other three SIMDgroups in the threadgroup.
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int ik = 0; ik < k_tile; ik += 8) {
+            simdgroup_load(weights0, weight_tile + row_block * k_tile + ik, k_tile);
+            simdgroup_load(weights1, weight_tile + (row_block + 8) * k_tile + ik, k_tile);
+            const int act_base = (k_base + ik) * args.reserved + col_base;
+            simdgroup_load(activations0, act_h + act_base, args.reserved);
+            simdgroup_load(activations1, act_h + act_base + 8, args.reserved);
+            simdgroup_load(activations2, act_h + act_base + 16, args.reserved);
+            simdgroup_load(activations3, act_h + act_base + 24, args.reserved);
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(accum00, weights0, activations0, accum00);
+            simdgroup_multiply_accumulate(accum01, weights0, activations1, accum01);
+            simdgroup_multiply_accumulate(accum02, weights0, activations2, accum02);
+            simdgroup_multiply_accumulate(accum03, weights0, activations3, accum03);
+            simdgroup_multiply_accumulate(accum10, weights1, activations0, accum10);
+            simdgroup_multiply_accumulate(accum11, weights1, activations1, accum11);
+            simdgroup_multiply_accumulate(accum12, weights1, activations2, accum12);
+            simdgroup_multiply_accumulate(accum13, weights1, activations3, accum13);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float * simd_out = out_tile + sgitg * 64U;
+    simdgroup_store(accum00, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 0, 0, simd_lane, sgitg);
+    simdgroup_store(accum10, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 0, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum01, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 1, 0, simd_lane, sgitg);
+    simdgroup_store(accum11, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 1, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum02, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 2, 0, simd_lane, sgitg);
+    simdgroup_store(accum12, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 2, 1, simd_lane, sgitg);
+
+    simdgroup_store(accum03, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 3, 0, simd_lane, sgitg);
+    simdgroup_store(accum13, simd_out, 8, 0, true);
+    row4_finish_prefill_m64n32_simd_stripe(
+        args, scales, act_scales, dst, out_tile, row_base, col_base, 3, 1, simd_lane, sgitg);
+}
+
+
+
+
+
+
+
+
+kernel void kernel_row8_w8a8_prefill(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const char * codes                         [[buffer(1)]],
+        device const float * scales                       [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        threadgroup half * weight_tile                    [[threadgroup(0)]],
+        threadgroup half * act_tile                       [[threadgroup(1)]],
+        threadgroup float * out_tile                      [[threadgroup(2)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint sgitg                                        [[simdgroup_index_in_threadgroup]]) {
+    constexpr int row_tile    = 16;
+    constexpr int col_tile    = 16;
+    constexpr int k_tile      = 32;
+    constexpr int k_segment   = 1024;
+    constexpr int n_threads   = 128;
+    const int row_base        = (int) tgpig.x * row_tile;
+    const int col_base        = (int) tgpig.y * col_tile;
+    const int k_tiles         = args.k / 128;
+    const int row_block       = (int) (sgitg & 1U);
+    const int col_block       = (int) (sgitg >> 1);
+    int exact_acc0            = 0;
+    int exact_acc1            = 0;
+
+    for (int segment_base = 0; segment_base < args.k; segment_base += k_segment) {
+        simdgroup_half8x8  weights;
+        simdgroup_half8x8  activations;
+        simdgroup_float8x8 segment_accum = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        const int segment_end = min(segment_base + k_segment, args.k);
+
+        for (int k_base = segment_base; k_base < segment_end; k_base += k_tile) {
+            for (uint index = tid; index < (uint) (row_tile * k_tile); index += n_threads) {
+                const int row = (int) index / k_tile;
+                const int ik  = (int) index % k_tile;
+                weight_tile[index] =
+                    (half) w8a8_weight_at(codes, k_tiles, row_base + row, k_base + ik);
+
+                const int kk    = (int) index / col_tile;
+                const int col   = (int) index % col_tile;
+                const int token = col_base + col;
+                act_tile[index] = token < args.act_rows ?
+                    (half) ((int) act_q[(ulong) token * (ulong) args.k + (ulong) (k_base + kk)]) : (half) 0.0h;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int ik = 0; ik < k_tile; ik += 8) {
+                simdgroup_load(weights, weight_tile + row_block * 8 * k_tile + ik, k_tile);
+                simdgroup_load(activations, act_tile + ik * col_tile + col_block * 8, col_tile);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(segment_accum, weights, activations, segment_accum);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        simdgroup_store(segment_accum, out_tile + sgitg * 64U, 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        exact_acc0 += (int) out_tile[tid];
+        exact_acc1 += (int) out_tile[tid + n_threads];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint indices[2] = { tid, tid + n_threads };
+    const int accumulators[2] = { exact_acc0, exact_acc1 };
+    for (int item = 0; item < 2; ++item) {
+        const uint index     = indices[item];
+        const uint matrix    = index >> 6;
+        const uint cell      = index & 63U;
+        const uint row       = (matrix & 1U) * 8U + cell / 8U;
+        const uint col       = (matrix >> 1) * 8U + cell % 8U;
+        const uint output    = (uint) row_base + row;
+        const uint token     = (uint) col_base + col;
+        if (token < (uint) args.act_rows) {
+            dst[(ulong) token * (ulong) args.m + (ulong) output] =
+                w8a8_finish_i32(accumulators[item], act_scales[token], scales[output]);
+        }
+    }
+}
+
+#undef ROW4_REDUCED_KERNEL
+#undef W8A8_REDUCED_KERNEL
 
 kernel void kernel_fairy2i_act_half_64_stage_bf16(
         constant ggml_metal_kargs_fairy2i_wide_linear_w2 & args [[buffer(0)]],
@@ -7500,24 +9369,6 @@ template [[host_name("kernel_rms_norm_f32")]]         kernel kernel_rms_norm_fus
 template [[host_name("kernel_rms_norm_mul_f32")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<2>;
 template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<3>;
 
-static inline uint fairy2i_mul_f32_bits_rne_ftz_safe(uint a, uint b) {
-    const uint abs_a = a & 0x7fffffffU;
-    const uint abs_b = b & 0x7fffffffU;
-    const uint exp_a = abs_a >> 23;
-    const uint exp_b = abs_b >> 23;
-    if (exp_a == 0xffU || exp_b == 0xffU) {
-        return fairy2i_mul_f32_bits_rne(a, b);
-    }
-    if (abs_a == 0U || abs_b == 0U) {
-        return ((a ^ b) >> 31) << 31;
-    }
-
-    if (exp_a > 0U && exp_b > 0U && exp_a + exp_b >= 128U) {
-        return as_type<uint>(as_type<float>(a) * as_type<float>(b));
-    }
-    return fairy2i_mul_f32_bits_rne(a, b);
-}
-
 static inline uint fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(ushort a, ushort b) {
     const uint abs_a = (uint) a & 0x7fffU;
     const uint abs_b = (uint) b & 0x7fffU;
@@ -7536,18 +9387,32 @@ static inline uint fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(ushort a, ushort b)
     return fairy2i_mul_bf16_to_f32_bits_rne(a, b);
 }
 
-kernel void kernel_fairy2i_silu_exact_f32(
-        constant ulong & ne,
-        device const uint * src0,
-        device       uint * dst,
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= ne) {
+static inline ushort fairy2i_silu_qat_bf16(ushort value_bits) {
+    const float value  = fairy2i_bf16_to_f32(value_bits);
+    const float result = value >= 0.0f ? value / (1.0f + exp(-value)) : value * exp(value) / (1.0f + exp(value));
+    return fairy2i_f32_to_bf16(result);
+}
+
+static inline ushort fairy2i_mul_qat_bf16(ushort lhs_bits, ushort rhs_bits) {
+    const float lhs = fairy2i_bf16_to_f32(lhs_bits);
+    const float rhs = fairy2i_bf16_to_f32(rhs_bits);
+    return fairy2i_f32_to_bf16(lhs * rhs);
+}
+
+kernel void kernel_fairy2i_silu_exact_f32(constant ggml_metal_kargs_fairy2i_elementwise_exact & args,
+                                          const device uint *                                   src0,
+                                          device uint *                                         dst,
+                                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne) {
         return;
     }
 
-    const ushort value_bits = (ushort) (src0[gid] >> 16);
-    const uint    abs_bits   = (uint) value_bits & 0x7fffU;
-    const uint    exponent   = abs_bits >> 7;
+    const ulong         row        = gid / args.ne0;
+    const ulong         col        = gid - row * args.ne0;
+    const device uint * src0_row   = (const device uint *) ((const device uchar *) src0 + row * args.src0_nb1);
+    const ushort        value_bits = (ushort) (src0_row[col] >> 16);
+    const uint          abs_bits   = (uint) value_bits & 0x7fffU;
+    const uint          exponent   = abs_bits >> 7;
 
     ushort result_bits;
     if (exponent <= 1U) {
@@ -7565,73 +9430,122 @@ kernel void kernel_fairy2i_silu_exact_f32(
             // can still round to a non-zero BF16 SiLU result. Build it from two
             // normal factors and keep the product as payload bits. At this scale,
             // 1 + exp(value) rounds exactly to 1 in F32.
-            const uint exp_bits = fairy2i_mul_f32_bits_rne(
-                as_type<uint>(exp(value + 64.0f)),
-                as_type<uint>(exp(-64.0f)));
-            const uint numerator_bits =
-                fairy2i_mul_f32_bits_rne(((uint) value_bits) << 16, exp_bits);
-            result_bits = fairy2i_f32_bits_to_bf16_rne(numerator_bits);
+            const uint exp_bits =
+                fairy2i_mul_f32_bits_rne(as_type<uint>(exp(value + 64.0f)), as_type<uint>(exp(-64.0f)));
+            const uint numerator_bits = fairy2i_mul_f32_bits_rne(((uint) value_bits) << 16, exp_bits);
+            result_bits               = fairy2i_f32_bits_to_bf16_rne(numerator_bits);
         } else {
             const float exp_value = exp(value);
-            result_bits = fairy2i_f32_to_bf16((value * exp_value) / (1.0f + exp_value));
+            result_bits           = fairy2i_f32_to_bf16((value * exp_value) / (1.0f + exp_value));
         }
     }
 
     dst[gid] = (uint) result_bits << 16;
 }
 
-kernel void kernel_fairy2i_silu_qat_f32(
-        constant ulong & ne,
-        device const uint * src0,
-        device       uint * dst,
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= ne) {
+kernel void kernel_fairy2i_silu_qat_f32(constant ggml_metal_kargs_fairy2i_elementwise_exact & args,
+                                        const device uint *                                   src0,
+                                        device uint *                                         dst,
+                                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne) {
         return;
     }
 
-    const ushort value_bits = (ushort) (src0[gid] >> 16);
-    const float value = fairy2i_bf16_to_f32(value_bits);
-    const float result = value >= 0.0f ? value / (1.0f + exp(-value)) :
-                                         value * exp(value) / (1.0f + exp(value));
-    dst[gid] = (uint) fairy2i_f32_to_bf16(result) << 16;
+    const ulong         row        = gid / args.ne0;
+    const ulong         col        = gid - row * args.ne0;
+    const device uint * src0_row   = (const device uint *) ((const device uchar *) src0 + row * args.src0_nb1);
+    const ushort        value_bits = (ushort) (src0_row[col] >> 16);
+    dst[gid]                       = (uint) fairy2i_silu_qat_bf16(value_bits) << 16;
 }
 
-kernel void kernel_fairy2i_mul_exact_f32(
-        constant ulong & ne,
-        device const uint * src0,
-        device const uint * src1,
-        device       uint * dst,
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= ne) {
+kernel void kernel_fairy2i_mul_exact_f32(constant ggml_metal_kargs_fairy2i_elementwise_exact & args,
+                                         const device uint *                                   src0,
+                                         const device uint *                                   src1,
+                                         device uint *                                         dst,
+                                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne) {
         return;
     }
 
-    const ushort lhs_bits     = (ushort) (src0[gid] >> 16);
-    const ushort rhs_bits     = (ushort) (src1[gid] >> 16);
-    const uint    product_bits = fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(lhs_bits, rhs_bits);
-    dst[gid]                   = (uint) fairy2i_f32_bits_to_bf16_rne(product_bits) << 16;
+    const ulong         row          = gid / args.ne0;
+    const ulong         col          = gid - row * args.ne0;
+    const device uint * src0_row     = (const device uint *) ((const device uchar *) src0 + row * args.src0_nb1);
+    const device uint * src1_row     = (const device uint *) ((const device uchar *) src1 + row * args.src1_nb1);
+    const ushort        lhs_bits     = (ushort) (src0_row[col] >> 16);
+    const ushort        rhs_bits     = (ushort) (src1_row[col] >> 16);
+    const uint          product_bits = fairy2i_mul_bf16_to_f32_bits_rne_ftz_safe(lhs_bits, rhs_bits);
+    dst[gid]                         = (uint) fairy2i_f32_bits_to_bf16_rne(product_bits) << 16;
 }
 
-kernel void kernel_fairy2i_mul_qat_f32(
-        constant ulong & ne,
-        device const uint * src0,
-        device const uint * src1,
-        device       uint * dst,
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= ne) {
+kernel void kernel_fairy2i_mul_qat_f32(constant ggml_metal_kargs_fairy2i_elementwise_exact & args,
+                                       const device uint *                                   src0,
+                                       const device uint *                                   src1,
+                                       device uint *                                         dst,
+                                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.ne) {
         return;
     }
 
-    const float lhs = fairy2i_bf16_to_f32((ushort) (src0[gid] >> 16));
-    const float rhs = fairy2i_bf16_to_f32((ushort) (src1[gid] >> 16));
-    dst[gid] = (uint) fairy2i_f32_to_bf16(lhs * rhs) << 16;
+    const ulong         row      = gid / args.ne0;
+    const ulong         col      = gid - row * args.ne0;
+    const device uint * src0_row = (const device uint *) ((const device uchar *) src0 + row * args.src0_nb1);
+    const device uint * src1_row = (const device uint *) ((const device uchar *) src1 + row * args.src1_nb1);
+    const ushort        lhs_bits = (ushort) (src0_row[col] >> 16);
+    const ushort        rhs_bits = (ushort) (src1_row[col] >> 16);
+    dst[gid]                     = (uint) fairy2i_mul_qat_bf16(lhs_bits, rhs_bits) << 16;
 }
 
-kernel void kernel_fairy2i_pack_bf16_exact(
-        constant ulong & ne,
-        device const uint * src0,
-        device     ushort * dst,
-        uint gid [[thread_position_in_grid]]) {
+kernel void kernel_fairy2i_swiglu_qat_f32(constant ggml_metal_kargs_fairy2i_elementwise_exact & args,
+                                          const device uint *                                   gate,
+                                          const device uint *                                   up,
+                                          device uint *                                         dst,
+                                          uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint row = gid.y;
+    if (col >= args.ne0 || (ulong) row * args.ne0 >= args.ne) {
+        return;
+    }
+
+    const device uint * gate_row  = (const device uint *) ((const device uchar *) gate + (ulong) row * args.src0_nb1);
+    const device uint * up_row    = (const device uint *) ((const device uchar *) up + (ulong) row * args.src1_nb1);
+    const ushort        gate_bits = (ushort) (gate_row[col] >> 16);
+    const ushort        up_bits   = (ushort) (up_row[col] >> 16);
+
+    // Materialize the SiLU result as BF16 bits before multiplication. This is
+    // the checkpoint QAT boundary, even though the intermediate tensor is no
+    // longer written to device memory.
+    const ushort silu_bits            = fairy2i_silu_qat_bf16(gate_bits);
+    const ushort out_bits             = fairy2i_mul_qat_bf16(silu_bits, up_bits);
+    dst[(ulong) row * args.ne0 + col] = (uint) out_bits << 16;
+}
+
+kernel void kernel_fairy2i_swiglu_qat_packed_bf16(
+        constant ggml_metal_kargs_fairy2i_elementwise_exact & args [[buffer(0)]],
+        const device uint * gate                                     [[buffer(1)]],
+        const device uint * up                                       [[buffer(2)]],
+        device ushort * dst                                          [[buffer(3)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint row = gid.y;
+    if (col >= args.ne0 || (ulong) row * args.ne0 >= args.ne) {
+        return;
+    }
+
+    const device uint * gate_row  = (const device uint *) ((const device uchar *) gate + (ulong) row * args.src0_nb1);
+    const device uint * up_row    = (const device uint *) ((const device uchar *) up + (ulong) row * args.src1_nb1);
+    const ushort        gate_bits = (ushort) (gate_row[col] >> 16);
+    const ushort        up_bits   = (ushort) (up_row[col] >> 16);
+
+    // Keep both QAT boundaries in their original order, but only publish the
+    // final BF16 payload needed by the following activation quantizer.
+    const ushort silu_bits            = fairy2i_silu_qat_bf16(gate_bits);
+    dst[(ulong) row * args.ne0 + col] = fairy2i_mul_qat_bf16(silu_bits, up_bits);
+}
+
+kernel void kernel_fairy2i_pack_bf16_exact(constant ulong &    ne,
+                                           const device uint * src0,
+                                           device ushort *     dst,
+                                           uint                gid [[thread_position_in_grid]]) {
     if (gid < ne) {
         dst[gid] = (ushort) (src0[gid] >> 16);
     }
@@ -14038,6 +15952,59 @@ kernel void kernel_set_rows_bf16_raw(
     for (int ind = tiitg % tptg.x; ind < args.nk0; ind += tptg.x) {
         dst_row[ind] = src_row[ind];
     }
+}
+
+kernel void kernel_set_rows_bf16_carrier_rows(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device        void * dst,
+        uint3                tgpig [[threadgroup_position_in_grid]],
+        uint                 tiitg [[thread_index_in_threadgroup]],
+        uint3                tptg  [[threads_per_threadgroup]]) {
+    const int32_t i02 = tgpig.y;
+    const int32_t i03 = tgpig.z;
+    const int32_t i11 = i02 % args.ne11;
+    const int32_t i12 = i03 % args.ne12;
+    const int32_t i01 = tgpig.x * tptg.y + tiitg / tptg.x;
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    const int64_t i1 = ((const device int64_t *) ((const device char *) src1 +
+                                                  i01 * args.nb10 + i11 * args.nb11 + i12 * args.nb12))[0];
+    device ushort * dst_row =
+        (device ushort *) ((device char *) dst + i1 * args.nb1 + i02 * args.nb2 + i03 * args.nb3);
+    const device uint * src_row =
+        (const device uint *) ((const device char *) src0 +
+                               i01 * args.nb01 + i02 * args.nb02 + i03 * args.nb03);
+
+    for (int ind = tiitg % tptg.x; ind < args.nk0; ind += tptg.x) {
+        dst_row[ind] = (ushort) (src_row[ind] >> 16);
+    }
+}
+
+kernel void kernel_set_rows_bf16_carrier_elements(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device        void * dst,
+        uint3                tgpig [[threadgroup_position_in_grid]],
+        uint                 tiitg [[thread_index_in_threadgroup]],
+        uint3                tptg  [[threads_per_threadgroup]]) {
+    const uint64_t element = (uint64_t) tgpig.x * tptg.x + tiitg;
+    const uint64_t n_elements = (uint64_t) args.ne00 * args.ne01 * args.ne02;
+    if (element >= n_elements) {
+        return;
+    }
+
+    const uint64_t i0 = element % args.ne00;
+    const uint64_t i1 = (element / args.ne00) % args.ne01;
+    const uint64_t i2 = element / ((uint64_t) args.ne00 * args.ne01);
+    const device uint * src = (const device uint *) ((const device char *) src0 +
+                                                     i0 * sizeof(uint) + i1 * args.nb01 + i2 * args.nb02);
+    const int64_t dst_element = ((const device int64_t *) ((const device char *) src1 + element * args.nb10))[0];
+    *(device ushort *) ((device char *) dst + dst_element * args.nb1) = (ushort) (*src >> 16);
 }
 
 #define BLOCK_SIZE_M 64 // 8 simdgroup matrices from matrix A

@@ -1,10 +1,12 @@
-#include "ggml-backend.h"
-#include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
-#include "repack.h"
-#include "traits.h"
-#include "ggml-impl.h"
+
 #include "amx/amx.h"
+#include "ggml-backend-impl.h"
+#include "ggml-backend.h"
+#include "ggml-impl.h"
+#include "repack.h"
+#include "row4/row4-cpu.h"
+#include "traits.h"
 
 #ifdef GGML_USE_FAIRY2I_CPU
 #    include "fairy2i/fairy2i-cpu.h"
@@ -411,9 +413,19 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    bool touches_row4_codes = op->type == GGML_TYPE_ROW4_CODES;
+    for (int i = 0; i < GGML_MAX_SRC && !touches_row4_codes; ++i) {
+        touches_row4_codes = op->src[i] && op->src[i]->type == GGML_TYPE_ROW4_CODES;
+    }
+    if (touches_row4_codes && op->op != GGML_OP_ROW4_LINEAR) {
+        // ROW4_CODES is an opaque byte plane. It can only be moved without a
+        // type conversion or consumed by the dedicated Row4 linear operator.
+        return op->op == GGML_OP_CPY && src0 && src0->type == GGML_TYPE_ROW4_CODES && op->type == GGML_TYPE_ROW4_CODES;
+    }
+
     if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && src0 &&
-        src0->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES) {
-        // Bundle codes are opaque storage for the dedicated Fairy2i wide-linear ops.
+        (src0->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES || src0->type == GGML_TYPE_ROW4_CODES)) {
+        // Bundle/Row4 codes are opaque storage for dedicated linear ops.
         return false;
     }
 
@@ -445,6 +457,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             }
 #endif
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
+        case GGML_OP_ROW4_LINEAR:
+        case GGML_OP_W8A8_LINEAR:
+            return ggml_row4_cpu_supports_op(op);
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
         case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
 #ifdef GGML_USE_FAIRY2I_CPU

@@ -766,7 +766,8 @@ struct llm_graph_context {
                              float                     kq_scale,
                              int                       il,
                              bool                      fairy2i_exact  = false,
-                             bool                      fairy2i_flash3 = false) const;
+                             bool                      fairy2i_flash3 = false,
+                             bool                      exact_carrier_kv_store = false) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 

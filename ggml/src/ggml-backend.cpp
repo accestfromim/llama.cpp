@@ -528,6 +528,25 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+
+    // ROW4_CODES is an opaque physical byte stream.  Only metadata-only views,
+    // a same-type raw copy, and the dedicated linear op may consume it.  Keep
+    // this guard central so permissive backends cannot accidentally advertise
+    // a generic arithmetic or dequantization path for the new type.
+    bool touches_row4_codes = op->type == GGML_TYPE_ROW4_CODES;
+    for (int i = 0; i < GGML_MAX_SRC && !touches_row4_codes; ++i) {
+        touches_row4_codes = op->src[i] != nullptr && op->src[i]->type == GGML_TYPE_ROW4_CODES;
+    }
+    if (touches_row4_codes) {
+        const bool metadata_only = op->op == GGML_OP_NONE || op->op == GGML_OP_VIEW || op->op == GGML_OP_RESHAPE ||
+                                   op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE;
+        const bool raw_copy      = op->op == GGML_OP_CPY && op->type == GGML_TYPE_ROW4_CODES && op->src[0] != nullptr &&
+                                   op->src[0]->type == GGML_TYPE_ROW4_CODES;
+        if (!metadata_only && !raw_copy && op->op != GGML_OP_ROW4_LINEAR) {
+            return false;
+        }
+    }
+
     return device->iface.supports_op(device, op);
 }
 
