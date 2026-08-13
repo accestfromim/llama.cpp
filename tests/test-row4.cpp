@@ -535,6 +535,127 @@ static std::vector<float> make_input(int64_t k, int64_t tokens) {
     return input;
 }
 
+constexpr int8_t ROW4_LUT16_ACTIVATION_EXTREMES[] = { -127, -1, 0, 1, 127 };
+
+static int row4_lut16_activation_index(int64_t k, int64_t token = 0) {
+    constexpr int count = sizeof(ROW4_LUT16_ACTIVATION_EXTREMES) / sizeof(ROW4_LUT16_ACTIVATION_EXTREMES[0]);
+    return (int) ((k + k / 16 + 3 * token) % count);
+}
+
+static uint8_t row4_lut16_exhaustive_code(int64_t group, int64_t k) {
+    return (uint8_t) ((5 * group + 3 * k + 7 * (k / 16) + 11 * (k / 128)) & 15);
+}
+
+static std::vector<float> make_row4_lut16_exhaustive_input(int64_t k, int64_t tokens) {
+    std::vector<float> input((size_t) k * (size_t) tokens);
+    for (int64_t token = 0; token < tokens; ++token) {
+        for (int64_t ik = 0; ik < k; ++ik) {
+            input[(size_t) token * (size_t) k + (size_t) ik] =
+                (float) ROW4_LUT16_ACTIVATION_EXTREMES[row4_lut16_activation_index(ik, token)];
+        }
+    }
+    return input;
+}
+
+static std::vector<uint8_t> make_row4_lut16_exhaustive_logical(int64_t o, int64_t k) {
+    std::vector<uint8_t> logical((size_t) (o / 4) * (size_t) k);
+    for (int64_t group = 0; group < o / 4; ++group) {
+        for (int64_t ik = 0; ik < k; ++ik) {
+            logical[(size_t) group * (size_t) k + (size_t) ik] = row4_lut16_exhaustive_code(group, ik);
+        }
+    }
+    return logical;
+}
+
+static bool test_row4_lut16_oracle() {
+    bool ok = true;
+
+    // Reconstruct each four-row LUT entry from the canonical uv axes instead
+    // of copying the Metal table.  The algebraic oracle must agree with the
+    // canonical codebook for every code and signed A8 extreme used below.
+    for (uint8_t code = 0; code < 16; ++code) {
+        const int axis_u = code & 3;
+        const int axis_v = code >> 2;
+        const int ur     = axis_u == 0 ? 1 : axis_u == 1 ? -1 : 0;
+        const int ui     = axis_u == 2 ? 1 : axis_u == 3 ? -1 : 0;
+        const int vr     = axis_v == 0 ? 1 : axis_v == 1 ? -1 : 0;
+        const int vi     = axis_v == 2 ? 1 : axis_v == 3 ? -1 : 0;
+        for (int8_t activation : ROW4_LUT16_ACTIVATION_EXTREMES) {
+            const int u_real        = ur * (int) activation;
+            const int u_imag        = ui * (int) activation;
+            const int v_real        = vr * (int) activation;
+            const int v_imag        = vi * (int) activation;
+            const int oracle_rows[] = {
+                u_real + v_real,
+                -u_imag + v_imag,
+                u_imag + v_imag,
+                u_real - v_real,
+            };
+            for (int row = 0; row < 4; ++row) {
+                const int   row_i32 = (int) ROW4_CODEBOOK[code][row] * (int) activation;
+                const float row_f32 = (float) ROW4_CODEBOOK[code][row] * (float) activation;
+                if (oracle_rows[row] != row_i32 || row_f32 != (float) row_i32) {
+                    fprintf(stderr, "Row4 LUT16 oracle mismatch code=%u activation=%d row=%d\n", code, (int) activation,
+                            row);
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // This one physical Pair2 tile covers both nibble positions, both K128
+    // halves, and both O4s assigned to one SIMDgroup.  Across O96, every
+    // code/activation combination occurs in every one of those dimensions.
+    constexpr int64_t          O       = 96;
+    constexpr int64_t          K       = 256;
+    const std::vector<float>   input   = make_row4_lut16_exhaustive_input(K, 1);
+    const quantized_token      qx      = oracle_quantize_token(input.data(), K);
+    const std::vector<uint8_t> logical = make_row4_lut16_exhaustive_logical(O, K);
+    const std::vector<uint8_t> v1      = pack_row4_codes(logical, O, K);
+    const std::vector<uint8_t> pair2   = pack_row4_pair2_codes(logical, O, K);
+    bool seen[16][sizeof(ROW4_LUT16_ACTIVATION_EXTREMES) / sizeof(ROW4_LUT16_ACTIVATION_EXTREMES[0])][2][2][2] = {};
+
+    if (f32_bits(qx.scale) != f32_bits(1.0f)) {
+        fprintf(stderr, "Row4 LUT16 exhaustive activation scale is not exactly one\n");
+        ok = false;
+    }
+    for (int64_t group = 0; group < O / 4; ++group) {
+        for (int64_t ik = 0; ik < K; ++ik) {
+            const int     activation_index = row4_lut16_activation_index(ik);
+            const uint8_t code             = logical[(size_t) group * K + (size_t) ik];
+            seen[code][activation_index][(ik % 16) >= 8][ik >= ROW4_TILE_K][group & 1] = true;
+            if (qx.values[(size_t) ik] != ROW4_LUT16_ACTIVATION_EXTREMES[activation_index] ||
+                unpack_row4_code(v1, group * 4, ik, K) != code ||
+                unpack_row4_pair2_code(pair2, group * 4, ik, K) != code) {
+                fprintf(stderr, "Row4 LUT16 exhaustive fixture mismatch group=%lld k=%lld\n", (long long) group,
+                        (long long) ik);
+                ok = false;
+            }
+        }
+    }
+    for (int code = 0; code < 16; ++code) {
+        for (size_t activation = 0;
+             activation < sizeof(ROW4_LUT16_ACTIVATION_EXTREMES) / sizeof(ROW4_LUT16_ACTIVATION_EXTREMES[0]);
+             ++activation) {
+            for (int nibble = 0; nibble < 2; ++nibble) {
+                for (int half = 0; half < 2; ++half) {
+                    for (int dual_o4 = 0; dual_o4 < 2; ++dual_o4) {
+                        if (!seen[code][activation][nibble][half][dual_o4]) {
+                            fprintf(stderr,
+                                    "Row4 LUT16 fixture lacks code=%d activation=%d nibble=%d half=%d dual_o4=%d\n",
+                                    code, (int) activation, nibble, half, dual_o4);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    printf("  Row4 LUT16 independent uv-axis oracle and Pair2 coverage - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static std::vector<uint16_t> make_row4_scales(int64_t o) {
     const uint16_t        profiles[] = { 0x3d80, 0xbd80, 0x3f80, 0xbf80, 0x0000, 0x8000, 0x0001, 0x8001 };
     std::vector<uint16_t> scales((size_t) o);
@@ -1750,7 +1871,7 @@ static void row4_decode_production_log_callback(enum ggml_log_level level, const
     (void) level;
     row4_decode_production_log_marker * state = static_cast<row4_decode_production_log_marker *>(user_data);
     if (strstr(text, "ROW4 Metal W1A8 path: decode") && strstr(text, "layout=m32k256_pair2_split8_v2") &&
-        strstr(text, "pipeline=dual-o4-lookahead-u2-4sg")) {
+        strstr(text, "pipeline=lut16-const-rows-f32")) {
         state->hit.store(true, std::memory_order_relaxed);
     }
 }
@@ -1776,11 +1897,16 @@ static bool test_metal_row4_pair2_decode_production() {
     constexpr int64_t O  = 96;
     bool              ok = true;
     for (int64_t k : { 256, 4096, 12288 }) {
-        const std::vector<float>    input       = make_input(k, 1);
-        const std::vector<uint8_t>  v1_codes    = make_row4_codes(O, k);
-        const std::vector<uint8_t>  pair2_codes = make_row4_pair2_codes(O, k);
-        const std::vector<uint16_t> scales      = make_row4_scales(O);
-        const std::vector<float>    expected    = oracle_row4_linear(input, v1_codes, scales, O, k, 1);
+        const bool                 exhaustive = k == 256;
+        const std::vector<float>   input      = exhaustive ? make_row4_lut16_exhaustive_input(k, 1) : make_input(k, 1);
+        const std::vector<uint8_t> logical =
+            exhaustive ? make_row4_lut16_exhaustive_logical(O, k) : std::vector<uint8_t>();
+        const std::vector<uint8_t> v1_codes = exhaustive ? pack_row4_codes(logical, O, k) : make_row4_codes(O, k);
+        const std::vector<uint8_t> pair2_codes =
+            exhaustive ? pack_row4_pair2_codes(logical, O, k) : make_row4_pair2_codes(O, k);
+        const std::vector<uint16_t> scales =
+            exhaustive ? std::vector<uint16_t>((size_t) O, oracle_bf16_bits(1.0f)) : make_row4_scales(O);
+        const std::vector<float> expected = oracle_row4_linear(input, v1_codes, scales, O, k, 1);
 
         row4_decode_production_log_marker production_marker;
         ggml_log_set(row4_decode_production_log_callback, &production_marker);
@@ -1795,6 +1921,27 @@ static bool test_metal_row4_pair2_decode_production() {
         ok = production_run &&
              compare_exact(("Row4 Pair2 production decode K=" + std::to_string(k)).c_str(), production, expected) &&
              production_hit && ok;
+    }
+
+    {
+        constexpr int64_t    K = 12288;
+        std::vector<uint8_t> logical((size_t) (O / 4) * K, 0);
+        for (int64_t ik = 0; ik < K; ++ik) {
+            logical[(size_t) K + (size_t) ik] = (uint8_t) ((ik & 1) ? 5 : 0);
+        }
+        const std::vector<float>    input((size_t) K, 1.0f);
+        const std::vector<uint8_t>  v1_codes    = pack_row4_codes(logical, O, K);
+        const std::vector<uint8_t>  pair2_codes = pack_row4_pair2_codes(logical, O, K);
+        const std::vector<uint16_t> scales((size_t) O, oracle_bf16_bits(1.0f));
+        const std::vector<float>    expected = oracle_row4_linear(input, v1_codes, scales, O, K, 1);
+        std::vector<float>          actual;
+        if (!run_operator_backend(actual, linear_kind::row4_pair2, input, pair2_codes, scales, {}, {}, O, K, 1, nullptr,
+                                  false, metal) ||
+            !compare_exact("Row4 Pair2 production K=12288 maximum/cancellation", actual, expected) ||
+            f32_bits(expected[0]) != f32_bits(24576.0f) || f32_bits(expected[4]) != f32_bits(0.0f)) {
+            fprintf(stderr, "Row4 Pair2 production maximum/cancellation guard failed\n");
+            ok = false;
+        }
     }
 
     ggml_backend_free(metal);
@@ -2041,7 +2188,7 @@ static bool test_metal_row4_decode_residual_fusion() {
         bool                  pair2_fusion_hit = false;
         ok = pair2_fused_backend &&
              run_row4_residual_backend(pair2_fused, pair2_fused_backend, input, pair2_codes, scales, residual, O, k,
-                                       test_case, true, &pair2_fusion_hit, "pipeline=dual-o4-lookahead-u2-4sg") &&
+                                       test_case, true, &pair2_fusion_hit, "pipeline=lut16-const-rows-f32") &&
              compare_exact(("Row4 pair2 production residual fused row4 K=" + std::to_string(k)).c_str(),
                            pair2_fused.row4, expected.row4) &&
              compare_exact(("Row4 pair2 production residual fused add K=" + std::to_string(k)).c_str(), pair2_fused.add,
@@ -2515,6 +2662,7 @@ int main() {
     failed += !test_pair2_layout();
     failed += !test_bf16_and_rounding();
     failed += !test_activation_profile();
+    failed += !test_row4_lut16_oracle();
     failed += !test_int32_extremes();
     failed += !test_fused_boundaries();
     failed += !test_opaque_type_isolation();

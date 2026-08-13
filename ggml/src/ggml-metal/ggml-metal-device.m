@@ -646,9 +646,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         }
 
         if (op->op == GGML_OP_ROW4_LINEAR) {
-            // Pair2 B1 stages the full-K activation in threadgroup memory.
-            const bool pair2_decode_tgmem_ok =
-                ggml_nrows(x) != 1 || (size_t) k * sizeof(int8_t) <= dev->props.max_theadgroup_memory_size;
+            // Pair2 B1 stages the full-K activation in threadgroup memory and
+            // accumulates LUT-decoded integer values in F32. Every integer is
+            // exactly representable through K=65536 (worst case 2^24).
+            const bool pair2_decode_ok = ggml_nrows(x) != 1 ||
+                                         (k <= 65536 &&
+                                          (size_t) k * sizeof(int8_t) <= dev->props.max_theadgroup_memory_size);
             const bool layout_v1 =
                 layout == 1 && m % 128 == 0 && codes->type == GGML_TYPE_ROW4_CODES && codes->ne[0] == 64 &&
                 codes->ne[1] == 4 &&
@@ -656,7 +659,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             const bool layout_v2 =
                 layout == 2 && m % 32 == 0 && k % 256 == 0 && codes->type == GGML_TYPE_ROW4_CODES_PAIR2 &&
                 codes->ne[0] == 128 && codes->ne[1] == 8 && codes->ne[2] == k / 256 && codes->ne[3] == m / 32 &&
-                pair2_decode_tgmem_ok;
+                pair2_decode_ok;
             return scales->type == GGML_TYPE_BF16 && (layout_v1 || layout_v2);
         }
 

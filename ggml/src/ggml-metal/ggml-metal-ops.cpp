@@ -2054,6 +2054,9 @@ static bool ggml_metal_buffer_ranges_overlap(ggml_metal_buffer_id lhs,
     return lhs.offs <= rhs.offs ? rhs.offs - lhs.offs < lhs_size : lhs.offs - rhs.offs < rhs_size;
 }
 
+static constexpr int32_t      row4_pair2_f32_exact_k_max = 65536;
+static constexpr const char * row4_pair2_decode_marker   = "lut16-const-rows-f32";
+
 static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                                                ggml_tensor *        op,
                                                ggml_metal_buffer_id x_buffer,
@@ -2157,7 +2160,10 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const bool      pair2_decode = row4_v2 && path == PATH_DECODE;
     const ggml_metal_device_props * props_dev            = ggml_metal_device_get_props(ctx->dev);
     const size_t                    row4_v2_decode_bytes = (size_t) k * sizeof(int8_t);
-    const bool row4_v2_decode_tgmem_ok = !pair2_decode || row4_v2_decode_bytes <= props_dev->max_theadgroup_memory_size;
+    const bool                      row4_v2_decode_tgmem_ok =
+        !pair2_decode ||
+        (k <= row4_pair2_f32_exact_k_max && row4_v2_decode_bytes <= props_dev->max_theadgroup_memory_size);
+    GGML_ASSERT(!pair2_decode || k % 256 == 0);
     GGML_ASSERT(row4_v2_decode_tgmem_ok);
     const char * suffix = path == PATH_DECODE ? "decode" : path == PATH_SMALL_BATCH ? "small_batch" : "prefill";
     const bool   row4_decode_o32_o4_staged_act =
@@ -2169,25 +2175,25 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const bool row4_prefill_m64n32_native_layout_dualw =
         row4 && path == PATH_PREFILL && m % 64 == 0 && !row4_direct_act;
     const char * pipeline_name =
-        qat_residual_add && pair2_decode ?
-            "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_qat_residual" :
+        pair2_decode ? (qat_residual_add ?
+                            "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32_"
+                            "qat_residual" :
+                            "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32") :
         qat_residual_add ? "kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual" :
         row4_prefill_m64n32_native_layout_dualw_direct_act ?
                            "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act_simd_localw" :
         row4_prefill_m64n32_native_layout_dualw ? "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw" :
-        row4_decode_o32_o4_staged_act && pair2_decode ?
-                                                  "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead" :
-        row4_decode_o32_o4_staged_act     ? "kernel_row4_w1a8_decode_o32_o4_staged_act" :
-        row4_decode_o32_segmented16       ? "kernel_row4_w1a8_decode_o32_segmented16" :
-        w8_decode_o128_rows16             ? "kernel_row8_w8a8_decode_o128_rows16" :
-        w8_decode_o64_rows8               ? "kernel_row8_w8a8_decode_o64_rows8" :
-        row4 && path == PATH_SMALL_BATCH  ? "kernel_row4_w1a8_small_batch" :
-        !row4 && path == PATH_SMALL_BATCH ? "kernel_row8_w8a8_small_batch" :
-        row4                              ? "kernel_row4_w1a8_prefill" :
-                                            "kernel_row8_w8a8_prefill";
+        row4_decode_o32_o4_staged_act           ? "kernel_row4_w1a8_decode_o32_o4_staged_act" :
+        row4_decode_o32_segmented16             ? "kernel_row4_w1a8_decode_o32_segmented16" :
+        w8_decode_o128_rows16                   ? "kernel_row8_w8a8_decode_o128_rows16" :
+        w8_decode_o64_rows8                     ? "kernel_row8_w8a8_decode_o64_rows8" :
+        row4 && path == PATH_SMALL_BATCH        ? "kernel_row4_w1a8_small_batch" :
+        !row4 && path == PATH_SMALL_BATCH       ? "kernel_row8_w8a8_small_batch" :
+        row4                                    ? "kernel_row4_w1a8_prefill" :
+                                                  "kernel_row8_w8a8_prefill";
     const char * row4_path_detail =
         row4_decode_o32_o4_staged_act && pair2_decode ?
-            "A8/I32 O32 two-O4-per-SIMDgroup staged-act" :
+            "A8/F32 exact-integer LUT16 O32 two-O4-per-SIMDgroup staged-act" :
         row4_decode_o32_o4_staged_act ?
             "A8/I32 O32 one-O4-per-SIMDgroup staged-act" :
         row4_decode_o32_segmented16 ?
@@ -2205,7 +2211,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
     }
 
-    using log_key = std::tuple<int, int, int32_t, int32_t, int32_t, int32_t>;
+    using log_key = std::tuple<int, int, bool, int32_t, int32_t, int32_t, int32_t>;
 
     static std::mutex                 log_mutex;
     static std::set<log_key>          logged;
@@ -2215,8 +2221,9 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         return result;
     }();
 
-    const int     op_index  = row4 ? 0 : 1;
-    const log_key key       = std::make_tuple(op_index, (int) path, layout, act_rows, m, k);
+    const int     op_index = row4 ? 0 : 1;
+    const log_key key =
+        std::make_tuple(op_index, (int) path, pair2_decode && qat_residual_add != nullptr, layout, act_rows, m, k);
     bool          log_shape = false;
     if (std::find(logged_local.begin(), logged_local.end(), key) == logged_local.end()) {
         {
@@ -2230,7 +2237,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
             GGML_LOG_INFO(
                 "ROW4 Metal W1A8 path: %s layout=m32k256_pair2_split8_v2 act_rows=%d O=%d K=%d pipeline=%s (%s, "
                 "BF16 boundary)\n",
-                suffix, act_rows, m, k, "dual-o4-lookahead-u2-4sg", row4_path_detail);
+                suffix, act_rows, m, k, row4_pair2_decode_marker, row4_path_detail);
         } else if (row4) {
             GGML_LOG_INFO("ROW4 Metal W1A8 path: %s layout=%s act_rows=%d O=%d K=%d (%s, BF16 boundary)\n", suffix,
                           row4_v2 ? "m32k256_pair2_split8_v2" : "m16k128_split8_v1", act_rows, m, k, row4_path_detail);
@@ -2297,6 +2304,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         constexpr int rows_per_tg = 32;
         const int     nth         = (pair2_decode ? 4 : 8) * 32;
         GGML_ASSERT(row4_v2 || k == 4096 || k == 12288);
+        GGML_ASSERT(!pair2_decode || k <= row4_pair2_f32_exact_k_max);
         GGML_ASSERT(act_q.offs % 16 == 0);
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
         const size_t stage_bytes   = (size_t) k * sizeof(int8_t);
@@ -2534,7 +2542,7 @@ int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
             GGML_LOG_DEBUG(
                 "%s: fuse Row4 decode staged epilogue + QAT COMPLEX_ADD residual "
                 "layout=m32k256_pair2_split8_v2 pipeline=%s\n",
-                __func__, "dual-o4-lookahead-u2-4sg");
+                __func__, row4_pair2_decode_marker);
         } else {
             GGML_LOG_DEBUG("%s: fuse Row4 decode staged epilogue + QAT COMPLEX_ADD residual layout=m16k128_split8_v1\n",
                            __func__);

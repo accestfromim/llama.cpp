@@ -1946,53 +1946,37 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual(
 }
 
 
-static inline void row4_decode_pair2_apply(
+// Pair2 B1 decode keeps the validated O32/128-thread/four-SIMDgroup geometry,
+// dual-O4 issue order, K256 u2 lookahead, activation staging, and epilogue
+// boundary. The 4-bit code directly indexes the existing 16-entry row LUT.
+// Each A8 * ROW4 term and every partial sum are exact in F32 through K=65536:
+// the worst-case magnitude is 2 * 128 * 65536 = 2^24.
+static inline void row4_decode_pair2_lut16_apply(
         uchar4 packed,
         char2 activation0_low,
         char2 activation0_high,
         char2 activation1_low,
         char2 activation1_high,
-        thread int & u_real,
-        thread int & u_imag,
-        thread int & v_real,
-        thread int & v_imag) {
-    row4_accumulate_basis_branchless(
-        (uint) (packed.x & 0x0fU), (int) activation0_low.x, u_real, u_imag, v_real, v_imag);
-    row4_accumulate_basis_branchless(
-        (uint) (packed.y & 0x0fU), (int) activation0_low.y, u_real, u_imag, v_real, v_imag);
-    row4_accumulate_basis_branchless(
-        (uint) (packed.x >> 4), (int) activation0_high.x, u_real, u_imag, v_real, v_imag);
-    row4_accumulate_basis_branchless(
-        (uint) (packed.y >> 4), (int) activation0_high.y, u_real, u_imag, v_real, v_imag);
-    row4_accumulate_basis_branchless(
-        (uint) (packed.z & 0x0fU), (int) activation1_low.x, u_real, u_imag, v_real, v_imag);
-    row4_accumulate_basis_branchless(
-        (uint) (packed.w & 0x0fU), (int) activation1_low.y, u_real, u_imag, v_real, v_imag);
-    row4_accumulate_basis_branchless(
-        (uint) (packed.z >> 4), (int) activation1_high.x, u_real, u_imag, v_real, v_imag);
-    row4_accumulate_basis_branchless(
-        (uint) (packed.w >> 4), (int) activation1_high.y, u_real, u_imag, v_real, v_imag);
+        thread float4 & acc) {
+    acc += float4(row4_decode4((uint) (packed.x & 0x0fU))) * float4((float) activation0_low.x);
+    acc += float4(row4_decode4((uint) (packed.y & 0x0fU))) * float4((float) activation0_low.y);
+    acc += float4(row4_decode4((uint) (packed.x >> 4))) * float4((float) activation0_high.x);
+    acc += float4(row4_decode4((uint) (packed.y >> 4))) * float4((float) activation0_high.y);
+    acc += float4(row4_decode4((uint) (packed.z & 0x0fU))) * float4((float) activation1_low.x);
+    acc += float4(row4_decode4((uint) (packed.w & 0x0fU))) * float4((float) activation1_low.y);
+    acc += float4(row4_decode4((uint) (packed.z >> 4))) * float4((float) activation1_high.x);
+    acc += float4(row4_decode4((uint) (packed.w >> 4))) * float4((float) activation1_high.y);
 }
 
-// Production Pair2 B1 decode: four SIMDgroups, two adjacent O4 groups per
-// SIMDgroup, and one K256-pair lookahead.  The next pair's two code streams
-// and shared activations are issued before either current O4 is updated.
-// Updates preserve the canonical order for each O4 and K256 pair.
-static inline void row4_decode_pair2_accumulate_dual_o4_lookahead(
+static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
         constant ggml_metal_kargs_row_quant_linear & args,
         device const uchar * codes,
         threadgroup const char * act_tg,
         uint3 tgpig,
         uint simd_lane,
         uint output_pair,
-        thread int & u0_real,
-        thread int & u0_imag,
-        thread int & v0_real,
-        thread int & v0_imag,
-        thread int & u1_real,
-        thread int & u1_imag,
-        thread int & v1_real,
-        thread int & v1_imag) {
+        thread float4 & acc0,
+        thread float4 & acc1) {
     constexpr int groups_per_block   = 8;
     constexpr int lanes_per_group    = 32;
     constexpr int bytes_per_record   = 4;
@@ -2000,10 +1984,10 @@ static inline void row4_decode_pair2_accumulate_dual_o4_lookahead(
     constexpr int group_record_bytes = lanes_per_group * bytes_per_record;
     constexpr int k_pair             = 256;
 
-    const uint split = simd_lane >> 2;
-    const uint j     = (simd_lane & 3U) * 2U;
+    const uint split         = simd_lane >> 2;
+    const uint j             = (simd_lane & 3U) * 2U;
     const uint output_group0 = output_pair * 2U;
-    const int k_pairs = args.k / k_pair;
+    const int k_pairs        = args.k / k_pair;
     device const uchar * code0_ptr = codes +
         (ulong) tgpig.x * (ulong) k_pairs * (ulong) bytes_per_k_pair +
         (ulong) output_group0 * (ulong) group_record_bytes + (ulong) simd_lane * bytes_per_record;
@@ -2029,46 +2013,34 @@ static inline void row4_decode_pair2_accumulate_dual_o4_lookahead(
         const char2 next_activation1_low  = *((threadgroup const char2 *) (next_act_ptr + 128));
         const char2 next_activation1_high = *((threadgroup const char2 *) (next_act_ptr + 136));
 
-        row4_decode_pair2_apply(
+        row4_decode_pair2_lut16_apply(
             current_packed0,
             current_activation0_low,
             current_activation0_high,
             current_activation1_low,
             current_activation1_high,
-            u0_real,
-            u0_imag,
-            v0_real,
-            v0_imag);
-        row4_decode_pair2_apply(
+            acc0);
+        row4_decode_pair2_lut16_apply(
             current_packed1,
             current_activation0_low,
             current_activation0_high,
             current_activation1_low,
             current_activation1_high,
-            u1_real,
-            u1_imag,
-            v1_real,
-            v1_imag);
-        row4_decode_pair2_apply(
+            acc1);
+        row4_decode_pair2_lut16_apply(
             next_packed0,
             next_activation0_low,
             next_activation0_high,
             next_activation1_low,
             next_activation1_high,
-            u0_real,
-            u0_imag,
-            v0_real,
-            v0_imag);
-        row4_decode_pair2_apply(
+            acc0);
+        row4_decode_pair2_lut16_apply(
             next_packed1,
             next_activation0_low,
             next_activation0_high,
             next_activation1_low,
             next_activation1_high,
-            u1_real,
-            u1_imag,
-            v1_real,
-            v1_imag);
+            acc1);
 
         code0_ptr += 2 * bytes_per_k_pair;
         code1_ptr += 2 * bytes_per_k_pair;
@@ -2082,30 +2054,14 @@ static inline void row4_decode_pair2_accumulate_dual_o4_lookahead(
         const char2 activation0_high = *((threadgroup const char2 *) (act_ptr + 8));
         const char2 activation1_low  = *((threadgroup const char2 *) (act_ptr + 128));
         const char2 activation1_high = *((threadgroup const char2 *) (act_ptr + 136));
-        row4_decode_pair2_apply(
-            packed0,
-            activation0_low,
-            activation0_high,
-            activation1_low,
-            activation1_high,
-            u0_real,
-            u0_imag,
-            v0_real,
-            v0_imag);
-        row4_decode_pair2_apply(
-            packed1,
-            activation0_low,
-            activation0_high,
-            activation1_low,
-            activation1_high,
-            u1_real,
-            u1_imag,
-            v1_real,
-            v1_imag);
+        row4_decode_pair2_lut16_apply(
+            packed0, activation0_low, activation0_high, activation1_low, activation1_high, acc0);
+        row4_decode_pair2_lut16_apply(
+            packed1, activation0_low, activation0_high, activation1_low, activation1_high, acc1);
     }
 }
 
-kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead(
+kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
         device const uchar * codes                        [[buffer(1)]],
         device const ushort * scales                      [[buffer(2)]],
@@ -2128,58 +2084,33 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    int u0_real = 0;
-    int u0_imag = 0;
-    int v0_real = 0;
-    int v0_imag = 0;
-    int u1_real = 0;
-    int u1_imag = 0;
-    int v1_real = 0;
-    int v1_imag = 0;
-    row4_decode_pair2_accumulate_dual_o4_lookahead(
-        args,
-        codes,
-        act_tg,
-        tgpig,
-        simd_lane,
-        output_pair,
-        u0_real,
-        u0_imag,
-        v0_real,
-        v0_imag,
-        u1_real,
-        u1_imag,
-        v1_real,
-        v1_imag);
+    float4 acc0 = {};
+    float4 acc1 = {};
+    row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
+        args, codes, act_tg, tgpig, simd_lane, output_pair, acc0, acc1);
 
-    const int sum_u0_real = simd_sum(u0_real);
-    const int sum_u0_imag = simd_sum(u0_imag);
-    const int sum_v0_real = simd_sum(v0_real);
-    const int sum_v0_imag = simd_sum(v0_imag);
+    const int4 sum0 = int4(simd_sum(acc0));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
         const float sx = act_scales[0];
-        dst[output + 0] = row4_finish_i32(sum_u0_real + sum_v0_real, sx, scales[output + 0]);
-        dst[output + 1] = row4_finish_i32(-sum_u0_imag + sum_v0_imag, sx, scales[output + 1]);
-        dst[output + 2] = row4_finish_i32(sum_u0_imag + sum_v0_imag, sx, scales[output + 2]);
-        dst[output + 3] = row4_finish_i32(sum_u0_real - sum_v0_real, sx, scales[output + 3]);
+        dst[output + 0] = row4_finish_i32(sum0.x, sx, scales[output + 0]);
+        dst[output + 1] = row4_finish_i32(sum0.y, sx, scales[output + 1]);
+        dst[output + 2] = row4_finish_i32(sum0.z, sx, scales[output + 2]);
+        dst[output + 3] = row4_finish_i32(sum0.w, sx, scales[output + 3]);
     }
 
-    const int sum_u1_real = simd_sum(u1_real);
-    const int sum_u1_imag = simd_sum(u1_imag);
-    const int sum_v1_real = simd_sum(v1_real);
-    const int sum_v1_imag = simd_sum(v1_imag);
+    const int4 sum1 = int4(simd_sum(acc1));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
         const float sx = act_scales[0];
-        dst[output + 0] = row4_finish_i32(sum_u1_real + sum_v1_real, sx, scales[output + 0]);
-        dst[output + 1] = row4_finish_i32(-sum_u1_imag + sum_v1_imag, sx, scales[output + 1]);
-        dst[output + 2] = row4_finish_i32(sum_u1_imag + sum_v1_imag, sx, scales[output + 2]);
-        dst[output + 3] = row4_finish_i32(sum_u1_real - sum_v1_real, sx, scales[output + 3]);
+        dst[output + 0] = row4_finish_i32(sum1.x, sx, scales[output + 0]);
+        dst[output + 1] = row4_finish_i32(sum1.y, sx, scales[output + 1]);
+        dst[output + 2] = row4_finish_i32(sum1.z, sx, scales[output + 2]);
+        dst[output + 3] = row4_finish_i32(sum1.w, sx, scales[output + 3]);
     }
 }
 
-kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_qat_residual(
+kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32_qat_residual(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
         device const uchar * codes                        [[buffer(1)]],
         device const ushort * scales                      [[buffer(2)]],
@@ -2204,42 +2135,20 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_qa
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    int u0_real = 0;
-    int u0_imag = 0;
-    int v0_real = 0;
-    int v0_imag = 0;
-    int u1_real = 0;
-    int u1_imag = 0;
-    int v1_real = 0;
-    int v1_imag = 0;
-    row4_decode_pair2_accumulate_dual_o4_lookahead(
-        args,
-        codes,
-        act_tg,
-        tgpig,
-        simd_lane,
-        output_pair,
-        u0_real,
-        u0_imag,
-        v0_real,
-        v0_imag,
-        u1_real,
-        u1_imag,
-        v1_real,
-        v1_imag);
+    float4 acc0 = {};
+    float4 acc1 = {};
+    row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
+        args, codes, act_tg, tgpig, simd_lane, output_pair, acc0, acc1);
 
-    const int sum_u0_real = simd_sum(u0_real);
-    const int sum_u0_imag = simd_sum(u0_imag);
-    const int sum_v0_real = simd_sum(v0_real);
-    const int sum_v0_imag = simd_sum(v0_imag);
+    const int4 sum0 = int4(simd_sum(acc0));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
         const float sx = act_scales[0];
         const float4 value = {
-            row4_finish_i32(sum_u0_real + sum_v0_real, sx, scales[output + 0]),
-            row4_finish_i32(-sum_u0_imag + sum_v0_imag, sx, scales[output + 1]),
-            row4_finish_i32(sum_u0_imag + sum_v0_imag, sx, scales[output + 2]),
-            row4_finish_i32(sum_u0_real - sum_v0_real, sx, scales[output + 3]),
+            row4_finish_i32(sum0.x, sx, scales[output + 0]),
+            row4_finish_i32(sum0.y, sx, scales[output + 1]),
+            row4_finish_i32(sum0.z, sx, scales[output + 2]),
+            row4_finish_i32(sum0.w, sx, scales[output + 3]),
         };
         *((device float4 *) (dst + output)) = value;
 
@@ -2254,18 +2163,15 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_qa
         }
     }
 
-    const int sum_u1_real = simd_sum(u1_real);
-    const int sum_u1_imag = simd_sum(u1_imag);
-    const int sum_v1_real = simd_sum(v1_real);
-    const int sum_v1_imag = simd_sum(v1_imag);
+    const int4 sum1 = int4(simd_sum(acc1));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
         const float sx = act_scales[0];
         const float4 value = {
-            row4_finish_i32(sum_u1_real + sum_v1_real, sx, scales[output + 0]),
-            row4_finish_i32(-sum_u1_imag + sum_v1_imag, sx, scales[output + 1]),
-            row4_finish_i32(sum_u1_imag + sum_v1_imag, sx, scales[output + 2]),
-            row4_finish_i32(sum_u1_real - sum_v1_real, sx, scales[output + 3]),
+            row4_finish_i32(sum1.x, sx, scales[output + 0]),
+            row4_finish_i32(sum1.y, sx, scales[output + 1]),
+            row4_finish_i32(sum1.z, sx, scales[output + 2]),
+            row4_finish_i32(sum1.w, sx, scales[output + 3]),
         };
         *((device float4 *) (dst + output)) = value;
 
