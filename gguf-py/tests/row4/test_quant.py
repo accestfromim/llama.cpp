@@ -6,6 +6,7 @@ import pytest
 from row4.quant import (
     decode_row4_codes,
     pack_row4_m16k128,
+    pack_row4_m32k256_pair2,
     pack_split8_group,
     pack_w8_m16k128,
     quantize_row4_codes,
@@ -78,6 +79,80 @@ def test_m16k128_offsets_match_canonical_formula() -> None:
                         assert int(flat[offset]) == expected
 
 
+def _pair2_code_at(packed: np.ndarray, group: int, k: int) -> int:
+    output_tile = group // 8
+    output_group = group % 8
+    k_tile = k // 256
+    k_half = (k % 256) // 128
+    r = k % 128
+    lane = (r // 16) * 4 + ((r % 8) // 2)
+    byte_index = lane * 4 + 2 * k_half + (r & 1)
+    byte = int(packed[output_tile, k_tile, output_group, byte_index])
+    return byte >> 4 if r & 8 else byte & 0xF
+
+
+def _v1_code_at(packed: np.ndarray, group: int, k: int) -> int:
+    output_tile = group // 4
+    output_group = group % 4
+    k_tile = k // 128
+    r = k % 128
+    byte = int(packed[output_tile, k_tile, output_group, (r // 16) * 8 + (r % 8)])
+    return byte >> 4 if r & 8 else byte & 0xF
+
+
+def test_m32k256_pair2_offsets_exhaustively_match_canonical_formula() -> None:
+    codes = (
+        np.arange(16 * 512, dtype=np.uint32).reshape(16, 512)
+        + np.arange(16, dtype=np.uint32)[:, None] * 3
+    ).astype(np.uint8) & np.uint8(0xF)
+
+    packed = pack_row4_m32k256_pair2(codes)
+    assert packed.shape == (2, 2, 8, 128)
+    assert packed.nbytes == codes.size // 2
+    for group in range(codes.shape[0]):
+        for k in range(codes.shape[1]):
+            assert _pair2_code_at(packed, group, k) == int(codes[group, k])
+
+
+def test_m32k256_pair2_is_lossless_v1_payload_permutation() -> None:
+    rng = np.random.default_rng(0x4A32)
+    codes = rng.integers(0, 16, size=(16, 512), dtype=np.uint8)
+    packed_v1 = pack_row4_m16k128(codes)
+    packed_v2 = pack_row4_m32k256_pair2(codes)
+
+    assert packed_v1.nbytes == packed_v2.nbytes == codes.size // 2
+    expected_from_v1 = (
+        packed_v1.reshape(2, 2, 2, 2, 4, 8, 4, 2)
+        .transpose(0, 2, 1, 4, 5, 6, 3, 7)
+        .reshape(2, 2, 8, 128)
+    )
+    np.testing.assert_array_equal(packed_v2, expected_from_v1)
+
+    boundary_k = (0, 1, 7, 8, 15, 16, 127, 128, 255, 256, 383, 511)
+    for group in (0, 3, 4, 7, 8, 11, 12, 15):
+        for k in boundary_k:
+            expected = int(codes[group, k])
+            assert _v1_code_at(packed_v1, group, k) == expected
+            assert _pair2_code_at(packed_v2, group, k) == expected
+
+    unpacked_v1 = np.asarray(
+        [
+            [_v1_code_at(packed_v1, group, k) for k in range(codes.shape[1])]
+            for group in range(codes.shape[0])
+        ],
+        dtype=np.uint8,
+    )
+    unpacked_v2 = np.asarray(
+        [
+            [_pair2_code_at(packed_v2, group, k) for k in range(codes.shape[1])]
+            for group in range(codes.shape[0])
+        ],
+        dtype=np.uint8,
+    )
+    np.testing.assert_array_equal(unpacked_v1, codes)
+    np.testing.assert_array_equal(unpacked_v2, codes)
+
+
 def test_w8_half_away_zero_row_and_tiled_order() -> None:
     row = np.asarray([-127.0, -2.5, -0.5, 0.0, 0.5, 2.5, 127.0], dtype=np.float32)
     weight = np.stack((row, np.zeros_like(row)))
@@ -99,3 +174,9 @@ def test_w8_half_away_zero_row_and_tiled_order() -> None:
 def test_row4_packer_rejects_unaligned_shapes(shape: tuple[int, int]) -> None:
     with pytest.raises(ValueError, match="O16/K128"):
         pack_row4_m16k128(np.zeros(shape, dtype=np.uint8))
+
+
+@pytest.mark.parametrize("shape", [(7, 256), (8, 255), (4, 128)])
+def test_row4_pair2_packer_rejects_unaligned_shapes(shape: tuple[int, int]) -> None:
+    with pytest.raises(ValueError, match="O32/K256"):
+        pack_row4_m32k256_pair2(np.zeros(shape, dtype=np.uint8))

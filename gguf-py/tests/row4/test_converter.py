@@ -29,6 +29,7 @@ from convert_row4_qwen3 import (  # noqa: E402
     REFERENCE_YARN_GGUF_PRE_FACTOR,
     REFERENCE_YARN_RAW_ATTN_FACTOR,
     Row4BundleWriter,
+    _build_parser,
     _atomic_publish_no_clobber,
     _cleanup_private_temporary,
     _create_private_temporary,
@@ -44,6 +45,7 @@ from convert_row4_qwen3 import (  # noqa: E402
 )
 from row4.quant import decode_row4_codes  # noqa: E402
 from row4.guard import is_qwen3_row4_checkpoint  # noqa: E402
+from row4.spec import ROW4_LAYOUT_V1, ROW4_LAYOUT_V2  # noqa: E402
 
 
 def _bf16_from_bits(bits: list[int]) -> torch.Tensor:
@@ -164,6 +166,59 @@ def test_fused_row4_stream_preserves_matrix_order_and_exact_bytes() -> None:
     assert [int(scale_bits[offset]) for offset in (0, 128, 256)] == [0x3F80, 0x4000, 0x4040]
 
 
+def test_cli_and_bundle_default_remain_byte_identical_v1() -> None:
+    args = _build_parser().parse_args(["checkpoint", "--dry-run"])
+    assert args.row4_layout == ROW4_LAYOUT_V1
+
+    reader = _FakeReader()
+    logical_group = decode_row4_codes(np.arange(128, dtype=np.uint8) & np.uint8(0xF))
+    reader.weights["weight"] = torch.from_numpy(np.tile(logical_group, (32, 1))).to(
+        torch.bfloat16
+    )
+    reader.scales["scale"] = torch.ones(128, dtype=torch.bfloat16)
+    default_bytes = b"".join(
+        chunk.tobytes()
+        for chunk in Row4BundleWriter(  # type: ignore[arg-type]
+            reader,
+            ["weight"],
+            ["scale"],
+        ).iter_codes()
+    )
+    explicit_v1_bytes = b"".join(
+        chunk.tobytes()
+        for chunk in Row4BundleWriter(  # type: ignore[arg-type]
+            reader,
+            ["weight"],
+            ["scale"],
+            ROW4_LAYOUT_V1,
+        ).iter_codes()
+    )
+    assert default_bytes == explicit_v1_bytes
+
+
+def test_fused_row4_v2_stream_preserves_matrix_order_and_payload_size() -> None:
+    reader = _FakeReader()
+    weight_names = ["q.weight", "k.weight", "v.weight"]
+    scale_names = ["q.scale", "k.scale", "v.scale"]
+    for code, weight_name, scale_name in zip((1, 2, 3), weight_names, scale_names):
+        logical_group = decode_row4_codes(np.full(256, code, dtype=np.uint8))
+        logical_weight = np.tile(logical_group, (32, 1))
+        reader.weights[weight_name] = torch.from_numpy(logical_weight).to(torch.bfloat16)
+        reader.scales[scale_name] = torch.full((128,), float(code), dtype=torch.bfloat16)
+
+    bundle = Row4BundleWriter(  # type: ignore[arg-type]
+        reader,
+        weight_names,
+        scale_names,
+        ROW4_LAYOUT_V2,
+    )
+    code_chunks = list(bundle.iter_codes())
+    assert [chunk.shape for chunk in code_chunks] == [(4, 1, 8, 128)] * 3
+    code_stream = b"".join(chunk.tobytes() for chunk in code_chunks)
+    assert len(code_stream) == 3 * 128 * 256 // 8
+    assert [code_stream[offset] for offset in (0, 4096, 8192)] == [0x11, 0x22, 0x33]
+
+
 def test_tiny_tensor_plan_streams_a_real_64_aligned_gguf(tmp_path: Path) -> None:
     dimensions = Qwen3Dimensions(
         layers=1,
@@ -233,6 +288,86 @@ def test_tiny_tensor_plan_streams_a_real_64_aligned_gguf(tmp_path: Path) -> None
         output_codes.shape,
         np.asarray([128, 16, 1, 8], dtype=np.uint64),
     )
+    assert output.stat().st_size >= sum(entry.nbytes for entry in plan)
+
+
+def test_tiny_v2_tensor_plan_streams_a_real_128_aligned_gguf(tmp_path: Path) -> None:
+    dimensions = Qwen3Dimensions(
+        layers=1,
+        hidden=256,
+        intermediate=256,
+        heads=2,
+        kv_heads=1,
+        head_dim=128,
+        vocab=128,
+    )
+    tensors: dict[str, torch.Tensor] = {
+        "model.embed_tokens.weight": torch.zeros((128, 256), dtype=torch.bfloat16),
+        "model.norm.weight": torch.ones(256, dtype=torch.bfloat16),
+        "lm_head.weight": torch.arange(-128, 128, dtype=torch.float32)[None, :]
+        .repeat(128, 1)
+        .to(torch.bfloat16),
+        "model.layers.0.input_layernorm.weight": torch.ones(256, dtype=torch.bfloat16),
+        "model.layers.0.post_attention_layernorm.weight": torch.ones(256, dtype=torch.bfloat16),
+        "model.layers.0.self_attn.q_norm.weight": torch.ones(128, dtype=torch.bfloat16),
+        "model.layers.0.self_attn.k_norm.weight": torch.ones(128, dtype=torch.bfloat16),
+    }
+    projection_shapes = {
+        "self_attn.q_proj": (256, 256),
+        "self_attn.k_proj": (128, 256),
+        "self_attn.v_proj": (128, 256),
+        "self_attn.o_proj": (256, 256),
+        "mlp.gate_proj": (256, 256),
+        "mlp.up_proj": (256, 256),
+        "mlp.down_proj": (256, 256),
+    }
+    for code, (suffix, shape) in enumerate(projection_shapes.items(), start=1):
+        logical_group = decode_row4_codes(np.full(shape[1], code, dtype=np.uint8))
+        tensors[f"model.layers.0.{suffix}.weight"] = torch.from_numpy(
+            np.tile(logical_group, (shape[0] // 4, 1))
+        ).to(torch.bfloat16)
+        tensors[f"model.layers.0.{suffix}.weight_scale"] = torch.full(
+            (shape[0],), float(code), dtype=torch.bfloat16
+        )
+
+    reader = _PlanReader(tensors)
+    plan = build_tensor_plan(  # type: ignore[arg-type]
+        reader,
+        dimensions,
+        ROW4_LAYOUT_V2,
+    )
+    output = tmp_path / "tiny-row4-v2.gguf"
+    writer = gguf.GGUFWriter(output, arch="qwen3")
+    add_model_metadata(
+        writer,
+        {"rms_norm_eps": 1.0e-6},
+        dimensions,
+        ROW4_LAYOUT_V2,
+    )
+    register_tensor_plan(writer, plan)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    write_tensor_plan(writer, plan, verbose=False)
+    writer.close()
+
+    gguf_reader = gguf.GGUFReader(output)
+    assert gguf_reader.alignment == 128
+    assert gguf_reader.get_field("row4.schema_version").contents() == 2
+    assert (
+        gguf_reader.get_field("row4.weight_layout").contents()
+        == "m32k256_pair2_split8_v2"
+    )
+    assert gguf_reader.get_field("row4.execution_profile").contents() == "metal_only_v1"
+    assert all(tensor.data_offset % 128 == 0 for tensor in gguf_reader.tensors)
+    tensor_map = {tensor.name: tensor for tensor in gguf_reader.tensors}
+    qkv = tensor_map["blk.0.attn_qkv.row4.codes"]
+    assert qkv.tensor_type == gguf.GGMLQuantizationType.ROW4_CODES_PAIR2
+    np.testing.assert_array_equal(
+        qkv.shape,
+        np.asarray([128, 8, 1, 16], dtype=np.uint64),
+    )
+    qkv_bytes = np.asarray(qkv.data).reshape(-1)
+    assert [int(qkv_bytes[offset]) for offset in (0, 8192, 12288)] == [0x11, 0x22, 0x33]
     assert output.stat().st_size >= sum(entry.nbytes for entry in plan)
 
 
@@ -641,6 +776,40 @@ def test_failed_conversion_removes_private_temp_and_public_output(
         )
     assert not output.exists() and not output.is_symlink()
     assert list(tmp_path.glob(".failed.gguf.tmp-*")) == []
+
+
+@pytest.mark.parametrize(
+    ("row4_layout", "raw_dtype"),
+    [
+        (ROW4_LAYOUT_V1, gguf.GGMLQuantizationType.ROW4_CODES_PAIR2),
+        (ROW4_LAYOUT_V2, gguf.GGMLQuantizationType.ROW4_CODES),
+    ],
+)
+def test_write_conversion_rejects_tensor_plan_layout_mismatch_before_output(
+    tmp_path: Path,
+    row4_layout: str,
+    raw_dtype: gguf.GGMLQuantizationType,
+) -> None:
+    output = tmp_path / "mismatched.gguf"
+    report = SimpleNamespace(config={}, dimensions=None)
+    plan = [
+        SimpleNamespace(
+            name="blk.0.attn_qkv.row4.codes",
+            raw_dtype=raw_dtype,
+        )
+    ]
+
+    with pytest.raises(ValueError, match=r"tensor plan requires raw_dtype=.*mismatches"):
+        converter.write_conversion_output(
+            tmp_path,
+            output,
+            report,
+            plan,  # type: ignore[arg-type]
+            verbose=False,
+            row4_layout=row4_layout,
+        )
+    assert not output.exists() and not output.is_symlink()
+    assert list(tmp_path.glob(".mismatched.gguf.tmp-*")) == []
 
 
 def test_generic_converter_row4_rejection_exempts_vocab_only() -> None:
