@@ -228,20 +228,17 @@ printf 'artifacts: %s.{json,stderr.log,host_paths.log,paths.log,meta}\n' "$prefi
 
 # Validate the complete reference-model tensor inventory and strict Row4
 # metadata before timing. Runtime markers below prove each logical shape ran.
-PYTHONPATH="$repo_root/gguf-py${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" - "$model" <<'PY' | tee "$prefix.host_paths.log"
+PYTHONPATH="$repo_root/gguf-py${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" - "$model" "$backend" <<'PY' | tee "$prefix.host_paths.log"
 import re
 import sys
 
 from gguf import GGMLQuantizationType, GGUFReader
 
 reader = GGUFReader(sys.argv[1])
+backend = sys.argv[2]
 tensors = {tensor.name: tensor for tensor in reader.tensors}
 if len(tensors) != 436:
     raise SystemExit(f"expected 436 tensors, found {len(tensors)}")
-if reader.alignment != 64:
-    raise SystemExit(f"expected GGUF alignment 64, found {reader.alignment}")
-if any(tensor.data_offset % 64 for tensor in reader.tensors):
-    raise SystemExit("found tensor payload not aligned to 64 bytes")
 
 
 def field_value(key: str):
@@ -254,12 +251,47 @@ def field_value(key: str):
     return part.reshape(-1)[0].item()
 
 
+schema_version = int(field_value("row4.schema_version"))
+if schema_version == 1:
+    row4_layout = "m16k128_split8_v1"
+    row4_type = GGMLQuantizationType.ROW4_CODES
+    alignment = 64
+    physical_by_label = {
+        "qkv": (64, 4, 32, 384),
+        "o": (64, 4, 32, 256),
+        "gate_up": (64, 4, 32, 1536),
+        "down": (64, 4, 96, 256),
+    }
+    if "row4.execution_profile" in reader.fields:
+        raise SystemExit("schema v1 forbids row4.execution_profile")
+elif schema_version == 2:
+    if backend != "metal":
+        raise SystemExit("schema v2 is Metal-only and cannot be benchmarked on CPU")
+    row4_layout = "m32k256_pair2_split8_v2"
+    row4_type = GGMLQuantizationType.ROW4_CODES_PAIR2
+    alignment = 128
+    physical_by_label = {
+        "qkv": (128, 8, 16, 192),
+        "o": (128, 8, 16, 128),
+        "gate_up": (128, 8, 16, 768),
+        "down": (128, 8, 48, 128),
+    }
+    if field_value("row4.execution_profile") != "metal_only_v1":
+        raise SystemExit("schema v2 requires row4.execution_profile=metal_only_v1")
+else:
+    raise SystemExit(f"unsupported row4.schema_version: {schema_version}")
+
+if reader.alignment != alignment:
+    raise SystemExit(f"expected GGUF alignment {alignment}, found {reader.alignment}")
+if any(tensor.data_offset % alignment for tensor in reader.tensors):
+    raise SystemExit(f"found tensor payload not aligned to {alignment} bytes")
+
 expected_metadata = {
     "general.architecture": "qwen3",
     "general.file_type": 43,
     "general.quantization_version": 2,
-    "row4.schema_version": 1,
-    "row4.weight_layout": "m16k128_split8_v1",
+    "row4.schema_version": schema_version,
+    "row4.weight_layout": row4_layout,
     "row4.codebook": "uv_axis_v1",
     "row4.numeric_profile": "bf16_a8_away_i32_bf16_v1",
     "row4.qkv_order": "q_k_v",
@@ -272,13 +304,15 @@ for key, expected in expected_metadata.items():
         raise SystemExit(f"invalid {key}: expected {expected!r}, found {actual!r}")
 
 row4_specs = (
-    ("qkv", re.compile(r"^blk\.(\d+)\.attn_qkv\.row4\.codes$"), (64, 4, 32, 384), 6144, 4096),
-    ("o", re.compile(r"^blk\.(\d+)\.attn_output\.row4\.codes$"), (64, 4, 32, 256), 4096, 4096),
-    ("gate_up", re.compile(r"^blk\.(\d+)\.ffn_gate_up\.row4\.codes$"), (64, 4, 32, 1536), 24576, 4096),
-    ("down", re.compile(r"^blk\.(\d+)\.ffn_down\.row4\.codes$"), (64, 4, 96, 256), 4096, 12288),
+    ("qkv", re.compile(r"^blk\.(\d+)\.attn_qkv\.row4\.codes$"), 6144, 4096),
+    ("o", re.compile(r"^blk\.(\d+)\.attn_output\.row4\.codes$"), 4096, 4096),
+    ("gate_up", re.compile(r"^blk\.(\d+)\.ffn_gate_up\.row4\.codes$"), 24576, 4096),
+    ("down", re.compile(r"^blk\.(\d+)\.ffn_down\.row4\.codes$"), 4096, 12288),
 )
 
-for label, pattern, physical, logical_o, logical_k in row4_specs:
+print(f"row4_host: schema={schema_version} layout={row4_layout} alignment={alignment} backend={backend}")
+for label, pattern, logical_o, logical_k in row4_specs:
+    physical = physical_by_label[label]
     matches = sorted(
         (tensor for name, tensor in tensors.items() if pattern.fullmatch(name)),
         key=lambda tensor: int(pattern.fullmatch(tensor.name).group(1)),
@@ -291,7 +325,7 @@ for label, pattern, physical, logical_o, logical_k in row4_specs:
     invalid = [
         tensor.name
         for tensor in matches
-        if tensor.tensor_type != GGMLQuantizationType.ROW4_CODES or tuple(map(int, tensor.shape)) != physical
+        if tensor.tensor_type != row4_type or tuple(map(int, tensor.shape)) != physical
     ]
     if invalid:
         raise SystemExit(f"invalid {label} Row4 physical tensor(s): {', '.join(invalid[:4])}")
@@ -329,6 +363,12 @@ if (
     raise SystemExit("invalid or missing output.w8.scales tensor")
 print("row4_host: op=w8a8 tensor=lm_head count=1 O=151936 K=4096 physical=128x16x32x9496")
 PY
+
+row4_layout=$(sed -n 's/^row4_host: schema=[0-9][0-9]* layout=\([^ ]*\) .*/\1/p' "$prefix.host_paths.log" | sed -n '1p')
+if [[ -z $row4_layout ]]; then
+    printf 'failed to determine validated Row4 layout\n' >&2
+    exit 4
+fi
 
 env_args=(GGML_ROW4_CPU_DEBUG=1)
 if [[ -n $force_path ]]; then
@@ -380,7 +420,7 @@ if [[ $require_markers != 0 ]]; then
             row4_cpu_panel=1
             row4_cpu_aqpack=bf16_rne_a8_away_pairk8_v1
         fi
-        row4_cpu_prefix="row4_cpu: op=row4 path=$row4_cpu_path layout=m16k128_split8_v1 B=$row4_cpu_batch"
+        row4_cpu_prefix="row4_cpu: op=row4 path=$row4_cpu_path layout=$row4_layout B=$row4_cpu_batch"
         w8_cpu_prefix="row4_cpu: op=w8a8 path=$w8_cpu_path layout=s8_m16k128_rowmajor_v1 B=1"
         required_runtime_markers=(
             "$row4_cpu_prefix O=6144 K=4096 nth=$threads aqpack=$row4_cpu_aqpack panel=$row4_cpu_panel prepack=0"
@@ -396,7 +436,7 @@ if [[ $require_markers != 0 ]]; then
             row4_dispatch=prefill
             row4_act_rows='[0-9]+'
         fi
-        row4_metal_prefix="ROW4 Metal W1A8 path: $row4_dispatch layout=m16k128_split8_v1 act_rows=$row4_act_rows"
+        row4_metal_prefix="ROW4 Metal W1A8 path: $row4_dispatch layout=$row4_layout act_rows=$row4_act_rows"
         w8_metal_prefix='ROW8 Metal W8A8 lm_head path: decode layout=s8_m16k128_rowmajor_v1 act_rows=1'
         gate_up_metal_marker="$row4_metal_prefix O=24576 K=4096 "
         if [[ $mode == pp ]]; then

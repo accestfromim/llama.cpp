@@ -3146,22 +3146,37 @@ struct test_fairy2i_wide_linear_bundle : public test_case {
 
 struct test_row_quant_linear : public test_case {
     const bool    w8a8;
+    const bool    pair2;
     const int64_t O;
     const int64_t N;
     const int64_t K;
 
-    test_row_quant_linear(bool w8a8, int64_t O, int64_t N, int64_t K) : w8a8(w8a8), O(O), N(N), K(K) {}
+    test_row_quant_linear(bool w8a8, int64_t O, int64_t N, int64_t K, bool pair2 = false) :
+        w8a8(w8a8),
+        pair2(pair2),
+        O(O),
+        N(N),
+        K(K) {
+        GGML_ASSERT(!w8a8 || !pair2);
+    }
 
     bool run_whole_graph() override { return true; }
 
-    std::string vars() override { return VARS_TO_STR4(w8a8, O, N, K); }
+    std::string vars() override {
+        std::string result = VARS_TO_STR4(w8a8, O, N, K);
+        if (pair2) {
+            result += ",layout=pair2";
+        }
+        return result;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, N);
         ggml_set_name(x, "x");
 
-        ggml_tensor * codes = w8a8 ? ggml_new_tensor_4d(ctx, GGML_TYPE_I8, 128, 16, K / 128, O / 16) :
-                                     ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, K / 128, O / 16);
+        ggml_tensor * codes = w8a8  ? ggml_new_tensor_4d(ctx, GGML_TYPE_I8, 128, 16, K / 128, O / 16) :
+                              pair2 ? ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, K / 256, O / 32) :
+                                      ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, K / 128, O / 16);
         ggml_set_name(codes, "codes");
 
         ggml_tensor * scales = ggml_new_tensor_1d(ctx, w8a8 ? GGML_TYPE_F32 : GGML_TYPE_BF16, O);
@@ -7326,6 +7341,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     const char * row4_decode_perf_shapes = getenv("LLAMA_ROW4_DECODE_PERF_SHAPES");
     if (row4_decode_perf_shapes && strcmp(row4_decode_perf_shapes, "0") != 0) {
+        const char *                      row4_pair2_perf_layout = getenv("LLAMA_ROW4_PAIR2_PERF_LAYOUT");
+        const bool                        pair2 = row4_pair2_perf_layout && strcmp(row4_pair2_perf_layout, "0") != 0;
         const std::pair<int64_t, int64_t> row4_shapes[] = {
             { 6144,  4096  },
             { 4096,  4096  },
@@ -7333,7 +7350,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             { 4096,  12288 },
         };
         for (const std::pair<int64_t, int64_t> & shape : row4_shapes) {
-            test_cases.emplace_back(new test_row_quant_linear(false, shape.first, 1, shape.second));
+            test_cases.emplace_back(new test_row_quant_linear(false, shape.first, 1, shape.second, pair2));
         }
         test_cases.emplace_back(new test_row_quant_linear(true, 151936, 1, 4096));
     }
