@@ -19,6 +19,10 @@ struct tensor_quantization {
     ggml_type quant = GGML_TYPE_COUNT;
 };
 
+static bool is_row4_opaque_type(ggml_type type) {
+    return type == GGML_TYPE_ROW4_CODES || type == GGML_TYPE_ROW4_CODES_PAIR2;
+}
+
 static void zeros(std::ofstream & file, size_t n) {
     char zero = 0;
     for (size_t i = 0; i < n; ++i) {
@@ -537,6 +541,19 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
 }
 
 static void llama_model_quantize_impl(const std::string & fname_inp, const std::string & fname_out, const llama_model_quantize_params * params) {
+    if (is_row4_opaque_type(params->output_tensor_type) || is_row4_opaque_type(params->token_embedding_type)) {
+        throw std::runtime_error("opaque Row4 code tensors can only be produced by gguf-py/convert_row4_qwen3.py");
+    }
+    if (params->tensor_types) {
+        const auto & tensor_types = *static_cast<const std::vector<tensor_quantization> *>(params->tensor_types);
+        for (const auto & tensor_type : tensor_types) {
+            if (is_row4_opaque_type(tensor_type.quant)) {
+                throw std::runtime_error(
+                    "opaque Row4 code tensors can only be produced by gguf-py/convert_row4_qwen3.py");
+            }
+        }
+    }
+
     ggml_type default_type;
     llama_ftype ftype = params->ftype;
 
