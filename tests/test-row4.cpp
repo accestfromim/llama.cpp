@@ -25,6 +25,8 @@ namespace {
 
 constexpr int64_t ROW4_TILE_K = 128;
 constexpr int64_t ROW4_TILE_O = 16;
+constexpr int64_t ROW4_PAIR2_TILE_K = 256;
+constexpr int64_t ROW4_PAIR2_TILE_O = 32;
 
 // Canonical uv_axis_v1 codebook, indexed as [code][row within an O4 group].
 constexpr int8_t ROW4_CODEBOOK[16][4] = {
@@ -135,6 +137,41 @@ static std::vector<uint8_t> pack_row4_codes(const std::vector<uint8_t> & logical
 
 static uint8_t unpack_row4_code(const std::vector<uint8_t> & packed, int64_t o, int64_t k, int64_t logical_k) {
     const uint8_t byte = packed[row4_offset(o, k, logical_k)];
+    return (k % 16) < 8 ? byte & 0x0fu : byte >> 4;
+}
+
+static size_t row4_pair2_offset(int64_t o, int64_t k, int64_t logical_k) {
+    const int64_t output_block = o / ROW4_PAIR2_TILE_O;
+    const int64_t group        = (o % ROW4_PAIR2_TILE_O) / 4;
+    const int64_t k_pair       = k / ROW4_PAIR2_TILE_K;
+    const int64_t k_half       = (k % ROW4_PAIR2_TILE_K) / ROW4_TILE_K;
+    const int64_t inner        = k % ROW4_TILE_K;
+    const int64_t split        = inner / 16;
+    const int64_t j            = inner % 8;
+    const int64_t lane         = split * 4 + j / 2;
+    const int64_t byte         = 2 * k_half + j % 2;
+    const int64_t k_pairs      = logical_k / ROW4_PAIR2_TILE_K;
+    return (size_t) (((((output_block * k_pairs + k_pair) * 8 + group) * 32 + lane) * 4) + byte);
+}
+
+static std::vector<uint8_t> pack_row4_pair2_codes(const std::vector<uint8_t> & logical_codes, int64_t o, int64_t k) {
+    std::vector<uint8_t> packed((size_t) o * (size_t) k / 8, 0);
+    for (int64_t group = 0; group < o / 4; ++group) {
+        for (int64_t ik = 0; ik < k; ++ik) {
+            const uint8_t code   = logical_codes[(size_t) group * (size_t) k + (size_t) ik];
+            const size_t  offset = row4_pair2_offset(group * 4, ik, k);
+            if ((ik % 16) < 8) {
+                packed[offset] = (uint8_t) ((packed[offset] & 0xf0u) | code);
+            } else {
+                packed[offset] = (uint8_t) ((packed[offset] & 0x0fu) | (uint8_t) (code << 4));
+            }
+        }
+    }
+    return packed;
+}
+
+static uint8_t unpack_row4_pair2_code(const std::vector<uint8_t> & packed, int64_t o, int64_t k, int64_t logical_k) {
+    const uint8_t byte = packed[row4_pair2_offset(o, k, logical_k)];
     return (k % 16) < 8 ? byte & 0x0fu : byte >> 4;
 }
 
@@ -317,6 +354,68 @@ static bool test_split8_layout() {
     return ok;
 }
 
+static bool test_pair2_layout() {
+    constexpr int64_t O = 64;
+    constexpr int64_t K = 512;
+
+    std::vector<uint8_t> logical((size_t) (O / 4) * K);
+    for (int64_t group = 0; group < O / 4; ++group) {
+        for (int64_t k = 0; k < K; ++k) {
+            logical[(size_t) group * K + k] = (uint8_t) ((13 * group + 7 * k + k / 128) & 15);
+        }
+    }
+
+    const std::vector<uint8_t> v1    = pack_row4_codes(logical, O, K);
+    const std::vector<uint8_t> pair2 = pack_row4_pair2_codes(logical, O, K);
+    bool                       ok    = pair2.size() == (size_t) O * K / 8 && pair2.size() == v1.size();
+
+    for (int64_t group = 0; group < O / 4; ++group) {
+        for (int64_t k = 0; k < K; ++k) {
+            const uint8_t expected = logical[(size_t) group * K + k];
+            const uint8_t actual   = unpack_row4_pair2_code(pair2, group * 4, k, K);
+            if (actual != expected) {
+                fprintf(stderr, "Row4 pair2 mismatch group=%lld k=%lld actual=%u expected=%u\n", (long long) group,
+                        (long long) k, actual, expected);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    // Pair2 is a pure permutation of two adjacent v1 K128 tiles.  Every lane
+    // stores the two v1 bytes for the first half followed by the two bytes for
+    // the second half.
+    for (int64_t ob = 0; ob < O / ROW4_PAIR2_TILE_O; ++ob) {
+        for (int64_t kp = 0; kp < K / ROW4_PAIR2_TILE_K; ++kp) {
+            for (int64_t group = 0; group < 8; ++group) {
+                for (int64_t lane = 0; lane < 32; ++lane) {
+                    const int64_t output_group = ob * 8 + group;
+                    const int64_t split        = lane / 4;
+                    const int64_t j            = (lane % 4) * 2;
+                    const size_t  pair_base    = row4_pair2_offset(output_group * 4, kp * 256 + split * 16 + j, K);
+                    for (int64_t half = 0; half < 2; ++half) {
+                        for (int64_t byte = 0; byte < 2; ++byte) {
+                            const int64_t k         = kp * 256 + half * 128 + split * 16 + j + byte;
+                            const size_t  v1_offset = row4_offset(output_group * 4, k, K);
+                            if (pair2[pair_base + 2 * half + byte] != v1[v1_offset]) {
+                                fprintf(stderr,
+                                        "Row4 pair2 permutation mismatch ob=%lld kp=%lld group=%lld lane=%lld "
+                                        "half=%lld byte=%lld\n",
+                                        (long long) ob, (long long) kp, (long long) group, (long long) lane,
+                                        (long long) half, (long long) byte);
+                                ok = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    printf("  Row4 M32K256 pair2 layout: exhaustive roundtrip and v1 permutation - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool test_bf16_and_rounding() {
     struct bf16_case {
         const char * label;
@@ -449,10 +548,22 @@ static std::vector<uint8_t> make_row4_codes(int64_t o, int64_t k) {
     std::vector<uint8_t> logical((size_t) (o / 4) * (size_t) k);
     for (int64_t group = 0; group < o / 4; ++group) {
         for (int64_t ik = 0; ik < k; ++ik) {
-            logical[(size_t) group * (size_t) k + (size_t) ik] = (uint8_t) ((5 * group + 3 * ik) & 15);
+            logical[(size_t) group * (size_t) k + (size_t) ik] =
+                (uint8_t) ((5 * group + 3 * ik + 7 * (ik / 128) + 11 * (ik / 256)) & 15);
         }
     }
     return pack_row4_codes(logical, o, k);
+}
+
+static std::vector<uint8_t> make_row4_pair2_codes(int64_t o, int64_t k) {
+    std::vector<uint8_t> logical((size_t) (o / 4) * (size_t) k);
+    for (int64_t group = 0; group < o / 4; ++group) {
+        for (int64_t ik = 0; ik < k; ++ik) {
+            logical[(size_t) group * (size_t) k + (size_t) ik] =
+                (uint8_t) ((5 * group + 3 * ik + 7 * (ik / 128) + 11 * (ik / 256)) & 15);
+        }
+    }
+    return pack_row4_pair2_codes(logical, o, k);
 }
 
 static std::vector<int8_t> make_w8_codes(int64_t o, int64_t k) {
@@ -476,6 +587,7 @@ static std::vector<float> make_w8_scales(int64_t o) {
 
 enum class linear_kind {
     row4,
+    row4_pair2,
     w8a8,
 };
 
@@ -566,18 +678,24 @@ static bool run_operator_backend(std::vector<float> &          output,
         codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, k / 128, o / 16);
         scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
         result = ggml_row4_linear(ctx, x, codes, scales, o, k);
+    } else if (kind == linear_kind::row4_pair2) {
+        codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, o / 32);
+        scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
+        result = ggml_row4_linear(ctx, x, codes, scales, o, k);
     } else {
         codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, 128, 16, k / 128, o / 16);
         scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, o);
         result = ggml_w8a8_linear(ctx, x, codes, scales, o, k);
     }
 
-    int32_t op_params[3];
+    const bool is_row4 = kind != linear_kind::w8a8;
+    int32_t    op_params[3];
     memcpy(op_params, result->op_params, sizeof(op_params));
-    bool ok = result->type == GGML_TYPE_F32 && result->ne[0] == o && result->ne[1] == tokens &&
-              result->op == (kind == linear_kind::row4 ? GGML_OP_ROW4_LINEAR : GGML_OP_W8A8_LINEAR) &&
-              result->src[0] == x && result->src[1] == codes && result->src[2] == scales && op_params[0] == 1 &&
-              op_params[1] == o && op_params[2] == k && ggml_backend_supports_op(backend, result);
+    const int expected_layout = kind == linear_kind::row4_pair2 ? 2 : 1;
+    bool      ok = result->type == GGML_TYPE_F32 && result->ne[0] == o && result->ne[1] == tokens &&
+                   result->op == (is_row4 ? GGML_OP_ROW4_LINEAR : GGML_OP_W8A8_LINEAR) && result->src[0] == x &&
+                   result->src[1] == codes && result->src[2] == scales && op_params[0] == expected_layout &&
+                   op_params[1] == o && op_params[2] == k && ggml_backend_supports_op(backend, result);
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
@@ -591,7 +709,7 @@ static bool run_operator_backend(std::vector<float> &          output,
     }
 
     ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
-    if (kind == linear_kind::row4) {
+    if (is_row4) {
         ggml_backend_tensor_set(codes, row4_codes.data(), 0, row4_codes.size());
         ggml_backend_tensor_set(scales, row4_scales.data(), 0, row4_scales.size() * sizeof(uint16_t));
     } else {
@@ -602,7 +720,7 @@ static bool run_operator_backend(std::vector<float> &          output,
     ok                       = codes->extra == nullptr && scales->extra == nullptr && ok;
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     if (status != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s path=%s graph compute failed: %s\n", kind == linear_kind::row4 ? "Row4" : "W8A8",
+        fprintf(stderr, "%s path=%s graph compute failed: %s\n", is_row4 ? "Row4" : "W8A8",
                 force_path ? force_path : "default", ggml_status_to_string(status));
         ok = false;
     } else {
@@ -620,6 +738,83 @@ static bool run_operator_backend(std::vector<float> &          output,
 }
 
 static ggml_backend_dev_t find_metal_device();
+
+struct pair2_copy_log_marker {
+    std::atomic<bool> hit = false;
+};
+
+static void pair2_copy_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    pair2_copy_log_marker * state = static_cast<pair2_copy_log_marker *>(user_data);
+    if (strstr(text, "kernel_cpy_row4_codes_pair2_row4_codes_pair2")) {
+        state->hit.store(true, std::memory_order_relaxed);
+    }
+}
+
+static bool run_pair2_raw_copy_backend(ggml_backend_t backend, const char * label, bool require_pipeline_marker) {
+    const ggml_init_params params = {
+        /*.mem_size   =*/256 * 1024,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * src  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, 2, 3);
+    ggml_tensor * dst  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, 2, 3);
+    ggml_tensor * copy = ggml_cpy(ctx, src, dst);
+    ggml_set_output(copy);
+
+    bool          ok    = ggml_backend_supports_op(backend, copy);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, copy);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    std::vector<uint8_t> expected(ggml_nbytes(src));
+    std::vector<uint8_t> sentinel(expected.size(), 0xa5U);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = (uint8_t) ((73 * i + 19) & 0xffU);
+    }
+    ggml_backend_tensor_set(src, expected.data(), 0, expected.size());
+    ggml_backend_tensor_set(dst, sentinel.data(), 0, sentinel.size());
+
+    pair2_copy_log_marker marker;
+    if (require_pipeline_marker) {
+        ggml_log_set(pair2_copy_log_callback, &marker);
+    }
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (require_pipeline_marker) {
+        ggml_log_set(nullptr, nullptr);
+    }
+
+    std::vector<uint8_t> actual(expected.size());
+    if (status == GGML_STATUS_SUCCESS) {
+        ggml_backend_tensor_get(copy, actual.data(), 0, actual.size());
+    } else {
+        fprintf(stderr, "%s Pair2 raw CPY graph compute failed: %s\n", label, ggml_status_to_string(status));
+        ok = false;
+    }
+    if (actual != expected) {
+        const auto   mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+        const size_t offset   = (size_t) std::distance(actual.begin(), mismatch.first);
+        fprintf(stderr, "%s Pair2 raw CPY byte mismatch at %zu\n", label, offset);
+        ok = false;
+    }
+    if (require_pipeline_marker && !marker.hit.load(std::memory_order_relaxed)) {
+        fprintf(stderr, "%s Pair2 raw CPY did not hit the lazy Metal Pair2 pipeline\n", label);
+        ok = false;
+    }
+
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return ok;
+}
 
 static bool test_opaque_type_isolation() {
     ggml_backend_t backend = ggml_backend_cpu_init();
@@ -643,6 +838,10 @@ static bool test_opaque_type_isolation() {
     ggml_tensor * codes_b = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, 1, 8);
     ggml_tensor * f32     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 4, 1, 8);
 
+    ggml_tensor * pair2_a   = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, 1, 1);
+    ggml_tensor * pair2_b   = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, 1, 1);
+    ggml_tensor * pair2_f32 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 8, 1, 1);
+
     ggml_tensor * raw_copy          = ggml_cpy(ctx, codes_a, codes_b);
     ggml_tensor * row4_to_f32       = ggml_cpy(ctx, codes_a, f32);
     ggml_tensor * f32_to_row4       = ggml_cpy(ctx, f32, codes_b);
@@ -651,6 +850,29 @@ static bool test_opaque_type_isolation() {
     ggml_tensor * generic_row4      = ggml_mul_mat(ctx, codes_a, row4_rhs);
     ggml_tensor * indices           = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1, 1, 8);
     ggml_tensor * get_rows          = ggml_get_rows(ctx, codes_a, indices);
+
+    ggml_tensor * pair2_raw_copy    = ggml_cpy(ctx, pair2_a, pair2_b);
+    ggml_tensor * pair2_to_f32      = ggml_cpy(ctx, pair2_a, pair2_f32);
+    ggml_tensor * f32_to_pair2      = ggml_cpy(ctx, pair2_f32, pair2_b);
+    ggml_tensor * pair2_add         = ggml_add(ctx, pair2_a, pair2_b);
+    ggml_tensor * pair2_rhs         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
+    ggml_tensor * pair2_scales      = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 32);
+    ggml_tensor * pair2_linear      = ggml_row4_linear(ctx, pair2_rhs, pair2_a, pair2_scales, 32, 256);
+    ggml_tensor * generic_pair2_rhs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 1, 1, 8);
+    ggml_tensor * generic_pair2     = ggml_mul_mat(ctx, pair2_a, generic_pair2_rhs);
+    ggml_tensor * pair2_indices     = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, 1, 1, 1);
+    ggml_tensor * pair2_get_rows    = ggml_get_rows(ctx, pair2_a, pair2_indices);
+
+    // Pair2 B1 stages the full activation row in Metal threadgroup memory.
+    // This valid opaque layout deliberately exceeds all supported Apple GPU
+    // threadgroup-memory limits and therefore must not be advertised.
+    constexpr int64_t oversized_pair2_k = 1 << 20;
+    ggml_tensor *     oversized_pair2_codes =
+        ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, oversized_pair2_k / 256, 1);
+    ggml_tensor * oversized_pair2_rhs    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, oversized_pair2_k, 1);
+    ggml_tensor * oversized_pair2_scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 32);
+    ggml_tensor * oversized_pair2_linear = ggml_row4_linear(ctx, oversized_pair2_rhs, oversized_pair2_codes,
+                                                            oversized_pair2_scales, 32, oversized_pair2_k);
 
     auto generic_ops_are_isolated = [&](ggml_backend_t candidate) {
         return !ggml_backend_supports_op(candidate, row4_to_f32) && !ggml_backend_supports_op(candidate, f32_to_row4) &&
@@ -662,6 +884,16 @@ static bool test_opaque_type_isolation() {
     if (!ok) {
         fprintf(stderr, "CPU ROW4_CODES escaped its dedicated operator contract\n");
     }
+    const bool pair2_cpu_ok =
+        ggml_backend_supports_op(backend, pair2_raw_copy) && !ggml_backend_supports_op(backend, pair2_to_f32) &&
+        !ggml_backend_supports_op(backend, f32_to_pair2) && !ggml_backend_supports_op(backend, pair2_add) &&
+        !ggml_backend_supports_op(backend, generic_pair2) && !ggml_backend_supports_op(backend, pair2_get_rows) &&
+        !ggml_backend_supports_op(backend, pair2_linear);
+    if (!pair2_cpu_ok) {
+        fprintf(stderr, "CPU ROW4_CODES_PAIR2 violated its opaque Metal-only contract\n");
+        ok = false;
+    }
+    ok = run_pair2_raw_copy_backend(backend, "CPU", false) && ok;
 
     ggml_backend_load_all();
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -669,7 +901,9 @@ static bool test_opaque_type_isolation() {
         const bool         device_ok =
             !ggml_backend_dev_supports_op(dev, row4_to_f32) && !ggml_backend_dev_supports_op(dev, f32_to_row4) &&
             !ggml_backend_dev_supports_op(dev, add) && !ggml_backend_dev_supports_op(dev, generic_row4) &&
-            !ggml_backend_dev_supports_op(dev, get_rows);
+            !ggml_backend_dev_supports_op(dev, get_rows) && !ggml_backend_dev_supports_op(dev, pair2_to_f32) &&
+            !ggml_backend_dev_supports_op(dev, f32_to_pair2) && !ggml_backend_dev_supports_op(dev, pair2_add) &&
+            !ggml_backend_dev_supports_op(dev, generic_pair2) && !ggml_backend_dev_supports_op(dev, pair2_get_rows);
         if (!device_ok) {
             fprintf(stderr, "%s device advertised a generic ROW4_CODES operation\n", ggml_backend_dev_name(dev));
             ok = false;
@@ -679,10 +913,18 @@ static bool test_opaque_type_isolation() {
     ggml_backend_dev_t metal_dev = find_metal_device();
     if (metal_dev) {
         ggml_backend_t metal    = ggml_backend_dev_init(metal_dev, nullptr);
-        const bool     metal_ok = metal && generic_ops_are_isolated(metal);
+        const bool     metal_ok =
+            metal && generic_ops_are_isolated(metal) && ggml_backend_supports_op(metal, pair2_raw_copy) &&
+            !ggml_backend_supports_op(metal, pair2_to_f32) && !ggml_backend_supports_op(metal, f32_to_pair2) &&
+            !ggml_backend_supports_op(metal, pair2_add) && !ggml_backend_supports_op(metal, generic_pair2) &&
+            !ggml_backend_supports_op(metal, pair2_get_rows) && ggml_backend_supports_op(metal, pair2_linear) &&
+            !ggml_backend_supports_op(metal, oversized_pair2_linear);
         if (!metal_ok) {
-            fprintf(stderr, "Metal ROW4_CODES escaped its dedicated operator contract\n");
+            fprintf(stderr, "Metal Row4 opaque/dedicated operator contract mismatch\n");
             ok = false;
+        }
+        if (metal) {
+            ok = run_pair2_raw_copy_backend(metal, "Metal", true) && ok;
         }
         if (metal) {
             ggml_backend_free(metal);
@@ -693,7 +935,8 @@ static bool test_opaque_type_isolation() {
 
     ggml_free(ctx);
     ggml_backend_free(backend);
-    printf("  CPU%s opaque ROW4_CODES generic-op isolation - %s\n", metal_dev ? "/Metal" : "", ok ? "PASS" : "FAIL");
+    printf("  CPU%s opaque ROW4_CODES isolation and Pair2 raw CPY execution - %s\n", metal_dev ? "/Metal" : "",
+           ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -998,11 +1241,12 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
                                          bool                          mark_mul_output,
                                          bool                          w8_down             = false,
                                          bool *                        gate_up_fusion_hit  = nullptr,
-                                         bool                          mark_gate_up_output = false) {
-    constexpr int64_t INPUT_K   = 128;
-    constexpr int64_t N_FF      = 128;
-    constexpr int64_t GATE_UP_O = 2 * N_FF;
-    constexpr int64_t DOWN_O    = 128;
+                                         bool                          mark_gate_up_output = false,
+                                         bool                          pair2               = false) {
+    const int64_t INPUT_K   = pair2 ? 256 : 128;
+    const int64_t N_FF      = pair2 ? 256 : 128;
+    const int64_t GATE_UP_O = 2 * N_FF;
+    const int64_t DOWN_O    = N_FF;
 
     const ggml_init_params params = {
         /*.mem_size   =*/4 * 1024 * 1024,
@@ -1016,7 +1260,9 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
 
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, INPUT_K, tokens);
     ggml_tensor * gate_up_codes =
-        ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, INPUT_K / ROW4_TILE_K, GATE_UP_O / ROW4_TILE_O);
+        pair2 ? ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, INPUT_K / ROW4_PAIR2_TILE_K,
+                                   GATE_UP_O / ROW4_PAIR2_TILE_O) :
+                ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, INPUT_K / ROW4_TILE_K, GATE_UP_O / ROW4_TILE_O);
     ggml_tensor * gate_up_scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, GATE_UP_O);
     ggml_tensor * gate_up        = ggml_row4_linear(ctx, x, gate_up_codes, gate_up_scales, GATE_UP_O, INPUT_K);
     if (mark_gate_up_output) {
@@ -1044,7 +1290,10 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
         w8_codes_data  = make_w8_codes(DOWN_O, N_FF);
         w8_scales_data = make_w8_scales(DOWN_O);
     } else {
-        down_codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, N_FF / ROW4_TILE_K, DOWN_O / ROW4_TILE_O);
+        down_codes = pair2 ?
+                         ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, N_FF / ROW4_PAIR2_TILE_K,
+                                            DOWN_O / ROW4_PAIR2_TILE_O) :
+                         ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, N_FF / ROW4_TILE_K, DOWN_O / ROW4_TILE_O);
         down_scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, DOWN_O);
         down        = ggml_row4_linear(ctx, mul, down_codes, down_scales, DOWN_O, N_FF);
     }
@@ -1277,6 +1526,68 @@ static bool test_metal_row4_swiglu_down_fusion() {
         }
     }
 
+    // Schema-v2 must support both the ordinary chain and the prefill
+    // gate/up producer fusion without converting the pair2 weights back to
+    // v1. The oracle deliberately consumes a separately packed v1 copy.
+    {
+        constexpr int64_t           PAIR_INPUT_K         = 256;
+        constexpr int64_t           PAIR_N_FF            = 256;
+        constexpr int64_t           PAIR_GATE_UP_O       = 2 * PAIR_N_FF;
+        constexpr int64_t           PAIR_DOWN_O          = PAIR_N_FF;
+        const std::vector<uint8_t>  gate_up_v1           = make_row4_codes(PAIR_GATE_UP_O, PAIR_INPUT_K);
+        const std::vector<uint8_t>  gate_up_pair2        = make_row4_pair2_codes(PAIR_GATE_UP_O, PAIR_INPUT_K);
+        const std::vector<uint16_t> gate_up_pair2_scales = make_row4_scales(PAIR_GATE_UP_O);
+        const std::vector<uint8_t>  down_v1              = make_row4_codes(PAIR_DOWN_O, PAIR_N_FF);
+        const std::vector<uint8_t>  down_pair2           = make_row4_pair2_codes(PAIR_DOWN_O, PAIR_N_FF);
+        const std::vector<uint16_t> down_pair2_scales    = make_row4_scales(PAIR_DOWN_O);
+
+        for (int64_t tokens : { 1, 9, 32 }) {
+            const std::vector<float> input = make_input(PAIR_INPUT_K, tokens);
+            const std::vector<float> oracle =
+                oracle_row4_qat_swiglu_down(input, gate_up_v1, gate_up_pair2_scales, down_v1, down_pair2_scales,
+                                            PAIR_INPUT_K, PAIR_N_FF, PAIR_DOWN_O, tokens);
+
+            fusion_disable.set("1");
+            fusion_debug.unset();
+            ggml_backend_t     metal_unfused = ggml_backend_dev_init(dev, nullptr);
+            std::vector<float> unfused;
+            ok = metal_unfused &&
+                 run_row4_swiglu_down_backend(unfused, metal_unfused, input, gate_up_pair2, gate_up_pair2_scales,
+                                              down_pair2, down_pair2_scales, tokens, true, false, false, nullptr, false,
+                                              true) &&
+                 compare_exact(("Row4 pair2 QAT SwiGLU-down unfused/oracle B=" + std::to_string(tokens)).c_str(),
+                               unfused, oracle) &&
+                 ok;
+            if (metal_unfused) {
+                ggml_backend_free(metal_unfused);
+            }
+
+            fusion_disable.unset();
+            fusion_debug.set("2");
+            ggml_backend_t     metal_fused = ggml_backend_dev_init(dev, nullptr);
+            std::vector<float> fused;
+            bool               gate_up_fusion_hit = false;
+            ok = metal_fused &&
+                 run_row4_swiglu_down_backend(fused, metal_fused, input, gate_up_pair2, gate_up_pair2_scales,
+                                              down_pair2, down_pair2_scales, tokens, true, false, false,
+                                              &gate_up_fusion_hit, false, true) &&
+                 compare_exact(("Row4 pair2 QAT SwiGLU-down fused/oracle B=" + std::to_string(tokens)).c_str(), fused,
+                               oracle) &&
+                 compare_exact(("Row4 pair2 QAT SwiGLU-down fused/unfused B=" + std::to_string(tokens)).c_str(), fused,
+                               unfused) &&
+                 ok;
+            const bool expect_gate_up_fusion = tokens > 8 && tokens % 32 == 0;
+            if (gate_up_fusion_hit != expect_gate_up_fusion) {
+                fprintf(stderr, "Row4 pair2 gate-up producer fusion hit mismatch B=%lld: actual=%d expected=%d\n",
+                        (long long) tokens, (int) gate_up_fusion_hit, (int) expect_gate_up_fusion);
+                ok = false;
+            }
+            if (metal_fused) {
+                ggml_backend_free(metal_fused);
+            }
+        }
+    }
+
     // A requested gate-up result must preserve the F32 materialization. The
     // legacy SiLU-start fusion may still consume the later QAT/down chain.
     {
@@ -1431,6 +1742,66 @@ struct row4_residual_outputs {
     std::vector<float> add;
 };
 
+struct row4_decode_production_log_marker {
+    std::atomic<bool> hit = false;
+};
+
+static void row4_decode_production_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    row4_decode_production_log_marker * state = static_cast<row4_decode_production_log_marker *>(user_data);
+    if (strstr(text, "ROW4 Metal W1A8 path: decode") && strstr(text, "layout=m32k256_pair2_split8_v2") &&
+        strstr(text, "pipeline=dual-o4-lookahead-u2-4sg")) {
+        state->hit.store(true, std::memory_order_relaxed);
+    }
+}
+
+static bool test_metal_row4_pair2_decode_production() {
+    ggml_backend_dev_t dev = find_metal_device();
+    if (!dev) {
+        const char * required = getenv("LLAMA_ROW4_REQUIRE_METAL_TESTS");
+        if (required && strcmp(required, "0") != 0) {
+            fprintf(stderr, "Pair2 production decode test requires Metal, but no Metal device is available\n");
+            return false;
+        }
+        printf("  Metal Row4 Pair2 production decode: SKIP (Metal backend unavailable)\n");
+        return true;
+    }
+
+    ggml_backend_t metal = ggml_backend_dev_init(dev, nullptr);
+    if (!metal) {
+        fprintf(stderr, "failed to initialize Metal backend for Pair2 production decode test\n");
+        return false;
+    }
+
+    constexpr int64_t O  = 96;
+    bool              ok = true;
+    for (int64_t k : { 256, 4096, 12288 }) {
+        const std::vector<float>    input       = make_input(k, 1);
+        const std::vector<uint8_t>  v1_codes    = make_row4_codes(O, k);
+        const std::vector<uint8_t>  pair2_codes = make_row4_pair2_codes(O, k);
+        const std::vector<uint16_t> scales      = make_row4_scales(O);
+        const std::vector<float>    expected    = oracle_row4_linear(input, v1_codes, scales, O, k, 1);
+
+        row4_decode_production_log_marker production_marker;
+        ggml_log_set(row4_decode_production_log_callback, &production_marker);
+        std::vector<float> production;
+        const bool production_run = run_operator_backend(production, linear_kind::row4_pair2, input, pair2_codes,
+                                                         scales, {}, {}, O, k, 1, nullptr, false, metal);
+        ggml_log_set(nullptr, nullptr);
+        const bool production_hit = production_marker.hit.load(std::memory_order_relaxed);
+        if (!production_hit) {
+            fprintf(stderr, "Row4 Pair2 production decode marker missing for K=%lld\n", (long long) k);
+        }
+        ok = production_run &&
+             compare_exact(("Row4 Pair2 production decode K=" + std::to_string(k)).c_str(), production, expected) &&
+             production_hit && ok;
+    }
+
+    ggml_backend_free(metal);
+    printf("  Metal Row4 Pair2 production decode exact matrix - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 struct row4_residual_case {
     int64_t tokens         = 1;
     bool    qat            = true;
@@ -1440,6 +1811,22 @@ struct row4_residual_case {
     bool    graph_gap      = false;
 };
 
+struct row4_residual_fusion_log_marker {
+    std::atomic<bool> hit               = false;
+    bool              require_pair2     = false;
+    const char *      required_pipeline = nullptr;
+};
+
+static void row4_residual_fusion_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    constexpr const char *            marker = "fuse Row4 decode staged epilogue + QAT COMPLEX_ADD residual";
+    row4_residual_fusion_log_marker * state  = static_cast<row4_residual_fusion_log_marker *>(user_data);
+    if (strstr(text, marker) && (!state->require_pair2 || strstr(text, "layout=m32k256_pair2_split8_v2")) &&
+        (!state->required_pipeline || strstr(text, state->required_pipeline))) {
+        state->hit.store(true, std::memory_order_relaxed);
+    }
+}
+
 static bool run_row4_residual_backend(row4_residual_outputs &       output,
                                       ggml_backend_t                backend,
                                       const std::vector<float> &    input,
@@ -1448,7 +1835,10 @@ static bool run_row4_residual_backend(row4_residual_outputs &       output,
                                       const std::vector<float> &    residual_data,
                                       int64_t                       o,
                                       int64_t                       k,
-                                      const row4_residual_case &    test_case) {
+                                      const row4_residual_case &    test_case,
+                                      bool                          pair2               = false,
+                                      bool *                        residual_fusion_hit = nullptr,
+                                      const char *                  required_pipeline   = nullptr) {
     const ggml_init_params params = {
         /*.mem_size   =*/4 * 1024 * 1024,
         /*.mem_buffer =*/nullptr,
@@ -1459,8 +1849,11 @@ static bool run_row4_residual_backend(row4_residual_outputs &       output,
         return false;
     }
 
-    ggml_tensor * x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, test_case.tokens);
-    ggml_tensor * codes    = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, k / ROW4_TILE_K, o / ROW4_TILE_O);
+    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, test_case.tokens);
+    ggml_tensor * codes =
+        pair2 ?
+            ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / ROW4_PAIR2_TILE_K, o / ROW4_PAIR2_TILE_O) :
+            ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, k / ROW4_TILE_K, o / ROW4_TILE_O);
     ggml_tensor * scales   = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
     ggml_tensor * row4     = ggml_row4_linear(ctx, x, codes, scales, o, k);
     ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, o, test_case.tokens);
@@ -1496,7 +1889,17 @@ static bool run_row4_residual_backend(row4_residual_outputs &       output,
     ggml_backend_tensor_set(scales, scales_data.data(), 0, scales_data.size() * sizeof(uint16_t));
     ggml_backend_tensor_set(residual, residual_data.data(), 0, residual_data.size() * sizeof(float));
 
+    row4_residual_fusion_log_marker marker;
+    marker.require_pair2     = pair2;
+    marker.required_pipeline = required_pipeline;
+    if (residual_fusion_hit) {
+        ggml_log_set(row4_residual_fusion_log_callback, &marker);
+    }
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    if (residual_fusion_hit) {
+        *residual_fusion_hit = marker.hit.load(std::memory_order_relaxed);
+        ggml_log_set(nullptr, nullptr);
+    }
     if (status == GGML_STATUS_SUCCESS) {
         output.row4.resize((size_t) o * (size_t) test_case.tokens);
         output.add.resize((size_t) o * (size_t) test_case.tokens);
@@ -1570,6 +1973,7 @@ static bool test_metal_row4_decode_residual_fusion() {
     for (int64_t k : { 4096, 12288 }) {
         const std::vector<float>    input       = make_input(k, 1);
         const std::vector<uint8_t>  codes       = make_row4_codes(O, k);
+        const std::vector<uint8_t>  pair2_codes = make_row4_pair2_codes(O, k);
         const std::vector<uint16_t> scales      = make_row4_residual_scales(O);
         const std::vector<float>    row4_oracle = oracle_row4_linear(input, codes, scales, O, k, 1);
         const std::vector<float>    residual    = make_residual_carriers(row4_oracle);
@@ -1612,6 +2016,93 @@ static bool test_metal_row4_decode_residual_fusion() {
              ok;
         if (metal_fused) {
             ggml_backend_free(metal_fused);
+        }
+
+        fusion_disable.set("1");
+        fusion_debug.unset();
+        ggml_backend_t        pair2_unfused_backend = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs pair2_unfused;
+        ok = pair2_unfused_backend &&
+             run_row4_residual_backend(pair2_unfused, pair2_unfused_backend, input, pair2_codes, scales, residual, O, k,
+                                       test_case, true) &&
+             compare_exact(("Row4 pair2 residual unfused row4 K=" + std::to_string(k)).c_str(), pair2_unfused.row4,
+                           expected.row4) &&
+             compare_exact(("Row4 pair2 residual unfused add K=" + std::to_string(k)).c_str(), pair2_unfused.add,
+                           expected.add) &&
+             ok;
+        if (pair2_unfused_backend) {
+            ggml_backend_free(pair2_unfused_backend);
+        }
+
+        fusion_disable.unset();
+        fusion_debug.set("2");
+        ggml_backend_t        pair2_fused_backend = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs pair2_fused;
+        bool                  pair2_fusion_hit = false;
+        ok = pair2_fused_backend &&
+             run_row4_residual_backend(pair2_fused, pair2_fused_backend, input, pair2_codes, scales, residual, O, k,
+                                       test_case, true, &pair2_fusion_hit, "pipeline=dual-o4-lookahead-u2-4sg") &&
+             compare_exact(("Row4 pair2 production residual fused row4 K=" + std::to_string(k)).c_str(),
+                           pair2_fused.row4, expected.row4) &&
+             compare_exact(("Row4 pair2 production residual fused add K=" + std::to_string(k)).c_str(), pair2_fused.add,
+                           expected.add) &&
+             compare_exact(("Row4 pair2 production residual fused/unfused K=" + std::to_string(k)).c_str(),
+                           pair2_fused.add, pair2_unfused.add) &&
+             ok;
+        if (!pair2_fusion_hit) {
+            fprintf(stderr, "Row4 pair2 production residual fusion marker missing for K=%lld\n", (long long) k);
+            ok = false;
+        }
+        if (pair2_fused_backend) {
+            ggml_backend_free(pair2_fused_backend);
+        }
+    }
+
+    // K256 is a correctness fixture, not a production fused shape.  It must
+    // remain on the standalone Pair2 ROW4 + QAT COMPLEX_ADD path.
+    {
+        constexpr int64_t           fallback_o           = 32;
+        constexpr int64_t           fallback_k           = 256;
+        const std::vector<float>    fallback_input       = make_input(fallback_k, 1);
+        const std::vector<uint8_t>  fallback_v1_codes    = make_row4_codes(fallback_o, fallback_k);
+        const std::vector<uint8_t>  fallback_pair2_codes = make_row4_pair2_codes(fallback_o, fallback_k);
+        const std::vector<uint16_t> fallback_scales      = make_row4_residual_scales(fallback_o);
+        const std::vector<float>    fallback_row4 =
+            oracle_row4_linear(fallback_input, fallback_v1_codes, fallback_scales, fallback_o, fallback_k, 1);
+        const std::vector<float> fallback_residual = make_residual_carriers(fallback_row4);
+        const row4_residual_case fallback_case;
+
+        fusion_disable.set("1");
+        fusion_debug.unset();
+        ggml_backend_t        fallback_unfused_backend = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs fallback_unfused;
+        ok = fallback_unfused_backend &&
+             run_row4_residual_backend(fallback_unfused, fallback_unfused_backend, fallback_input, fallback_pair2_codes,
+                                       fallback_scales, fallback_residual, fallback_o, fallback_k, fallback_case,
+                                       true) &&
+             ok;
+        if (fallback_unfused_backend) {
+            ggml_backend_free(fallback_unfused_backend);
+        }
+
+        fusion_disable.unset();
+        fusion_debug.set("2");
+        ggml_backend_t        fallback_backend = ggml_backend_dev_init(dev, nullptr);
+        row4_residual_outputs fallback_output;
+        bool                  fallback_fusion_hit = false;
+        ok = fallback_backend &&
+             run_row4_residual_backend(fallback_output, fallback_backend, fallback_input, fallback_pair2_codes,
+                                       fallback_scales, fallback_residual, fallback_o, fallback_k, fallback_case, true,
+                                       &fallback_fusion_hit) &&
+             compare_exact("Row4 pair2 residual K256 fallback row4", fallback_output.row4, fallback_row4) &&
+             compare_exact("Row4 pair2 residual K256 fallback/unfused", fallback_output.add, fallback_unfused.add) &&
+             ok;
+        if (fallback_fusion_hit) {
+            fprintf(stderr, "Row4 pair2 K256 unexpectedly entered the production-only residual fusion\n");
+            ok = false;
+        }
+        if (fallback_backend) {
+            ggml_backend_free(fallback_backend);
         }
     }
 
@@ -1708,6 +2199,46 @@ static bool test_metal_operator_matrix() {
         }
     }
 
+    // Minimum Pair2 output block: exercises O32 decode, reduced small-batch,
+    // and the non-M64 generic prefill kernel at B9.
+    {
+        constexpr int64_t           pair2_o        = 32;
+        constexpr int64_t           pair2_k        = 256;
+        const std::vector<uint8_t>  pair2_v1_codes = make_row4_codes(pair2_o, pair2_k);
+        const std::vector<uint8_t>  pair2_codes    = make_row4_pair2_codes(pair2_o, pair2_k);
+        const std::vector<uint16_t> pair2_scales   = make_row4_scales(pair2_o);
+        for (int64_t tokens : { 1, 2, 9 }) {
+            const std::vector<float> input = make_input(pair2_k, tokens);
+            const std::vector<float> expected =
+                oracle_row4_linear(input, pair2_v1_codes, pair2_scales, pair2_o, pair2_k, tokens);
+            std::vector<float> actual;
+            if (!run_operator_backend(actual, linear_kind::row4_pair2, input, pair2_codes, pair2_scales, {}, {},
+                                      pair2_o, pair2_k, tokens, nullptr, false, metal) ||
+                !compare_exact(("Row4 pair2 Metal O32 K256 B=" + std::to_string(tokens)).c_str(), actual, expected)) {
+                ok = false;
+            }
+        }
+    }
+
+    // Pair2 is a Metal-only physical layout for the same logical Row4
+    // weights. Cover every dispatch boundary using K=256, the minimum legal
+    // pair2 K, and compare against the independent v1 oracle.
+    {
+        constexpr int64_t          KPAIR       = 256;
+        const std::vector<uint8_t> v1_codes    = make_row4_codes(O, KPAIR);
+        const std::vector<uint8_t> pair2_codes = make_row4_pair2_codes(O, KPAIR);
+        for (int64_t tokens : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128 }) {
+            const std::vector<float> input    = make_input(KPAIR, tokens);
+            const std::vector<float> expected = oracle_row4_linear(input, v1_codes, row4_scales, O, KPAIR, tokens);
+            std::vector<float>       actual;
+            if (!run_operator_backend(actual, linear_kind::row4_pair2, input, pair2_codes, row4_scales, {}, {}, O,
+                                      KPAIR, tokens, nullptr, false, metal) ||
+                !compare_exact(("Row4 pair2 Metal B=" + std::to_string(tokens)).c_str(), actual, expected)) {
+                ok = false;
+            }
+        }
+    }
+
     // Real-K prefill cases. Row4 covers all 96 K tiles of ffn_down and
     // includes both the maximum sum and cancellation. W8 crosses four K1024
     // segments so an implementation cannot accidentally use one inexact F32
@@ -1719,7 +2250,8 @@ static bool test_metal_operator_matrix() {
         for (int64_t k = 0; k < KROW4; ++k) {
             logical[(size_t) KROW4 + (size_t) k] = (uint8_t) ((k & 1) ? 5 : 0);
         }
-        const std::vector<uint8_t>  codes = pack_row4_codes(logical, O, KROW4);
+        const std::vector<uint8_t>  codes       = pack_row4_codes(logical, O, KROW4);
+        const std::vector<uint8_t>  pair2_codes = pack_row4_pair2_codes(logical, O, KROW4);
         const std::vector<uint16_t> scales((size_t) O, oracle_bf16_bits(1.0f));
         const std::vector<float>    input((size_t) KROW4 * TOKENS, 1.0f);
         const std::vector<float>    expected = oracle_row4_linear(input, codes, scales, O, KROW4, TOKENS);
@@ -1727,6 +2259,11 @@ static bool test_metal_operator_matrix() {
         if (!run_operator_backend(actual, linear_kind::row4, input, codes, scales, {}, {}, O, KROW4, TOKENS, nullptr,
                                   false, metal) ||
             !compare_exact("Row4 Metal K=12288 B=9 maximum/cancellation", actual, expected)) {
+            ok = false;
+        }
+        if (!run_operator_backend(actual, linear_kind::row4_pair2, input, pair2_codes, scales, {}, {}, O, KROW4, TOKENS,
+                                  nullptr, false, metal) ||
+            !compare_exact("Row4 pair2 Metal K=12288 B=9 maximum/cancellation", actual, expected)) {
             ok = false;
         }
     }
@@ -1825,7 +2362,8 @@ static bool test_metal_real_shape_matrix() {
 
     bool ok = true;
     for (const row4_shape & shape : shapes) {
-        const std::vector<uint8_t> codes = make_row4_codes(shape.o, shape.k);
+        const std::vector<uint8_t> codes       = make_row4_codes(shape.o, shape.k);
+        const std::vector<uint8_t> pair2_codes = make_row4_pair2_codes(shape.o, shape.k);
         std::vector<uint16_t>      scales((size_t) shape.o);
         for (int64_t row = 0; row < shape.o; ++row) {
             const float scale    = (row & 1) ? -0.03125f * (float) (1 + row % 3) : 0.03125f * (float) (1 + row % 3);
@@ -1846,6 +2384,14 @@ static bool test_metal_real_shape_matrix() {
             if (!run_operator_backend(actual, linear_kind::row4, input, codes, scales, {}, {}, shape.o, shape.k, tokens,
                                       nullptr, false, metal) ||
                 !compare_exact_matrix(label.c_str(), actual, expected, shape.o)) {
+                ok = false;
+            }
+            const std::string pair2_label = std::string("Row4 pair2 Metal real ") + shape.label +
+                                            " O=" + std::to_string(shape.o) + " K=" + std::to_string(shape.k) +
+                                            " B=" + std::to_string(tokens);
+            if (!run_operator_backend(actual, linear_kind::row4_pair2, input, pair2_codes, scales, {}, {}, shape.o,
+                                      shape.k, tokens, nullptr, false, metal) ||
+                !compare_exact_matrix(pair2_label.c_str(), actual, expected, shape.o)) {
                 ok = false;
             }
         }
@@ -1966,12 +2512,14 @@ int main() {
     int failed = 0;
     failed += !test_codebook();
     failed += !test_split8_layout();
+    failed += !test_pair2_layout();
     failed += !test_bf16_and_rounding();
     failed += !test_activation_profile();
     failed += !test_int32_extremes();
     failed += !test_fused_boundaries();
     failed += !test_opaque_type_isolation();
     failed += !test_cpu_operator_matrix();
+    failed += !test_metal_row4_pair2_decode_production();
     failed += !test_metal_row4_swiglu_fusion();
     failed += !test_metal_row4_swiglu_down_fusion();
     failed += !test_metal_row4_decode_residual_fusion();

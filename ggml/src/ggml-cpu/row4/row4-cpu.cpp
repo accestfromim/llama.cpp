@@ -615,6 +615,11 @@ static bool validate_op(const struct ggml_tensor * dst) {
     if (!x || !codes || !scales || x->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
+    if (codes->type == GGML_TYPE_ROW4_CODES_PAIR2) {
+        // Schema v2 is intentionally Metal-only. Do not silently reinterpret
+        // its O32/K256 byte stream as the v1 CPU layout.
+        return false;
+    }
     for (int i = 3; i < GGML_MAX_SRC; ++i) {
         if (dst->src[i]) {
             return false;
