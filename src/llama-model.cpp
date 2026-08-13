@@ -44,7 +44,7 @@ static bool llama_backend_dev_is_metal(ggml_backend_dev_t dev) {
     return reg_name && strcmp(reg_name, "Metal") == 0;
 }
 
-static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev);
+static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev, uint32_t schema_version);
 
 enum llama_fairy2i_env_policy {
     LLAMA_FAIRY2I_ENV_POLICY_AUTO,
@@ -567,9 +567,9 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             if (strncmp(key, "row4.", 5) == 0) {
                 has_row4_marker = true;
                 if (strcmp(key, "row4.schema_version") != 0 && strcmp(key, "row4.weight_layout") != 0 &&
-                    strcmp(key, "row4.codebook") != 0 && strcmp(key, "row4.numeric_profile") != 0 &&
-                    strcmp(key, "row4.qkv_order") != 0 && strcmp(key, "row4.ffn_order") != 0 &&
-                    strcmp(key, "row4.lm_head_layout") != 0) {
+                    strcmp(key, "row4.execution_profile") != 0 && strcmp(key, "row4.codebook") != 0 &&
+                    strcmp(key, "row4.numeric_profile") != 0 && strcmp(key, "row4.qkv_order") != 0 &&
+                    strcmp(key, "row4.ffn_order") != 0 && strcmp(key, "row4.lm_head_layout") != 0) {
                     throw std::runtime_error(format("unsupported Row4 metadata key: %s", key));
                 }
             }
@@ -586,6 +586,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
         uint32_t    schema_version = 0;
         std::string weight_layout;
+        std::string execution_profile;
         std::string codebook;
         std::string numeric_profile;
         std::string qkv_order;
@@ -594,6 +595,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
         const bool has_schema            = ml.get_key(LLM_KV_ROW4_SCHEMA_VERSION, schema_version, false);
         const bool has_layout            = ml.get_key(LLM_KV_ROW4_WEIGHT_LAYOUT, weight_layout, false);
+        const bool has_execution_profile = ml.get_key(LLM_KV_ROW4_EXECUTION_PROFILE, execution_profile, false);
         const bool has_codebook          = ml.get_key(LLM_KV_ROW4_CODEBOOK, codebook, false);
         const bool has_numeric           = ml.get_key(LLM_KV_ROW4_NUMERIC_PROFILE, numeric_profile, false);
         const bool has_qkv               = ml.get_key(LLM_KV_ROW4_QKV_ORDER, qkv_order, false);
@@ -602,12 +604,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         uint32_t   general_file_type     = 0;
         const bool has_general_file_type = ml.get_key(LLM_KV_GENERAL_FILE_TYPE, general_file_type, false);
 
-        const bool any_row4 = has_row4_marker || has_schema || has_layout || has_codebook || has_numeric || has_qkv ||
-                              has_ffn || has_lm_head ||
+        const bool any_row4 = has_row4_marker || has_schema || has_layout || has_execution_profile || has_codebook ||
+                              has_numeric || has_qkv || has_ffn || has_lm_head ||
                               (has_general_file_type && general_file_type == LLAMA_FTYPE_MOSTLY_ROW4);
         if (any_row4) {
             if (arch != LLM_ARCH_QWEN3) {
-                throw std::runtime_error("Row4 schema v1 requires general.architecture=qwen3");
+                throw std::runtime_error("Row4 requires general.architecture=qwen3");
             }
             if (!(has_schema && has_layout && has_codebook && has_numeric && has_qkv && has_ffn && has_lm_head)) {
                 throw std::runtime_error(
@@ -618,19 +620,39 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             uint32_t general_alignment = 0;
             if (!has_general_file_type || general_file_type != LLAMA_FTYPE_MOSTLY_ROW4) {
                 throw std::runtime_error(
-                    format("Row4 schema v1 requires general.file_type=%u", (unsigned) LLAMA_FTYPE_MOSTLY_ROW4));
+                    format("Row4 requires general.file_type=%u", (unsigned) LLAMA_FTYPE_MOSTLY_ROW4));
             }
-            if (!ml.get_key(LLM_KV_GENERAL_ALIGNMENT, general_alignment, false) || general_alignment != 64) {
-                throw std::runtime_error("Row4 schema v1 requires general.alignment=64");
+
+            const bool common_descriptor_matches =
+                codebook == "uv_axis_v1" && numeric_profile == "bf16_a8_away_i32_bf16_v1" && qkv_order == "q_k_v" &&
+                ffn_order == "gate_up" && lm_head_layout == "s8_m16k128_rowmajor_v1";
+            bool descriptor_matches = false;
+            if (schema_version == 1) {
+                if (has_execution_profile) {
+                    throw std::runtime_error("Row4 schema v1 forbids row4.execution_profile");
+                }
+                if (!ml.get_key(LLM_KV_GENERAL_ALIGNMENT, general_alignment, false) || general_alignment != 64) {
+                    throw std::runtime_error("Row4 schema v1 requires general.alignment=64");
+                }
+                descriptor_matches = weight_layout == "m16k128_split8_v1" && common_descriptor_matches;
+            } else if (schema_version == 2) {
+                if (!has_execution_profile) {
+                    throw std::runtime_error("Row4 schema v2 requires row4.execution_profile");
+                }
+                if (!ml.get_key(LLM_KV_GENERAL_ALIGNMENT, general_alignment, false) || general_alignment != 128) {
+                    throw std::runtime_error("Row4 schema v2 requires general.alignment=128");
+                }
+                descriptor_matches = weight_layout == "m32k256_pair2_split8_v2" &&
+                                     execution_profile == "metal_only_v1" && common_descriptor_matches;
             }
-            if (schema_version != 1 || weight_layout != "m16k128_split8_v1" || codebook != "uv_axis_v1" ||
-                numeric_profile != "bf16_a8_away_i32_bf16_v1" || qkv_order != "q_k_v" || ffn_order != "gate_up" ||
-                lm_head_layout != "s8_m16k128_rowmajor_v1") {
+
+            if (!descriptor_matches) {
                 throw std::runtime_error(
-                    format("unsupported Row4 descriptor: schema=%u layout=%s codebook=%s numeric=%s qkv=%s ffn=%s "
-                           "lm_head=%s",
-                           schema_version, weight_layout.c_str(), codebook.c_str(), numeric_profile.c_str(),
-                           qkv_order.c_str(), ffn_order.c_str(), lm_head_layout.c_str()));
+                    format("unsupported Row4 descriptor: schema=%u layout=%s execution=%s codebook=%s numeric=%s "
+                           "qkv=%s ffn=%s lm_head=%s",
+                           schema_version, weight_layout.c_str(),
+                           has_execution_profile ? execution_profile.c_str() : "<absent>", codebook.c_str(),
+                           numeric_profile.c_str(), qkv_order.c_str(), ffn_order.c_str(), lm_head_layout.c_str()));
             }
 
             row4_enabled        = true;
@@ -2619,11 +2641,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             row4_devs.push_back(pimpl->dev_output.dev);
         }
         for (ggml_backend_dev_t dev : row4_devs) {
-            if (!llama_backend_dev_supports_row4(dev)) {
+            if (row4_schema_version == 2 && !llama_backend_dev_is_metal(dev)) {
                 throw std::runtime_error(format(
-                    "Qwen3 Row4 requires a native ARM CPU or Metal backend with ROW4_LINEAR and W8A8_LINEAR support; "
-                    "device %s is unsupported",
+                    "Qwen3 Row4 schema v2 uses execution_profile=metal_only_v1; every Row4 layer and the W8 output "
+                    "must be placed on Metal, but device %s was selected",
                     dev ? ggml_backend_dev_name(dev) : "none"));
+            }
+            if (!llama_backend_dev_supports_row4(dev, row4_schema_version)) {
+                throw std::runtime_error(format(
+                    "Qwen3 Row4 schema v%u requires ROW4_LINEAR and W8A8_LINEAR support; device %s is unsupported",
+                    row4_schema_version, dev ? ggml_backend_dev_name(dev) : "none"));
             }
         }
     }
@@ -2871,6 +2898,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     throw std::runtime_error("no CPU backend found");
                 }
                 buft = ggml_backend_dev_buffer_type(cpu_dev);
+            }
+
+            if (row4_enabled && row4_schema_version == 2) {
+                ggml_backend_dev_t final_dev = ggml_backend_buft_get_device(buft);
+                if (!llama_backend_dev_is_metal(final_dev)) {
+                    throw std::runtime_error(format(
+                        "Qwen3 Row4 schema v2 uses execution_profile=metal_only_v1; model tensor %s was assigned "
+                        "to non-Metal buffer type %s",
+                        tn.str().c_str(), ggml_backend_buft_name(buft)));
+                }
             }
 
             if (buft != buft_list->front().second) {
@@ -3793,14 +3830,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     auto reject_tensor = [&](llm_tensor tensor, const char * suffix, int bid = -1) {
                         const auto name = tn(tensor, suffix, bid).str();
                         if (ml.get_tensor_meta(name.c_str())) {
-                            throw std::runtime_error(format("Row4 schema v1 forbids tensor %s", name.c_str()));
+                            throw std::runtime_error(
+                                format("Row4 schema v%u forbids tensor %s", row4_schema_version, name.c_str()));
                         }
                     };
                     auto create_row4_linear = [&](llama_row_quant_linear & linear, llm_tensor tensor, int bid,
                                                   int64_t logical_k, int64_t logical_o) {
-                        if (logical_k % 128 != 0 || logical_o % 128 != 0) {
+                        const int64_t required_k_multiple = row4_schema_version == 2 ? 256 : 128;
+                        if (logical_k % required_k_multiple != 0 || logical_o % 128 != 0) {
                             throw std::runtime_error(
-                                format("Row4 schema v1 requires K/O multiples of 128 for %s: K=%lld O=%lld",
+                                format("Row4 schema v%u requires K multiple of %lld and O multiple of 128 for %s: "
+                                       "K=%lld O=%lld",
+                                       row4_schema_version, (long long) required_k_multiple,
                                        tn(tensor, bid).str().c_str(), (long long) logical_k, (long long) logical_o));
                         }
 
@@ -3813,15 +3854,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                                             tn(tensor, bid).str().c_str(), codes_name.str().c_str(),
                                                             scales_name.str().c_str()));
                         }
-                        if (codes_meta->type != GGML_TYPE_ROW4_CODES || scales_meta->type != GGML_TYPE_BF16) {
+                        const ggml_type codes_type =
+                            row4_schema_version == 2 ? GGML_TYPE_ROW4_CODES_PAIR2 : GGML_TYPE_ROW4_CODES;
+                        if (codes_meta->type != codes_type || scales_meta->type != GGML_TYPE_BF16) {
                             throw std::runtime_error(format(
-                                "invalid Row4 tensor types for %s: codes must be ROW4_CODES and scales must be BF16; "
-                                "got %s/%s",
-                                tn(tensor, bid).str().c_str(), ggml_type_name(codes_meta->type),
-                                ggml_type_name(scales_meta->type)));
+                                "invalid Row4 tensor types for %s: codes must be %s and scales must be BF16; got "
+                                "%s/%s",
+                                tn(tensor, bid).str().c_str(), ggml_type_name(codes_type),
+                                ggml_type_name(codes_meta->type), ggml_type_name(scales_meta->type)));
                         }
 
-                        linear.codes     = create_tensor(codes_name, { 64, 4, logical_k / 128, logical_o / 16 }, 0);
+                        linear.codes = row4_schema_version == 2 ?
+                                           create_tensor(codes_name, { 128, 8, logical_k / 256, logical_o / 32 }, 0) :
+                                           create_tensor(codes_name, { 64, 4, logical_k / 128, logical_o / 16 }, 0);
                         linear.scales    = create_tensor(scales_name, { logical_o }, 0);
                         linear.logical_k = logical_k;
                         linear.logical_o = logical_o;
@@ -7257,7 +7302,11 @@ void llama_model::print_info() const {
 
     if (row4_enabled) {
         LLAMA_LOG_INFO("%s: row4 schema      = %u\n", __func__, row4_schema_version);
-        LLAMA_LOG_INFO("%s: row4 layout      = m16k128_split8_v1\n", __func__);
+        LLAMA_LOG_INFO("%s: row4 layout      = %s\n", __func__,
+                       row4_schema_version == 2 ? "m32k256_pair2_split8_v2" : "m16k128_split8_v1");
+        if (row4_schema_version == 2) {
+            LLAMA_LOG_INFO("%s: row4 execution   = metal_only_v1\n", __func__);
+        }
         LLAMA_LOG_INFO("%s: row4 numeric     = bf16_a8_away_i32_bf16_v1\n", __func__);
     }
 
@@ -7352,7 +7401,7 @@ static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t d
     return op_supported;
 }
 
-static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev) {
+static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev, uint32_t schema_version) {
     if (!dev) {
         return false;
     }
@@ -7360,6 +7409,10 @@ static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg      = ggml_backend_dev_backend_reg(dev);
     const char *       reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
     const bool         is_metal = reg_name && strcmp(reg_name, "Metal") == 0;
+
+    if (schema_version == 2 && !is_metal) {
+        return false;
+    }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
     if (!is_metal && !(reg_name && strcmp(reg_name, "CPU") == 0)) {
@@ -7376,11 +7429,17 @@ static bool llama_backend_dev_supports_row4(ggml_backend_dev_t dev) {
         return false;
     }
 
-    auto row4_probe = [](ggml_context * ctx) {
-        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1);
-        ggml_tensor * codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, 1, 8);
+    auto row4_probe = [schema_version](ggml_context * ctx) {
+        const int64_t k     = schema_version == 2 ? 256 : 128;
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * codes = nullptr;
+        if (schema_version == 2) {
+            codes = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, 1, 4);
+        } else {
+            codes = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES, 64, 4, 1, 8);
+        }
         ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 128);
-        return ggml_row4_linear(ctx, x, codes, scales, 128, 128);
+        return ggml_row4_linear(ctx, x, codes, scales, 128, k);
     };
     auto w8_probe = [](ggml_context * ctx) {
         ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 1);

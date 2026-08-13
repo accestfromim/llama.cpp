@@ -423,7 +423,8 @@ extern "C" {
         GGML_TYPE_FAIRY2I_ACT_Q16_64   = 45,  // Fairy2i 64-value complex activation block
         GGML_TYPE_FAIRY2I_BUNDLE_CODES = 46,  // opaque Fairy2i M64xK64 bundle code plane
         GGML_TYPE_ROW4_CODES           = 47,  // opaque Row4 M16xK128 split8 code plane
-        GGML_TYPE_COUNT                = 48,
+        GGML_TYPE_ROW4_CODES_PAIR2     = 48,  // opaque Row4 M32xK256 pair2 split8 code plane
+        GGML_TYPE_COUNT                = 49,
     };
 
     // precision
@@ -1764,8 +1765,10 @@ extern "C" {
 
     // Row4/W8A8 deployment linear operators. Both operators consume an F32
     // activation carrier in src[0], packed codes in src[1], and row scales in
-    // src[2]. op_params contain int32 { layout_version = 1, logical_o,
-    // logical_k }. The result is an F32 carrier with a BF16 output boundary.
+    // src[2]. op_params contain int32 { layout_version, logical_o, logical_k }.
+    // Row4 layout_version is 1 for ROW4_CODES and 2 for
+    // ROW4_CODES_PAIR2; W8A8 layout_version is 1. The result is an F32
+    // carrier with a BF16 output boundary.
     GGML_API struct ggml_tensor * ggml_row4_linear(struct ggml_context * ctx,
                                                    struct ggml_tensor *  x,
                                                    struct ggml_tensor *  codes,

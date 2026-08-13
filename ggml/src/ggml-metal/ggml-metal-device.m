@@ -636,8 +636,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         const int32_t              m      = ggml_get_op_params_i32(op, 1);
         const int32_t              k      = ggml_get_op_params_i32(op, 2);
 
-        if (!has_simdgroup_mm || !has_simdgroup_reduction || !x || !codes || !scales || op->src[3] || layout != 1 ||
-            m <= 0 || k <= 0 || m % 128 != 0 || k % 128 != 0 || op->type != GGML_TYPE_F32 ||
+        if (!has_simdgroup_mm || !has_simdgroup_reduction || !x || !codes || !scales || op->src[3] ||
+            m <= 0 || k <= 0 || k % 128 != 0 || op->type != GGML_TYPE_F32 ||
             x->type != GGML_TYPE_F32 || x->ne[0] != k || op->ne[0] != m || op->ne[1] != x->ne[1] ||
             op->ne[2] != x->ne[2] || op->ne[3] != x->ne[3] || scales->ne[0] != m || scales->ne[1] != 1 ||
             scales->ne[2] != 1 || scales->ne[3] != 1 || !ggml_is_contiguous(x) || !ggml_is_contiguous(codes) ||
@@ -646,12 +646,24 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         }
 
         if (op->op == GGML_OP_ROW4_LINEAR) {
-            return codes->type == GGML_TYPE_ROW4_CODES && scales->type == GGML_TYPE_BF16 &&
-                   codes->ne[0] == 64 && codes->ne[1] == 4 && codes->ne[2] == k / 128 &&
-                   codes->ne[3] == m / 16;
+            // Pair2 B1 stages the full-K activation in threadgroup memory and
+            // accumulates LUT-decoded integer values in F32. Every integer is
+            // exactly representable through K=65536 (worst case 2^24).
+            const bool pair2_decode_ok = ggml_nrows(x) != 1 ||
+                                         (k <= 65536 &&
+                                          (size_t) k * sizeof(int8_t) <= dev->props.max_theadgroup_memory_size);
+            const bool layout_v1 =
+                layout == 1 && m % 128 == 0 && codes->type == GGML_TYPE_ROW4_CODES && codes->ne[0] == 64 &&
+                codes->ne[1] == 4 &&
+                codes->ne[2] == k / 128 && codes->ne[3] == m / 16;
+            const bool layout_v2 =
+                layout == 2 && m % 32 == 0 && k % 256 == 0 && codes->type == GGML_TYPE_ROW4_CODES_PAIR2 &&
+                codes->ne[0] == 128 && codes->ne[1] == 8 && codes->ne[2] == k / 256 && codes->ne[3] == m / 32 &&
+                pair2_decode_ok;
+            return scales->type == GGML_TYPE_BF16 && (layout_v1 || layout_v2);
         }
 
-        return codes->type == GGML_TYPE_I8 && scales->type == GGML_TYPE_F32 &&
+        return layout == 1 && m % 128 == 0 && codes->type == GGML_TYPE_I8 && scales->type == GGML_TYPE_F32 &&
                codes->ne[0] == 128 && codes->ne[1] == 16 && codes->ne[2] == k / 128 &&
                codes->ne[3] == m / 16;
     }
@@ -715,11 +727,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 (u_s1->ne[2] == 1 && u_s1->ne[3] == 1 && w_s1->ne[2] == 1 && w_s1->ne[3] == 1));
     }
 
+    // Pair2 is opaque but permits an exact same-type byte copy.  No numeric
+    // conversion is implied by this path.
+    if (op->op == GGML_OP_CPY && op->src[0] &&
+        op->src[0]->type == GGML_TYPE_ROW4_CODES_PAIR2 && op->type == GGML_TYPE_ROW4_CODES_PAIR2) {
+        return ggml_are_same_shape(op->src[0], op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+    }
+
     // custom complex types are CPU-only for compute ops, except when they are stored as leaf tensors for fused kernels.
     if (op->op != GGML_OP_NONE &&
         (op->type == GGML_TYPE_IFAIRY || op->type == GGML_TYPE_IFAIRY_Q16 || op->type == GGML_TYPE_IFAIRY64 ||
          op->type == GGML_TYPE_FAIRY2I_TILE64_V2 || op->type == GGML_TYPE_FAIRY2I_ACT_Q16_64 ||
-         op->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES || op->type == GGML_TYPE_ROW4_CODES)) {
+         op->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES || op->type == GGML_TYPE_ROW4_CODES ||
+         op->type == GGML_TYPE_ROW4_CODES_PAIR2)) {
         return false;
     }
     for (size_t i = 0, n = GGML_MAX_SRC; i < n; ++i) {
@@ -728,7 +748,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
              op->src[i]->type == GGML_TYPE_IFAIRY64 || op->src[i]->type == GGML_TYPE_FAIRY2I_TILE64_V2 ||
              op->src[i]->type == GGML_TYPE_FAIRY2I_ACT_Q16_64 ||
              op->src[i]->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES ||
-             op->src[i]->type == GGML_TYPE_ROW4_CODES)) {
+             op->src[i]->type == GGML_TYPE_ROW4_CODES || op->src[i]->type == GGML_TYPE_ROW4_CODES_PAIR2)) {
             return false;
         }
     }

@@ -5,6 +5,8 @@ import numpy as np
 
 M_TILE = 16
 K_TILE = 128
+PAIR2_M_TILE = 32
+PAIR2_K_TILE = 256
 
 
 def _axis_code(real: np.ndarray, imag: np.ndarray) -> np.ndarray:
@@ -95,6 +97,37 @@ def pack_row4_m16k128(codes: np.ndarray) -> np.ndarray:
     split = code_array.reshape(m_tiles, 4, k_tiles, 8, 16)
     packed = np.bitwise_or(split[..., :8], np.left_shift(split[..., 8:], 4))
     return np.ascontiguousarray(packed.transpose(0, 2, 1, 3, 4).reshape(m_tiles, k_tiles, 4, 64))
+
+
+def pack_row4_m32k256_pair2(codes: np.ndarray) -> np.ndarray:
+    """Pack logical ``[O/4,K]`` codes to ``[O/32,K/256,8,128]``.
+
+    A 128-byte output-group record contains 32 lanes of ``uchar4`` data.  For
+    each lane, ``xy`` holds adjacent K values from the first K128 half and
+    ``zw`` holds the same positions from the second half.  Each byte retains
+    the v1 split8 nibble convention, so the payload size remains O*K/8.
+    """
+
+    code_array = np.asarray(codes, dtype=np.uint8)
+    if code_array.ndim != 2:
+        raise ValueError(f"Row4 codes must be 2D, got shape {code_array.shape}")
+    groups, in_features = code_array.shape
+    if groups % (PAIR2_M_TILE // 4) != 0 or in_features % PAIR2_K_TILE != 0:
+        raise ValueError(
+            "Row4 pair2 codes require O32/K256 alignment, got "
+            f"O={groups * 4}, K={in_features}"
+        )
+    if np.any(code_array > 15):
+        raise ValueError("Row4 codes must be in [0, 15]")
+
+    m_tiles = groups // (PAIR2_M_TILE // 4)
+    k_tiles = in_features // PAIR2_K_TILE
+    split = code_array.reshape(m_tiles, 8, k_tiles, 2, 8, 16)
+    packed = np.bitwise_or(split[..., :8], np.left_shift(split[..., 8:], 4))
+    paired = packed.reshape(m_tiles, 8, k_tiles, 2, 8, 4, 2)
+    return np.ascontiguousarray(
+        paired.transpose(0, 2, 1, 4, 5, 3, 6).reshape(m_tiles, k_tiles, 8, 128)
+    )
 
 
 def _round_half_away_from_zero(values: np.ndarray) -> np.ndarray:

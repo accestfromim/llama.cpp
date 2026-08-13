@@ -413,6 +413,17 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    bool touches_row4_pair2 = op->type == GGML_TYPE_ROW4_CODES_PAIR2;
+    for (int i = 0; i < GGML_MAX_SRC && !touches_row4_pair2; ++i) {
+        touches_row4_pair2 = op->src[i] && op->src[i]->type == GGML_TYPE_ROW4_CODES_PAIR2;
+    }
+    if (touches_row4_pair2) {
+        // Pair2 is a Metal-only compute schema. A same-type byte copy is safe,
+        // but CPU must not advertise fallback execution or reinterpretation.
+        return op->op == GGML_OP_CPY && src0 && src0->type == GGML_TYPE_ROW4_CODES_PAIR2 &&
+               op->type == GGML_TYPE_ROW4_CODES_PAIR2;
+    }
+
     bool touches_row4_codes = op->type == GGML_TYPE_ROW4_CODES;
     for (int i = 0; i < GGML_MAX_SRC && !touches_row4_codes; ++i) {
         touches_row4_codes = op->src[i] && op->src[i]->type == GGML_TYPE_ROW4_CODES;
@@ -424,7 +435,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && src0 &&
-        (src0->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES || src0->type == GGML_TYPE_ROW4_CODES)) {
+        (src0->type == GGML_TYPE_FAIRY2I_BUNDLE_CODES || src0->type == GGML_TYPE_ROW4_CODES ||
+         src0->type == GGML_TYPE_ROW4_CODES_PAIR2)) {
         // Bundle/Row4 codes are opaque storage for dedicated linear ops.
         return false;
     }

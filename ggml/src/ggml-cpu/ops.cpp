@@ -5916,6 +5916,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_FAIRY2I_ACT_Q16_64:
         case GGML_TYPE_FAIRY2I_BUNDLE_CODES:
         case GGML_TYPE_ROW4_CODES:
+        case GGML_TYPE_ROW4_CODES_PAIR2:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");

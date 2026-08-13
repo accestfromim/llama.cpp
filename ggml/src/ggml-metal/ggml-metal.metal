@@ -1101,6 +1101,115 @@ static inline int row4_weight_at(
     }
 }
 
+// M32K256 pair2 stores the two adjacent K128 tiles for one SIMD lane in a
+// single uchar4.  Bytes xy are the first K128 tile and zw are the second; each
+// byte retains the v1 split8 low/high-nibble contract.
+static inline int row4_weight_at_pair2(
+        device const uchar * codes,
+        int k_pairs,
+        int output,
+        int k) {
+    const int output_block = output >> 5;
+    const int output_lane  = output & 31;
+    const int group        = output_lane >> 2;
+    const int row          = output_lane & 3;
+    const int k_pair       = k >> 8;
+    const int k_in_pair    = k & 255;
+    const int k_half       = k_in_pair >> 7;
+    const int k_in_tile    = k_in_pair & 127;
+    const int split        = k_in_tile >> 4;
+    const int j            = k_in_tile & 7;
+    const int lane         = split * 4 + (j >> 1);
+    const int byte         = 2 * k_half + (j & 1);
+    const ulong offset =
+        (((((ulong) output_block * (ulong) k_pairs + (ulong) k_pair) * 8UL + (ulong) group) * 32UL +
+          (ulong) lane) * 4UL) + (ulong) byte;
+    const uchar packed = codes[offset];
+    const uint code = (k_in_tile & 8) == 0 ? (uint) (packed & 0x0fU) : (uint) (packed >> 4);
+
+    const uint u_axis = code & 3U;
+    const uint v_axis = code >> 2;
+    const int ur = (int) (u_axis == 0U) - (int) (u_axis == 1U);
+    const int ui = (int) (u_axis == 2U) - (int) (u_axis == 3U);
+    const int vr = (int) (v_axis == 0U) - (int) (v_axis == 1U);
+    const int vi = (int) (v_axis == 2U) - (int) (v_axis == 3U);
+
+    switch (row) {
+        case 0: return ur + vr;
+        case 1: return -ui + vi;
+        case 2: return ui + vi;
+        default: return ur - vr;
+    }
+}
+
+static inline uchar row4_load_prefill_byte(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        uint output_tile,
+        int k_base,
+        uint group,
+        uint local_split,
+        uint j) {
+    if (args.layout == 1) {
+        const int k_tiles          = args.k / 128;
+        const int canonical_k_tile = k_base >> 7;
+        const int split_base       = (k_base & 127) >> 4;
+        const ulong code_offset =
+            ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+            (ulong) (split_base + (int) local_split) * 8UL + (ulong) j;
+        return codes[code_offset];
+    }
+
+    const int k_pairs      = args.k / 256;
+    const uint output_block = output_tile >> 1;
+    const uint global_group = (output_tile & 1U) * 4U + group;
+    const int k_pair        = k_base >> 8;
+    const int k_half        = (k_base >> 7) & 1;
+    const int split_base    = (k_base & 127) >> 4;
+    const int split         = split_base + (int) local_split;
+    const int lane          = split * 4 + (int) (j >> 1);
+    const int byte          = 2 * k_half + (int) (j & 1U);
+    const ulong code_offset =
+        (((((ulong) output_block * (ulong) k_pairs + (ulong) k_pair) * 8UL + (ulong) global_group) * 32UL +
+          (ulong) lane) * 4UL) + (ulong) byte;
+    return codes[code_offset];
+}
+
+static inline uchar4 row4_load_prefill_packed4(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        uint output_tile,
+        int k_base,
+        uint group,
+        uint local_split,
+        uint jblock) {
+    if (args.layout == 1) {
+        const int k_tiles          = args.k / 128;
+        const int canonical_k_tile = k_base >> 7;
+        const int split_base       = (k_base & 127) >> 4;
+        const ulong code_offset =
+            ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
+            (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
+        return *((device const uchar4 *) (codes + code_offset));
+    }
+
+    const int k_pairs       = args.k / 256;
+    const uint output_block = output_tile >> 1;
+    const uint global_group = (output_tile & 1U) * 4U + group;
+    const int k_pair        = k_base >> 8;
+    const int k_half        = (k_base >> 7) & 1;
+    const int split_base    = (k_base & 127) >> 4;
+    const int split         = split_base + (int) local_split;
+    const int lane0         = split * 4 + (int) jblock * 2;
+    const ulong code_offset =
+        ((((ulong) output_block * (ulong) k_pairs + (ulong) k_pair) * 8UL + (ulong) global_group) * 32UL +
+         (ulong) lane0) * 4UL;
+    const uchar4 pair0 = *((device const uchar4 *) (codes + code_offset));
+    const uchar4 pair1 = *((device const uchar4 *) (codes + code_offset + 4UL));
+    return k_half == 0 ? uchar4(pair0.x, pair0.y, pair1.x, pair1.y) :
+                         uchar4(pair0.z, pair0.w, pair1.z, pair1.w);
+}
+
 constexpr constant static half4 k_row4_prefill_codebook[16] = {
     half4( 2.0h,  0.0h,  0.0h,  0.0h),
     half4( 0.0h,  0.0h,  0.0h, -2.0h),
@@ -1233,7 +1342,9 @@ static inline void row4_linear_reduced(
 
     int acc = 0;
     for (int k = (int) dot_lane; k < args.k; k += (int) lanes_per_row) {
-        acc += row4_weight_at(codes, k_tiles, output, k) * (int) act_q[act_base + (ulong) k];
+        const int weight = args.layout == 1 ? row4_weight_at(codes, k_tiles, output, k) :
+                                              row4_weight_at_pair2(codes, args.k / 256, output, k);
+        acc += weight * (int) act_q[act_base + (ulong) k];
     }
     partials[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1323,18 +1434,13 @@ static inline void row4_stage_prefill_m64n32_simd_localw(
         uint simd_lane,
         uint sgitg) {
     constexpr int k_tile = 32;
-    const int canonical_k_tile = k_base >> 7;
-    const int split_base       = (k_base & 127) >> 4;
-    const int k_tiles          = args.k / 128;
 
     if (simd_lane < 16U) {
         const uint group       = simd_lane >> 2;
         const uint local_split = (simd_lane >> 1) & 1U;
         const uint jblock      = simd_lane & 1U;
-        const ulong code_offset =
-            ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
-            (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
-        const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+        const uchar4 packed =
+            row4_load_prefill_packed4(args, codes, output_tile, k_base, group, local_split, jblock);
 
         const half4 low0  = row4_decode4((uint) (packed.x & 0x0fU));
         const half4 low1  = row4_decode4((uint) (packed.y & 0x0fU));
@@ -1840,6 +1946,247 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual(
 }
 
 
+// Pair2 B1 decode keeps the validated O32/128-thread/four-SIMDgroup geometry,
+// dual-O4 issue order, K256 u2 lookahead, activation staging, and epilogue
+// boundary. The 4-bit code directly indexes the existing 16-entry row LUT.
+// Each A8 * ROW4 term and every partial sum are exact in F32 through K=65536:
+// the worst-case magnitude is 2 * 128 * 65536 = 2^24.
+static inline void row4_decode_pair2_lut16_apply(
+        uchar4 packed,
+        char2 activation0_low,
+        char2 activation0_high,
+        char2 activation1_low,
+        char2 activation1_high,
+        thread float4 & acc) {
+    acc += float4(row4_decode4((uint) (packed.x & 0x0fU))) * float4((float) activation0_low.x);
+    acc += float4(row4_decode4((uint) (packed.y & 0x0fU))) * float4((float) activation0_low.y);
+    acc += float4(row4_decode4((uint) (packed.x >> 4))) * float4((float) activation0_high.x);
+    acc += float4(row4_decode4((uint) (packed.y >> 4))) * float4((float) activation0_high.y);
+    acc += float4(row4_decode4((uint) (packed.z & 0x0fU))) * float4((float) activation1_low.x);
+    acc += float4(row4_decode4((uint) (packed.w & 0x0fU))) * float4((float) activation1_low.y);
+    acc += float4(row4_decode4((uint) (packed.z >> 4))) * float4((float) activation1_high.x);
+    acc += float4(row4_decode4((uint) (packed.w >> 4))) * float4((float) activation1_high.y);
+}
+
+static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        threadgroup const char * act_tg,
+        uint3 tgpig,
+        uint simd_lane,
+        uint output_pair,
+        thread float4 & acc0,
+        thread float4 & acc1) {
+    constexpr int groups_per_block   = 8;
+    constexpr int lanes_per_group    = 32;
+    constexpr int bytes_per_record   = 4;
+    constexpr int bytes_per_k_pair   = groups_per_block * lanes_per_group * bytes_per_record;
+    constexpr int group_record_bytes = lanes_per_group * bytes_per_record;
+    constexpr int k_pair             = 256;
+
+    const uint split         = simd_lane >> 2;
+    const uint j             = (simd_lane & 3U) * 2U;
+    const uint output_group0 = output_pair * 2U;
+    const int k_pairs        = args.k / k_pair;
+    device const uchar * code0_ptr = codes +
+        (ulong) tgpig.x * (ulong) k_pairs * (ulong) bytes_per_k_pair +
+        (ulong) output_group0 * (ulong) group_record_bytes + (ulong) simd_lane * bytes_per_record;
+    device const uchar * code1_ptr = code0_ptr + group_record_bytes;
+    threadgroup const char * act_ptr = act_tg + (ulong) split * 16UL + (ulong) j;
+
+    int kp = 0;
+    for (; kp + 1 < k_pairs; kp += 2) {
+        const uchar4 current_packed0 = *((device const uchar4 *) code0_ptr);
+        const uchar4 current_packed1 = *((device const uchar4 *) code1_ptr);
+        const char2 current_activation0_low  = *((threadgroup const char2 *) act_ptr);
+        const char2 current_activation0_high = *((threadgroup const char2 *) (act_ptr + 8));
+        const char2 current_activation1_low  = *((threadgroup const char2 *) (act_ptr + 128));
+        const char2 current_activation1_high = *((threadgroup const char2 *) (act_ptr + 136));
+
+        device const uchar * next_code0_ptr = code0_ptr + bytes_per_k_pair;
+        device const uchar * next_code1_ptr = code1_ptr + bytes_per_k_pair;
+        threadgroup const char * next_act_ptr = act_ptr + k_pair;
+        const uchar4 next_packed0 = *((device const uchar4 *) next_code0_ptr);
+        const uchar4 next_packed1 = *((device const uchar4 *) next_code1_ptr);
+        const char2 next_activation0_low  = *((threadgroup const char2 *) next_act_ptr);
+        const char2 next_activation0_high = *((threadgroup const char2 *) (next_act_ptr + 8));
+        const char2 next_activation1_low  = *((threadgroup const char2 *) (next_act_ptr + 128));
+        const char2 next_activation1_high = *((threadgroup const char2 *) (next_act_ptr + 136));
+
+        row4_decode_pair2_lut16_apply(
+            current_packed0,
+            current_activation0_low,
+            current_activation0_high,
+            current_activation1_low,
+            current_activation1_high,
+            acc0);
+        row4_decode_pair2_lut16_apply(
+            current_packed1,
+            current_activation0_low,
+            current_activation0_high,
+            current_activation1_low,
+            current_activation1_high,
+            acc1);
+        row4_decode_pair2_lut16_apply(
+            next_packed0,
+            next_activation0_low,
+            next_activation0_high,
+            next_activation1_low,
+            next_activation1_high,
+            acc0);
+        row4_decode_pair2_lut16_apply(
+            next_packed1,
+            next_activation0_low,
+            next_activation0_high,
+            next_activation1_low,
+            next_activation1_high,
+            acc1);
+
+        code0_ptr += 2 * bytes_per_k_pair;
+        code1_ptr += 2 * bytes_per_k_pair;
+        act_ptr += 2 * k_pair;
+    }
+
+    if (kp < k_pairs) {
+        const uchar4 packed0 = *((device const uchar4 *) code0_ptr);
+        const uchar4 packed1 = *((device const uchar4 *) code1_ptr);
+        const char2 activation0_low  = *((threadgroup const char2 *) act_ptr);
+        const char2 activation0_high = *((threadgroup const char2 *) (act_ptr + 8));
+        const char2 activation1_low  = *((threadgroup const char2 *) (act_ptr + 128));
+        const char2 activation1_high = *((threadgroup const char2 *) (act_ptr + 136));
+        row4_decode_pair2_lut16_apply(
+            packed0, activation0_low, activation0_high, activation1_low, activation1_high, acc0);
+        row4_decode_pair2_lut16_apply(
+            packed1, activation0_low, activation0_high, activation1_low, activation1_high, acc1);
+    }
+}
+
+kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        threadgroup char * act_tg                         [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_pair                                  [[simdgroup_index_in_threadgroup]]) {
+    constexpr int rows_per_group = 4;
+    constexpr int rows_per_pair  = 8;
+    constexpr int copy_bytes     = 16;
+    constexpr int threads_per_tg = 128;
+
+    for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
+         byte_offset += threads_per_tg * copy_bytes) {
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 acc0 = {};
+    float4 acc1 = {};
+    row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
+        args, codes, act_tg, tgpig, simd_lane, output_pair, acc0, acc1);
+
+    const int4 sum0 = int4(simd_sum(acc0));
+    if (simd_lane == 0U) {
+        const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
+        const float sx = act_scales[0];
+        dst[output + 0] = row4_finish_i32(sum0.x, sx, scales[output + 0]);
+        dst[output + 1] = row4_finish_i32(sum0.y, sx, scales[output + 1]);
+        dst[output + 2] = row4_finish_i32(sum0.z, sx, scales[output + 2]);
+        dst[output + 3] = row4_finish_i32(sum0.w, sx, scales[output + 3]);
+    }
+
+    const int4 sum1 = int4(simd_sum(acc1));
+    if (simd_lane == 0U) {
+        const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
+        const float sx = act_scales[0];
+        dst[output + 0] = row4_finish_i32(sum1.x, sx, scales[output + 0]);
+        dst[output + 1] = row4_finish_i32(sum1.y, sx, scales[output + 1]);
+        dst[output + 2] = row4_finish_i32(sum1.z, sx, scales[output + 2]);
+        dst[output + 3] = row4_finish_i32(sum1.w, sx, scales[output + 3]);
+    }
+}
+
+kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32_qat_residual(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device const ushort * scales                      [[buffer(2)]],
+        device const char * act_q                         [[buffer(3)]],
+        device const float * act_scales                   [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        device const uint * residual                      [[buffer(6)]],
+        device uint * add_dst                             [[buffer(7)]],
+        threadgroup char * act_tg                         [[threadgroup(0)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tid                                          [[thread_index_in_threadgroup]],
+        uint simd_lane                                    [[thread_index_in_simdgroup]],
+        uint output_pair                                  [[simdgroup_index_in_threadgroup]]) {
+    constexpr int rows_per_group = 4;
+    constexpr int rows_per_pair  = 8;
+    constexpr int copy_bytes     = 16;
+    constexpr int threads_per_tg = 128;
+
+    for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
+         byte_offset += threads_per_tg * copy_bytes) {
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 acc0 = {};
+    float4 acc1 = {};
+    row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
+        args, codes, act_tg, tgpig, simd_lane, output_pair, acc0, acc1);
+
+    const int4 sum0 = int4(simd_sum(acc0));
+    if (simd_lane == 0U) {
+        const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
+        const float sx = act_scales[0];
+        const float4 value = {
+            row4_finish_i32(sum0.x, sx, scales[output + 0]),
+            row4_finish_i32(sum0.y, sx, scales[output + 1]),
+            row4_finish_i32(sum0.z, sx, scales[output + 2]),
+            row4_finish_i32(sum0.w, sx, scales[output + 3]),
+        };
+        *((device float4 *) (dst + output)) = value;
+
+        for (int i = 0; i < rows_per_group; ++i) {
+            const uint a = *((device volatile uint *) (dst + output + i));
+            const uint b = residual[output + i];
+            const float real = fairy2i_bf16_to_f32((ushort) (a & 0xffffU)) +
+                               fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
+            const float imag = fairy2i_bf16_to_f32((ushort) (a >> 16)) +
+                               fairy2i_bf16_to_f32((ushort) (b >> 16));
+            add_dst[output + i] = fairy2i_pack_bf16_pair(real, imag);
+        }
+    }
+
+    const int4 sum1 = int4(simd_sum(acc1));
+    if (simd_lane == 0U) {
+        const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
+        const float sx = act_scales[0];
+        const float4 value = {
+            row4_finish_i32(sum1.x, sx, scales[output + 0]),
+            row4_finish_i32(sum1.y, sx, scales[output + 1]),
+            row4_finish_i32(sum1.z, sx, scales[output + 2]),
+            row4_finish_i32(sum1.w, sx, scales[output + 3]),
+        };
+        *((device float4 *) (dst + output)) = value;
+
+        for (int i = 0; i < rows_per_group; ++i) {
+            const uint a = *((device volatile uint *) (dst + output + i));
+            const uint b = residual[output + i];
+            const float real = fairy2i_bf16_to_f32((ushort) (a & 0xffffU)) +
+                               fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
+            const float imag = fairy2i_bf16_to_f32((ushort) (a >> 16)) +
+                               fairy2i_bf16_to_f32((ushort) (b >> 16));
+            add_dst[output + i] = fairy2i_pack_bf16_pair(real, imag);
+        }
+    }
+}
+
 ROW4_REDUCED_KERNEL(kernel_row4_w1a8_small_batch, tgpig.y)
 
 
@@ -2049,7 +2396,6 @@ static inline void row4_w1a8_prefill_impl(
     constexpr int n_threads  = col_tile * 8;
     const int row_base       = (int) tgpig.x * row_tile;
     const int col_base       = (int) tgpig.y * col_tile;
-    const int k_tiles        = args.k / 128;
     const int row_block      = (int) (sgitg & 1U);
     const int col_block      = (int) (sgitg >> 1);
 
@@ -2058,17 +2404,13 @@ static inline void row4_w1a8_prefill_impl(
     simdgroup_float8x8 accum = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
     for (int k_base = 0; k_base < args.k; k_base += k_tile) {
-        const int canonical_k_tile = k_base >> 7;
-        const int split_base       = (k_base & 127) >> 4;
         for (uint packed_index = tid; packed_index < 64U; packed_index += n_threads) {
             const uint group       = packed_index >> 4;
             const uint byte        = packed_index & 15U;
             const uint local_split = byte >> 3;
             const uint j           = byte & 7U;
-            const ulong code_offset =
-                ((((ulong) tgpig.x * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
-                (ulong) (split_base + (int) local_split) * 8UL + (ulong) j;
-            const uchar packed = codes[code_offset];
+            const uchar packed =
+                row4_load_prefill_byte(args, codes, tgpig.x, k_base, group, local_split, j);
             const uint k_low   = local_split * 16U + j;
             const uint k_high  = k_low + 8U;
 
@@ -2190,7 +2532,6 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw(
     constexpr int n_threads = 128;
     const int row_base      = (int) tgpig.x * row_tile;
     const int col_base      = (int) tgpig.y * col_tile;
-    const int k_tiles       = args.k / 128;
     const int row_block     = (int) sgitg * 16;
     const uint simd_lane    = tid & 31U;
 
@@ -2210,8 +2551,6 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw(
     simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
     for (int k_base = 0; k_base < args.k; k_base += k_tile) {
-        const int canonical_k_tile = k_base >> 7;
-        const int split_base       = (k_base & 127) >> 4;
         for (uint work = tid; work < 64U; work += n_threads) {
             const uint output_quarter = work >> 4;
             const uint tile_work      = work & 15U;
@@ -2219,10 +2558,8 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw(
             const uint local_split    = (tile_work >> 1) & 1U;
             const uint jblock         = tile_work & 1U;
             const uint output_tile    = (uint) tgpig.x * 4U + output_quarter;
-            const ulong code_offset =
-                ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
-                (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
-            const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+            const uchar4 packed =
+                row4_load_prefill_packed4(args, codes, output_tile, k_base, group, local_split, jblock);
 
             const half4 low0 = row4_decode4((uint) (packed.x & 0x0fU));
             const half4 low1 = row4_decode4((uint) (packed.y & 0x0fU));
@@ -2331,7 +2668,6 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act(
     constexpr int n_threads = 128;
     const int row_base      = (int) tgpig.x * row_tile;
     const int col_base      = (int) tgpig.y * col_tile;
-    const int k_tiles       = args.k / 128;
     const int row_block     = (int) sgitg * 16;
     const uint simd_lane    = tid & 31U;
 
@@ -2351,8 +2687,6 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act(
     simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
     for (int k_base = 0; k_base < args.k; k_base += k_tile) {
-        const int canonical_k_tile = k_base >> 7;
-        const int split_base       = (k_base & 127) >> 4;
         for (uint work = tid; work < 64U; work += n_threads) {
             const uint output_quarter = work >> 4;
             const uint tile_work      = work & 15U;
@@ -2360,10 +2694,8 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act(
             const uint local_split    = (tile_work >> 1) & 1U;
             const uint jblock         = tile_work & 1U;
             const uint output_tile    = (uint) tgpig.x * 4U + output_quarter;
-            const ulong code_offset =
-                ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
-                (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
-            const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+            const uchar4 packed =
+                row4_load_prefill_packed4(args, codes, output_tile, k_base, group, local_split, jblock);
 
             const half4 low0 = row4_decode4((uint) (packed.x & 0x0fU));
             const half4 low1 = row4_decode4((uint) (packed.y & 0x0fU));
@@ -2465,7 +2797,6 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act_
     constexpr int k_tile   = 32;
     const int row_base     = (int) tgpig.x * row_tile;
     const int col_base     = (int) tgpig.y * col_tile;
-    const int k_tiles      = args.k / 128;
     const int row_block    = (int) sgitg * 16;
     const uint simd_lane   = tid & 31U;
 
@@ -2485,17 +2816,13 @@ kernel void kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act_
     simdgroup_float8x8 accum13 = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
     for (int k_base = 0; k_base < args.k; k_base += k_tile) {
-        const int canonical_k_tile = k_base >> 7;
-        const int split_base       = (k_base & 127) >> 4;
         if (simd_lane < 16U) {
             const uint group       = simd_lane >> 2;
             const uint local_split = (simd_lane >> 1) & 1U;
             const uint jblock      = simd_lane & 1U;
             const uint output_tile = (uint) tgpig.x * 4U + sgitg;
-            const ulong code_offset =
-                ((((ulong) output_tile * (ulong) k_tiles + (ulong) canonical_k_tile) * 4UL + (ulong) group) * 64UL) +
-                (ulong) (split_base + (int) local_split) * 8UL + (ulong) jblock * 4UL;
-            const uchar4 packed = *((device const uchar4 *) (codes + code_offset));
+            const uchar4 packed =
+                row4_load_prefill_packed4(args, codes, output_tile, k_base, group, local_split, jblock);
 
             const half4 low0  = row4_decode4((uint) (packed.x & 0x0fU));
             const half4 low1  = row4_decode4((uint) (packed.y & 0x0fU));
@@ -13735,6 +14062,8 @@ template [[host_name("kernel_cpy_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy<fl
 #endif
 template [[host_name("kernel_cpy_f16_f32")]]   kernel kernel_cpy_t kernel_cpy<half,   float>;
 template [[host_name("kernel_cpy_f16_f16")]]   kernel kernel_cpy_t kernel_cpy<half,   half>;
+template [[host_name("kernel_cpy_row4_codes_pair2_row4_codes_pair2")]]
+kernel kernel_cpy_t kernel_cpy<uchar, uchar>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy<bfloat, float>;
 template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy<bfloat, bfloat>;

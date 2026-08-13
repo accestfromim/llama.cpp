@@ -13,7 +13,8 @@ static const size_t GiB = 1024*MiB;
 
 static uint64_t llama_tensor_logical_nelements(const ggml_tensor * tensor) {
     const uint64_t n_elements = ggml_nelements(tensor);
-    return tensor->type == GGML_TYPE_ROW4_CODES ? n_elements * 8 : n_elements;
+    return tensor->type == GGML_TYPE_ROW4_CODES || tensor->type == GGML_TYPE_ROW4_CODES_PAIR2 ? n_elements * 8 :
+                                                                                                n_elements;
 }
 
 const char * llama_file_version_name(llama_fver version) {
@@ -684,6 +685,7 @@ llama_model_loader::llama_model_loader(
                 ftype = LLAMA_FTYPE_MOSTLY_FAIRY2I_BUNDLE_V1;
                 break;
             case GGML_TYPE_ROW4_CODES:
+            case GGML_TYPE_ROW4_CODES_PAIR2:
                 ftype = LLAMA_FTYPE_MOSTLY_ROW4;
                 break;
             default:

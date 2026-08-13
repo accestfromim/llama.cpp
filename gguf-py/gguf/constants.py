@@ -2937,6 +2937,7 @@ class GGMLQuantizationType(IntEnum):
     FAIRY2I_ACT_Q16_64 = 45
     FAIRY2I_BUNDLE_CODES = 46
     ROW4_CODES = 47
+    ROW4_CODES_PAIR2 = 48
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -3097,6 +3098,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.FAIRY2I_ACT_Q16_64:(QK_FAIRY2I_ACT_Q16_64, 4 + QK_FAIRY2I_ACT_Q16_64 * 2),
     GGMLQuantizationType.FAIRY2I_BUNDLE_CODES:(1, 1),
     GGMLQuantizationType.ROW4_CODES:(1, 1),
+    GGMLQuantizationType.ROW4_CODES_PAIR2:(1, 1),
 }
 
 
