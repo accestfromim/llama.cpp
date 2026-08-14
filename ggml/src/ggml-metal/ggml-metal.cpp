@@ -183,7 +183,8 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
 }
 
 static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    size_t res = ggml_nbytes(tensor);
+    ggml_metal_device_t dev = (ggml_metal_device_t) buft->device->context;
+    size_t              res = ggml_nbytes(tensor);
 
     res += ggml_metal_fairy2i_packed_weight_extra(tensor);
 
@@ -207,7 +208,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
         case GGML_OP_ROW4_LINEAR:
         case GGML_OP_W8A8_LINEAR:
             {
-                res += ggml_metal_op_row_quant_linear_extra_act_q(tensor);
+                res += ggml_metal_op_row_quant_linear_extra_act_q(dev, tensor);
             }
             break;
         default:
@@ -215,8 +216,6 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
     }
 
     return res;
-
-    GGML_UNUSED(buft);
 }
 
 // default (shared) buffer type

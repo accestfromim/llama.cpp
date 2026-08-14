@@ -9,7 +9,15 @@ __embed_ggml-common.h__
 
 #include <metal_stdlib>
 
+#if defined(GGML_METAL_HAS_MPP_TENSOROPS)
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
+
 using namespace metal;
+#if defined(GGML_METAL_HAS_MPP_TENSOROPS)
+using namespace mpp::tensor_ops;
+#endif
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -1151,6 +1159,251 @@ static inline float w8a8_finish_i32(int acc, float sx, float row_scale) {
     return fairy2i_bf16_to_f32(fairy2i_f32_bits_to_bf16_rne(value));
 }
 
+#if defined(GGML_METAL_HAS_MPP_TENSOROPS)
+
+// M5 TensorOps consume numeric signed INT4 values, while one Row4 nibble is a
+// codebook index shared by four output rows. Expand one BK128/O128 tile into a
+// padded threadgroup INT4 tensor. The padded 256-element row stride is required
+// by the MSL 4 tensor layout and keeps every physical row 128-byte aligned.
+constexpr constant static char4 k_row4_m5_int4_codebook[16] = {
+    char4( 2,  0,  0,  0),
+    char4( 0,  0,  0, -2),
+    char4( 1, -1,  1, -1),
+    char4( 1,  1, -1, -1),
+    char4( 0,  0,  0,  2),
+    char4(-2,  0,  0,  0),
+    char4(-1, -1,  1,  1),
+    char4(-1,  1, -1,  1),
+    char4( 1,  1,  1,  1),
+    char4(-1,  1,  1, -1),
+    char4( 0,  0,  2,  0),
+    char4( 0,  2,  0,  0),
+    char4( 1, -1, -1,  1),
+    char4(-1, -1, -1, -1),
+    char4( 0, -2,  0,  0),
+    char4( 0,  0, -2,  0),
+};
+
+static inline uchar row4_m5_pack_int4(char low, char high) {
+    return (uchar) (((uint) ((uchar) low) & 0x0fU) | (((uint) ((uchar) high) & 0x0fU) << 4U));
+}
+
+// Losslessly expand the physical m16k128_split8_v1 code stream into ordinary
+// row-major numeric signed INT4.  One source byte contains the two K8 halves
+// for a group of four output rows and therefore produces four destination
+// bytes (eight INT4 values).
+kernel void kernel_row4_m5_preexpand_int4(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const uchar * codes                        [[buffer(1)]],
+        device uchar * weight_i4                          [[buffer(2)]],
+        uint gid                                          [[thread_position_in_grid]]) {
+    const ulong source_bytes = (ulong) (uint) args.m * (ulong) (uint) args.k / 8UL;
+    if ((ulong) gid >= source_bytes) {
+        return;
+    }
+
+    uint x           = gid;
+    const uint j     = x & 7U;
+    x >>= 3;
+    const uint split = x & 7U;
+    x >>= 3;
+    const uint group = x & 3U;
+    x >>= 2;
+    const uint k_tiles = (uint) args.k >> 7;
+    const uint kt      = x % k_tiles;
+    const uint ot      = x / k_tiles;
+
+    const uint output = ot * 16U + group * 4U;
+    const uint k_low  = kt * 128U + split * 16U + j;
+    const uint k_high = k_low + 8U;
+    const uchar code_pair = codes[gid];
+    const char4 low        = k_row4_m5_int4_codebook[(uint) (code_pair & 0x0fU)];
+    const char4 high       = k_row4_m5_int4_codebook[(uint) (code_pair >> 4)];
+
+    const ulong low_offset  = ((ulong) k_low * (ulong) args.m + (ulong) output) >> 1;
+    const ulong high_offset = ((ulong) k_high * (ulong) args.m + (ulong) output) >> 1;
+    weight_i4[low_offset + 0UL]  = row4_m5_pack_int4(low.x, low.y);
+    weight_i4[low_offset + 1UL]  = row4_m5_pack_int4(low.z, low.w);
+    weight_i4[high_offset + 0UL] = row4_m5_pack_int4(high.x, high.y);
+    weight_i4[high_offset + 1UL] = row4_m5_pack_int4(high.z, high.w);
+}
+
+// Large prefills amortize one complete Row4 expansion across many token tiles.
+// Keep the cooperative INT32 accumulator live across K and write through the
+// same exact scale/BF16 epilogue as every other Row4 path.
+kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device int8_t * act_q                             [[buffer(1)]],
+        device uchar * weight_i4                          [[buffer(2)]],
+        device const float * act_scales                   [[buffer(3)]],
+        device const ushort * scales                      [[buffer(4)]],
+        device float * dst                                [[buffer(5)]],
+        uint3 tgpig                                       [[threadgroup_position_in_grid]]) {
+    constexpr int row_tile    = 32;
+    constexpr int output_tile = 128;
+    constexpr int k_tile      = 128;
+    constexpr auto desc = matmul2d_descriptor(
+        row_tile,
+        output_tile,
+        k_tile,
+        false,
+        false,
+        false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+
+    using activation_tensor = tensor<device int8_t, dextents<int, 2>, tensor_inline>;
+    using weight_tensor     = tensor<device int4b_format, dextents<int, 2>, tensor_inline>;
+    auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    const uint output_base = tgpig.x * output_tile;
+    const uint row_base    = tgpig.y * row_tile;
+    for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
+        activation_tensor activation(
+            act_q + (ulong) row_base * (ulong) args.k + (ulong) k_base,
+            dextents<int, 2>(k_tile, row_tile),
+            array<int, 2>{ 1, args.k });
+        weight_tensor weight(
+            weight_i4 + (((ulong) k_base * (ulong) args.m + (ulong) output_base) >> 1),
+            dextents<int, 2>(output_tile, k_tile),
+            array<int, 2>{ 1, args.m });
+        op.run(activation, weight, acc);
+    }
+
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto coordinate = acc.get_multidimensional_index(i);
+            const uint output     = output_base + (uint) coordinate[0];
+            const uint row        = row_base + (uint) coordinate[1];
+            dst[(ulong) row * (ulong) args.m + (ulong) output] =
+                row4_finish_i32(acc[i], act_scales[row], scales[output]);
+        }
+    }
+}
+
+template<int row_tile, int output_tile, int n_simdgroups>
+static inline void row4_w1a8_m5_tensorops_prefill_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        device const ushort * scales,
+        device int8_t * act_q,
+        device const float * act_scales,
+        device float * dst,
+        threadgroup uchar * weight_i4,
+        uint3 tgpig,
+        uint tid) {
+    constexpr int threadgroup_threads = n_simdgroups * 32;
+    constexpr int k_tile      = 128;
+
+    constexpr auto desc = matmul2d_descriptor(
+        row_tile,
+        output_tile,
+        k_tile,
+        false,
+        false,
+        false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<n_simdgroups>> op;
+
+    using activation_tensor = tensor<device int8_t, dextents<int, 2>, tensor_inline>;
+    using weight_tensor     = tensor<threadgroup int4b_format, dextents<int, 2>, tensor_inline>;
+
+    auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    const uint output_base = tgpig.x * output_tile;
+    const uint row_base    = tgpig.y * row_tile;
+    const uint k_tiles     = (uint) args.k >> 7;
+    for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
+        const uint kt = k_base >> 7;
+        for (uint work = tid; work < (uint) (output_tile / 4) * 64U; work += threadgroup_threads) {
+            const uint g4     = work >> 6;
+            const uint b      = work & 63U;
+            const uint split  = b >> 3;
+            const uint j      = b & 7U;
+            const uint k_low  = split * 16U + j;
+            const uint k_high = k_low + 8U;
+            const uint output = output_base + 4U * g4;
+            const uint ot     = output >> 4;
+            const uint group  = (output & 15U) >> 2;
+            const ulong source_offset =
+                ((((ulong) ot * (ulong) k_tiles + (ulong) kt) * 4UL + (ulong) group) * 64UL) +
+                (ulong) split * 8UL + (ulong) j;
+            const uchar code_pair = codes[source_offset];
+            const char4 low        = k_row4_m5_int4_codebook[(uint) (code_pair & 0x0fU)];
+            const char4 high       = k_row4_m5_int4_codebook[(uint) (code_pair >> 4)];
+            const uint dst_low     = k_low * 128U + g4 * 2U;
+            const uint dst_high    = k_high * 128U + g4 * 2U;
+            weight_i4[dst_low + 0U]  = row4_m5_pack_int4(low.x, low.y);
+            weight_i4[dst_low + 1U]  = row4_m5_pack_int4(low.z, low.w);
+            weight_i4[dst_high + 0U] = row4_m5_pack_int4(high.x, high.y);
+            weight_i4[dst_high + 1U] = row4_m5_pack_int4(high.z, high.w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        activation_tensor activation(
+            act_q + (ulong) row_base * (ulong) args.k + (ulong) k_base,
+            dextents<int, 2>(k_tile, row_tile),
+            array<int, 2>{ 1, args.k });
+        weight_tensor weight(
+            weight_i4,
+            dextents<int, 2>(output_tile, k_tile),
+            array<int, 2>{ 1, 256 });
+        op.run(activation, weight, acc);
+
+        // TensorOps consume the staged tile before the following iteration
+        // overwrites it with the next BK128 block.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            // Cooperative tensor coordinates are [output, token].
+            const auto coordinate = acc.get_multidimensional_index(i);
+            const uint output     = output_base + (uint) coordinate[0];
+            const uint row        = row_base + (uint) coordinate[1];
+            dst[(ulong) row * (ulong) args.m + (ulong) output] =
+                row4_finish_i32(acc[i], act_scales[row], scales[output]);
+        }
+    }
+}
+
+#define template_row4_m5_tensorops_prefill(kernel_name, row_tile, output_tile, n_simdgroups)                         \
+kernel void kernel_name(                                                                                           \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],                                           \
+        device const uchar * codes                        [[buffer(1)]],                                           \
+        device const ushort * scales                      [[buffer(2)]],                                           \
+        device int8_t * act_q                             [[buffer(3)]],                                           \
+        device const float * act_scales                   [[buffer(4)]],                                           \
+        device float * dst                                [[buffer(5)]],                                           \
+        threadgroup uchar * weight_i4                     [[threadgroup(0)]],                                      \
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],                        \
+        uint tid                                          [[thread_index_in_threadgroup]]) {                       \
+    row4_w1a8_m5_tensorops_prefill_impl<row_tile, output_tile, n_simdgroups>(                                      \
+        args, codes, scales, act_q, act_scales, dst, weight_i4, tgpig, tid);                                       \
+}
+
+template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m32n128,  32, 128, 4)
+template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m64n64,    64,  64, 4)
+template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m128n32,  128,  32, 4)
+template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m256n32,  256,  32, 8)
+#undef template_row4_m5_tensorops_prefill
+
+#endif
+
 static inline void row4_accumulate_basis_branchless(
         uint code,
         int activation,
@@ -1680,7 +1933,7 @@ kernel void kernel_row4_w1a8_decode_o32_segmented16(
 }
 
 
-kernel void kernel_row4_w1a8_decode_o32_o4_staged_act(
+kernel void kernel_row4_w1a8_decode_o16_o4_staged_act(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
         device const uchar * codes                        [[buffer(1)]],
         device const ushort * scales                      [[buffer(2)]],
@@ -1692,54 +1945,78 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act(
         uint tid                                          [[thread_index_in_threadgroup]],
         uint simd_lane                                    [[thread_index_in_simdgroup]],
         uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
-    constexpr int output_tiles_per_tg = 2;
+    constexpr int output_tiles_per_tg = 1;
     constexpr int groups_per_tile     = 4;
     constexpr int rows_per_group      = 4;
     constexpr int k_tile              = 128;
     constexpr int code_tile_bytes     = 256;
-    constexpr int copy_bytes          = 16;
-    constexpr int threads_per_tg      = 256;
+    constexpr int copy_bytes          = 32;
+    constexpr int threads_per_tg      = 128;
 
     for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
          byte_offset += threads_per_tg * copy_bytes) {
         *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+        *((threadgroup uint4 *) (act_tg + byte_offset + 16)) = *((device const uint4 *) (act_q + byte_offset + 16));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint split = simd_lane >> 2;
     const uint j     = (simd_lane & 3U) * 2U;
-    const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) (output_group >> 2);
-    const int output_group_in_tile = (int) (output_group & 3U);
+    const int output_tile = (int) tgpig.x * output_tiles_per_tg;
+    const int output_group_in_tile = (int) output_group;
     const int k_tiles = args.k / k_tile;
     device const uchar * code_ptr = codes +
         (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes +
         (ulong) output_group_in_tile * 64UL + (ulong) simd_lane * 2UL;
     threadgroup const char * act_ptr = act_tg + (ulong) split * 16UL + (ulong) j;
 
-    int u_real = 0;
-    int u_imag = 0;
-    int v_real = 0;
-    int v_imag = 0;
-    for (int kt = 0; kt < k_tiles; ++kt) {
-        const uchar2 packed = *((device const uchar2 *) code_ptr);
-        const char2 activation_low = *((threadgroup const char2 *) act_ptr);
-        const char2 activation_high = *((threadgroup const char2 *) (act_ptr + 8));
-        row4_accumulate_basis_branchless(
-            (uint) (packed.x & 0x0fU), (int) activation_low.x, u_real, u_imag, v_real, v_imag);
-        row4_accumulate_basis_branchless(
-            (uint) (packed.y & 0x0fU), (int) activation_low.y, u_real, u_imag, v_real, v_imag);
-        row4_accumulate_basis_branchless(
-            (uint) (packed.x >> 4), (int) activation_high.x, u_real, u_imag, v_real, v_imag);
-        row4_accumulate_basis_branchless(
-            (uint) (packed.y >> 4), (int) activation_high.y, u_real, u_imag, v_real, v_imag);
-        code_ptr += code_tile_bytes;
-        act_ptr += k_tile;
+    int u_real[4] = { 0, 0, 0, 0 };
+    int u_imag[4] = { 0, 0, 0, 0 };
+    int v_real[4] = { 0, 0, 0, 0 };
+    int v_imag[4] = { 0, 0, 0, 0 };
+    for (int kt = 0; kt < k_tiles; kt += 4) {
+        const uchar2 packed[4] = {
+            *((device const uchar2 *) (code_ptr + 0 * code_tile_bytes)),
+            *((device const uchar2 *) (code_ptr + 1 * code_tile_bytes)),
+            *((device const uchar2 *) (code_ptr + 2 * code_tile_bytes)),
+            *((device const uchar2 *) (code_ptr + 3 * code_tile_bytes)),
+        };
+        const char2 activation_low[4] = {
+            *((threadgroup const char2 *) (act_ptr + 0 * k_tile)),
+            *((threadgroup const char2 *) (act_ptr + 1 * k_tile)),
+            *((threadgroup const char2 *) (act_ptr + 2 * k_tile)),
+            *((threadgroup const char2 *) (act_ptr + 3 * k_tile)),
+        };
+        const char2 activation_high[4] = {
+            *((threadgroup const char2 *) (act_ptr + 0 * k_tile + 8)),
+            *((threadgroup const char2 *) (act_ptr + 1 * k_tile + 8)),
+            *((threadgroup const char2 *) (act_ptr + 2 * k_tile + 8)),
+            *((threadgroup const char2 *) (act_ptr + 3 * k_tile + 8)),
+        };
+#pragma unroll
+        for (int bank = 0; bank < 4; ++bank) {
+            row4_accumulate_basis_branchless((uint) (packed[bank].x & 0x0fU), (int) activation_low[bank].x,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+            row4_accumulate_basis_branchless((uint) (packed[bank].y & 0x0fU), (int) activation_low[bank].y,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+            row4_accumulate_basis_branchless((uint) (packed[bank].x >> 4), (int) activation_high[bank].x,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+            row4_accumulate_basis_branchless((uint) (packed[bank].y >> 4), (int) activation_high[bank].y,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+        }
+        code_ptr += 4 * code_tile_bytes;
+        act_ptr += 4 * k_tile;
     }
 
-    const int sum_u_real = simd_sum(u_real);
-    const int sum_u_imag = simd_sum(u_imag);
-    const int sum_v_real = simd_sum(v_real);
-    const int sum_v_imag = simd_sum(v_imag);
+    const int merged_u_real = ((u_real[0] + u_real[1]) + u_real[2]) + u_real[3];
+    const int merged_u_imag = ((u_imag[0] + u_imag[1]) + u_imag[2]) + u_imag[3];
+    const int merged_v_real = ((v_real[0] + v_real[1]) + v_real[2]) + v_real[3];
+    const int merged_v_imag = ((v_imag[0] + v_imag[1]) + v_imag[2]) + v_imag[3];
+
+    const int sum_u_real = simd_sum(merged_u_real);
+    const int sum_u_imag = simd_sum(merged_u_imag);
+    const int sum_v_real = simd_sum(merged_v_real);
+    const int sum_v_imag = simd_sum(merged_v_imag);
     if (simd_lane == 0U) {
         const int output = output_tile * groups_per_tile * rows_per_group + output_group_in_tile * rows_per_group;
         const float sx = act_scales[0];
@@ -1750,7 +2027,7 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act(
     }
 }
 
-kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual(
+kernel void kernel_row4_w1a8_decode_o16_o4_staged_act_qat_residual(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
         device const uchar * codes                        [[buffer(1)]],
         device const ushort * scales                      [[buffer(2)]],
@@ -1764,54 +2041,78 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_qat_residual(
         uint tid                                          [[thread_index_in_threadgroup]],
         uint simd_lane                                    [[thread_index_in_simdgroup]],
         uint output_group                                 [[simdgroup_index_in_threadgroup]]) {
-    constexpr int output_tiles_per_tg = 2;
+    constexpr int output_tiles_per_tg = 1;
     constexpr int groups_per_tile     = 4;
     constexpr int rows_per_group      = 4;
     constexpr int k_tile              = 128;
     constexpr int code_tile_bytes     = 256;
-    constexpr int copy_bytes          = 16;
-    constexpr int threads_per_tg      = 256;
+    constexpr int copy_bytes          = 32;
+    constexpr int threads_per_tg      = 128;
 
     for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
          byte_offset += threads_per_tg * copy_bytes) {
         *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+        *((threadgroup uint4 *) (act_tg + byte_offset + 16)) = *((device const uint4 *) (act_q + byte_offset + 16));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint split = simd_lane >> 2;
     const uint j     = (simd_lane & 3U) * 2U;
-    const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) (output_group >> 2);
-    const int output_group_in_tile = (int) (output_group & 3U);
+    const int output_tile = (int) tgpig.x * output_tiles_per_tg;
+    const int output_group_in_tile = (int) output_group;
     const int k_tiles = args.k / k_tile;
     device const uchar * code_ptr = codes +
         (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes +
         (ulong) output_group_in_tile * 64UL + (ulong) simd_lane * 2UL;
     threadgroup const char * act_ptr = act_tg + (ulong) split * 16UL + (ulong) j;
 
-    int u_real = 0;
-    int u_imag = 0;
-    int v_real = 0;
-    int v_imag = 0;
-    for (int kt = 0; kt < k_tiles; ++kt) {
-        const uchar2 packed = *((device const uchar2 *) code_ptr);
-        const char2 activation_low = *((threadgroup const char2 *) act_ptr);
-        const char2 activation_high = *((threadgroup const char2 *) (act_ptr + 8));
-        row4_accumulate_basis_branchless(
-            (uint) (packed.x & 0x0fU), (int) activation_low.x, u_real, u_imag, v_real, v_imag);
-        row4_accumulate_basis_branchless(
-            (uint) (packed.y & 0x0fU), (int) activation_low.y, u_real, u_imag, v_real, v_imag);
-        row4_accumulate_basis_branchless(
-            (uint) (packed.x >> 4), (int) activation_high.x, u_real, u_imag, v_real, v_imag);
-        row4_accumulate_basis_branchless(
-            (uint) (packed.y >> 4), (int) activation_high.y, u_real, u_imag, v_real, v_imag);
-        code_ptr += code_tile_bytes;
-        act_ptr += k_tile;
+    int u_real[4] = { 0, 0, 0, 0 };
+    int u_imag[4] = { 0, 0, 0, 0 };
+    int v_real[4] = { 0, 0, 0, 0 };
+    int v_imag[4] = { 0, 0, 0, 0 };
+    for (int kt = 0; kt < k_tiles; kt += 4) {
+        const uchar2 packed[4] = {
+            *((device const uchar2 *) (code_ptr + 0 * code_tile_bytes)),
+            *((device const uchar2 *) (code_ptr + 1 * code_tile_bytes)),
+            *((device const uchar2 *) (code_ptr + 2 * code_tile_bytes)),
+            *((device const uchar2 *) (code_ptr + 3 * code_tile_bytes)),
+        };
+        const char2 activation_low[4] = {
+            *((threadgroup const char2 *) (act_ptr + 0 * k_tile)),
+            *((threadgroup const char2 *) (act_ptr + 1 * k_tile)),
+            *((threadgroup const char2 *) (act_ptr + 2 * k_tile)),
+            *((threadgroup const char2 *) (act_ptr + 3 * k_tile)),
+        };
+        const char2 activation_high[4] = {
+            *((threadgroup const char2 *) (act_ptr + 0 * k_tile + 8)),
+            *((threadgroup const char2 *) (act_ptr + 1 * k_tile + 8)),
+            *((threadgroup const char2 *) (act_ptr + 2 * k_tile + 8)),
+            *((threadgroup const char2 *) (act_ptr + 3 * k_tile + 8)),
+        };
+#pragma unroll
+        for (int bank = 0; bank < 4; ++bank) {
+            row4_accumulate_basis_branchless((uint) (packed[bank].x & 0x0fU), (int) activation_low[bank].x,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+            row4_accumulate_basis_branchless((uint) (packed[bank].y & 0x0fU), (int) activation_low[bank].y,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+            row4_accumulate_basis_branchless((uint) (packed[bank].x >> 4), (int) activation_high[bank].x,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+            row4_accumulate_basis_branchless((uint) (packed[bank].y >> 4), (int) activation_high[bank].y,
+                                              u_real[bank], u_imag[bank], v_real[bank], v_imag[bank]);
+        }
+        code_ptr += 4 * code_tile_bytes;
+        act_ptr += 4 * k_tile;
     }
 
-    const int sum_u_real = simd_sum(u_real);
-    const int sum_u_imag = simd_sum(u_imag);
-    const int sum_v_real = simd_sum(v_real);
-    const int sum_v_imag = simd_sum(v_imag);
+    const int merged_u_real = ((u_real[0] + u_real[1]) + u_real[2]) + u_real[3];
+    const int merged_u_imag = ((u_imag[0] + u_imag[1]) + u_imag[2]) + u_imag[3];
+    const int merged_v_real = ((v_real[0] + v_real[1]) + v_real[2]) + v_real[3];
+    const int merged_v_imag = ((v_imag[0] + v_imag[1]) + v_imag[2]) + v_imag[3];
+
+    const int sum_u_real = simd_sum(merged_u_real);
+    const int sum_u_imag = simd_sum(merged_u_imag);
+    const int sum_v_real = simd_sum(merged_v_real);
+    const int sum_v_imag = simd_sum(merged_v_imag);
     if (simd_lane == 0U) {
         const int output = output_tile * groups_per_tile * rows_per_group + output_group_in_tile * rows_per_group;
         const float sx = act_scales[0];

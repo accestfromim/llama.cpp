@@ -181,6 +181,8 @@ struct ggml_metal_device_props {
     bool fairy2i_metal3_compat;
 
     bool supports_gpu_family_apple7;
+    bool supports_gpu_family_apple10;
+    bool has_mpp_tensorops;
 };
 
 ggml_metal_device_t ggml_metal_device_init(void);
@@ -224,6 +226,9 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_for_size(ggml_metal_buffer_t        buf,
+                                                              const struct ggml_tensor * t,
+                                                              size_t                     size);
 struct ggml_metal_buffer_id ggml_metal_buffer_get_fairy2i_w1_coeff_lut(ggml_metal_buffer_t        buf,
                                                                        const struct ggml_tensor * scales);
 
