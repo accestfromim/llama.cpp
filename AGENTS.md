@@ -114,6 +114,7 @@ Optimize ggml CPU operators on ARM without changing numerical behavior.
 - Use `LLAMACPP_TEST_MODELFILE=/path/model.gguf` when tests need weights.
 - For perf/quality spot checks: `./build-rel/bin/llama-bench ...`, `./build-rel/bin/llama-perplexity ...`.
 - For targeted suites: `ctest -R tokenizer` or `scripts/debug-test.sh`; server tests: `tools/server/tests/tests.sh`.
+- For GGUF/converter and Fairy2i Python tests: `scripts/test-gguf-py.sh`.
 
 ## 8) Commit & Pull Request Guidelines
 
@@ -125,3 +126,13 @@ Optimize ggml CPU operators on ARM without changing numerical behavior.
 - Consult `SECURITY.md` before disclosing vulnerabilities.
 - Never commit model weights, API keys, or proprietary datasets.
 - Store environment-specific overrides outside the repo (e.g. `~/.config/llama.cpp/`).
+
+## 10) Contribution and agent guardrails
+
+- AI-assisted changes are acceptable only when the contributor understands and can defend every changed line.
+- Before non-trivial edits, read the relevant source, tests, build files, and existing issue/PR context. Prefer existing infrastructure over new machinery.
+- Keep each change single-purpose. Split invasive design changes, new public APIs, new GGML types, and new backend infrastructure into separately reviewed work.
+- Do not generate PR descriptions, commit messages, issue or review text, or submit commits, pushes, or PRs on the contributor's behalf.
+- Disclose meaningful AI assistance in the PR template. Use `Assisted-by:` for AI assistance; reserve `Co-authored-by:` for human co-authors.
+- Run the applicable code review pass after targeted validation and before presenting a transplant as complete.
+- Reusable task workflows live in `skills/`; read the matching skill before non-trivial work.
