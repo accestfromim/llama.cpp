@@ -1,0 +1,98 @@
+name: C/C++ Format
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - '.clang-format'
+      - '.github/workflows/cpp-format.yml'
+      - '**/*.c'
+      - '**/*.cc'
+      - '**/*.cpp'
+      - '**/*.cxx'
+      - '**/*.h'
+      - '**/*.hh'
+      - '**/*.hpp'
+      - '**/*.hxx'
+      - '**/*.cu'
+      - '**/*.cuh'
+      - '**/*.m'
+      - '**/*.mm'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.clang-format'
+      - '.github/workflows/cpp-format.yml'
+      - '**/*.c'
+      - '**/*.cc'
+      - '**/*.cpp'
+      - '**/*.cxx'
+      - '**/*.h'
+      - '**/*.hh'
+      - '**/*.hpp'
+      - '**/*.hxx'
+      - '**/*.cu'
+      - '**/*.cuh'
+      - '**/*.m'
+      - '**/*.mm'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  clang-format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install clang-format
+        run: |
+          if ! command -v clang-format >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y clang-format
+          fi
+
+      - name: Check changed C/C++ lines
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          base_sha="${BASE_SHA}"
+          if [[ -z "${base_sha}" || "${base_sha}" =~ ^0+$ ]]; then
+            base_sha="$(git rev-list --max-parents=0 "${HEAD_SHA}")"
+          fi
+
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=ACMR "${base_sha}" "${HEAD_SHA}" -- \
+              '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hh' '*.hpp' '*.hxx' \
+              '*.cu' '*.cuh' '*.m' '*.mm'
+          )
+
+          if ((${#files[@]} == 0)); then
+            echo 'No changed C/C++ files.'
+            exit 0
+          fi
+
+          patch_file="$(mktemp)"
+          trap 'rm -f "${patch_file}"' EXIT
+          git clang-format --diff "${base_sha}" -- "${files[@]}" >"${patch_file}"
+
+          if [[ -s "${patch_file}" ]]; then
+            cat "${patch_file}"
+            echo 'clang-format differences found.' >&2
+            exit 1
+          fi
+
+          echo 'Changed C/C++ lines are clang-format clean.'
