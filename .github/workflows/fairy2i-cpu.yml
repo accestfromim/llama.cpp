@@ -1,0 +1,44 @@
+name: Fairy2i CPU Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/fairy2i-cpu.yml'
+      - 'CMakeLists.txt'
+      - 'ggml/src/ggml-cpu/**'
+      - 'ggml/src/ggml-quants*'
+      - 'src/**'
+      - 'tests/CMakeLists.txt'
+      - 'tests/test-fairy2i*'
+      - 'tests/test-legacy-ifairy*'
+      - 'scripts/ci-fairy2i-cpu.sh'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/fairy2i-cpu.yml'
+      - 'CMakeLists.txt'
+      - 'ggml/src/ggml-cpu/**'
+      - 'ggml/src/ggml-quants*'
+      - 'src/**'
+      - 'tests/CMakeLists.txt'
+      - 'tests/test-fairy2i*'
+      - 'tests/test-legacy-ifairy*'
+      - 'scripts/ci-fairy2i-cpu.sh'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source repository
+        uses: actions/checkout@v4
+
+      - name: Run Fairy2i and legacy iFairy CPU matrix
+        run: bash scripts/ci-fairy2i-cpu.sh

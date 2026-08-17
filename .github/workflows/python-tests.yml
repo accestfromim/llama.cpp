@@ -1,0 +1,48 @@
+name: Python Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/python-tests.yml'
+      - 'gguf-py/**'
+      - 'scripts/row4/**'
+      - 'scripts/test-gguf-py.sh'
+      - 'convert*.py'
+      - 'requirements/**'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/python-tests.yml'
+      - 'gguf-py/**'
+      - 'scripts/row4/**'
+      - 'scripts/test-gguf-py.sh'
+      - 'convert*.py'
+      - 'requirements/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  gguf-py:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pyyaml pytest tqdm
+
+      - name: Run GGUF and Fairy2i Python tests
+        run: bash scripts/test-gguf-py.sh
