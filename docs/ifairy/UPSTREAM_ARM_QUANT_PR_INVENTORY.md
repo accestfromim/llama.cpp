@@ -8,8 +8,8 @@
 - upstream snapshot: `34af94cd9` (`upstream/master` fetched before this report)
 - range: first-parent commits in `4b8560ab56fdd9819358b47c338bbc8ec357c57e..upstream/master`
 - upstream range size: 3951 commits; PR-tagged unique numbers observed: 3852
-- current branch: `lwt/merge_master` at `3133499b5`
-- source code status: no source transplant performed; existing `tools/ifairy-microbench/ifairy-microbench.cpp` worktree change was preserved
+- current branch: `lwt/merge_master`, source tip `1c8e8bf8d` (A0-A2 adapted in separate commits)
+- source code status: A0 SIMD scale fix, A1 ARM feature/CMake chain, and A2 HWCAP/FP16 fallback are implemented; detailed evidence is in `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`
 
 ## Filter definition
 
@@ -242,9 +242,9 @@ Fairy2i implementation, not upstream names alone.
 
 | Batch | Upstream PR(s) | Local decision | Why | Required proof |
 |---|---|---|---|---|
-| A0 correctness | [#16307](https://github.com/ggml-org/llama.cpp/pull/16307), `b887d2f34` | **Adapt first** | Local `ggml_vec_mad1_f32` still uses `GGML_F32_VEC_FMA(ay[j], vs, vb)` while the upstream fix changes it to `GGML_F32_VEC_FMA(vb, ay[j], vs)`. Fairy2i graph call sites include LoRA scaling and exact-attention scaling. | Generic `test-backend-ops` scale case with `n > GGML_F32_STEP`; Fairy2i direct/LUT matrix; compare scalar and SIMD outputs. |
-| A1 ARM CMake chain | [#16229](https://github.com/ggml-org/llama.cpp/pull/16229), [#16239](https://github.com/ggml-org/llama.cpp/pull/16239), [#17170](https://github.com/ggml-org/llama.cpp/pull/17170), [#17519](https://github.com/ggml-org/llama.cpp/pull/17519) | **Inspect and adapt as one chain** | Current CMake has a nested `check_arm_feature` function, custom Fairy2i source flags, and post-hoc macro inspection. Upstream successively fixes `-march` detection, feature verification scope, explicit macro undefines, and list-to-string flag passing. | Clean native build with Fairy2i DOTPROD enabled; compile variants with and without dotprod; run `scripts/ci-fairy2i-cpu.sh`; verify no unsupported ISA reaches the fallback path. |
-| A2 ARM feature portability | [#25554](https://github.com/ggml-org/llama.cpp/pull/25554), `cb26014d9` | **Adapt narrowly** | Local `arch/arm/cpu-feats.cpp` defines only some HWCAP fallbacks and still models `has_fp16_va`; older Linux/Android headers can miss the other constants. Keep the local backend-score ABI and Fairy2i runtime gate; do not import the later `ggml-feats.h` refactor wholesale. | Linux/Android header-compatibility compile; backend score on a machine lacking optional HWCAP macros; Fairy2i direct path remains runtime-gated. |
+| A0 correctness | [#16307](https://github.com/ggml-org/llama.cpp/pull/16307), `b887d2f34` | **Adapted and verified** | Fixed local `ggml_vec_mad1_f32()` to use `GGML_F32_VEC_FMA(vb, ay[j], vs)`; Fairy2i LoRA and exact-attention scale call sites remain on the shared generic scale path. | Long-vector `SCALE` regression (`n=100`) passes SIMD/CPU comparison; direct/LUT Fairy2i CPU matrix passes. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
+| A1 ARM CMake chain | [#16229](https://github.com/ggml-org/llama.cpp/pull/16229), [#16239](https://github.com/ggml-org/llama.cpp/pull/16239), [#17170](https://github.com/ggml-org/llama.cpp/pull/17170), [#17519](https://github.com/ggml-org/llama.cpp/pull/17519) | **Adapted locally and verified** | Adapted native `-march`/`-mcpu` selection, scoped macro verification, explicit undefines, and list-to-string flag handling without changing Fairy2i source split or DOTPROD gates. | Native, explicit ARM baseline, all CPU variants, dotprod on/off, and full `scripts/ci-fairy2i-cpu.sh` checks pass. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
+| A2 ARM feature portability | [#25554](https://github.com/ggml-org/llama.cpp/pull/25554), `cb26014d9` | **Adapted narrowly and verified** | Added only missing HWCAP fallbacks and changed FP16 runtime detection to require both `HWCAP_FPHP` and `HWCAP_ASIMDHP`; retained local backend-score ABI and runtime gates. | Linux header-compatibility harness and ARM CPU matrix pass; no later `ggml-feats.h` refactor imported. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
 | B0 shared CPU scheduling | [#17133](https://github.com/ggml-org/llama.cpp/pull/17133), [#17748](https://github.com/ggml-org/llama.cpp/pull/17748) | **Inspect only after A0–A2** | These are generic NOP/barrier and threadpool-race fixes. They may protect the local dynamic W1/W2 tile path, but the local claim loop is not upstream's scheduler implementation. | Stress repeated `N == 1` W1/W2 LUT runs while varying thread count; no output drift, deadlock, or race report; then compare the smallest shared-runtime diff. |
 | B1 shared operation optimization | [#22423](https://github.com/ggml-org/llama.cpp/pull/22423), [#19422](https://github.com/ggml-org/llama.cpp/pull/19422), [#19012](https://github.com/ggml-org/llama.cpp/pull/19012) | **Reference only** | Upstream fuses generic RMS_NORM/MUL or changes generic flash-attention tiling. Fairy2i has custom `ifairy_build_norm` and `GGML_OP_FAIRY2I_ATTN_EXACT_CPU`; cherry-picking would bypass BF16/complex semantics. | If pursued, implement a local op and compare exact graph outputs before/after; do not transplant generic graph builders. |
 | B2 LUT initialization | [#23595](https://github.com/ggml-org/llama.cpp/pull/23595) | **Reference only** | The PR parallelizes IQ quantizer table construction in `ggml-quants.c`; Fairy2i LUT transform currently serializes encode/pack work in `ggml-fairy2i-lut-transform.cpp`. The algorithm and data are different, but the local transform is a measurable candidate. | Measure first-transform latency and peak memory; parallelize only row/tile-independent stages after preserving cache ownership and duplicate-builder cleanup. |
@@ -254,8 +254,8 @@ Fairy2i implementation, not upstream names alone.
 
 ### Migration order and gates
 
-1. **A0:** port the two-line FMA semantic fix and its scale regression test. No Fairy2i layout changes.
-2. **A1–A2:** adapt ARM feature detection against the local CMake/source split. Keep DOTPROD compile-time availability separate from `ggml_cpu_has_dotprod()` runtime availability.
+1. **A0:** adapted and verified in `64cd4f3bc` and `8c351ee68`; no Fairy2i layout changes.
+2. **A1–A2:** adapted and verified in `6028b4b64` and `1c8e8bf8d`; DOTPROD compile-time availability remains separate from `ggml_cpu_has_dotprod()` runtime availability.
 3. **B0:** inspect only if the thread-count stress gate exposes a shared runtime defect. Do not change dynamic tile batching while evaluating an upstream scheduler fix.
 4. **B1–B2:** treat as local experiments, not upstream cherry-picks. Record `eval tok/s`, first-transform latency, thread count, model/layout, and all environment variables.
 5. **C–E:** remain reference/deferred until a Fairy2i-specific fixture or benchmark identifies a concrete contract.
@@ -274,4 +274,4 @@ ctest --test-dir build-ifairy-direct --output-on-failure -R legacy-ifairy-direct
 GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy
 ```
 
-No source transplant is approved by this inventory alone. The first implementation candidate is A0; A1 and A2 require local CMake/feature review before editing.
+No source transplant is approved by this inventory alone. A0-A2 are narrow local adaptations; future B0-E work remains gated by Fairy2i-specific evidence.
