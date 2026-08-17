@@ -1,7 +1,7 @@
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
-#include "ggml-ifairy-lut-impl.h"
-#include "ggml-ifairy-lut.h"
+#include "ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut-impl.h"
+#include "ggml-cpu/legacy-ifairy/lut/ggml-ifairy-lut.h"
 
 #include <chrono>
 #include <cinttypes>
