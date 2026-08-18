@@ -4392,6 +4392,236 @@ static bool test_fairy2i_wide_linear_w2_lut_dynamic_tiles() {
 #endif
 }
 
+static bool test_fairy2i_lut_thread_switch_stress() {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    struct persistent_graph {
+        ggml_context *        ctx   = nullptr;
+        ggml_backend_buffer_t buf   = nullptr;
+        ggml_cgraph *         graph = nullptr;
+        ggml_tensor *         y     = nullptr;
+    };
+
+    const fairy2i_w2_case tc                = { 256, 1, 256, true };
+    const int             thread_sequence[] = { 1, 2, 1, 3, 1, 4, 1, 6, 1, 8, 1, 10, 1, 12 };
+    constexpr int         n_rounds          = 3;
+    const fairy2i_w1_data w1_data           = make_fairy2i_w1_data(tc);
+    const fairy2i_w2_data w2_data           = make_fairy2i_w2_data(tc);
+    std::vector<uint32_t> w1_ref;
+    std::vector<uint32_t> w2_ref;
+
+    scoped_env_var env_lut("GGML_FAIRY2I_LUT");
+    scoped_env_var env_impl("GGML_FAIRY2I_LUT_IMPL");
+    scoped_env_var env_require_lut("GGML_FAIRY2I_TEST_REQUIRE_LUT");
+    scoped_env_var env_w1_dynamic("GGML_FAIRY2I_W1_DYNAMIC_TILES");
+    scoped_env_var env_w1_batch("GGML_FAIRY2I_W1_DYNAMIC_TILE_BATCH");
+    scoped_env_var env_w2_dynamic("GGML_FAIRY2I_W2_DYNAMIC_TILES");
+    scoped_env_var env_w2_batch("GGML_FAIRY2I_W2_DYNAMIC_TILE_BATCH");
+    env_lut.set("1");
+    env_impl.set("lut16");
+    env_require_lut.set("1");
+    env_w1_dynamic.set("1");
+    env_w1_batch.set("1");
+    env_w2_dynamic.set("1");
+    env_w2_batch.set("1");
+
+    ggml_backend_t    backend    = ggml_backend_cpu_init();
+    ggml_threadpool_t threadpool = nullptr;
+    persistent_graph  w1;
+    persistent_graph  w2;
+
+    auto cleanup = [&]() {
+        if (w1.buf) {
+            ggml_backend_buffer_free(w1.buf);
+            w1.buf = nullptr;
+        }
+        if (w2.buf) {
+            ggml_backend_buffer_free(w2.buf);
+            w2.buf = nullptr;
+        }
+        if (w1.ctx) {
+            ggml_free(w1.ctx);
+            w1.ctx = nullptr;
+        }
+        if (w2.ctx) {
+            ggml_free(w2.ctx);
+            w2.ctx = nullptr;
+        }
+        if (threadpool) {
+            ggml_threadpool_free(threadpool);
+            threadpool = nullptr;
+        }
+        if (backend) {
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
+    };
+
+    if (!backend) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to initialize CPU backend\n");
+        return false;
+    }
+
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(12);
+    threadpool                        = ggml_threadpool_new(&tpp);
+    if (!threadpool) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to create threadpool\n");
+        cleanup();
+        return false;
+    }
+    ggml_backend_cpu_set_threadpool(backend, threadpool);
+
+    const auto init_context = []() {
+        return ggml_init(ggml_init_params{
+            /*.mem_size   =*/32 * 1024 * 1024,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        });
+    };
+
+    w1.ctx = init_context();
+    w2.ctx = init_context();
+    if (!w1.ctx || !w2.ctx) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to initialize contexts\n");
+        cleanup();
+        return false;
+    }
+
+    ggml_tensor * w1_x    = ggml_new_tensor_2d(w1.ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * w1_u_s0 = ggml_new_tensor_2d(w1.ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w1_w_s0 = ggml_new_tensor_2d(w1.ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w1_bias = ggml_new_tensor_1d(w1.ctx, GGML_TYPE_F32, 2 * tc.M);
+    w1.y                  = ggml_fairy2i_wide_linear_w1(w1.ctx, w1_x, w1_u_s0, w1_w_s0, w1_bias);
+    w1.graph              = ggml_new_graph(w1.ctx);
+    if (!w1_x || !w1_u_s0 || !w1_w_s0 || !w1_bias || !w1.y || !w1.graph) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to build W1 graph\n");
+        cleanup();
+        return false;
+    }
+    ggml_build_forward_expand(w1.graph, w1.y);
+    w1.buf = ggml_backend_alloc_ctx_tensors(w1.ctx, backend);
+    if (!w1.buf) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to allocate W1 tensors\n");
+        cleanup();
+        return false;
+    }
+    ggml_backend_tensor_set(w1_x, w1_data.x.data(), 0, w1_data.x.size() * sizeof(float));
+    ggml_backend_tensor_set(w1_u_s0, w1_data.u_s0.data(), 0, w1_data.u_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w1_w_s0, w1_data.w_s0.data(), 0, w1_data.w_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w1_bias, w1_data.bias.data(), 0, w1_data.bias.size() * sizeof(float));
+
+    ggml_tensor * w2_x    = ggml_new_tensor_2d(w2.ctx, GGML_TYPE_F32, tc.K, tc.N);
+    ggml_tensor * w2_u_s0 = ggml_new_tensor_2d(w2.ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w2_u_s1 = ggml_new_tensor_2d(w2.ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w2_w_s0 = ggml_new_tensor_2d(w2.ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w2_w_s1 = ggml_new_tensor_2d(w2.ctx, GGML_TYPE_FAIRY2I_TILE64_V2, tc.K, tc.M);
+    ggml_tensor * w2_bias = ggml_new_tensor_1d(w2.ctx, GGML_TYPE_F32, 2 * tc.M);
+    w2.y                  = ggml_fairy2i_wide_linear_w2(w2.ctx, w2_x, w2_u_s0, w2_u_s1, w2_w_s0, w2_w_s1, w2_bias);
+    w2.graph              = ggml_new_graph(w2.ctx);
+    if (!w2_x || !w2_u_s0 || !w2_u_s1 || !w2_w_s0 || !w2_w_s1 || !w2_bias || !w2.y || !w2.graph) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to build W2 graph\n");
+        cleanup();
+        return false;
+    }
+    ggml_build_forward_expand(w2.graph, w2.y);
+    w2.buf = ggml_backend_alloc_ctx_tensors(w2.ctx, backend);
+    if (!w2.buf) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to allocate W2 tensors\n");
+        cleanup();
+        return false;
+    }
+    ggml_backend_tensor_set(w2_x, w2_data.x.data(), 0, w2_data.x.size() * sizeof(float));
+    ggml_backend_tensor_set(w2_u_s0, w2_data.u_s0.data(), 0, w2_data.u_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w2_u_s1, w2_data.u_s1.data(), 0, w2_data.u_s1.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w2_w_s0, w2_data.w_s0.data(), 0, w2_data.w_s0.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w2_w_s1, w2_data.w_s1.data(), 0, w2_data.w_s1.size() * sizeof(block_fairy2i_tile64_v2));
+    ggml_backend_tensor_set(w2_bias, w2_data.bias.data(), 0, w2_data.bias.size() * sizeof(float));
+    env_w1_dynamic.set("0");
+    env_w2_dynamic.set("0");
+    ggml_backend_cpu_set_n_threads(backend, 1);
+    if (ggml_backend_graph_compute(backend, w1.graph) != GGML_STATUS_SUCCESS ||
+        ggml_backend_graph_compute(backend, w2.graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "Fairy2i LUT thread-switch stress: failed to compute static baselines\n");
+        cleanup();
+        return false;
+    }
+    w1_ref.resize((size_t) tc.M * (size_t) tc.N);
+    w2_ref.resize((size_t) tc.M * (size_t) tc.N);
+    ggml_backend_tensor_get(w1.y, w1_ref.data(), 0, w1_ref.size() * sizeof(float));
+    ggml_backend_tensor_get(w2.y, w2_ref.data(), 0, w2_ref.size() * sizeof(float));
+    env_w1_dynamic.set("1");
+    env_w2_dynamic.set("1");
+
+    auto compute_w1 = [&](int n_threads, int iteration) {
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+        ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(true);
+        const ggml_status status = ggml_backend_graph_compute(backend, w1.graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "Fairy2i W1 thread-switch stress compute failed: threads=%d iteration=%d status=%s\n",
+                    n_threads, iteration, ggml_status_to_string(status));
+            return false;
+        }
+
+        std::vector<uint32_t> actual(w1_ref.size());
+        ggml_backend_tensor_get(w1.y, actual.data(), 0, actual.size() * sizeof(float));
+        char label[128];
+        snprintf(label, sizeof(label), "W1 LUT thread-switch threads=%d iteration=%d", n_threads, iteration);
+        bool      ok    = compare_exact(label, actual, w1_ref);
+        const int hits  = ggml_fairy2i_wide_linear_w1_dynamic_tiles_hits_for_test(false);
+        const int batch = ggml_fairy2i_wide_linear_w1_dynamic_tiles_last_batch_for_test();
+        if (hits <= 0 || batch != 1) {
+            fprintf(stderr, "%s dynamic scheduling mismatch: hits=%d batch=%d\n", label, hits, batch);
+            ok = false;
+        }
+        return ok;
+    };
+
+    auto compute_w2 = [&](int n_threads, int iteration) {
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+        ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(true);
+        const ggml_status status = ggml_backend_graph_compute(backend, w2.graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "Fairy2i W2 thread-switch stress compute failed: threads=%d iteration=%d status=%s\n",
+                    n_threads, iteration, ggml_status_to_string(status));
+            return false;
+        }
+
+        std::vector<uint32_t> actual(w2_ref.size());
+        ggml_backend_tensor_get(w2.y, actual.data(), 0, actual.size() * sizeof(float));
+        char label[128];
+        snprintf(label, sizeof(label), "W2 LUT thread-switch threads=%d iteration=%d", n_threads, iteration);
+        bool      ok    = compare_exact(label, actual, w2_ref);
+        const int hits  = ggml_fairy2i_wide_linear_w2_dynamic_tiles_hits_for_test(false);
+        const int batch = ggml_fairy2i_wide_linear_w2_dynamic_tiles_last_batch_for_test();
+        if (hits <= 0 || batch != 1) {
+            fprintf(stderr, "%s dynamic scheduling mismatch: hits=%d batch=%d\n", label, hits, batch);
+            ok = false;
+        }
+        return ok;
+    };
+
+    bool ok        = true;
+    int  iteration = 0;
+    for (int round = 0; round < n_rounds && ok; ++round) {
+        for (int n_threads : thread_sequence) {
+            ++iteration;
+            ok = compute_w1(n_threads, iteration) && ok;
+            ok = compute_w2(n_threads, iteration) && ok;
+            if (!ok) {
+                break;
+            }
+        }
+    }
+
+    printf("  Fairy2i W1/W2 LUT same-backend thread-switch stress: %d graph pairs - %s\n", iteration,
+           ok ? "PASS" : "FAIL");
+    cleanup();
+    return ok;
+#else
+    printf("  Fairy2i W1/W2 LUT same-backend thread-switch stress skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+#endif
+}
+
 static bool compare_exact(const char *                  label,
                           const std::vector<uint32_t> & actual,
                           const std::vector<uint32_t> & expected) {
@@ -6102,6 +6332,11 @@ int main() {
         fprintf(stderr, "Fairy2i W2 LUT dynamic tiles FAILED\n");
         ++num_failed;
     }
+    if (!test_fairy2i_lut_thread_switch_stress()) {
+        fprintf(stderr, "Fairy2i W1/W2 LUT same-backend thread-switch stress FAILED\n");
+        ++num_failed;
+    }
+
     if (!test_fairy2i_metal_wide_linear()) {
         fprintf(stderr, "Fairy2i Metal W1/W2 FAILED\n");
         ++num_failed;
