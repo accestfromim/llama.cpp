@@ -1,19 +1,20 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前 `lwt/merge_master` 分支完成并验证的 A0-A2 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前 `lwt/merge_master` 分支完成并验证的 A0-A2 与 B0 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
 - 分支：`lwt/merge_master`
-- 最新实现提交：`1c8e8bf8d`
+- 最新实现提交：`89e5045d2`（B0 源码），`66b095e15`（B0 回归）
 - 回滚粒度：每个目标一个提交，提交顺序见下表。
-- 工作树：A0-A2 实现完成；源代码提交后由 CPU 矩阵和真实模型 smoke 验证。
+- 工作树：A0-A2 与 B0 实现完成；源代码提交后由 CPU 矩阵和真实模型 smoke 验证。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
 | A0 | 修正 `ggml_vec_mad1_f32()` 的 SIMD FMA 参数顺序；加入长向量 `SCALE` 回归用例 | `64cd4f3bc`, `8c351ee68` |
 | A1 | 适配 ARM `-mcpu`/`-march` 探测、宏验证和所需 feature flag 传递；保留 Fairy2i source split 与 DOTPROD gate | `6028b4b64` |
 | A2 | 增加 Linux/aarch64 缺失 HWCAP fallback；FP16 runtime 能力要求 `HWCAP_FPHP` 与 `HWCAP_ASIMDHP` 同时存在 | `1c8e8bf8d` |
+| B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
 
 ## A0 证据
 
@@ -87,42 +88,47 @@ bash scripts/ci-fairy2i-cpu.sh
 
 两项均通过。
 
-## B0 调度器移植决策（尚未改源代码）
+## B0 调度器移植决策（已完成）
 
-- **下一目标：#17748**（threadpool 中把 `n_graph` 与 active-thread count 合并为一个原子状态）；**#17133**（跳过 NOP/barrier）后置为独立优化提交。
-- 选择依据：当前本地 threadpool 在同一个 `ggml_threadpool` 上交替执行 `1` 与 `N` 线程图时可复现崩溃/挂死；这已经是共享 CPU runtime 缺陷，不是 Fairy2i tile claim 算法缺陷。
-- 不把 #17748 与 #17133、Fairy2i dynamic tile batching 或算子布局改动合并；先修状态一致性，再单独评估 NOP 优化。
+- **目标：#17748**（threadpool 中把 `n_graph` 与 active-thread count 合并为一个原子状态）；**#17133**（跳过 NOP/barrier）仍保持独立后续提交。
+- 选择依据：修复前，同一个 `ggml_threadpool` 交替执行 `1` 与 `N` 线程图会出现 `SIGSEGV`、挂死或极端延迟；这是共享 CPU runtime 状态一致性缺陷，不是 Fairy2i tile claim 算法缺陷。
+- B0 提交：`d8fe14ad4`（barrier active/multi-graph 回归）、`89e5045d2`（threadpool packed state）、`66b095e15`（同 backend/threadpool 的 Fairy2i W1/W2 LUT stress）。
 
-### 已有证据
+### 实现边界
 
-- `./build-rel-fairy2i/bin/test-fairy2i`：通过 W1 `768` 个 `N=1` dynamic cases、`384` 个 `N>1` fallback cases；W2 通过 `1664`/`832` 个对应 cases。该测试覆盖线程数矩阵，但每次 helper 调用会重建 backend，不能覆盖同一 threadpool 的 active-thread 切换。
-- `./build-rel-fairy2i/bin/test-barrier 10 1000`：固定线程数路径通过，不能覆盖 #17748 的 race。
-- 临时 active/multi-graph harness（同一 threadpool，反复 `1`/`10` 线程切换）链接当前 `build-rel-fairy2i` 后：`10` 线程、`10000` 次 active graph 在重复运行中出现 `SIGSEGV`；`12` 线程同配置出现 `15s` 无输出挂死。说明当前实现确实存在 upstream #17748 描述的状态不一致窗口。
-- 当前兼容 iFairy 模型基线：
+1. **`ggml/src/ggml-cpu/ggml-cpu.c`**：只适配 packed `n_graph`/active-thread count、barrier 读取、worker ready/poll、kickoff 发布、OpenMP 分支，以及 threadpool 线程数状态字段。保留 Fairy2i/legacy `prepare_graph`、extension work-size、affinity 和 pause 逻辑。
+2. **`tests/test-barrier.cpp`**：active-thread graph 与 two-graph back-to-back regression 在同一 threadpool 上反复切换 `1`/`N` 线程并重新 plan。
+3. **`tests/test-fairy2i.cpp`**：固定 `M=256,N=1,K=256`，复用同一个 CPU backend/threadpool，按 `1,2,1,3,1,4,1,6,1,8,1,10,1,12` 切换 3 轮；W1/W2 LUT 每轮检查 BF16 输出、dynamic-tile hit 和 `batch=1`。
+
+以下文件不属于 B0 源码改动：`fairy2i/wide-linear*.cpp`、LUT qgemm/pack layout、模型 loader、通用 `ggml_op_is_empty` 重构。Fairy2i dynamic tile batch 未因 scheduler patch 改写。
+
+### 验证
+
+- 修复前的临时同-threadpool harness 已复现 `10` 线程 active graph `SIGSEGV`，以及 `12` 线程无输出挂死。
+- 修复后 `timeout 120 ./build-rel-fairy2i/bin/test-barrier 10 1000` 正常返回：1000 次 2000-node graph、10000 次 active graph、1000 次双 graph；graph compute 5.04 s。
+- 修复后 `timeout 30 ./build-rel-fairy2i/bin/test-barrier 12 1` 正常返回；M4 仅有 10 个逻辑 CPU，12-thread case 为过量线程诊断，不作为性能配置。
+- `./build-rel-fairy2i/bin/test-fairy2i` 全部通过；新增同 backend/threadpool stress 为 42 对图，W1/W2 输出与静态首轮基线一致，dynamic hit/batch 约束通过。
+- `./build-ifairy-legacy/bin/test-legacy-ifairy` 与 `test-legacy-ifairy-direct` 全部通过；`GGML_IFAIRY_LUT=1` 的 legacy ctest 也通过。
+- `bash scripts/ci-fairy2i-cpu.sh` 通过：CPU baseline、Fairy2i direct/LUT loader/test、LUT required/disabled、Fairy2i W2 backend-op `14578/14578`、legacy direct/LUT gates 全部通过。
+
+### 真实模型 smoke 与速度记录
+
+- Qwen3 Row4 模型 `models/qwen3-row4-int8-v1-final-bos.gguf` 的 direct-mode `llama-cli`（`-t 8`, BF16 KV, `-no-cnv`, 固定 seed）输出可读中文/ASCII，无乱码；eval 为 `27.26 t/s`。
+- 完成的 focused `llama-bench` 命令：
 
   ```bash
-  GGML_IFAIRY_LUT=1 ./build-ifairy-legacy/bin/llama-bench \
-    -m models/Fairy-plus-minus-i-700M/ifairy.gguf -t 4 -p 128 -n 256 \
-    -ngl 0 -dev none -r 5 --no-warmup -o md
+  ./build-rel-fairy2i/bin/llama-bench \
+    -m ./models/qwen3-row4-int8-v1-final-bos.gguf -pg 128,256 -t 8,10 \
+    -b 64 -ub 1 -ctk bf16 -ctv bf16 -ngl 0 -dev none -r 1 --no-warmup -o md
   ```
 
-  结果：`pp128 = 135.08 ± 20.63 t/s`，`tg256 = 78.05 ± 0.66 t/s`；仅作 B0 前后性能参考，不作为正确性证据。
+  同一命令结果：`t=8` 的 `tg128=26.22 t/s`、`pp512=27.50 t/s`、`pp128+tg256=23.85 t/s`；`t=10` 的 `tg128=13.14 t/s`。本次实际最高 decode 为 **26.22 t/s**，未达到预期的约 40 t/s。
+- `t=11/12` 的额外 CLI probe 分别只有 `0.45/0.24 eval t/s`；结合 M4 的 10-CPU 拓扑，暂判定为过量线程诊断结果，不把它们作为推荐配置。此前包含 `t=12` 的完整 benchmark 在 900 s 截止前未完成。
+- `models/Fairy-plus-minus-i-700M/ifairy.gguf` 在 `GGML_IFAIRY_LUT=1`、CPU-only、固定 seed 下也输出可读文本；eval 为 `92.30 t/s`。
 
-### 最小安全移植边界
+### 后续
 
-1. **`ggml/src/ggml-cpu/ggml-cpu.c`**：只适配 #17748 的 threadpool 状态链：packed `n_graph`/active-thread count、barrier 读取、worker ready/poll、kickoff 发布、OpenMP 分支，以及 `n_threads_max` 的本地字段替换。保留 Fairy2i/legacy `prepare_graph`、extension work-size 和现有 affinity/pause 逻辑。
-2. **`tests/test-barrier.cpp`**：加入 active-thread graph 与 two-graph back-to-back regression；测试必须在同一个 threadpool 上交替 `1`/`N` 线程并反复重新 plan，先证明旧代码可失败，再证明修复后不崩溃、不挂死。
-3. **`tests/test-fairy2i.cpp`**：补一个复用同一 CPU backend/threadpool 的 W1/W2 LUT `N=1` thread-switch stress；每轮保存 scalar/direct 参考或首轮输出，验证线程切换不改变 BF16 输出及 dynamic-tile hit/batch 约束。
-
-以下文件不属于首个 B0 提交：`fairy2i/wide-linear*.cpp`、LUT qgemm/pack layout、模型 loader、通用 `ggml_op_is_empty` 重构。Fairy2i dynamic tile batch 不因 upstream scheduler patch 改写。
-
-### 提交顺序与验证门
-
-1. 先加入 deterministic regression（固定 `N`、线程序列和轮数）；保留可控 stress 参数，避免普通单元测试无界运行。
-2. 移植 #17748 状态修复；提交后运行 `test-barrier` active/multi-graph 和 Fairy2i W1/W2 thread-switch stress。
-3. 运行 `./build-rel-fairy2i/bin/test-fairy2i`、legacy iFairy direct/LUT tests、真实 `ifairy.gguf` CPU smoke，并记录固定 seed 的输出/状态。
-4. 运行完整 `bash scripts/ci-fairy2i-cpu.sh`；若 sanitizer 配置可用，再运行 thread-sanitized barrier/stress。性能只比较同命令、同线程数、同模型的 `eval tok/s`。
-5. #17748 稳定后，另起提交评估 #17133：本地没有上游 `ggml_op_is_empty` helper，不能直接 cherry-pick；只在 worker loop 明确跳过 `NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE`，并删除对应无效 dispatch 函数，单独做 output/benchmark 回归。
+- B0 已稳定；不把 #17133 的 NOP/barrier 优化与本提交混合。下一步若继续移植，应单独实现并验证 `NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE` 的 worker-loop 跳过逻辑，保留独立输出与性能回归。
 
 ## 暂不移植
 
