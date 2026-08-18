@@ -227,6 +227,8 @@ typedef void * thread_ret_t;
 #endif
 
 typedef pthread_t ggml_thread_t;
+#define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
+#define GGML_THREADPOOL_N_THREADS_BITS (16)
 
 #if defined(__APPLE__)
 #    include <mach/mach.h>
@@ -520,7 +522,7 @@ struct ggml_threadpool {
     struct ggml_cplan  * cplan;
 
     // synchronization primitives
-    atomic_int n_graph;       // incremented when there is work to be done (i.e each graph)
+    atomic_int n_graph;       // updated when there is work to be done; holds graph and active thread counts
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
@@ -531,8 +533,7 @@ struct ggml_threadpool {
     atomic_int abort;         // Used for aborting processing of a graph
 
     struct ggml_compute_state * workers;   // per thread state
-    int          n_threads_max; // number of threads in the pool
-    atomic_int   n_threads_cur; // number of threads used in the current graph
+    int          n_threads;   // number of threads in the pool
 
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
@@ -601,7 +602,7 @@ struct ggml_state {
 static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp) {
-    int n_threads = atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed);
+    int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
         return;
     }
@@ -2899,7 +2900,7 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
 void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     if (!threadpool) return;
 
-    const int n_threads = threadpool->n_threads_max;
+    const int n_threads = threadpool->n_threads;
 
 #ifndef GGML_USE_OPENMP
     struct ggml_compute_state* workers = threadpool->workers;
@@ -2975,7 +2976,7 @@ struct ggml_cplan ggml_graph_plan(
         //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
     }
     if (n_threads <= 0) {
-        n_threads = threadpool ? threadpool->n_threads_max : GGML_DEFAULT_N_THREADS;
+        n_threads = threadpool ? threadpool->n_threads : GGML_DEFAULT_N_THREADS;
     }
 
     size_t work_size = 0;
@@ -3206,7 +3207,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     struct ggml_compute_params params = {
         /*.ith       =*/ state->ith,
-        /*.nth       =*/ atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed),
+        /*.nth       =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
         /*.wsize     =*/ cplan->work_size,
         /*.wdata     =*/ cplan->work_data,
         /*.threadpool=*/ tp,
@@ -3236,13 +3237,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
 #ifndef GGML_USE_OPENMP
 
-// check if thread is active
-static inline bool ggml_graph_compute_thread_active(struct ggml_compute_state * state) {
-    struct ggml_threadpool * threadpool = state->threadpool;
-    int n_threads = atomic_load_explicit(&threadpool->n_threads_cur, memory_order_relaxed);
-    return (state->ith < n_threads);
-}
-
 // check if thread is ready to proceed (exit from polling or sleeping)
 static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
@@ -3250,13 +3244,15 @@ static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * s
     if (state->pending || threadpool->stop || threadpool->pause) { return true; }
 
     // check for new graph/work
-    int new_graph = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed);
-    if (new_graph != state->last_graph) {
-        state->pending    = ggml_graph_compute_thread_active(state);
-        state->last_graph = new_graph;
+    int n_graph   = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed);
+    int n_threads = n_graph & GGML_THREADPOOL_N_THREADS_MASK;
+    if (n_graph != state->last_graph) {
+        state->pending    = (state->ith < n_threads);
+        state->last_graph = n_graph;
+        return true;
     }
 
-    return state->pending;
+    return false;
 }
 
 // sync thread state after polling
@@ -3273,10 +3269,6 @@ static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * st
 static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
-    // Skip polling for unused threads
-    if (!ggml_graph_compute_thread_active(state)) {
-        return state->pending;
-    }
 
     // This seems to make 0 ... 100 a decent range for polling level across modern processors.
     // Perhaps, we can adjust it dynamically based on load and things.
@@ -3354,14 +3346,13 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
 
     ggml_mutex_lock(&threadpool->mutex);
 
-    GGML_PRINT_DEBUG("threadpool: n_threads_cur %d n_threads %d\n", threadpool->n_threads_cur, n_threads);
+    // Update the graph generation and active thread count in one atomic state.
+    int n_graph = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >> GGML_THREADPOOL_N_THREADS_BITS;
+    n_graph = ((n_graph + 1) << GGML_THREADPOOL_N_THREADS_BITS) | (n_threads & GGML_THREADPOOL_N_THREADS_MASK);
 
-    // Update the number of active threads
-    atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
-
-    // Indicate the graph is ready to be processed
-    // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
-    atomic_fetch_add_explicit(&threadpool->n_graph, 1, memory_order_seq_cst);
+    // Indicate the graph is ready to be processed.
+    // We need the full seq-cst fence here because of the polling threads (used in thread_sync).
+    atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
 
     if (threadpool->pause) {
        // Update main thread prio and affinity to match the threadpool settings
@@ -3399,8 +3390,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->pause            = tpp->paused;
         threadpool->abort            = -1;
         threadpool->workers          = NULL;
-        threadpool->n_threads_max    = tpp->n_threads;
-        threadpool->n_threads_cur    = tpp->n_threads;
+        threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
@@ -3497,19 +3487,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
-                atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
+                atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 
             ggml_graph_compute_thread(&threadpool->workers[omp_get_thread_num()]);
         }
     } else {
-        atomic_store_explicit(&threadpool->n_threads_cur, 1, memory_order_relaxed);
+        atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
         ggml_graph_compute_thread(&threadpool->workers[0]);
     }
 #else
-    if (n_threads > threadpool->n_threads_max) {
-        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads_max);
-        n_threads = threadpool->n_threads_max;
+    if (n_threads > threadpool->n_threads) {
+        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
+        n_threads = threadpool->n_threads;
     }
 
     // Kick all threads to start the new graph
