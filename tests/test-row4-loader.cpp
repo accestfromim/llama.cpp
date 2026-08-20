@@ -63,6 +63,10 @@ enum class loader_case {
     dense_lm_head,
     separate_q_weight,
     non_aligned_ffn,
+    v2_valid,
+    v2_bad_profile,
+    v2_wrong_codes_type,
+    v2_wrong_codes_shape,
 };
 
 static const char * case_name(loader_case tc) {
@@ -97,6 +101,14 @@ static const char * case_name(loader_case tc) {
             return "separate-q-weight";
         case loader_case::non_aligned_ffn:
             return "non-aligned-ffn";
+        case loader_case::v2_valid:
+            return "v2-valid";
+        case loader_case::v2_bad_profile:
+            return "v2-bad-profile";
+        case loader_case::v2_wrong_codes_type:
+            return "v2-wrong-codes-type";
+        case loader_case::v2_wrong_codes_shape:
+            return "v2-wrong-codes-shape";
     }
     return "unknown";
 }
@@ -325,11 +337,96 @@ static std::string write_model(loader_case tc) {
     return path;
 }
 
-static llama_model * load_model(const char * path, int n_gpu_layers) {
-    llama_model_params params = llama_model_default_params();
-    params.n_gpu_layers       = n_gpu_layers;
-    params.use_mmap           = false;
-    params.check_tensors      = true;
+static void add_row4_linear_v2(tiny_writer & writer,
+                               const char *  base,
+                               int64_t       o,
+                               int64_t       k,
+                               uint8_t       seed,
+                               loader_case   tc) {
+    const std::string codes_name  = std::string(base) + ".row4.codes";
+    const std::string scales_name = std::string(base) + ".row4.scales";
+    const bool        is_qkv      = strcmp(base, "blk.0.attn_qkv") == 0;
+    const ggml_type   codes_type =
+        is_qkv && tc == loader_case::v2_wrong_codes_type ? GGML_TYPE_ROW4_CODES : GGML_TYPE_ROW4_CODES_PAIR2;
+    const int64_t ne0 = is_qkv && tc == loader_case::v2_wrong_codes_shape ? 127 : 128;
+
+    writer.add(codes_name.c_str(), codes_type, { ne0, 8, k / 256, o / 32 });
+    fill_row4_codes(writer, codes_name.c_str(), seed);
+    writer.add(scales_name.c_str(), GGML_TYPE_BF16, { o });
+    fill_bf16(writer, scales_name.c_str(), 0.03125f);
+}
+
+static std::string write_model_v2(loader_case tc) {
+    const std::string path = make_tmp_path(tc);
+    tiny_writer       writer;
+
+    gguf_context * gguf = writer.gguf;
+    gguf_set_val_str(gguf, "general.architecture", "qwen3");
+    gguf_set_val_str(gguf, "general.name", "tiny-qwen3-row4-v2");
+    gguf_set_val_u32(gguf, "general.file_type", LLAMA_FTYPE_MOSTLY_ROW4);
+    gguf_set_val_u32(gguf, "general.quantization_version", GGML_QNT_VERSION);
+    gguf_set_val_u32(gguf, "general.alignment", 128);
+
+    gguf_set_val_u32(gguf, "qwen3.context_length", 32);
+    gguf_set_val_u32(gguf, "qwen3.embedding_length", 256);
+    gguf_set_val_u32(gguf, "qwen3.block_count", 1);
+    gguf_set_val_u32(gguf, "qwen3.feed_forward_length", 256);
+    gguf_set_val_u32(gguf, "qwen3.attention.head_count", 2);
+    gguf_set_val_u32(gguf, "qwen3.attention.head_count_kv", 2);
+    gguf_set_val_f32(gguf, "qwen3.attention.layer_norm_rms_epsilon", 1.0e-6f);
+    gguf_set_val_u32(gguf, "qwen3.rope.dimension_count", 128);
+    gguf_set_val_f32(gguf, "qwen3.rope.freq_base", 1000000.0f);
+    gguf_set_val_u32(gguf, "qwen3.vocab_size", 128);
+    gguf_set_val_str(gguf, "tokenizer.ggml.model", "no_vocab");
+
+    gguf_set_val_u32(gguf, "row4.schema_version", 2);
+    gguf_set_val_str(gguf, "row4.weight_layout", "m32k256_pair2_split8_v2");
+    gguf_set_val_str(gguf, "row4.execution_profile",
+                     tc == loader_case::v2_bad_profile ? "portable_v1" : "metal_only_v1");
+    gguf_set_val_str(gguf, "row4.codebook", "uv_axis_v1");
+    gguf_set_val_str(gguf, "row4.numeric_profile", "bf16_a8_away_i32_bf16_v1");
+    gguf_set_val_str(gguf, "row4.qkv_order", "q_k_v");
+    gguf_set_val_str(gguf, "row4.ffn_order", "gate_up");
+    gguf_set_val_str(gguf, "row4.lm_head_layout", "s8_m16k128_rowmajor_v1");
+
+    writer.add("token_embd.weight", GGML_TYPE_BF16, { 256, 128 });
+    writer.add("output_norm.weight", GGML_TYPE_BF16, { 256 });
+    writer.add("blk.0.attn_norm.weight", GGML_TYPE_BF16, { 256 });
+    writer.add("blk.0.attn_q_norm.weight", GGML_TYPE_BF16, { 128 });
+    writer.add("blk.0.attn_k_norm.weight", GGML_TYPE_BF16, { 128 });
+    writer.add("blk.0.ffn_norm.weight", GGML_TYPE_BF16, { 256 });
+
+    fill_bf16(writer, "token_embd.weight", 0.0f, true);
+    for (const char * name : { "output_norm.weight", "blk.0.attn_norm.weight", "blk.0.attn_q_norm.weight",
+                               "blk.0.attn_k_norm.weight", "blk.0.ffn_norm.weight" }) {
+        fill_bf16(writer, name, 1.0f);
+    }
+
+    add_row4_linear_v2(writer, "blk.0.attn_qkv", 768, 256, 1, tc);
+    add_row4_linear_v2(writer, "blk.0.attn_output", 256, 256, 3, tc);
+    add_row4_linear_v2(writer, "blk.0.ffn_gate_up", 512, 256, 5, tc);
+    add_row4_linear_v2(writer, "blk.0.ffn_down", 256, 256, 7, tc);
+
+    writer.add("output.w8.codes", GGML_TYPE_I8, { 128, 16, 2, 8 });
+    fill_w8_codes(writer, "output.w8.codes");
+    writer.add("output.w8.scales", GGML_TYPE_F32, { 128 });
+    fill_f32(writer, "output.w8.scales", 0.00390625f, -0.00390625f);
+
+    if (!gguf_write_to_file(writer.gguf, path.c_str(), false)) {
+        fprintf(stderr, "failed to write %s\n", path.c_str());
+        exit(EXIT_FAILURE);
+    }
+    return path;
+}
+
+static llama_model * load_model(const char *                             path,
+                                int                                      n_gpu_layers,
+                                const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+    llama_model_params params    = llama_model_default_params();
+    params.n_gpu_layers          = n_gpu_layers;
+    params.use_mmap              = false;
+    params.check_tensors         = true;
+    params.tensor_buft_overrides = tensor_buft_overrides;
     return llama_model_load_from_file(path, params);
 }
 
@@ -469,6 +566,75 @@ static bool has_metal_device() {
     return false;
 }
 
+static bool test_schema_v2_metal_only_contract() {
+    bool ok = true;
+
+    const std::string valid_path = write_model_v2(loader_case::v2_valid);
+    llama_model *     cpu_model  = load_model(valid_path.c_str(), 0);
+    if (cpu_model) {
+        fprintf(stderr, "Row4 schema v2 unexpectedly loaded on CPU\n");
+        ok = false;
+    }
+    llama_model_free(cpu_model);
+
+    const bool metal_available = has_metal_device();
+    for (loader_case tc :
+         { loader_case::v2_bad_profile, loader_case::v2_wrong_codes_type, loader_case::v2_wrong_codes_shape }) {
+        const std::string path  = write_model_v2(tc);
+        llama_model *     model = load_model(path.c_str(), metal_available ? 99 : 0);
+        if (model) {
+            fprintf(stderr, "Row4 schema v2 loader %s unexpectedly succeeded\n", case_name(tc));
+            ok = false;
+        }
+        llama_model_free(model);
+        unlink(path.c_str());
+    }
+
+    if (metal_available) {
+        llama_model * mixed_model = load_model(valid_path.c_str(), 1);
+        if (mixed_model) {
+            fprintf(stderr, "Row4 schema v2 unexpectedly accepted mixed Metal/CPU placement\n");
+            ok = false;
+        }
+        llama_model_free(mixed_model);
+
+        llama_model * metal_model = load_model(valid_path.c_str(), 99);
+        if (!metal_model || !metal_model->row4_enabled || metal_model->row4_schema_version != 2 ||
+            metal_model->layers.empty() || metal_model->layers[0].wqkv_row4.codes->type != GGML_TYPE_ROW4_CODES_PAIR2 ||
+            metal_model->layers[0].wo_row4.codes->type != GGML_TYPE_ROW4_CODES_PAIR2 ||
+            metal_model->layers[0].ffn_gate_up_row4.codes->type != GGML_TYPE_ROW4_CODES_PAIR2 ||
+            metal_model->layers[0].ffn_down_row4.codes->type != GGML_TYPE_ROW4_CODES_PAIR2) {
+            fprintf(stderr, "Row4 schema v2 full-Metal model state was not populated\n");
+            ok = false;
+        } else {
+            std::vector<float> first;
+            std::vector<float> second;
+            if (!run_decode(metal_model, first, true) || !run_decode(metal_model, second, true) || first != second) {
+                fprintf(stderr, "Row4 schema v2 Metal prefill/two-decode was not deterministic\n");
+                ok = false;
+            }
+        }
+        llama_model_free(metal_model);
+
+        const llama_model_tensor_buft_override cpu_tensor_override[] = {
+            { "^blk\\.0\\.attn_norm\\.weight$", ggml_backend_cpu_buffer_type() },
+            { nullptr,                          nullptr                        },
+        };
+        llama_model * override_model = load_model(valid_path.c_str(), 99, cpu_tensor_override);
+        if (override_model) {
+            fprintf(stderr, "Row4 schema v2 unexpectedly accepted a CPU tensor buffer override\n");
+            ok = false;
+        }
+        llama_model_free(override_model);
+    } else {
+        printf("  Row4 schema v2 full-Metal graph: SKIP (Metal unavailable)\n");
+    }
+
+    unlink(valid_path.c_str());
+    printf("  Row4 schema v2 Metal-only load/placement/full-graph contract - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static bool test_context_contract() {
     const std::string path      = write_model(loader_case::valid);
     llama_model *     cpu_model = load_model(path.c_str(), 0);
@@ -509,6 +675,50 @@ static bool test_context_contract() {
 
     unlink(path.c_str());
     printf("  Row4 BF16 KV/Metal Flash Attention context contract - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool test_quantize_opaque_type_rejection() {
+    struct tensor_quantization {
+        std::string name;
+        ggml_type   quant = GGML_TYPE_COUNT;
+    };
+
+    const std::string input  = write_model(loader_case::valid);
+    const std::string output = "/tmp/llama-row4-opaque-quantize-" + std::to_string((long long) getpid()) + ".gguf";
+    unlink(output.c_str());
+
+    const auto is_rejected_before_io = [&](llama_model_quantize_params & params) {
+        log_capture capture;
+        llama_log_set(capture_log, &capture);
+        const uint32_t result = llama_model_quantize(input.c_str(), output.c_str(), &params);
+        llama_log_set(nullptr, nullptr);
+        return result != 0 &&
+               capture.text.find("opaque Row4 code tensors can only be produced by") != std::string::npos &&
+               access(output.c_str(), F_OK) != 0;
+    };
+
+    bool ok = true;
+    for (const ggml_type type : { GGML_TYPE_ROW4_CODES, GGML_TYPE_ROW4_CODES_PAIR2 }) {
+        llama_model_quantize_params params = llama_model_quantize_default_params();
+        params.output_tensor_type          = type;
+        ok &= is_rejected_before_io(params);
+
+        params                      = llama_model_quantize_default_params();
+        params.token_embedding_type = type;
+        ok &= is_rejected_before_io(params);
+
+        std::vector<tensor_quantization> tensor_types = {
+            { ".*", type }
+        };
+        params              = llama_model_quantize_default_params();
+        params.tensor_types = &tensor_types;
+        ok &= is_rejected_before_io(params);
+    }
+
+    unlink(input.c_str());
+    unlink(output.c_str());
+    printf("  Row4 opaque quantization type rejection - %s\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -577,7 +787,9 @@ int main() {
     int failed = 0;
     failed += !test_loader_cases();
     failed += !test_lora_rejection();
+    failed += !test_schema_v2_metal_only_contract();
     failed += !test_context_contract();
+    failed += !test_quantize_opaque_type_rejection();
     failed += !test_full_graph();
 
     printf("========================================\n");

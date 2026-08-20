@@ -1,8 +1,8 @@
-# Qwen3 Row4 W1A8-INT8 v1 格式与实现笔记
+# Qwen3 Row4 W1A8-INT8 v1/v2 格式与实现笔记
 
-> 状态：已实现的 normative v1 合同；本文描述当前 converter、GGUF、loader、graph、ARM CPU 和 Metal 必须共同遵守的格式。
+> 状态：已实现的 normative v1 合同，以及保持同一数值合同的 Metal-only schema v2 Pair2 布局；本文描述当前 converter、GGUF、loader、graph、ARM CPU 和 Metal 必须共同遵守的格式。
 >
-> 更新日期：2026-08-09
+> 更新日期：2026-08-13
 >
 > 验证边界：converter 的真实 checkpoint 抽样已通过独立 bit-exact oracle；operator/loader 测试已落地，最终 CPU/Metal 路径的 pp512/tg128 性能和贪心生成 smoke test 也已记录。缺失 BOS metadata 导致的早期重复/破损输出已修复，但原 H100/FA3 环境的 full-model reference 尚未捕获，CPU eager attention 与 Metal FA3 的完整模型 logits 仍有分歧，因此 logits、NLL 和 PPL **尚未签收**。
 
@@ -10,7 +10,7 @@
 
 ## 1. 权威结论与证据边界
 
-1. 当前模型的部署计算是 **W1A8-INT8**。Row4 权重解码成小范围 signed INT8，activation 动态量化为 signed INT8，点积以 INT32 累加；可读的 FP8 kernel 只用于参考实现结构、padding 等细节，不能改变 INT8 判断。
+1. 当前模型的部署计算是 **W1A8-INT8**。Row4 权重解码成小范围 signed INT8，activation 动态量化为 signed INT8，点积遵守精确 INT32 语义；schema v2 B=1 Metal production 允许在已证明的范围内用 F32 物理累加，并在 scale 前无损还原为 I32。可读的 FP8 kernel 只用于参考实现结构、padding 等细节，不能改变 INT8 判断。
 2. checkpoint 是 QAT checkpoint，不是已经打包的 1-bit 文件。它保留 BF16 latent weight 和每个 Row4 projection 的 learned signed BF16 row scale；converter 离线生成 Row4 code。
 3. `lm_head` 已在 converter 中离线做 W8 量化，推理必须走 W8A8 INT8 路径，不允许退回 BF16/F16 dense output。
 4. 本模型所有目标维度都满足 O/K 的 128 对齐。v1 不提供非对齐 fallback，也不接受非对齐 GGUF。
@@ -283,6 +283,46 @@ SHA-256 = 306b3086b28251cf662c462e0bc2d4e153b2a517593a651cf95f3887a62b5deb
 
 该文件含完整 436 个 tensor、上表的固定 payload 统计、`general.quantization_version=2` 和 `tokenizer.ggml.add_bos_token=true`。规范性检查以 tensor count、各类 payload、metadata 与 SHA-256 为准，不以文件系统稀疏占用为准。
 
+### 5.6 Metal-only schema v2 `m32k256_pair2_split8_v2`
+
+schema v2 不改变 codebook、signed BF16 row scale、A8、精确整数点积语义或 BF16 输出边界；它只是对 v1 的 868,220,928-byte Row4 code plane 做无损置换，使 Metal decode 的一个 lane 能用一次 `uchar4` load 同时取得相邻两个 K128 tile。固定 descriptor 差异如下：
+
+| 项目 | schema v2 固定值 |
+| --- | --- |
+| Row4 code type | `GGML_TYPE_ROW4_CODES_PAIR2` = 48，opaque `(1,1)` |
+| `general.alignment` | 128 |
+| `row4.schema_version` | 2 |
+| `row4.weight_layout` | `m32k256_pair2_split8_v2` |
+| `row4.execution_profile` | `metal_only_v1` |
+
+逻辑 code 仍是 `[O/4,K]`，但物理 `ne` 固定为：
+
+```text
+[128, 8, K/256, O/32]
+```
+
+令：
+
+```text
+ob    = o / 32
+g     = (o % 32) / 4
+kp    = k / 256
+half  = (k % 256) / 128
+r     = k % 128
+split = r / 16
+j     = r % 8
+lane  = split * 4 + j / 2
+byte  = 2 * half + j % 2
+
+byte_offset = (((ob * (K/256) + kp) * 8 + g) * 128 + lane * 4 + byte)
+```
+
+当 `r % 16 < 8` 时取该 byte 的低 nibble，否则取高 nibble。每个 O4xK256 record 仍是 128 bytes，每个 O32xK256 block 是 1024 bytes，因此 v1/v2 的 tensor payload 和整个模型的有效 BPW 完全相同。converter 测试和真实 36-layer GGUF verifier 都必须证明 v2 是 v1 payload 的精确 permutation，而不是重新量化。
+
+v2 是显式 Metal-only execution profile：所有 model tensor、36 层和 output 必须完整放到 Metal；CPU、RPC、mixed placement、tensor buffer override 和 generic op 不得消费 type 48。type 48 只允许 dedicated `ROW4_LINEAR` 与同类型 raw copy。B=1 production kernel 固定使用 O32、128 threads/4 SIMDgroups；每个 SIMDgroup 同时负责相邻两个 O4，共享 activation load，并为两个 O4 各维护一个 `float4` accumulator。每个 4-bit code 直接索引 constant address space 中的 16-entry `half4` row LUT，所得四行权重 `{-2,-1,0,1,2}` 转为 `float4` 后与 signed A8 activation 相乘。K loop 仍以两个 K256 record 软件流水：先发出下一对 `uchar4` code 与 activation load，再按每个 O4 原有的前 K128、后 K128 次序更新 accumulator；SIMDgroup reduction 后先无损转换为 `int4`，再进入原有 signed BF16 scale 和 BF16 rounding 边界。
+
+该 F32 物理累加仍严格实现 I32 点积。每个乘积都是绝对值不超过 `2*127` 的整数，任意 partial sum 的绝对值不超过 `2*127*K`；device support predicate 与 host encoder 都要求 `K%256==0` 且 `K<=65536`，因此最坏值 `16,646,144 < 2^24`，所有乘积、加法、SIMDgroup reduction 和最终 `float4`→`int4` 转换都落在 binary32 连续精确表示整数的范围内。本模型实际最大 `K=12288`，界限为 `3,121,152`。权重 compulsory bytes、Pair2 load 数、activation staging 与 prefill accessor 均不改变；B=1 的 full-K staging 还在 device support 与 encoder dispatch 两层验证 Metal threadgroup-memory 上限，禁止 silent fallback。
+
 ## 6. converter
 
 专用入口是 `gguf-py/convert_row4_qwen3.py`。源 tar 应先解压到仓库外目录；converter 需要 NumPy、PyTorch、SafeTensors 和本仓库的 `gguf` Python package。
@@ -294,6 +334,12 @@ python3 gguf-py/convert_row4_qwen3.py \
   /path/to/extracted-checkpoint \
   /path/to/qwen3-row4-int8.gguf \
   --verbose
+
+python3 gguf-py/convert_row4_qwen3.py \
+  /path/to/extracted-checkpoint \
+  /path/to/qwen3-row4-int8-pair2.gguf \
+  --row4-layout v2 \
+  --verbose
 ```
 
 converter 的 v1 职责是：
@@ -304,6 +350,8 @@ converter 的 v1 职责是：
 - 将 lm_head 离线量化为 tiled W8 + F32 scale；
 - 流式写入私有临时目录，成功后以原子 no-clobber hard link 发布；拒绝覆盖已有目标；
 - 对参考 profile 核对 436 tensors 和固定 payload 统计。
+
+`--row4-layout` 默认为 `v1`，因此既有调用和 v1 输出 byte-for-byte 不变。选择 `v2` 时，converter 必须同时切换 type 48、schema 2 metadata、128-byte alignment 和 Pair2 physical shape；tensor plan 的 raw dtype 与请求的 layout 在创建输出路径前做 fail-closed 交叉校验，禁止产生 type/metadata 混搭文件。
 
 普通 `convert_hf_to_gguf.py` 会识别并拒绝 specialized Row4 checkpoint，`llama-quantize` 也会拒绝 Row4 GGUF。不得用通用 converter/quantizer 重解释或 requantize 此格式；必须从原 checkpoint 重新运行专用 converter。
 
@@ -370,27 +418,32 @@ aqpack=<bf16_rne_a8_away_v1|bf16_rne_a8_away_pairk8_v1> panel=<0|1> prepack=0
 kernel_row4_quantize_activation_i8
 ```
 
-随后按 token 行数和 production shape 选择 Row4 或 W8 kernel：
+随后按 token 行数、schema 和 production shape 选择 Row4 或 W8 kernel：
 
-| token rows `T` | Row4 | lm_head W8 |
-| ---: | --- | --- |
-| 1 | `kernel_row4_w1a8_decode_o32_o4_staged_act` | `kernel_row8_w8a8_decode_o128_rows16` |
-| 2..8 | `kernel_row4_w1a8_small_batch` | `kernel_row8_w8a8_small_batch` |
-| >=9 | M64N32 native-layout dual-W direct-act prefill | `kernel_row8_w8a8_prefill` |
+| token rows `T` | Row4 schema v1 | Row4 schema v2 | lm_head W8 |
+| ---: | --- | --- | --- |
+| 1 | `kernel_row4_w1a8_decode_o32_o4_staged_act` | `kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32` | `kernel_row8_w8a8_decode_o128_rows16` |
+| 2..8 | `kernel_row4_w1a8_small_batch` | `kernel_row4_w1a8_small_batch`（Pair2 accessor） | `kernel_row8_w8a8_small_batch` |
+| >=9 | M64N32 native-layout dual-W direct-act prefill | 同族 prefill（Pair2 accessor） | `kernel_row8_w8a8_prefill` |
 
-decode/small-batch 使用 A8/I32。本 profile 的 Row4 decode 以 O32 threadgroup 为单位，8 个 SIMDgroup 各处理一个 O4，并把 K4096/K12288 activation 一次性 staged 到 threadgroup memory。W8 decode 每个 O128 threadgroup 使用 8 个 SIMDgroup，每组计算一个 canonical O16 tile，即每个 SIMDgroup 处理 16 行。
+small-batch 和 schema v1 decode 使用 A8/I32。schema v1 的真实模型 decode 以 O32 threadgroup 为单位，256 threads/8 SIMDgroups 各处理一个 O4，并把 K4096/K12288 activation 一次性 staged 到 threadgroup memory。当前 schema v2 B=1 production 同样以 O32 为单位，但使用 128 threads/4 SIMDgroups；每个 SIMDgroup 同时处理两个相邻 O4，并以 current/next K256 Pair2 record 做软件流水和 load/decode 重叠。它以 16-entry `half4` row LUT 替代逐 code 的整数 bit/sign/mask 构造，在 `float4` 中做 exact-integer accumulation，SIMDgroup reduction 后转回 `int4`，再走不变的 scale/BF16 epilogue。W8 decode 每个 O128 threadgroup 使用 8 个 SIMDgroup，每组计算一个 canonical O16 tile，即每个 SIMDgroup 处理 16 行。
 
 pp512 的 Row4 production path 先把 token-major INT8 activation 用 32x32 coalesced transpose 转为 K-major half，再用 `kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw_direct_act_simd_localw`。该 kernel 每个 threadgroup 计算 M64N32；每个 SIMDgroup 只 staging 自己消费的 16-row weight slice，并直接消费 transpose 后的 activation，避免 token tile 重复 staging 和跨 SIMDgroup 的 weight barrier。gate/up 的专用 producer kernel 保持相同 MMA/舍入顺序，顺序计算配对的 gate 与 up，执行 exact QAT SiLU/multiply 后把 packed BF16 直接交给 down projection。非 32 倍数的 prefill rows 保留同族 native-layout fallback。Row4 prefill 用 half MMA/F32 exact accumulation；在当前最大 `K=12288` 下极值 `2*127*K=3,121,152 < 2^24`。W8 prefill 以 K1024 分段做 F32 exact accumulation，再转/合并为 I32；完整 `K=4096` 极值为 66,064,384，不能用单个 F32 accumulator 冒充全 K 精确 INT32。
 
 单 token production graph 还保留三组严格门控的逐 bit fusion：72 个 QAT RMSNorm→Row4 activation-quant 链共享一个 dispatch，同时仍物化原 RMS carrier；35 个 attention output 和 36 个 down projection 把 QAT residual add 合入 Row4 epilogue；36 个 QAT SwiGLU→down 链使用 packed BF16 handoff。任一节点有额外 consumer、被标记为 output、shape/layout 不匹配或 scratch 与输入/输出 allocation 重叠时都回退到分离路径。
 
-这些 kernel 与 `s8_m16k128_rowmajor_v1` / `m16k128_split8_v1` 物理布局直接对应。Row4/W8 host 使用静态 pipeline 名，不在每个 op 重复格式化；pipeline cache 用 allocation-free 的 64-bit hash lookup，并在碰撞桶内比较完整名称。path marker 先查 thread-local shape cache，只有首见 shape 才进全局 mutex/set，避免 decode 热路径反复分配或串行化。
+这些 kernel 与 `s8_m16k128_rowmajor_v1`、`m16k128_split8_v1` 和 `m32k256_pair2_split8_v2` 物理布局直接对应。Row4/W8 host 使用静态 pipeline 名，不在每个 op 重复格式化；pipeline cache 用 allocation-free 的 64-bit hash lookup，并在碰撞桶内比较完整名称。path marker 先查 thread-local shape cache，只有首见 shape 才进全局 mutex/set，避免 decode 热路径反复分配或串行化。
 
 首次遇到每个 `(op,path,T,O,K)` shape 时打印：
 
 ```text
 ROW4 Metal W1A8 path: <decode|small_batch|prefill> \
-layout=m16k128_split8_v1 act_rows=<T> O=<O> K=<K> (..., BF16 boundary)
+layout=<m16k128_split8_v1|m32k256_pair2_split8_v2> \
+act_rows=<T> O=<O> K=<K> (..., BF16 boundary)
+
+ROW4 Metal W1A8 path: decode layout=m32k256_pair2_split8_v2 \
+act_rows=1 O=<O> K=<K> pipeline=lut16-const-rows-f32 \
+(A8/F32 exact-integer LUT16 O32 two-O4-per-SIMDgroup staged-act, BF16 boundary)
 
 ROW8 Metal W8A8 lm_head path: <decode|small_batch|prefill> \
 layout=s8_m16k128_rowmajor_v1 act_rows=<T> O=<O> K=<K> (..., BF16 boundary)
@@ -565,6 +618,61 @@ perf/scripts/run_row4_bench.sh metal tg /path/to/model.gguf row4-v1
 
 这些 artifact 不属于模型或仓库资产，不得提交。CPU prefill 的主要收益来自 pairk8 activation packing 和八行共享 panel。Metal prefill 的主要收益来自 M64N32 direct-act SIMD-local weight staging、gate/up SwiGLU producer fusion，以及移除 graph 中的 K/V pack/cont。Metal decode 的主要收益来自 Row4 O32 staged activation、W8 O128、72 个 RMS→quant fusion、71 个 residual epilogue fusion 和 36 个 packed SwiGLU/down handoff。静态 pipeline 名、allocation-free cache lookup 与 TLS marker fastpath 进一步减少了 host 侧 decode 开销。所有结果都保留 canonical Row4/W8 path-marker 证据；性能结论不改变第 9.4 节的 full-model blocker。
 
+### 10.1 schema v2 Pair2 的最终 Metal 签收
+
+schema v2 使用与 v1 相同的逻辑 code、scale 和有效 payload，仅改变 Row4 code plane 的物理 permutation。参考 v2 GGUF 为：
+
+```text
+/Users/a1806/llama/tmp/qwen3-row4-int8-v2-pair2.gguf
+SHA-256 = 7ede7350097357dce67929c05f9d65c7afd2bd0aaa9cff246f6b6e749a2a6c39
+```
+
+真实 436-tensor verifier 已证明 144 个 Row4 code tensor 都是 v1→v2 的精确 byte permutation，其余 292 个 tensor 逐 byte 不变；文件仅因 128-byte alignment 与 metadata 比 v1 多 64 bytes。最终 production binary 还用同一 prompt 对 v1/v2 导出完整 vocab logits，B=1 输出逐 byte 相同，双方 SHA-256 均为 `644423c21e97be3db32e427552a411d778aa0ab54958731b0e2c5039e4331e67`。
+
+Apple M4、Metal full offload、8 CPU threads、`b=2048`、`ub=512`、BF16 K/V、Flash Attention、warmup、R5/block 的最终 ABBA 结果如下。当时 v2 首次签收的 production marker 为 `dual-o4-lookahead-u2-4sg`；该历史路径随后被第 10.2 节的 LUT16 production 取代：
+
+| workload | v1 | schema v2 production | 相对变化 |
+| --- | ---: | ---: | ---: |
+| 36x real-shape Row4 operator latency | 24.769680 ms/token | 21.418800 ms/token | -13.528% |
+| Metal tg128 | 30.159601 tok/s | 33.452157 tok/s | +10.917% |
+| Metal pp512 | 239.509118 tok/s | 238.932197 tok/s | -0.241% |
+
+tg128 的两个 block contrast 为 `+10.984%` / `+10.850%`，block-level 95% CI 为 `[+10.060%, +11.773%]`。pp512 的两个 contrast 为 `-0.244%` / `-0.238%`；回退很小但重复出现，因此必须记录，不能称为完全 parity。四个 decode shape 全部改善：QKV `-11.487%`、attention-O `-8.178%`、gate-up `-14.850%`、down K12288 `-14.063%` latency。
+
+正式 artifact 与冻结身份位于：
+
+```text
+/Users/a1806/llama/tmp/row4-production-v1-v2-signoff-400799
+```
+
+其中 `summary/report.txt`、`summary/results.json`、`summary/validation.txt` 和 `ARTIFACT_SHA256SUMS` 记录 source patch、binary/dylib/model SHA、ABBA 顺序、cooldown、R5 samples、inventory、K12288、last-token pruning、fusion 与 path marker。artifact manifest SHA-256 为 `8679096123977c669a33f0b5e84f56190d522c4411c75e2461f2e2b5614e7a6a`。这些外部 benchmark/model artifact 不得提交仓库。
+
+### 10.2 schema v2 Pair2 LUT16 decode 的最终 Metal 签收
+
+当前 B=1 production marker 是 `lut16-const-rows-f32`。它保持第 10.1 节的 Pair2 布局、O32/128-thread geometry、dual-O4 K256 lookahead、full-K activation staging 和原 scale/BF16 epilogue，只把逐 code 的整数 bit/sign/mask decode 换为第 5.6 节的 16-entry `half4` row LUT 与 `float4` exact-integer accumulation。
+
+Apple M4 real-shape operator formal interleaved A/B 测量中，36 层加权 latency 从 `21.782629 ms/token` 降至 `16.220521 ms/token`，即 `-25.534603%`。四类 shape 全部改善：QKV `-22.871618%`、attention-O `-23.137150%`、gate-up `-27.588563%`、down K12288 `-24.055691%`。128 个连续 decode position 的质量比较覆盖 `19,447,808` 个 F32 logits；旧 Pair2 production 与 LUT16 的 token IDs 相同，所有 logits raw bytes 逐 byte 相同，因此该候选不仅满足 cosine/BF16-ULP gate，而且达到 exact PASS。
+
+整模使用 Metal full offload、8 CPU threads、`b=2048`、`ub=512`、BF16 K/V、Flash Attention、mmap、warmup，tg128 后 pp512；每个 workload 运行 12 个 `A B B A | B A A B | A B B A` block、每 block R5、block 间 cooldown 15 秒，并由六个相邻且不重叠的 log-throughput contrast 计算置信区间：
+
+| workload | 旧 Pair2 decode | LUT16 production | paired geometric delta | 验收下界 |
+| --- | ---: | ---: | ---: | ---: |
+| Metal tg128 | 32.585151 tok/s | 43.082327 tok/s | +32.213438% | two-sided 95% lower `+31.696430%` |
+| Metal pp512 | 233.228907 tok/s | 233.322793 tok/s | +0.040263% | one-sided 95% lower `-0.021903%` |
+
+tg128 显著超过 `>=+1%` 且 95% lower `>0` 的 gate；pp512 同时满足 point delta `>=-0.25%` 与 one-sided 95% lower `>-0.5%` 的 non-regression gate。全部 24 个 block 都通过 frozen binary/dylib/model identity、schema/layout/inventory、K12288/W8 与 exact marker cardinality 检查。两个整数 LUT 实验 `lut16-const-basis-i32` 和 `lut16-const-rows-i32` 的 operator latency 均回退超过 `+115%`，判定 NO-GO；对应 selector、kernel 和测试不保留在 production。
+
+冻结证据位于：
+
+```text
+operator: /Users/a1806/llama/tmp/row4-lut-wave1-f1d348/wave1-f3.formal.lut16-const-rows-f32.20260813T102820Z.90271
+quality-A: /Users/a1806/llama/tmp/row4-lut-f32-quality-f1d348.production.row4q
+quality-B: /Users/a1806/llama/tmp/row4-lut-f32-quality-f1d348.lut16-const-rows-f32.row4q
+full:     /Users/a1806/llama/tmp/row4-lut-f32-full-signoff-f1d348/run.20260813T110259Z.93288
+```
+
+这些外部 artifact 不得提交仓库；performance 结论仍不能替代第 9.4 节尚未完成的跨 backend full-model logits/NLL/PPL 验收。
+
 ## 11. 与已有量化方式的区别
 
 | 维度 | Row4 W1A8-INT8 v1 | Fairy2i W1 learned-scale | 普通 GGML block quant |
@@ -580,15 +688,15 @@ perf/scripts/run_row4_bench.sh metal tg /path/to/model.gguf row4-v1
 
 Row4 与 Fairy2i 共享“两个复数轴选择”的代数来源，但 4 数的来源、scale 粒度、activation 语义、物理布局和 graph 均不同。禁止复用或重解释 Fairy2i tensor type/kernel。Row4 也不能套用普通每行独立的 `block_q*` dequant contract。
 
-## 12. v1 明确限制与未完成项
+## 12. 明确限制与未完成项
 
 - **硬件范围**：当前支持/验收目标仅为 Apple M4 的 native ARM64 CPU 和 Metal。x86 CPU、CUDA、RPC 以及其他未 probe 的 backend 不支持，loader 会拒绝。
 - **无 fallback**：projection 和 lm_head 都必须走专用量化 op；不提供 dense、generic matmul、非对齐或跨 backend fallback。
 - **固定 runtime route**：K/V cache 只能是 BF16；全 CPU 使用 Flash Attention off，全 Metal 必须 `offload_kqv=true` 并使用 BF16 exact FA3；mixed placement 和 tensor buffer override 都不支持。
-- **固定对齐/profile**：O/K 必须是 128 的倍数；只支持本文列出的 36-layer Qwen3 tensor inventory、bundle 顺序和无 bias profile。
-- **当前 K 上界**：Row4 production contract 锁到 `K<=12288`，W8 lm_head 锁到 `K=4096`；更大的 K 需要重新证明 accumulator/Metal 分段精确性并升级合同，不能假定 v1 自动支持。
+- **固定对齐/profile**：schema v1 要求 O/K 是 128 的倍数；schema v2 进一步要求 O32/K256 physical tiles 与 128-byte GGUF alignment。只支持本文列出的 36-layer Qwen3 tensor inventory、bundle 顺序和无 bias profile。
+- **本模型验收最大 K**：四类 Row4 projection 的最大输入维度是 `K=12288`，W8 lm_head 固定为 `K=4096`；这不是 generic Row4 operator 的硬编码上限。generic shape 仍必须满足对应 schema 的 K128/K256 对齐、schema v2 B=1 的 `K<=65536` exact-F32 gate 与 full-K activation staging 的 Metal threadgroup-memory 容量，以及其他 decode I32 不溢出、prefill F32 能精确表示整数累加的数值边界；扩展到新模型或更大 K 前必须逐项重新证明。
 - **无 adapter 扩展**：Row4 graph 明确拒绝 LoRA 和 control-vector adapters。
-- **无通用转换链**：不能用普通 HF converter 或 `llama-quantize` 生成、copy 或 requantize Row4 v1。
+- **无通用转换链**：不能用普通 HF converter 或 `llama-quantize` 生成、copy 或 requantize Row4 v1/v2；两种 opaque code type 都在 CLI 和公共 quantize API 中 fail closed。
 - **oracle 边界**：缺少原始 `row4_qat` 源码，所以现有 bit-exact oracle 是独立 pure-Torch primitive/layout oracle；`full_model.py` 使用透明兼容 shim，且原 H100/FA3 reference 尚未捕获。
 - **整模正确性**：CPU eager attention 与 Metal FA3 已观察到 KLD 分歧，logits、NLL、PPL 尚未签收。
 - **生成质量**：BOS 修复后 CPU/Metal 均能生成连贯语言，32-token greedy code prompt 逐 byte 相同；但默认 reasoning 在 512 tokens 内仍未输出最终答案，chat UX 尚未完全签收。

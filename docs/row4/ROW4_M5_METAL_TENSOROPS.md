@@ -11,7 +11,10 @@ output boundary.
 Metal 4 MPP TensorOps can execute signed `INT8 x INT4 -> INT32` matrix
 products on Apple M5 GPUs. Row4 cannot feed its packed nibbles directly to this
 operation: one Row4 nibble is a codebook index shared by four output rows, not
-one signed INT4 weight. The M5 path therefore uses two exact prefill pipelines:
+one signed INT4 weight. Schema v1 uses the two exact prefill pipelines below.
+Pair2 schema v2 uses its layout-aware portable path below B512 and a dedicated
+device pre-expansion feeding the same large-prefill MPP kernel at B512 and
+above:
 
 ```text
 32 <= B < 512:
@@ -39,6 +42,19 @@ The original M4-tuned path measured on the same M5 Max was 953.375 tok/s for
 pp512 and 97.596 tok/s for tg128. The final M5 prefill result is 4.050x the
 initial pp512 result. Relative to the first online-threadgroup MPP result
 (3568.788 tok/s), full pre-expansion adds 8.20% end-to-end.
+
+After merging the Pair2/LUT16 work from master, the same release binary measured:
+
+| format and path | pp512 | tg128 |
+| --- | ---: | ---: |
+| schema v1 M5 | 3942.799 tok/s | 106.282 tok/s |
+| Pair2 portable prefill | 969.701 tok/s | - |
+| Pair2 M5 prefill + LUT16 decode | 3737.879 tok/s | 148.803 tok/s |
+
+The Pair2 M5 prefill route is 3.855x (+285.5%) faster than the same-binary
+portable Pair2 route. It gives up 5.20% pp512 versus schema v1 while the Pair2
+LUT16 decode path improves tg128 by 40.0%, making Pair2 the faster combined
+prefill/decode production format on this machine.
 
 ## Numeric contract
 
@@ -95,10 +111,12 @@ boundary represented as F32.
 
 For B at least 512, every token tile reuses the same weights often enough that
 one complete lossless expansion is faster than repeating the codebook lookup in
-each threadgroup. `kernel_row4_m5_preexpand_int4` expands one Row4 source byte
-to four ordinary signed-INT4 bytes in row-major `{K, O}` order. The direct MPP
-kernel uses M32N128/BK128 with four SIMDgroups, retains INT32 across all K, and
-applies `row4_finish_i32()` directly from the cooperative accumulator.
+each threadgroup. `kernel_row4_m5_preexpand_int4` expands schema v1, while
+`kernel_row4_m5_preexpand_int4_pair2` applies the exact Pair2 inverse
+permutation for schema v2. Both produce ordinary signed-INT4 bytes in row-major
+`{K, O}` order. The direct MPP kernel uses M32N128/BK128 with four SIMDgroups,
+retains INT32 across all K, and applies `row4_finish_i32()` directly from the
+cooperative accumulator.
 
 The temporary is `O*K/2` bytes: 12 MiB for qkv, 8 MiB for attention output,
 48 MiB for gate/up, and 24 MiB for down. It is backend-private trailing scratch,
@@ -125,8 +143,12 @@ path when `GGML_METAL_FORCE_SOURCE=1` is used and runtime source compilation
 succeeds.
 
 The operator selector also requires a Row4 linear operation, no fused residual,
-K divisible by 128, and complete M/N tiles. Unsupported shapes use the existing
-portable Metal path. W8A8 is not routed through this selector.
+and complete M/N tiles. Schema v1 requires K divisible by 128. Pair2 schema v2
+requires K divisible by 256 and only selects the device-preexpanded route for B
+at least 512; its smaller batches stay on the layout-aware portable path because
+the online MPP staging kernels decode the schema v1 physical layout.
+Unsupported shapes use the existing portable Metal path. W8A8 is not routed
+through this selector.
 
 Set this environment variable to make an explicit same-binary comparison:
 
@@ -145,9 +167,9 @@ The measured selector is:
 | divisible by 64 | `O % 64 == 0` | M64N64 | 4 | 128 |
 | divisible by 32 | `O % 128 == 0` | M32N128 | 4 | 128 |
 
-For B at least 512 and divisible by 32, `O % 128 == 0` selects device
-pre-expansion plus direct M32N128 TensorOps before this online-staging table.
-The grid is `{O / N_tile, B / M_tile, 1}`. When a TensorOps tile is
+For B at least 512 and divisible by 32, `O % 128 == 0` selects layout-specific
+device pre-expansion plus direct M32N128 TensorOps before this online-staging
+table. The grid is `{O / N_tile, B / M_tile, 1}`. When a TensorOps tile is
 available, the old gate/up producer fusion is deliberately bypassed so both
 Row4 linear operations can use the faster M5 path; exact SiLU and multiply
 semantics are unchanged. MPP shapes allocate only the A8 activation and its F32
@@ -221,7 +243,8 @@ path for single-stream latency.
 final test matrix covers:
 
 - B = 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, and 512;
-- all four online M5 tiles plus the pre-expanded path, with required markers;
+- all four schema v1 online M5 tiles plus both layout-specific pre-expanded
+  paths, with a required Pair2 B512 `device-preexpand` marker;
 - real qkv O6144/K4096, output O4096/K4096, gate/up O24576/K4096, and down
   O4096/K12288 shapes;
 - signed BF16 scales, QAT SwiGLU/down, decode residual fusion, and the full
@@ -310,6 +333,11 @@ GGML_METAL_ROW4_M5_TENSOROPS=0 \
 RESULTS_DIR=$PWD/tmp/row4-m5/results \
 PYTHON=$PWD/.venv/bin/python \
 perf/scripts/run_row4_bench.sh metal pp "$MODEL" m5-combined-portable
+
+MODEL=/path/to/qwen3-row4-v2-pair2.gguf
+RESULTS_DIR=$PWD/tmp/row4-m5/results \
+PYTHON=$PWD/.venv/bin/python \
+perf/scripts/run_row4_bench.sh metal pp "$MODEL" m5-pair2
 ```
 
 Raw local evidence from the development machine is under these ignored paths:

@@ -214,6 +214,7 @@ typedef struct {
     int32_t m;
     int32_t act_rows;
     int32_t reserved;
+    int32_t layout;
 } ggml_metal_kargs_row_quant_linear;
 
 typedef struct {

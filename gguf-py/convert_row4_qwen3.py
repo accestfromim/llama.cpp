@@ -20,8 +20,20 @@ import torch
 
 import gguf
 from row4.checkpoint import CheckpointManifest, TensorReader, load_manifest
-from row4.quant import pack_row4_m16k128, pack_w8_m16k128, quantize_row4_codes, quantize_w8_rows
-from row4.spec import write_metadata
+from row4.quant import (
+    pack_row4_m16k128,
+    pack_row4_m32k256_pair2,
+    pack_w8_m16k128,
+    quantize_row4_codes,
+    quantize_w8_rows,
+)
+from row4.spec import (
+    ROW4_LAYOUTS,
+    ROW4_LAYOUT_V1,
+    ROW4_LAYOUT_V2,
+    alignment_for_layout,
+    write_metadata,
+)
 
 
 LINEAR_SHAPES = (
@@ -608,10 +620,13 @@ class Row4BundleWriter:
         reader: TensorReader,
         weight_names: Sequence[str],
         scale_names: Sequence[str],
+        row4_layout: str = ROW4_LAYOUT_V1,
     ):
         self.reader = reader
         self.weight_names = tuple(weight_names)
         self.scale_names = tuple(scale_names)
+        alignment_for_layout(row4_layout)
+        self.row4_layout = row4_layout
 
     def iter_codes(self) -> Iterator[np.ndarray]:
         for name in self.weight_names:
@@ -621,7 +636,11 @@ class Row4BundleWriter:
                     chunk = read_rows(start, min(start + 128, out_features))
                     weight = chunk.to(torch.float32).cpu().numpy()
                     try:
-                        packed = pack_row4_m16k128(quantize_row4_codes(weight))
+                        logical_codes = quantize_row4_codes(weight)
+                        if self.row4_layout == ROW4_LAYOUT_V1:
+                            packed = pack_row4_m16k128(logical_codes)
+                        else:
+                            packed = pack_row4_m32k256_pair2(logical_codes)
                     except ValueError as exc:
                         raise ValueError(
                             f"failed to encode {name} rows "
@@ -689,19 +708,42 @@ def _add_row4_bundle(
     gguf_base: str,
     weight_names: Sequence[str],
     scale_names: Sequence[str],
+    row4_layout: str,
 ) -> None:
     input_dims = {reader.shape(name)[1] for name in weight_names}
     if len(input_dims) != 1:
         raise ValueError(f"{gguf_base} fused inputs do not share K: {sorted(input_dims)}")
     in_features = input_dims.pop()
     out_features = sum(reader.shape(name)[0] for name in weight_names)
-    bundle = Row4BundleWriter(reader, weight_names, scale_names)
+    if row4_layout == ROW4_LAYOUT_V1:
+        output_tile, input_tile = 16, 128
+        codes_shape = (out_features // 16, in_features // 128, 4, 64)
+        codes_type = gguf.GGMLQuantizationType.ROW4_CODES
+    elif row4_layout == ROW4_LAYOUT_V2:
+        output_tile, input_tile = 32, 256
+        codes_shape = (out_features // 32, in_features // 256, 8, 128)
+        codes_type = gguf.GGMLQuantizationType.ROW4_CODES_PAIR2
+    else:
+        alignment_for_layout(row4_layout)
+        raise AssertionError("unreachable")
+    unaligned = [
+        f"{name}={reader.shape(name)}"
+        for name in weight_names
+        if reader.shape(name)[0] % output_tile != 0
+        or reader.shape(name)[1] % input_tile != 0
+    ]
+    if unaligned:
+        raise ValueError(
+            f"{gguf_base} Row4 {row4_layout} requires O{output_tile}/K{input_tile} "
+            f"alignment for every source matrix: {', '.join(unaligned)}"
+        )
+    bundle = Row4BundleWriter(reader, weight_names, scale_names, row4_layout)
     plan.append(
         _entry(
             f"{gguf_base}.row4.codes",
-            (out_features // 16, in_features // 128, 4, 64),
+            codes_shape,
             np.uint8,
-            gguf.GGMLQuantizationType.ROW4_CODES,
+            codes_type,
             bundle.iter_codes,
         )
     )
@@ -716,7 +758,12 @@ def _add_row4_bundle(
     )
 
 
-def build_tensor_plan(reader: TensorReader, dimensions: Qwen3Dimensions) -> list[TensorWriteEntry]:
+def build_tensor_plan(
+    reader: TensorReader,
+    dimensions: Qwen3Dimensions,
+    row4_layout: str = ROW4_LAYOUT_V1,
+) -> list[TensorWriteEntry]:
+    alignment_for_layout(row4_layout)
     plan: list[TensorWriteEntry] = [
         _entry(
             "token_embd.weight",
@@ -742,10 +789,18 @@ def build_tensor_plan(reader: TensorReader, dimensions: Qwen3Dimensions) -> list
             f"blk.{layer}.attn_qkv",
             [pair[0] for pair in qkv],
             [pair[1] for pair in qkv],
+            row4_layout,
         )
 
         output = _weight_and_scale_names(layer, "self_attn.o_proj")
-        _add_row4_bundle(plan, reader, f"blk.{layer}.attn_output", [output[0]], [output[1]])
+        _add_row4_bundle(
+            plan,
+            reader,
+            f"blk.{layer}.attn_output",
+            [output[0]],
+            [output[1]],
+            row4_layout,
+        )
         _add_bf16(plan, reader, f"blk.{layer}.ffn_norm.weight", f"{prefix}.post_attention_layernorm.weight")
 
         gate_up = [
@@ -758,9 +813,17 @@ def build_tensor_plan(reader: TensorReader, dimensions: Qwen3Dimensions) -> list
             f"blk.{layer}.ffn_gate_up",
             [pair[0] for pair in gate_up],
             [pair[1] for pair in gate_up],
+            row4_layout,
         )
         down = _weight_and_scale_names(layer, "mlp.down_proj")
-        _add_row4_bundle(plan, reader, f"blk.{layer}.ffn_down", [down[0]], [down[1]])
+        _add_row4_bundle(
+            plan,
+            reader,
+            f"blk.{layer}.ffn_down",
+            [down[0]],
+            [down[1]],
+            row4_layout,
+        )
 
     _add_bf16(plan, reader, "output_norm.weight", "model.norm.weight")
     w8 = W8BundleWriter(reader, "lm_head.weight")
@@ -869,8 +932,9 @@ def add_model_metadata(
     writer: gguf.GGUFWriter,
     config: Mapping[str, object],
     dimensions: Qwen3Dimensions,
+    row4_layout: str = ROW4_LAYOUT_V1,
 ) -> None:
-    writer.add_custom_alignment(64)
+    writer.add_custom_alignment(alignment_for_layout(row4_layout))
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
     writer.add_name(str(config.get("_name_or_path", "Qwen3-Row4-INT8")))
     writer.add_context_length(131072)
@@ -891,7 +955,7 @@ def add_model_metadata(
     writer.add_file_type(gguf.LlamaFileType.MOSTLY_ROW4)
     writer.add_vocab_size(dimensions.vocab)
     writer.add_add_bos_token(True)
-    write_metadata(writer)
+    write_metadata(writer, row4_layout)
 
 
 def print_preflight(report: PreflightReport) -> None:
@@ -1013,6 +1077,30 @@ def _atomic_publish_no_clobber(temporary: Path, output_file: Path) -> None:
     os.link(temporary, output_file, follow_symlinks=False)
 
 
+def _validate_tensor_plan_row4_layout(
+    plan: Sequence[TensorWriteEntry],
+    row4_layout: str,
+) -> None:
+    if row4_layout == ROW4_LAYOUT_V1:
+        expected_type = gguf.GGMLQuantizationType.ROW4_CODES
+    elif row4_layout == ROW4_LAYOUT_V2:
+        expected_type = gguf.GGMLQuantizationType.ROW4_CODES_PAIR2
+    else:
+        alignment_for_layout(row4_layout)
+        raise AssertionError("unreachable")
+
+    mismatches = [
+        f"{entry.name}={entry.raw_dtype.name}"
+        for entry in plan
+        if entry.name.endswith(".row4.codes") and entry.raw_dtype != expected_type
+    ]
+    if mismatches:
+        raise ValueError(
+            f"Row4 {row4_layout} tensor plan requires raw_dtype={expected_type.name} for every "
+            f".row4.codes tensor; mismatches: {', '.join(mismatches)}"
+        )
+
+
 def write_conversion_output(
     model_dir: Path,
     output_file: Path,
@@ -1020,7 +1108,9 @@ def write_conversion_output(
     plan: Sequence[TensorWriteEntry],
     *,
     verbose: bool,
+    row4_layout: str = ROW4_LAYOUT_V1,
 ) -> None:
+    _validate_tensor_plan_row4_layout(plan, row4_layout)
     output_file = _resolve_safe_output_path(output_file)
     if output_file.exists() or output_file.is_symlink():
         raise FileExistsError(f"refusing to overwrite existing output: {output_file}")
@@ -1028,7 +1118,7 @@ def write_conversion_output(
     temporary: PrivateTemporaryOutput | None = None
     try:
         writer = gguf.GGUFWriter(None, arch="qwen3")
-        add_model_metadata(writer, report.config, report.dimensions)
+        add_model_metadata(writer, report.config, report.dimensions, row4_layout)
         add_qwen2_vocab(model_dir, report.config, writer)
         register_tensor_plan(writer, plan)
         temporary = _create_private_temporary(output_file)
@@ -1053,13 +1143,25 @@ def write_conversion_output(
             _cleanup_private_temporary(temporary)
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Convert Qwen3 Row4 W1A8-INT8 weights to strict GGUF v1")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Convert Qwen3 Row4 W1A8-INT8 weights to strict GGUF v1 or v2"
+    )
     parser.add_argument("model_dir", type=Path, help="Qwen3 Row4 checkpoint directory")
     parser.add_argument("output_file", type=Path, nargs="?", help="destination GGUF")
     parser.add_argument("--dry-run", action="store_true", help="validate without writing")
     parser.add_argument("--verbose", action="store_true", help="print per-tensor write progress")
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--row4-layout",
+        choices=ROW4_LAYOUTS,
+        default=ROW4_LAYOUT_V1,
+        help="Row4 codes layout (default: v1; v2 is Metal-only)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _build_parser().parse_args(argv)
 
     if args.output_file is None and not args.dry_run:
         raise ValueError("output_file is required unless --dry-run is used")
@@ -1076,13 +1178,18 @@ def main(argv: list[str] | None = None) -> None:
 
     assert output_file is not None
     reader = TensorReader(args.model_dir, report.manifest)
-    plan = build_tensor_plan(reader, report.dimensions)
+    plan = build_tensor_plan(reader, report.dimensions, args.row4_layout)
     plan_bytes = sum(entry.nbytes for entry in plan)
     if plan_bytes != report.tensor_payload_bytes:
         raise AssertionError(
             f"Row4 tensor plan payload mismatch: plan={plan_bytes}, preflight={report.tensor_payload_bytes}"
         )
-    row4_codes = sum(entry.nbytes for entry in plan if entry.raw_dtype == gguf.GGMLQuantizationType.ROW4_CODES)
+    row4_codes_type = (
+        gguf.GGMLQuantizationType.ROW4_CODES
+        if args.row4_layout == ROW4_LAYOUT_V1
+        else gguf.GGMLQuantizationType.ROW4_CODES_PAIR2
+    )
+    row4_codes = sum(entry.nbytes for entry in plan if entry.raw_dtype == row4_codes_type)
     row4_scales = sum(
         entry.nbytes for entry in plan if entry.name.endswith(".row4.scales")
     )
@@ -1100,6 +1207,7 @@ def main(argv: list[str] | None = None) -> None:
         report,
         plan,
         verbose=args.verbose,
+        row4_layout=args.row4_layout,
     )
     print(f"GGUF saved to: {output_file}")
 

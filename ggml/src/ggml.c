@@ -1001,6 +1001,12 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 1,
         .is_quantized             = true,
     },
+    [GGML_TYPE_ROW4_CODES_PAIR2] = {
+        .type_name                = "row4_codes_pair2",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -4486,21 +4492,29 @@ static struct ggml_tensor * ggml_row_quant_linear_impl(struct ggml_context * ctx
                                                        enum ggml_op          op) {
     GGML_ASSERT(x && codes && scales);
     GGML_ASSERT(x->type == GGML_TYPE_F32);
-    GGML_ASSERT(logical_o > 0 && logical_o <= INT32_MAX && logical_o % 128 == 0);
-    GGML_ASSERT(logical_k > 0 && logical_k <= INT32_MAX && logical_k % 128 == 0);
+    GGML_ASSERT(logical_o > 0 && logical_o <= INT32_MAX);
+    GGML_ASSERT(logical_k > 0 && logical_k <= INT32_MAX);
     GGML_ASSERT(x->ne[0] == logical_k);
 
-    const int64_t k_tiles = logical_k / 128;
-    const int64_t o_tiles = logical_o / 16;
     if (op == GGML_OP_ROW4_LINEAR) {
-        GGML_ASSERT(codes->type == GGML_TYPE_ROW4_CODES);
         GGML_ASSERT(scales->type == GGML_TYPE_BF16);
-        GGML_ASSERT(codes->ne[0] == 64 && codes->ne[1] == 4 && codes->ne[2] == k_tiles && codes->ne[3] == o_tiles);
+        if (codes->type == GGML_TYPE_ROW4_CODES) {
+            GGML_ASSERT(logical_o % 128 == 0 && logical_k % 128 == 0);
+            GGML_ASSERT(codes->ne[0] == 64 && codes->ne[1] == 4 && codes->ne[2] == logical_k / 128 &&
+                        codes->ne[3] == logical_o / 16);
+        } else {
+            GGML_ASSERT(codes->type == GGML_TYPE_ROW4_CODES_PAIR2);
+            GGML_ASSERT(logical_o % 32 == 0 && logical_k % 256 == 0);
+            GGML_ASSERT(codes->ne[0] == 128 && codes->ne[1] == 8 && codes->ne[2] == logical_k / 256 &&
+                        codes->ne[3] == logical_o / 32);
+        }
     } else {
         GGML_ASSERT(op == GGML_OP_W8A8_LINEAR);
+        GGML_ASSERT(logical_o % 128 == 0 && logical_k % 128 == 0);
         GGML_ASSERT(codes->type == GGML_TYPE_I8);
         GGML_ASSERT(scales->type == GGML_TYPE_F32);
-        GGML_ASSERT(codes->ne[0] == 128 && codes->ne[1] == 16 && codes->ne[2] == k_tiles && codes->ne[3] == o_tiles);
+        GGML_ASSERT(codes->ne[0] == 128 && codes->ne[1] == 16 && codes->ne[2] == logical_k / 128 &&
+                    codes->ne[3] == logical_o / 16);
     }
     GGML_ASSERT(scales->ne[0] == logical_o && scales->ne[1] == 1 && scales->ne[2] == 1 && scales->ne[3] == 1);
 
@@ -4510,7 +4524,7 @@ static struct ggml_tensor * ggml_row_quant_linear_impl(struct ggml_context * ctx
     result->src[0]              = x;
     result->src[1]              = codes;
     result->src[2]              = scales;
-    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 0, codes->type == GGML_TYPE_ROW4_CODES_PAIR2 ? 2 : 1);
     ggml_set_op_params_i32(result, 1, (int32_t) logical_o);
     ggml_set_op_params_i32(result, 2, (int32_t) logical_k);
     return result;

@@ -120,6 +120,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 
     { LLM_KV_ROW4_SCHEMA_VERSION,          "row4.schema_version"                   },
     { LLM_KV_ROW4_WEIGHT_LAYOUT,           "row4.weight_layout"                    },
+    { LLM_KV_ROW4_EXECUTION_PROFILE,       "row4.execution_profile"                },
     { LLM_KV_ROW4_CODEBOOK,                "row4.codebook"                         },
     { LLM_KV_ROW4_NUMERIC_PROFILE,         "row4.numeric_profile"                  },
     { LLM_KV_ROW4_QKV_ORDER,               "row4.qkv_order"                        },

@@ -5980,6 +5980,7 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             // Every 2-bit pattern is valid; structural validation belongs to the bundle op.
             break;
         case GGML_TYPE_ROW4_CODES:
+        case GGML_TYPE_ROW4_CODES_PAIR2:
             // Every nibble is a valid Row4 code. Shape/layout validation belongs to ROW4_LINEAR.
             break;
         case GGML_TYPE_IQ1_S:

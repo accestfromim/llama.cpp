@@ -1738,11 +1738,11 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
         if (src == nullptr) {
             continue;
         }
-        if (src->type == GGML_TYPE_ROW4_CODES) {
+        if (src->type == GGML_TYPE_ROW4_CODES || src->type == GGML_TYPE_ROW4_CODES_PAIR2) {
             return false;
         }
     }
-    if (op->type == GGML_TYPE_ROW4_CODES) {
+    if (op->type == GGML_TYPE_ROW4_CODES || op->type == GGML_TYPE_ROW4_CODES_PAIR2) {
         return false;
     }
 
