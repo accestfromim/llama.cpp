@@ -28,6 +28,10 @@
 // overload of MTLGPUFamilyMetal3 (not available in some environments)
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
+static const NSInteger MTLGPUFamilyApple10_GGML = 1010;
+static const MTLLanguageVersion MTLLanguageVersion4_0_GGML = (MTLLanguageVersion) (4 << 16);
+
+static void ggml_metal_device_disable_mpp_tensorops(ggml_metal_device_t dev);
 
 static bool ggml_metal_env_flag(const char * name, bool default_value) {
     const char * value = getenv(name);
@@ -263,6 +267,13 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
         }
 #endif
 
+        if (library && ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
+            // The portable precompiled metallib does not contain the MSL 4.0
+            // TensorOps entry points. A force-source or source-fallback load
+            // can still enable them in non-embedded builds.
+            ggml_metal_device_disable_mpp_tensorops(dev);
+        }
+
         if (!library) {
             @autoreleasepool {
                 // dictionary of preprocessor macros
@@ -272,24 +283,49 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                     [prep setObject:@"1" forKey:@"GGML_METAL_HAS_BF16"];
                 }
 
+                if (ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
+                    [prep setObject:@"1" forKey:@"GGML_METAL_HAS_MPP_TENSOROPS"];
+                }
+
 #if GGML_METAL_EMBED_LIBRARY
                 [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
 #endif
 
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
+                if (ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
+                    options.languageVersion = MTLLanguageVersion4_0_GGML;
+                }
 
                 //[options setFastMathEnabled:false];
 
                 library = [device newLibraryWithSource:src options:options error:&error];
-                if (error) {
-                    GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
-                    return nil;
-                }
+                if (!library && ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
+                    GGML_LOG_WARN("%s: M5 MPP TensorOps source compile failed; retrying portable Metal path\n", __func__);
+                    if (error) {
+                        GGML_LOG_WARN("%s: MPP compile error: %s\n", __func__, [[error description] UTF8String]);
+                    }
+                    ggml_metal_device_disable_mpp_tensorops(dev);
+                    [prep removeObjectForKey:@"GGML_METAL_HAS_MPP_TENSOROPS"];
+                    error = nil;
 
+                    MTLCompileOptions * fallback_options = [MTLCompileOptions new];
+                    fallback_options.preprocessorMacros = prep;
+                    library = [device newLibraryWithSource:src options:fallback_options error:&error];
+#if !__has_feature(objc_arc)
+                    [fallback_options release];
+#endif
+                }
 #if !__has_feature(objc_arc)
                 [options release];
 #endif
+                if (!library) {
+                    GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+#if GGML_METAL_EMBED_LIBRARY
+                    [src release];
+#endif
+                    return nil;
+                }
             }
         }
 
@@ -361,10 +397,23 @@ ggml_metal_pipeline_t ggml_metal_library_compile_pipeline(ggml_metal_library_t l
                 GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
             }
 
+            ggml_metal_pipeline_free(res);
             return nil;
         }
 
         res->obj = [lib->device newComputePipelineStateWithFunction:mtl_function error:&error];
+        if (!res->obj) {
+            [mtl_function release];
+            ggml_critical_section_end();
+
+            GGML_LOG_ERROR("%s: error: failed to create pipeline: base = '%s', name = '%s'\n", __func__, base, name);
+            if (error) {
+                GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+            }
+
+            ggml_metal_pipeline_free(res);
+            return nil;
+        }
 
         ggml_metal_pipelines_add(lib->pipelines, name, res);
 
@@ -461,6 +510,10 @@ struct ggml_metal_device {
     size_t scratch_size;
 };
 
+static void ggml_metal_device_disable_mpp_tensorops(ggml_metal_device_t dev) {
+    dev->props.has_mpp_tensorops = false;
+}
+
 ggml_metal_device_t ggml_metal_device_init(void) {
     ggml_metal_device_t dev = calloc(1, sizeof(struct ggml_metal_device));
 
@@ -513,6 +566,17 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 "GGML_FAIRY2I_METAL3_COMPAT", !supports_metal4);
 
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+            dev->props.supports_gpu_family_apple10 =
+                [dev->mtl_device supportsFamily:MTLGPUFamilyApple10_GGML];
+            // MPP TensorOps kernels are compiled from source as MSL 4.0. Keep
+            // precompiled libraries on the existing portable path until the
+            // build-time metallib toolchain can guarantee these entry points.
+            if (@available(macOS 26.4, iOS 26.4, tvOS 26.4, visionOS 26.4, *)) {
+                dev->props.has_mpp_tensorops = supports_metal4 && dev->props.supports_gpu_family_apple10 &&
+                                                ggml_metal_env_flag("GGML_METAL_ROW4_M5_TENSOROPS", true);
+            } else {
+                dev->props.has_mpp_tensorops = false;
+            }
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
             dev->props.max_working_set_size       = dev->mtl_device.recommendedMaxWorkingSetSize;
@@ -525,6 +589,27 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 GGML_LOG_ERROR("%s: error: failed to create library (disabling Metal backend)\n", __func__);
                 ggml_metal_device_free(dev);
                 return NULL;
+            }
+
+            if (dev->props.has_mpp_tensorops) {
+                const char * const mpp_pipeline_names[] = {
+                    "kernel_row4_m5_preexpand_int4",
+                    "kernel_row4_m5_preexpand_int4_pair2",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_m64n64",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_m128n32",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_m256n32",
+                };
+                for (size_t i = 0; i < sizeof(mpp_pipeline_names) / sizeof(mpp_pipeline_names[0]); ++i) {
+                    const char * name = mpp_pipeline_names[i];
+                    if (!ggml_metal_library_compile_pipeline(dev->library, name, name, NULL)) {
+                        GGML_LOG_WARN(
+                            "%s: M5 MPP TensorOps pipeline probe failed; using portable Row4 kernels\n", __func__);
+                        dev->props.has_mpp_tensorops = false;
+                        break;
+                    }
+                }
             }
 
             // --------------------------------------------------
@@ -565,6 +650,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             GGML_LOG_INFO("%s: use residency sets    = %s\n", __func__, dev->props.use_residency_sets      ? "true" : "false");
             GGML_LOG_INFO("%s: use shared buffers    = %s\n", __func__, dev->props.use_shared_buffers      ? "true" : "false");
             GGML_LOG_INFO("%s: Fairy2i Metal3 compat = %s\n", __func__, dev->props.fairy2i_metal3_compat   ? "true" : "false");
+            GGML_LOG_INFO("%s: MPP TensorOps         = %s\n", __func__, dev->props.has_mpp_tensorops       ? "true" : "false");
 
 #if TARGET_OS_OSX || (TARGET_OS_IOS && __clang_major__ >= 15)
             if (@available(macOS 10.12, iOS 16.0, *)) {
@@ -1686,17 +1772,21 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
-struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_for_size(
+        ggml_metal_buffer_t buf,
+        const struct ggml_tensor * t,
+        size_t size) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 
-    const int64_t tsize = ggml_nbytes(t);
-
-    // find the view that contains the tensor fully
+    // Find the view that contains the requested allocation fully.  Most callers
+    // request ggml_nbytes(t); Metal ops with backend-private trailing scratch
+    // request the full allocation so a split mapped buffer cannot select a view
+    // that contains only the logical destination.
     for (int i = 0; i < buf->n_buffers; ++i) {
         const int64_t ioffs = (int64_t) t->data - (int64_t) buf->buffers[i].data;
 
-        //GGML_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf->buffers[i].size);
-        if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf->buffers[i].size) {
+        if (ioffs >= 0 && size <= (size_t) INT64_MAX - (size_t) ioffs &&
+            ioffs + (int64_t) size <= (int64_t) buf->buffers[i].size) {
             res.metal = buf->buffers[i].metal;
             res.offs  = (size_t) ioffs;
 
@@ -1709,6 +1799,10 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
 
     return res;
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    return ggml_metal_buffer_get_id_for_size(buf, t, ggml_nbytes(t));
 }
 
 struct ggml_metal_buffer_id ggml_metal_buffer_get_fairy2i_w1_coeff_lut(

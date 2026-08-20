@@ -1225,7 +1225,13 @@ static ggml_backend_dev_t find_metal_device() {
 }
 
 struct gate_up_fusion_log_marker {
-    std::atomic<bool> hit = false;
+    std::atomic<bool> hit                     = false;
+    std::atomic<bool> m5_tensorops_bypass_hit = false;
+};
+
+struct m5_tensorops_path_log_marker {
+    std::atomic<uint32_t> tile_mask              = 0;
+    std::atomic<bool>     pair2_device_preexpand = false;
 };
 
 static void gate_up_fusion_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
@@ -1233,6 +1239,34 @@ static void gate_up_fusion_log_callback(enum ggml_log_level level, const char * 
     constexpr const char * marker = "fuse Row4 gate_up + VIEW + QAT SILU_EXACT + VIEW + QAT MUL_EXACT + ROW4_LINEAR";
     if (strstr(text, marker)) {
         static_cast<gate_up_fusion_log_marker *>(user_data)->hit.store(true, std::memory_order_relaxed);
+    }
+    constexpr const char * m5_marker = "bypass Row4 gate-up producer fusion for M5 MPP TensorOps";
+    if (strstr(text, m5_marker)) {
+        static_cast<gate_up_fusion_log_marker *>(user_data)->m5_tensorops_bypass_hit.store(true,
+                                                                                           std::memory_order_relaxed);
+    }
+}
+
+static void m5_tensorops_path_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    uint32_t bit = 0;
+    if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M32N128 BK128 device-preexpand")) {
+        bit = 1u << 4;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M32N128")) {
+        bit = 1u << 0;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M64N64")) {
+        bit = 1u << 1;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M128N32")) {
+        bit = 1u << 2;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M256N32")) {
+        bit = 1u << 3;
+    }
+    if (bit != 0) {
+        m5_tensorops_path_log_marker * marker = static_cast<m5_tensorops_path_log_marker *>(user_data);
+        marker->tile_mask.fetch_or(bit, std::memory_order_relaxed);
+        if (strstr(text, "layout=m32k256_pair2_split8_v2") && strstr(text, "M32N128 BK128 device-preexpand")) {
+            marker->pair2_device_preexpand.store(true, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -1360,10 +1394,11 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
                                          int64_t                       tokens,
                                          bool                          qat,
                                          bool                          mark_mul_output,
-                                         bool                          w8_down             = false,
-                                         bool *                        gate_up_fusion_hit  = nullptr,
-                                         bool                          mark_gate_up_output = false,
-                                         bool                          pair2               = false) {
+                                         bool                          w8_down                 = false,
+                                         bool *                        gate_up_fusion_hit      = nullptr,
+                                         bool                          mark_gate_up_output     = false,
+                                         bool                          pair2                   = false,
+                                         bool *                        m5_tensorops_bypass_hit = nullptr) {
     const int64_t INPUT_K   = pair2 ? 256 : 128;
     const int64_t N_FF      = pair2 ? 256 : 128;
     const int64_t GATE_UP_O = 2 * N_FF;
@@ -1456,12 +1491,17 @@ static bool run_row4_swiglu_down_backend(std::vector<float> &          output,
     }
 
     gate_up_fusion_log_marker marker;
-    if (gate_up_fusion_hit != nullptr) {
+    if (gate_up_fusion_hit != nullptr || m5_tensorops_bypass_hit != nullptr) {
         ggml_log_set(gate_up_fusion_log_callback, &marker);
     }
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
-    if (gate_up_fusion_hit != nullptr) {
-        *gate_up_fusion_hit = marker.hit.load(std::memory_order_relaxed);
+    if (gate_up_fusion_hit != nullptr || m5_tensorops_bypass_hit != nullptr) {
+        if (gate_up_fusion_hit != nullptr) {
+            *gate_up_fusion_hit = marker.hit.load(std::memory_order_relaxed);
+        }
+        if (m5_tensorops_bypass_hit != nullptr) {
+            *m5_tensorops_bypass_hit = marker.m5_tensorops_bypass_hit.load(std::memory_order_relaxed);
+        }
         ggml_log_set(nullptr, nullptr);
     }
     if (status == GGML_STATUS_SUCCESS) {
@@ -1593,7 +1633,7 @@ static bool test_metal_row4_swiglu_down_fusion() {
     scoped_env_var fusion_debug("GGML_METAL_FUSION_DEBUG");
     bool           ok = true;
 
-    for (int64_t tokens : { 1, 3, 8, 9, 32, 64 }) {
+    for (int64_t tokens : { 1, 3, 8, 9, 32, 64, 128, 256, 512 }) {
         const std::vector<float> input  = make_input(INPUT_K, tokens);
         const std::vector<float> oracle = oracle_row4_qat_swiglu_down(input, gate_up_codes, gate_up_scales, down_codes,
                                                                       down_scales, INPUT_K, N_FF, DOWN_O, tokens);
@@ -1628,18 +1668,23 @@ static bool test_metal_row4_swiglu_down_fusion() {
         fusion_debug.set("2");
         ggml_backend_t     metal_fused = ggml_backend_dev_init(dev, nullptr);
         std::vector<float> fused;
-        bool               gate_up_fusion_hit = false;
+        bool               gate_up_fusion_hit      = false;
+        bool               m5_tensorops_bypass_hit = false;
         ok =
             metal_fused &&
             run_row4_swiglu_down_backend(fused, metal_fused, input, gate_up_codes, gate_up_scales, down_codes,
-                                         down_scales, tokens, true, false, false, &gate_up_fusion_hit) &&
+                                         down_scales, tokens, true, false, false, &gate_up_fusion_hit, false, false,
+                                         &m5_tensorops_bypass_hit) &&
             compare_exact(("Row4 QAT SwiGLU-down fused/oracle B=" + std::to_string(tokens)).c_str(), fused, oracle) &&
             compare_exact(("Row4 QAT SwiGLU-down fused/unfused B=" + std::to_string(tokens)).c_str(), fused, unfused) &&
             ok;
         const bool expect_gate_up_fusion = tokens > 8 && tokens % 32 == 0;
-        if (gate_up_fusion_hit != expect_gate_up_fusion) {
-            fprintf(stderr, "Row4 gate-up producer fusion hit mismatch B=%lld: actual=%d expected=%d\n",
-                    (long long) tokens, (int) gate_up_fusion_hit, (int) expect_gate_up_fusion);
+        const bool optimized_route_hit   = gate_up_fusion_hit != m5_tensorops_bypass_hit;
+        if (optimized_route_hit != expect_gate_up_fusion) {
+            fprintf(stderr,
+                    "Row4 gate-up optimized route mismatch B=%lld: fusion=%d M5-TensorOps-bypass=%d expected=%d\n",
+                    (long long) tokens, (int) gate_up_fusion_hit, (int) m5_tensorops_bypass_hit,
+                    (int) expect_gate_up_fusion);
             ok = false;
         }
         if (metal_fused) {
@@ -2303,11 +2348,13 @@ static bool test_metal_row4_decode_residual_fusion() {
 }
 
 static bool test_metal_operator_matrix() {
+    const char *       require_m5_value     = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
+    const bool         require_m5_tensorops = require_m5_value && strcmp(require_m5_value, "0") != 0;
     ggml_backend_dev_t dev = find_metal_device();
     if (!dev) {
-        const char * required = getenv("LLAMA_ROW4_REQUIRE_METAL_TESTS");
-        if (required && strcmp(required, "0") != 0) {
-            fprintf(stderr, "LLAMA_ROW4_REQUIRE_METAL_TESTS is set, but no Metal device is available\n");
+        const char * require_metal = getenv("LLAMA_ROW4_REQUIRE_METAL_TESTS");
+        if ((require_metal && strcmp(require_metal, "0") != 0) || require_m5_tensorops) {
+            fprintf(stderr, "a required Metal Row4 test was requested, but no Metal device is available\n");
             return false;
         }
         printf("  Metal Row4/W8A8 dispatch boundaries: SKIP (Metal backend unavailable)\n");
@@ -2327,8 +2374,13 @@ static bool test_metal_operator_matrix() {
     const std::vector<int8_t>   w8_codes    = make_w8_codes(O, K);
     const std::vector<float>    w8_scales   = make_w8_scales(O);
 
+    m5_tensorops_path_log_marker m5_marker;
+    if (require_m5_tensorops) {
+        ggml_log_set(m5_tensorops_path_log_callback, &m5_marker);
+    }
+
     bool ok = true;
-    for (int64_t tokens : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128 }) {
+    for (int64_t tokens : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
         const std::vector<float> input = make_input(K, tokens);
         std::vector<float>       actual;
         const std::vector<float> expected_row4 = oracle_row4_linear(input, row4_codes, row4_scales, O, K, tokens);
@@ -2345,7 +2397,6 @@ static bool test_metal_operator_matrix() {
             ok = false;
         }
     }
-
     // Minimum Pair2 output block: exercises O32 decode, reduced small-batch,
     // and the non-M64 generic prefill kernel at B9.
     {
@@ -2374,7 +2425,7 @@ static bool test_metal_operator_matrix() {
         constexpr int64_t          KPAIR       = 256;
         const std::vector<uint8_t> v1_codes    = make_row4_codes(O, KPAIR);
         const std::vector<uint8_t> pair2_codes = make_row4_pair2_codes(O, KPAIR);
-        for (int64_t tokens : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128 }) {
+        for (int64_t tokens : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
             const std::vector<float> input    = make_input(KPAIR, tokens);
             const std::vector<float> expected = oracle_row4_linear(input, v1_codes, row4_scales, O, KPAIR, tokens);
             std::vector<float>       actual;
@@ -2429,6 +2480,20 @@ static bool test_metal_operator_matrix() {
         if (!run_operator_backend(actual, linear_kind::w8a8, input, {}, {}, codes, scales, O, KW8, TOKENS, nullptr,
                                   false, metal) ||
             !compare_exact("W8A8 Metal K=4096 B=9 segmented maximum/cancellation", actual, expected)) {
+            ok = false;
+        }
+    }
+
+    if (require_m5_tensorops) {
+        ggml_log_set(nullptr, nullptr);
+        constexpr uint32_t all_m5_tiles = (1u << 5) - 1u;
+        const uint32_t     hit_mask     = m5_marker.tile_mask.load(std::memory_order_relaxed);
+        if (hit_mask != all_m5_tiles) {
+            fprintf(stderr, "M5 TensorOps tile marker mismatch: actual=0x%x expected=0x%x\n", hit_mask, all_m5_tiles);
+            ok = false;
+        }
+        if (!m5_marker.pair2_device_preexpand.load(std::memory_order_relaxed)) {
+            fprintf(stderr, "M5 TensorOps Pair2 B512 device-preexpand marker was not observed\n");
             ok = false;
         }
     }
@@ -2519,8 +2584,9 @@ static bool test_metal_real_shape_matrix() {
 
         const std::vector<float> input_two    = make_input(shape.k, 2);
         const std::vector<float> expected_two = oracle_row4_linear(input_two, codes, scales, shape.o, shape.k, 2);
-        for (int64_t tokens : { 1, 9, 16, 17, 31, 32, 33, 64, 96, 128 }) {
-            if (!shape.packed_n32_boundaries && tokens != 1 && tokens != 9 && tokens != 32) {
+        for (int64_t tokens : { 1, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
+            if (!shape.packed_n32_boundaries && tokens != 1 && tokens != 9 && tokens != 32 && tokens != 256 &&
+                tokens != 512) {
                 continue;
             }
             const std::vector<float> input    = repeat_two_token_pattern(input_two, shape.k, tokens);
@@ -2668,10 +2734,10 @@ int main() {
     failed += !test_opaque_type_isolation();
     failed += !test_cpu_operator_matrix();
     failed += !test_metal_row4_pair2_decode_production();
+    failed += !test_metal_operator_matrix();
     failed += !test_metal_row4_swiglu_fusion();
     failed += !test_metal_row4_swiglu_down_fusion();
     failed += !test_metal_row4_decode_residual_fusion();
-    failed += !test_metal_operator_matrix();
     failed += !test_metal_real_shape_matrix();
 
     printf("========================================\n");
