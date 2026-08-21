@@ -590,6 +590,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_set_rows(ctx, idx);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                n_fuse = ggml_metal_op_turbo_wht(ctx, idx);
+            }
+            break;
         case GGML_OP_RMS_NORM:
             {
                 n_fuse = ggml_metal_op_rms_norm(ctx, idx);
@@ -1313,8 +1318,12 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
             lib, mode == GGML_SET_ROWS_BF16_CARRIER_ELEMENTS);
     } else {
         GGML_ASSERT(mode == 0);
-        pipeline = op->src[0]->type == GGML_TYPE_BF16 ? ggml_metal_get_pipeline_set_rows_bf16_raw(lib) :
-                                                        ggml_metal_library_get_pipeline_set_rows(lib, op->type);
+        if (op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) {
+            pipeline = ggml_metal_library_get_pipeline_set_rows_turbo(lib, op->type, op->src[1]->type);
+        } else {
+            pipeline = op->src[0]->type == GGML_TYPE_BF16 ? ggml_metal_get_pipeline_set_rows_bf16_raw(lib) :
+                                                            ggml_metal_library_get_pipeline_set_rows(lib, op->type);
+        }
     }
 
     const int32_t nk0 = ne0/ggml_blck_size(op->type);
@@ -1370,6 +1379,33 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     nth = std::min(nth, nk0);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_turbo_wht(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ggml_graph_node(ctx->gf, idx);
+    GGML_ASSERT(op->src[0] && op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(!op->src[1]);
+
+    const int64_t n_elements = ggml_nelements(op->src[0]);
+    const int32_t direction  = ggml_get_op_params_i32(op, 0);
+    GGML_ASSERT(ggml_get_op_params_i32(op, 1) == 128);
+
+    ggml_metal_pipeline_t      pipeline = ggml_metal_library_get_pipeline_turbo_wht(ctx->lib);
+    ggml_metal_kargs_turbo_wht args     = {
+        /*.n_elements =*/n_elements,
+        /*.direction  =*/direction,
+    };
+
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op), 2);
+
+    const int     nth      = std::min(32, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int64_t n_groups = n_elements / 128;
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_groups + nth - 1) / nth, 1, 1, nth, 1, 1);
 
     return 1;
 }
@@ -3485,6 +3521,13 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
 bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
+    const ggml_type type_k = op->src[1]->type;
+    const ggml_type type_v = op->src[2]->type;
+    if (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+        type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0) {
+        return false;
+    }
+
     if (ggml_flash_attn_ext_get_fairy2i_exact(op) && !ggml_flash_attn_ext_get_fairy2i_flash3(op)) {
         return false;
     }
@@ -3569,7 +3612,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ne11 % 32 == 0);
 
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->src[1]->type == op->src[2]->type);
+
+    const ggml_type type_k = op->src[1]->type;
+    const ggml_type type_v = op->src[2]->type;
+    const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
+    const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+    GGML_ASSERT(type_k == type_v || (k_turbo && (v_turbo || type_v == GGML_TYPE_Q8_0)) ||
+                (v_turbo && type_k == GGML_TYPE_Q8_0));
 
     //GGML_ASSERT(ggml_are_same_shape (src1, src2));
     GGML_ASSERT(ne11 == ne21);

@@ -697,6 +697,11 @@ typedef struct {
 } ggml_metal_kargs_set_rows;
 
 typedef struct {
+    int64_t n_elements;
+    int32_t direction;
+} ggml_metal_kargs_turbo_wht;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

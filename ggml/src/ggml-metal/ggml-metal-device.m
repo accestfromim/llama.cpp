@@ -1045,10 +1045,26 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 // TODO: disabled for now, until optmized
                 return false;
             }
+
+            const enum ggml_type type_k = op->src[1]->type;
+            const enum ggml_type type_v = op->src[2]->type;
+            const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
+            const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+            if (k_turbo || v_turbo) {
+                const bool pair_supported = (k_turbo && v_turbo) ||
+                                            (k_turbo && type_v == GGML_TYPE_Q8_0) ||
+                                            (v_turbo && type_k == GGML_TYPE_Q8_0);
+                return pair_supported && op->src[0]->ne[0] == 128 && op->src[1]->ne[0] == 128 &&
+                       op->src[2]->ne[0] == 128 && has_simdgroup_mm;
+            }
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_TURBO_WHT:
+            return op->src[0] && !op->src[1] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] % 128 == 0 && ggml_get_op_params_i32(op, 1) == 128 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
@@ -1159,6 +1175,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
                         return true;
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                        return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32) &&
+                               op->ne[0] % 128 == 0 &&
+                               (ggml_get_op_params_i32(op, 1) == 0 || ggml_get_op_params_i32(op, 1) == 128);
                     default:
                         return false;
                 };

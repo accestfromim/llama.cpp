@@ -191,6 +191,33 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_set_rows(ggml_metal_librar
     return res;
 }
 
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_set_rows_turbo(ggml_metal_library_t lib,
+                                                                     ggml_type            tdst,
+                                                                     ggml_type            tidx) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_set_rows_%s_%s", ggml_type_name(tdst), ggml_type_name(tidx));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    return ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+}
+
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib) {
+    constexpr const char * name = "kernel_turbo_wht";
+    ggml_metal_pipeline_t  res  = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    return ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+}
+
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_repeat(ggml_metal_library_t lib, ggml_type tsrc) {
     char base[256];
     char name[256];
@@ -956,10 +983,18 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
-    const char * type_name =
-        ggml_flash_attn_ext_get_fairy2i_flash3(op) ? "fairy_bf16" : ggml_type_name(op->src[1]->type);
+    const ggml_type type_k = op->src[1]->type;
+    const ggml_type type_v = op->src[2]->type;
+    const bool turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+                       type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d", "flash_attn_ext", type_name, dk, dv);
+    if (turbo) {
+        snprintf(base, 256, "kernel_flash_attn_ext_k%s_v%s_dk%d_dv%d", ggml_type_name(type_k), ggml_type_name(type_v),
+                 dk, dv);
+    } else {
+        const char * type_name = ggml_flash_attn_ext_get_fairy2i_flash3(op) ? "fairy_bf16" : ggml_type_name(type_k);
+        snprintf(base, 256, "kernel_flash_attn_ext_%s_dk%d_dv%d", type_name, dk, dv);
+    }
 
     snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_ns10=%d_ns20=%d_nsg=%d",
             base,
