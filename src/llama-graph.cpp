@@ -1291,6 +1291,10 @@ static ggml_tensor * llm_fairy2i_bf16_roundtrip(ggml_context * ctx, ggml_tensor 
     return ggml_cast(ctx, ggml_cast(ctx, tensor, GGML_TYPE_BF16), GGML_TYPE_F32);
 }
 
+static bool llm_is_turbo_kv_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
 ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
                                                 ggml_tensor * k,
                                                 ggml_tensor * v,
@@ -1703,6 +1707,24 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
     ggml_build_forward_expand(gf, v_cur);
 
     const auto * mctx_cur = inp->mctx;
+    ggml_tensor * k        = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v        = mctx_cur->get_v(ctx0, il);
+
+    const bool turbo_k  = llm_is_turbo_kv_type(k->type);
+    const bool turbo_v  = llm_is_turbo_kv_type(v->type);
+    const bool turbo_kv = turbo_k || turbo_v;
+
+    if (turbo_kv) {
+        GGML_ASSERT(arch == LLM_ARCH_QWEN3);
+        GGML_ASSERT(cparams.flash_attn);
+        GGML_ASSERT(q_cur->ne[0] % 128 == 0);
+        GGML_ASSERT(k_cur->ne[0] % 128 == 0);
+        GGML_ASSERT(v_cur->ne[0] % 128 == 0);
+        GGML_ASSERT(kq_b == nullptr && sinks == nullptr && v_mla == nullptr);
+        fairy2i_exact          = false;
+        fairy2i_flash3         = false;
+        exact_carrier_kv_store = false;
+    }
 
     // store to KV cache
     {
@@ -1720,12 +1742,24 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
     const auto & kq_mask = inp->get_kq_mask(fairy2i_exact && (!fairy2i_flash3 || !cparams.flash_attn));
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    if (turbo_k) {
+        q = ggml_turbo_wht(ctx0, q, 0, 128, nullptr);
+        cb(q, "turbo_q_wht", il);
+    }
 
     ggml_tensor * cur =
         build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, fairy2i_exact, fairy2i_flash3);
     cb(cur, "kqv_out", il);
+
+    if (turbo_v) {
+        cur = ggml_turbo_wht(ctx0, cur, 1, 128, nullptr);
+        cb(cur, "turbo_v_wht_inv", il);
+    }
+
+    if (turbo_kv) {
+        cur = llm_fairy2i_bf16_roundtrip(ctx0, cur);
+        cb(cur, "turbo_attn_bf16_output", il);
+    }
 
     if (wo) {
         cur = build_lora_mm(wo, cur);

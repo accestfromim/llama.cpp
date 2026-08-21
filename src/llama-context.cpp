@@ -351,7 +351,7 @@ llama_context::llama_context(
             }
             if (row4_requires_metal_fa && (fa_device_mismatch || n_fa_nodes == 0)) {
                 throw std::runtime_error(
-                    "Qwen3 Row4 full Metal placement requires every BF16 Flash Attention node to remain on Metal");
+                    "Qwen3 Row4 full Metal placement requires every Flash Attention node to remain on Metal");
             }
             if (fa_device_mismatch) {
                 cparams.flash_attn = false;
@@ -2343,11 +2343,11 @@ llama_context * llama_init_from_model(
     }
 
     const bool   fairy2i_bf16_runtime = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_bf16_runtime_profile();
-    const bool   row4_bf16_runtime    = model->arch == LLM_ARCH_QWEN3 && model->row4_enabled;
+    const bool   row4_runtime         = model->arch == LLM_ARCH_QWEN3 && model->row4_enabled;
     const bool   fairy2i_qwen3_qat = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_qwen3_qat_numeric_profile();
     const char * fairy2i_numeric_profile =
         model->arch == LLM_ARCH_FAIRY2I ? model->fairy2i_numeric_profile_name() : "n/a";
-    const ggml_type default_kv_type = fairy2i_bf16_runtime || row4_bf16_runtime ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    const ggml_type default_kv_type = fairy2i_bf16_runtime || row4_runtime ? GGML_TYPE_BF16 : GGML_TYPE_F16;
     if (params.type_k == GGML_TYPE_COUNT) {
         params.type_k = default_kv_type;
     }
@@ -2363,12 +2363,37 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if (row4_bf16_runtime && (params.type_k != GGML_TYPE_BF16 || params.type_v != GGML_TYPE_BF16)) {
+    const auto is_turbo_kv = [](ggml_type type) {
+        return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+    };
+    const bool row4_turbo_runtime = row4_runtime && (is_turbo_kv(params.type_k) || is_turbo_kv(params.type_v));
+    const bool row4_turbo_pair =
+        (is_turbo_kv(params.type_k) && (is_turbo_kv(params.type_v) || params.type_v == GGML_TYPE_Q8_0)) ||
+        (params.type_k == GGML_TYPE_Q8_0 && is_turbo_kv(params.type_v));
+    const bool row4_bf16_pair = params.type_k == GGML_TYPE_BF16 && params.type_v == GGML_TYPE_BF16;
+
+    if (row4_runtime && !row4_bf16_pair && !row4_turbo_pair) {
         LLAMA_LOG_ERROR(
-            "%s: Qwen3 Row4 bf16_a8_away_i32_bf16_v1 requires BF16 K/V cache, got type_k=%s type_v=%s; "
-            "set both cache types to bf16\n",
+            "%s: Qwen3 Row4 supports bf16/bf16 or explicit TurboQuant pairs turboN/turboM, "
+            "q8_0/turboN, and turboN/q8_0; got type_k=%s type_v=%s\n",
             __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
+    }
+
+    if (row4_turbo_runtime) {
+        if (model->hparams.n_embd_head_k % 128 != 0 || model->hparams.n_embd_head_v % 128 != 0) {
+            LLAMA_LOG_ERROR("%s: Qwen3 Row4 TurboQuant requires K/V head dimensions divisible by 128, got K=%u V=%u\n",
+                            __func__, model->hparams.n_embd_head_k, model->hparams.n_embd_head_v);
+            return nullptr;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: Qwen3 Row4 TurboQuant requires Flash Attention\n", __func__);
+            return nullptr;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: Qwen3 Row4 TurboQuant requires Flash Attention; enabling it\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
     }
 
     if (fairy2i_bf16_runtime) {
@@ -2449,7 +2474,7 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (row4_bf16_runtime) {
+    if (row4_runtime) {
         if (model->has_tensor_overrides()) {
             LLAMA_LOG_ERROR(
                 "%s: Qwen3 Row4 forbids tensor buffer overrides because they can create an unvalidated "
@@ -2482,13 +2507,16 @@ llama_context * llama_init_from_model(
                 return nullptr;
             }
             if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-                LLAMA_LOG_ERROR(
-                    "%s: Qwen3 Row4 full Metal placement requires BF16 exact Flash Attention; enable Flash "
-                    "Attention\n",
-                    __func__);
+                LLAMA_LOG_ERROR("%s: Qwen3 Row4 full Metal placement requires Flash Attention\n", __func__);
                 return nullptr;
             }
         } else if (all_row4_devices_cpu) {
+            if (row4_turbo_runtime) {
+                LLAMA_LOG_ERROR(
+                    "%s: Qwen3 Row4 TurboQuant requires full Metal placement; CPU execution is unsupported\n",
+                    __func__);
+                return nullptr;
+            }
             if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED) {
                 LLAMA_LOG_ERROR(
                     "%s: Qwen3 Row4 exact Flash Attention requires Metal; use --flash-attn off for the CPU "
@@ -2504,10 +2532,17 @@ llama_context * llama_init_from_model(
                 params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
             }
         } else {
-            LLAMA_LOG_ERROR(
-                "%s: Qwen3 Row4 forbids mixed CPU/Metal placement; choose full Metal offload with Flash "
-                "Attention or --gpu-layers 0 with --flash-attn off\n",
-                __func__);
+            if (row4_turbo_runtime) {
+                LLAMA_LOG_ERROR(
+                    "%s: Qwen3 Row4 TurboQuant forbids mixed CPU/Metal placement and requires full Metal "
+                    "offload with Flash Attention\n",
+                    __func__);
+            } else {
+                LLAMA_LOG_ERROR(
+                    "%s: Qwen3 Row4 forbids mixed CPU/Metal placement; choose full Metal offload with Flash "
+                    "Attention or --gpu-layers 0 with --flash-attn off\n",
+                    __func__);
+            }
             return nullptr;
         }
     }

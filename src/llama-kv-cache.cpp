@@ -1,9 +1,9 @@
 #include "llama-kv-cache.h"
 
+#include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
-#include "llama-context.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1044,7 +1044,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     }
 
     // store the current K values into the cache
-    return ggml_set_rows(ctx, k, k_cur, k_idxs);
+    ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
+    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+        result->op_params[1] = 128;
+    }
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::cpy_k_bf16_carrier(
@@ -1111,7 +1115,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
         }
 
-        return ggml_set_rows(ctx, v, v_cur, v_idxs);
+        ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
+        if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
+            result->op_params[1] = 128;
+        }
+        return result;
     }
 
     if (ggml_row_size(v_cur->type, n_embd_gqa) == v_cur->nb[2]) {
