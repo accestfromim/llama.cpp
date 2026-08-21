@@ -13,6 +13,12 @@
 
 #include <algorithm>
 
+extern "C" {
+GGML_API int  turbo3_cpu_wht_group_size;
+GGML_API void turbo_cpu_fwht_forward(float * x, int group_size);
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
+}
+
 static inline uint32_t fairy2i_load_packed_bf16_pair(const void * src) {
     uint32_t bits;
     memcpy(&bits, src, sizeof(bits));
@@ -5138,6 +5144,11 @@ static void ggml_compute_forward_set_rows_f32(
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
+    if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0) {
+        const int group_size      = ggml_get_op_params_i32(dst, 1);
+        turbo3_cpu_wht_group_size = group_size == 128 ? group_size : 0;
+    }
+
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
             for (int64_t i = ir0; i < ir1; ++i) {
@@ -5145,7 +5156,8 @@ static void ggml_compute_forward_set_rows_f32(
                 const int64_t i11 = i02%ne11;
                 const int64_t i10 = i;
 
-                const int64_t i1 = *(int64_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                const char *  index = (const char *) src1->data + i10 * nb10 + i11 * nb11 + i12 * nb12;
+                const int64_t i1    = src1->type == GGML_TYPE_I64 ? *(const int64_t *) index : *(const int32_t *) index;
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
@@ -5185,7 +5197,8 @@ static void ggml_compute_forward_set_rows_bf16(const ggml_compute_params * param
             for (int64_t i = ir0; i < ir1; ++i) {
                 const int64_t i12 = i03 % ne12;
                 const int64_t i11 = i02 % ne11;
-                const int64_t i1  = *(int64_t *) ((char *) src1->data + i * nb10 + i11 * nb11 + i12 * nb12);
+                const char *  index = (const char *) src1->data + i * nb10 + i11 * nb11 + i12 * nb12;
+                const int64_t i1    = src1->type == GGML_TYPE_I64 ? *(const int64_t *) index : *(const int32_t *) index;
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
@@ -5917,6 +5930,9 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_FAIRY2I_BUNDLE_CODES:
         case GGML_TYPE_ROW4_CODES:
         case GGML_TYPE_ROW4_CODES_PAIR2:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -11114,5 +11130,44 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+void ggml_compute_forward_turbo_wht(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src        = dst->src[0];
+    const ggml_tensor * scale      = dst->src[1];
+    const int           direction  = ggml_get_op_params_i32(dst, 0);
+    const int           group_size = ggml_get_op_params_i32(dst, 1);
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(group_size == 128 && src->ne[0] % group_size == 0);
+
+    const int64_t groups     = ggml_nelements(src) / group_size;
+    const int64_t begin      = groups * params->ith / params->nth;
+    const int64_t end        = groups * (params->ith + 1) / params->nth;
+    const float * scale_data = scale ? (const float *) scale->data : nullptr;
+
+    for (int64_t group = begin; group < end; ++group) {
+        const float * in  = (const float *) src->data + group * group_size;
+        float *       out = (float *) dst->data + group * group_size;
+        memcpy(out, in, group_size * sizeof(float));
+
+        if (direction == 0 && scale_data) {
+            for (int i = 0; i < group_size; ++i) {
+                out[i] *= scale_data[i];
+            }
+        }
+
+        if (direction == 0) {
+            turbo_cpu_fwht_forward(out, group_size);
+        } else {
+            turbo_cpu_fwht_inverse(out, group_size);
+        }
+
+        if (direction == 1 && scale_data) {
+            for (int i = 0; i < group_size; ++i) {
+                out[i] *= scale_data[i];
+            }
+        }
     }
 }

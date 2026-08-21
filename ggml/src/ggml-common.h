@@ -268,6 +268,42 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// TurboQuant KV blocks are runtime-only and store values in the rotated domain.
+#        define QK_TURBO2       128
+#        define QK_TURBO2_GROUP 128
+#        define NL_TURBO2       (QK_TURBO2 / 16)
+#        define NL_TURBO2_VEC   (QK_TURBO2 / 4)
+
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO2 / 4];
+} block_turbo2_0;
+
+static_assert(sizeof(block_turbo2_0) == 34, "wrong turbo2_0 block size");
+
+#        define QK_TURBO3       128
+#        define QK_TURBO3_GROUP 128
+#        define NL_TURBO3       (QK_TURBO3 / 16)
+#        define NL_TURBO3_VEC   (QK_TURBO3 / 4)
+
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO3 / 4];
+    uint8_t   signs[QK_TURBO3 / 8];
+} block_turbo3_0;
+
+static_assert(sizeof(block_turbo3_0) == 50, "wrong turbo3_0 block size");
+
+#        define QK_TURBO4       128
+#        define TURBO4_USE_4BIT 1
+
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO4 / 2];
+} block_turbo4_0;
+
+static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
+
 // ifairy_model
 // 每个块处理 QK_IFAIRY 个 2-bit 值
 // 每个复数用一个 2-bit 值表示（离散化到 4 个复数值）

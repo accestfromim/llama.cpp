@@ -424,7 +424,10 @@ extern "C" {
         GGML_TYPE_FAIRY2I_BUNDLE_CODES = 46,  // opaque Fairy2i M64xK64 bundle code plane
         GGML_TYPE_ROW4_CODES           = 47,  // opaque Row4 M16xK128 split8 code plane
         GGML_TYPE_ROW4_CODES_PAIR2     = 48,  // opaque Row4 M32xK256 pair2 split8 code plane
-        GGML_TYPE_COUNT                = 49,
+        GGML_TYPE_TURBO2_0             = 49,  // runtime-only TurboQuant 2-bit KV cache
+        GGML_TYPE_TURBO3_0             = 50,  // runtime-only TurboQuant 3-bit KV cache
+        GGML_TYPE_TURBO4_0             = 51,  // runtime-only TurboQuant 4-bit KV cache
+        GGML_TYPE_COUNT                = 52,
     };
 
     // precision
@@ -588,6 +591,7 @@ extern "C" {
         GGML_OP_FAIRY2I_ATTN_EXACT_CPU,
         GGML_OP_ROW4_LINEAR,
         GGML_OP_W8A8_LINEAR,
+        GGML_OP_TURBO_WHT,
 
         GGML_OP_COUNT,
     };
@@ -2393,6 +2397,14 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_fairy2i_flash3(struct ggml_tensor * a, bool flash3);
 
     GGML_API bool ggml_flash_attn_ext_get_fairy2i_flash3(const struct ggml_tensor * a);
+
+    // Signed Walsh-Hadamard rotation for TurboQuant KV cache tensors.
+    // direction: 0 = forward, 1 = inverse. group_size must be 128 for Turbo KV.
+    GGML_API struct ggml_tensor * ggml_turbo_wht(struct ggml_context * ctx,
+                                                 struct ggml_tensor *  a,
+                                                 int                   direction,
+                                                 int                   group_size,
+                                                 struct ggml_tensor *  scale);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

@@ -8,6 +8,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "ggml-threading.h"
 #include "ops.h"
 #include "quants.h"
@@ -233,6 +234,31 @@ typedef pthread_t ggml_thread_t;
 #    include <TargetConditionals.h>
 #endif
 
+static void ggml_vec_dot_turbo2_0_f32(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      size_t                     bx,
+                                      const void * GGML_RESTRICT vy,
+                                      size_t                     by,
+                                      int                        nrc);
+static void ggml_vec_dot_turbo3_0_f32(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      size_t                     bx,
+                                      const void * GGML_RESTRICT vy,
+                                      size_t                     by,
+                                      int                        nrc);
+static void ggml_vec_dot_turbo4_0_f32(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      size_t                     bx,
+                                      const void * GGML_RESTRICT vy,
+                                      size_t                     by,
+                                      int                        nrc);
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -445,6 +471,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_ifairy64,
         .vec_dot                  = ggml_vec_dot_ifairy64_q16_K,
         .vec_dot_type             = GGML_TYPE_FAIRY2I_ACT_Q16_64,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO2_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo2_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo3_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .from_float               = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_turbo4_0_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
 };
@@ -2272,6 +2316,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_rwkv_wkv7(params, tensor);
             } break;
+        case GGML_OP_TURBO_WHT:
+            {
+                ggml_compute_forward_turbo_wht(params, tensor);
+            }
+            break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2435,6 +2484,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = 1;
             } break;
         case GGML_OP_COUNT_EQUAL:
+        case GGML_OP_TURBO_WHT:
             {
                 n_tasks = n_threads;
             } break;
@@ -3096,6 +3146,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W1:
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
+                case GGML_OP_TURBO_WHT:
                     {
                         cur = 0;
                     } break;
@@ -3537,6 +3588,81 @@ enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct g
     cplan.work_data = (uint8_t *)ggml_new_buffer(ctx, cplan.work_size);
 
     return ggml_graph_compute(cgraph, &cplan);
+}
+
+#define GGML_TURBO_DOT_CHUNK 256
+
+static void ggml_vec_dot_turbo_f32_impl(enum ggml_type             type_x,
+                                        int                        n,
+                                        float * GGML_RESTRICT      s,
+                                        const void * GGML_RESTRICT vx,
+                                        const void * GGML_RESTRICT vy) {
+    const struct ggml_type_traits * traits = ggml_get_type_traits(type_x);
+    const int64_t                   block  = traits->blck_size;
+    const int64_t                   chunk  = (GGML_TURBO_DOT_CHUNK / block) * block;
+    const char *                    px     = (const char *) vx;
+    const float *                   y      = (const float *) vy;
+    float                           xb[GGML_TURBO_DOT_CHUNK];
+    float                           sum = 0.0f;
+
+    GGML_ASSERT(n % block == 0);
+    GGML_ASSERT(block <= GGML_TURBO_DOT_CHUNK);
+
+    for (int64_t i = 0; i < n; i += chunk) {
+        const int64_t count = MIN(chunk, n - i);
+        traits->to_float(px, xb, count);
+        for (int64_t j = 0; j < count; ++j) {
+            sum += xb[j] * y[i + j];
+        }
+        px += (count / block) * traits->type_size;
+    }
+
+    *s = sum;
+}
+
+static void ggml_vec_dot_turbo2_0_f32(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      size_t                     bx,
+                                      const void * GGML_RESTRICT vy,
+                                      size_t                     by,
+                                      int                        nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO2_0, n, s, vx, vy);
+}
+
+static void ggml_vec_dot_turbo3_0_f32(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      size_t                     bx,
+                                      const void * GGML_RESTRICT vy,
+                                      size_t                     by,
+                                      int                        nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO3_0, n, s, vx, vy);
+}
+
+static void ggml_vec_dot_turbo4_0_f32(int                        n,
+                                      float * GGML_RESTRICT      s,
+                                      size_t                     bs,
+                                      const void * GGML_RESTRICT vx,
+                                      size_t                     bx,
+                                      const void * GGML_RESTRICT vy,
+                                      size_t                     by,
+                                      int                        nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO4_0, n, s, vx, vy);
 }
 
 void ggml_cpu_fp32_to_fp32(const float * x, float * y, int64_t n) {
