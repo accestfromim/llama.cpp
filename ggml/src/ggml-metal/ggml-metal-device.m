@@ -1053,7 +1053,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (k_turbo || v_turbo) {
                 const bool pair_supported = (k_turbo && v_turbo) ||
                                             (k_turbo && type_v == GGML_TYPE_Q8_0) ||
-                                            (v_turbo && type_k == GGML_TYPE_Q8_0);
+                                            (v_turbo && type_k == GGML_TYPE_Q8_0) ||
+                                            (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_TURBO4_0);
                 return pair_supported && op->src[0]->ne[0] == 128 && op->src[1]->ne[0] == 128 &&
                        op->src[2]->ne[0] == 128 && has_simdgroup_mm;
             }
@@ -1070,7 +1071,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64) &&
                    op->src[2]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && op->src[0]->ne[2] == ggml_nelements(op->src[1]) &&
-                   op->src[0]->ne[3] == 1 && op->src[0]->ne[0] * op->src[0]->ne[1] == ggml_nelements(op->src[2]) &&
+                   op->src[0]->ne[3] == 1 && op->src[0]->ne[0] * op->src[0]->ne[1] + 1 == ggml_nelements(op->src[2]) &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:

@@ -3642,8 +3642,9 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     const ggml_type type_v = op->src[2]->type;
     const bool turbo_k = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
     const bool turbo_v = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
-    if ((turbo_k || turbo_v) && !(type_k == GGML_TYPE_TURBO4_0 && type_v == GGML_TYPE_TURBO4_0 &&
-                                  op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128)) {
+    const bool turbo_vec_pair = (type_k == GGML_TYPE_TURBO4_0 && type_v == GGML_TYPE_TURBO4_0) ||
+                                (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_TURBO4_0);
+    if ((turbo_k || turbo_v) && !(turbo_vec_pair && op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128)) {
         return false;
     }
 
@@ -3694,7 +3695,12 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     const bool    turbo_gqa4 = ggml_flash_attn_ext_get_turbo4_fused(op) && op->src[0]->ne[0] == 128 &&
                                op->src[0]->ne[1] == 1 && op->src[0]->ne[2] == 4 * op->src[1]->ne[2] &&
                                op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128;
-    const int64_t nwg        = turbo_gqa4 && op->src[1]->ne[1] >= 32768 ? 64 : 32;
+    int64_t nwg = 32;
+    if (turbo_gqa4 && op->src[1]->ne[1] >= 65536) {
+        nwg = 128;
+    } else if (turbo_gqa4 && op->src[1]->ne[1] >= 32768) {
+        nwg = 64;
+    }
 
     const int64_t ne01 = op->src[0]->ne[1];
     const int64_t ne02 = op->src[0]->ne[2];
@@ -3748,7 +3754,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
     const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
     GGML_ASSERT(type_k == type_v || (k_turbo && (v_turbo || type_v == GGML_TYPE_Q8_0)) ||
-                (v_turbo && type_k == GGML_TYPE_Q8_0));
+                (v_turbo && (type_k == GGML_TYPE_Q8_0 || type_k == GGML_TYPE_Q4_0)));
 
     //GGML_ASSERT(ggml_are_same_shape (src1, src2));
     GGML_ASSERT(ne11 == ne21);
@@ -4128,7 +4134,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nwg = 1;
             nsg = 4;
         } else {
-            nwg = turbo_gqa4_shape && ne11 >= 32768 ? 64 : 32;
+            nwg = 32;
+            if (turbo_gqa4_shape && ne11 >= 65536) {
+                nwg = 128;
+            } else if (turbo_gqa4_shape && ne11 >= 32768) {
+                nwg = 64;
+            }
             nsg = 1;
             while (2*nwg*nsg*nkpsg < ne11 && nsg < 4) {
                 nsg *= 2;

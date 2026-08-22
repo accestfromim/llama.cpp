@@ -5924,7 +5924,7 @@ struct ggml_tensor * ggml_turbo_k_mean_center(struct ggml_context * ctx,
     GGML_ASSERT(indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64);
     GGML_ASSERT(sum->type == GGML_TYPE_F32 && ggml_is_contiguous(sum));
     GGML_ASSERT(k->ne[2] == ggml_nelements(indices) && k->ne[3] == 1);
-    GGML_ASSERT(k->ne[0] * k->ne[1] == ggml_nelements(sum));
+    GGML_ASSERT(k->ne[0] * k->ne[1] + 1 == ggml_nelements(sum));
     GGML_ASSERT(warmup > 0);
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, k);

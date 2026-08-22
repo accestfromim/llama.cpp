@@ -1063,13 +1063,19 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(ggml_me
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
-    const char * type_name = ggml_type_name(op->src[1]->type);
+    const ggml_type type_k    = op->src[1]->type;
+    const ggml_type type_v    = op->src[2]->type;
+    const char *    type_name = ggml_type_name(type_k);
+    char            mixed_type_name[64];
     if (turbo_gqa4) {
         type_name = "turbo4_gqa4_fused";
     } else if (turbo_fused) {
         type_name = "turbo4_fused";
     } else if (ggml_flash_attn_ext_get_fairy2i_flash3(op)) {
         type_name = "fairy_bf16";
+    } else if (type_k != type_v) {
+        snprintf(mixed_type_name, sizeof(mixed_type_name), "k%s_v%s", ggml_type_name(type_k), ggml_type_name(type_v));
+        type_name = mixed_type_name;
     }
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d", "flash_attn_ext_vec", type_name, dk, dv);

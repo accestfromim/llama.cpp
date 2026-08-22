@@ -11252,7 +11252,7 @@ void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params
     GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT((indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64) && sum->type == GGML_TYPE_F32);
     GGML_ASSERT(src->ne[2] == ggml_nelements(indices) && src->ne[3] == 1);
-    GGML_ASSERT(src->ne[0] * src->ne[1] == ggml_nelements(sum));
+    GGML_ASSERT(src->ne[0] * src->ne[1] + 1 == ggml_nelements(sum));
     GGML_ASSERT(warmup > 0);
 
     const int64_t n_features = src->ne[0] * src->ne[1];
@@ -11265,12 +11265,19 @@ void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params
         return indices->type == GGML_TYPE_I64 ? *(const int64_t *) ptr : (int64_t) *(const int32_t *) ptr;
     };
 
-    bool reset    = false;
-    bool complete = false;
+    bool    reset     = false;
+    int64_t max_index = -1;
     for (int64_t it = 0; it < n_tokens; ++it) {
         const int64_t index = get_index(it);
         reset |= index == 0;
-        complete |= index >= warmup - 1;
+        max_index = MAX(max_index, index);
+    }
+    const int32_t effective_warmup = center_warmup ? (reset ? MIN(warmup, (int32_t) max_index + 1) :
+                                                              MAX(1, (int32_t) ((float *) sum->data)[n_features])) :
+                                                     warmup;
+    const bool    complete         = max_index >= effective_warmup - 1;
+    if (params->ith == 0) {
+        ((float *) sum->data)[n_features] = (float) effective_warmup;
     }
 
     for (int64_t feature = begin; feature < end; ++feature) {
@@ -11280,7 +11287,7 @@ void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params
 
         for (int64_t it = 0; it < n_tokens; ++it) {
             const int64_t index = get_index(it);
-            if (index < warmup) {
+            if (index < effective_warmup) {
                 acc +=
                     *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
             }
@@ -11292,7 +11299,8 @@ void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params
             const float   value =
                 *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
             *(float *) ((char *) dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + it * dst->nb[2]) =
-                complete && (center_warmup || index >= warmup) ? value - acc / (float) warmup : value;
+                complete && (center_warmup || index >= effective_warmup) ? value - acc / (float) effective_warmup :
+                                                                           value;
         }
     }
 }

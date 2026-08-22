@@ -14028,6 +14028,8 @@ template [[host_name("kernel_flash_attn_ext_kq8_0_vturbo3_dk128_dv128")]] kernel
     kernel_flash_attn_ext<FA_TYPES, block_q8_0, 2, dequantize_q8_0, block_turbo3_0, 8, dequantize_turbo3_0, 128, 128>;
 template [[host_name("kernel_flash_attn_ext_kq8_0_vturbo4_dk128_dv128")]] kernel flash_attn_ext_t
     kernel_flash_attn_ext<FA_TYPES, block_q8_0, 2, dequantize_q8_0, block_turbo4_0, 8, dequantize_turbo4_0, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_kq4_0_vturbo4_dk128_dv128")]] kernel flash_attn_ext_t
+    kernel_flash_attn_ext<FA_TYPES, block_q4_0, 2, dequantize_q4_0, block_turbo4_0, 8, dequantize_turbo4_0, 128, 128>;
 template [[host_name("kernel_flash_attn_ext_kturbo2_vq8_0_dk128_dv128")]] kernel flash_attn_ext_t
     kernel_flash_attn_ext<FA_TYPES, block_turbo2_0, 8, dequantize_turbo2_0, block_q8_0, 2, dequantize_q8_0, 128, 128>;
 template [[host_name("kernel_flash_attn_ext_kturbo3_vq8_0_dk128_dv128")]] kernel flash_attn_ext_t
@@ -14589,6 +14591,7 @@ template [[host_name("kernel_flash_attn_ext_vec_q5_0_dk128_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_vec_q5_1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q5_1, 8, dequantize_q5_1_t4, block_q5_1,  8, dequantize_q5_1_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q8_0,  8, dequantize_q8_0_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_turbo4_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_kq4_0_vturbo4_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_turbo4_fused_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 128, 128, 1, 1, 32, true>;
 
 kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
@@ -14750,11 +14753,17 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     const float M0 = ss[rid*(2*NWG) + 2*iwg + 1];
     const float S1 = NWG > 32 ? ss[rid*(2*NWG) + 2*(iwg + 32) + 0] : 0.0f;
     const float M1 = NWG > 32 ? ss[rid*(2*NWG) + 2*(iwg + 32) + 1] : -FLT_MAX/2;
+    const float S2 = NWG > 64 ? ss[rid*(2*NWG) + 2*(iwg + 64) + 0] : 0.0f;
+    const float M2 = NWG > 64 ? ss[rid*(2*NWG) + 2*(iwg + 64) + 1] : -FLT_MAX/2;
+    const float S3 = NWG > 96 ? ss[rid*(2*NWG) + 2*(iwg + 96) + 0] : 0.0f;
+    const float M3 = NWG > 96 ? ss[rid*(2*NWG) + 2*(iwg + 96) + 1] : -FLT_MAX/2;
 
-    const float m = simd_max(max(M0, M1));
+    const float m = simd_max(max(max(M0, M1), max(M2, M3)));
     const float ms0 = exp(M0 - m);
     const float ms1 = NWG > 32 ? exp(M1 - m) : 0.0f;
-    const float S = 1.0f/simd_sum(S0*ms0 + S1*ms1);
+    const float ms2 = NWG > 64 ? exp(M2 - m) : 0.0f;
+    const float ms3 = NWG > 96 ? exp(M3 - m) : 0.0f;
+    const float S = 1.0f/simd_sum(S0*ms0 + S1*ms1 + S2*ms2 + S3*ms3);
 
     const short DV4 = DV/4;
 
@@ -14765,6 +14774,12 @@ kernel void kernel_flash_attn_ext_vec_reduce(
         float4 v = htmp4[i*NWG + iwg]*ms0;
         if (NWG > 32) {
             v += htmp4[i*NWG + iwg + 32]*ms1;
+        }
+        if (NWG > 64) {
+            v += htmp4[i*NWG + iwg + 64]*ms2;
+        }
+        if (NWG > 96) {
+            v += htmp4[i*NWG + iwg + 96]*ms3;
         }
         v = simd_sum(v);
 
@@ -16993,12 +17008,19 @@ kernel void kernel_turbo_k_mean_center(constant ggml_metal_kargs_turbo_k_mean_ce
     }
 
     bool reset = false;
-    bool complete = false;
+    int64_t max_index = -1;
     for (int64_t token = 0; token < args.n_tokens; ++token) {
         const int64_t index = args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
                                                *(const device int32_t *) (indices + token * args.nb10);
         reset |= index == 0;
-        complete |= index >= args.warmup - 1;
+        max_index = max(max_index, index);
+    }
+    const int effective_warmup = args.center_warmup ?
+                                     (reset ? min(args.warmup, int(max_index) + 1) : max(1, int(sum[args.n_features]))) :
+                                     args.warmup;
+    const bool complete = max_index >= effective_warmup - 1;
+    if (feature == 0) {
+        sum[args.n_features] = float(effective_warmup);
     }
 
     const int64_t i0 = feature % args.ne00;
@@ -17007,7 +17029,7 @@ kernel void kernel_turbo_k_mean_center(constant ggml_metal_kargs_turbo_k_mean_ce
     for (int64_t token = 0; token < args.n_tokens; ++token) {
         const int64_t index = args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
                                                *(const device int32_t *) (indices + token * args.nb10);
-        if (index < args.warmup) {
+        if (index < effective_warmup) {
             acc += *(const device float *) (src + i0 * args.nb00 + i1 * args.nb01 + token * args.nb02);
         }
     }
@@ -17018,7 +17040,7 @@ kernel void kernel_turbo_k_mean_center(constant ggml_metal_kargs_turbo_k_mean_ce
                                                *(const device int32_t *) (indices + token * args.nb10);
         const float value = *(const device float *) (src + i0 * args.nb00 + i1 * args.nb01 + token * args.nb02);
         *(device float *) (dst + i0 * args.nb0 + i1 * args.nb1 + token * args.nb2) =
-            complete && (args.center_warmup || index >= args.warmup) ? value - acc / args.warmup : value;
+            complete && (args.center_warmup || index >= effective_warmup) ? value - acc / effective_warmup : value;
     }
 }
 

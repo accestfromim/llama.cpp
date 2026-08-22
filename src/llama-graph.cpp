@@ -1747,7 +1747,7 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
 
     const int64_t turbo4_kv_capacity = k->view_src ? k->view_src->ne[1] : k->ne[2];
     const bool    turbo4_predequant  = k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0 &&
-                                       q_cur->ne[2] >= 20 && turbo4_kv_capacity > 512 && turbo4_kv_capacity < 32768;
+                                       q_cur->ne[2] >= 20 && turbo4_kv_capacity >= 512 && turbo4_kv_capacity < 32768;
 
     ggml_tensor * q = q_cur;
     if (turbo_k && !turbo4_fused) {

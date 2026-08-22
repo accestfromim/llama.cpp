@@ -2211,26 +2211,28 @@ struct test_turbo_wht : public test_case {
 struct test_turbo_k_mean_center : public test_case {
     const ggml_type type_idx;
     const bool      center_warmup;
+    const int       warmup;
 
     std::string vars() override {
-        return VARS_TO_STR2(type_idx, center_warmup) + ",head_dim=128,n_heads=8,n_tokens=64,warmup=32";
+        return VARS_TO_STR3(type_idx, center_warmup, warmup) + ",head_dim=128,n_heads=8,n_tokens=64";
     }
 
     double max_nmse_err() override { return 1e-7; }
 
-    test_turbo_k_mean_center(ggml_type type_idx, bool center_warmup) :
+    test_turbo_k_mean_center(ggml_type type_idx, bool center_warmup, int warmup = 32) :
         type_idx(type_idx),
-        center_warmup(center_warmup) {}
+        center_warmup(center_warmup),
+        warmup(warmup) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 8, 64);
         ggml_set_name(input, "input");
         ggml_tensor * indices = ggml_new_tensor_1d(ctx, type_idx, 64);
         ggml_set_name(indices, "indices");
-        ggml_tensor * sum = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128LL * 8);
+        ggml_tensor * sum = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128LL * 8 + 1);
         ggml_set_name(sum, "sum");
 
-        ggml_tensor * out = ggml_turbo_k_mean_center(ctx, input, indices, sum, 32, center_warmup);
+        ggml_tensor * out = ggml_turbo_k_mean_center(ctx, input, indices, sum, warmup, center_warmup);
         ggml_set_name(out, "out");
         return out;
     }
@@ -2252,7 +2254,7 @@ struct test_turbo_k_mean_center : public test_case {
                     ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(data[0]));
                 }
             } else if (strcmp(t->name, "sum") == 0) {
-                std::vector<float> data(size_t(128) * 8, 0.0f);
+                std::vector<float> data(size_t(128) * 8 + 1, 0.0f);
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(data[0]));
             } else {
                 init_tensor_uniform(t);
@@ -6584,6 +6586,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_turbo_k_mean_center(GGML_TYPE_I32, center_warmup));
         test_cases.emplace_back(new test_turbo_k_mean_center(GGML_TYPE_I64, center_warmup));
     }
+    test_cases.emplace_back(new test_turbo_k_mean_center(GGML_TYPE_I32, true, 128));
+    test_cases.emplace_back(new test_turbo_k_mean_center(GGML_TYPE_I64, true, 128));
 
     for (ggml_type type_dst : { GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0 }) {
         for (ggml_type type_idx : { GGML_TYPE_I32, GGML_TYPE_I64 }) {
@@ -7576,11 +7580,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, nb, true, false, 0.0f, 0.0f,
                                                             GGML_PREC_F32, type_k, GGML_TYPE_Q8_0));
         }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, nb, true, false, 0.0f, 0.0f,
+                                                        GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0));
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, 1, true, false, 0.0f, 0.0f,
                                                     GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
     if (getenv("LLAMA_TURBO_KV_LONG_CORRECTNESS")) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 32768, 1, true, false, 0.0f, 0.0f,
+                                                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 65536, 1, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 8192, 32, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));

@@ -52,8 +52,33 @@ llama_kv_cache::llama_kv_cache(
         if (type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0 || !offload || n_stream != 1) {
             throw std::invalid_argument("TURBO_K_MEAN_CENTER requires offloaded turbo4/turbo4 KV with one stream");
         }
-        LLAMA_LOG_INFO("%s: Turbo4 K mean centering mode %d enabled with 32 warmup tokens\n", __func__,
-                       turbo_k_mean_center);
+        const char * turbo_k_mean_warmup_env = getenv("TURBO_K_MEAN_WARMUP");
+        if (turbo_k_mean_warmup_env) {
+            char *     end    = nullptr;
+            const long warmup = std::strtol(turbo_k_mean_warmup_env, &end, 10);
+            if (*turbo_k_mean_warmup_env == '\0' || *end != '\0' || warmup < 1 || warmup > kv_size) {
+                throw std::invalid_argument("TURBO_K_MEAN_WARMUP must be between 1 and the KV cache size");
+            }
+            turbo_k_mean_warmup = (int) warmup;
+        }
+        LLAMA_LOG_INFO("%s: Turbo4 K mean centering mode %d enabled with %d warmup tokens\n", __func__,
+                       turbo_k_mean_center, turbo_k_mean_warmup);
+    }
+
+    const char * turbo_boundary_bf16_env = getenv("TURBO_KV_BOUNDARY_BF16_LAYERS");
+    if (turbo_boundary_bf16_env) {
+        char *     end      = nullptr;
+        const long n_layers = std::strtol(turbo_boundary_bf16_env, &end, 10);
+        if (*turbo_boundary_bf16_env == '\0' || *end != '\0' || n_layers < 0 || 2 * n_layers > hparams.n_layer) {
+            throw std::invalid_argument("TURBO_KV_BOUNDARY_BF16_LAYERS must be between 0 and half the layer count");
+        }
+        turbo_boundary_bf16_layers = (int) n_layers;
+    }
+    if (turbo_boundary_bf16_layers) {
+        if (!model.row4_enabled || type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0 || !offload) {
+            throw std::invalid_argument("TURBO_KV_BOUNDARY_BF16_LAYERS requires offloaded Row4 turbo4/turbo4 KV");
+        }
+        LLAMA_LOG_INFO("%s: first and last %d Row4 KV layers use BF16\n", __func__, turbo_boundary_bf16_layers);
     }
 
     // create a context for each buffer type
@@ -143,15 +168,21 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+        const bool boundary_bf16 =
+            turbo_boundary_bf16_layers && (il < (uint32_t) turbo_boundary_bf16_layers ||
+                                           il >= hparams.n_layer - (uint32_t) turbo_boundary_bf16_layers);
+        const ggml_type layer_type_k = boundary_bf16 ? GGML_TYPE_BF16 : type_k;
+        const ggml_type layer_type_v = boundary_bf16 ? GGML_TYPE_BF16 : type_v;
+
         ggml_tensor * k;
         ggml_tensor * v;
         ggml_tensor * k_mean = nullptr;
 
-        k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
-        v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+        k = ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa, kv_size, n_stream);
+        v = ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream);
 
-        if (turbo_k_mean_center) {
-            k_mean = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd_k_gqa);
+        if (turbo_k_mean_center && !boundary_bf16) {
+            k_mean = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd_k_gqa + 1);
             ggml_format_name(k_mean, "cache_k_mean_l%d", il);
         }
 
@@ -1059,9 +1090,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     const int64_t n_embd_gqa = n_embd_head*n_head;
 
-    if (turbo_k_mean_center) {
-        GGML_ASSERT(layers[ikv].k_mean);
-        k_cur = ggml_turbo_k_mean_center(ctx, k_cur, k_idxs, layers[ikv].k_mean, 32, turbo_k_mean_center == 2);
+    if (layers[ikv].k_mean) {
+        k_cur = ggml_turbo_k_mean_center(ctx, k_cur, k_idxs, layers[ikv].k_mean, turbo_k_mean_warmup,
+                                         turbo_k_mean_center == 2);
     }
 
     // we can merge dims 0 and 1

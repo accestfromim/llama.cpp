@@ -2369,13 +2369,14 @@ llama_context * llama_init_from_model(
     const bool row4_turbo_runtime = row4_runtime && (is_turbo_kv(params.type_k) || is_turbo_kv(params.type_v));
     const bool row4_turbo_pair =
         (is_turbo_kv(params.type_k) && (is_turbo_kv(params.type_v) || params.type_v == GGML_TYPE_Q8_0)) ||
-        (params.type_k == GGML_TYPE_Q8_0 && is_turbo_kv(params.type_v));
+        (params.type_k == GGML_TYPE_Q8_0 && is_turbo_kv(params.type_v)) ||
+        (params.type_k == GGML_TYPE_Q4_0 && params.type_v == GGML_TYPE_TURBO4_0);
     const bool row4_bf16_pair = params.type_k == GGML_TYPE_BF16 && params.type_v == GGML_TYPE_BF16;
 
     if (row4_runtime && !row4_bf16_pair && !row4_turbo_pair) {
         LLAMA_LOG_ERROR(
             "%s: Qwen3 Row4 supports bf16/bf16 or explicit TurboQuant pairs turboN/turboM, "
-            "q8_0/turboN, and turboN/q8_0; got type_k=%s type_v=%s\n",
+            "q8_0/turboN, turboN/q8_0, and q4_0/turbo4; got type_k=%s type_v=%s\n",
             __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
     }
