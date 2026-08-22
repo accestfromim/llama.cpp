@@ -2321,6 +2321,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_turbo_wht(params, tensor);
             }
             break;
+        case GGML_OP_TURBO_K_MEAN_CENTER:
+            {
+                ggml_compute_forward_turbo_k_mean_center(params, tensor);
+            }
+            break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2485,6 +2490,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_TURBO_WHT:
+        case GGML_OP_TURBO_K_MEAN_CENTER:
             {
                 n_tasks = n_threads;
             } break;
@@ -3147,6 +3153,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_FAIRY2I_WIDE_LINEAR_W2:
                 case GGML_OP_IFAIRY_WIDE_LINEAR_W2:
                 case GGML_OP_TURBO_WHT:
+                case GGML_OP_TURBO_K_MEAN_CENTER:
                     {
                         cur = 0;
                     } break;

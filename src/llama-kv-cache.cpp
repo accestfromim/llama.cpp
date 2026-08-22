@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 
+#include "ggml.h"
 #include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -37,15 +39,33 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
+    const char * turbo_k_mean_center_env = getenv("TURBO_K_MEAN_CENTER");
+    if (turbo_k_mean_center_env) {
+        char *     end  = nullptr;
+        const long mode = std::strtol(turbo_k_mean_center_env, &end, 10);
+        if (*turbo_k_mean_center_env == '\0' || *end != '\0' || mode < 0 || mode > 2) {
+            throw std::invalid_argument("TURBO_K_MEAN_CENTER must be 0, 1, or 2");
+        }
+        turbo_k_mean_center = (int) mode;
+    }
+    if (turbo_k_mean_center) {
+        if (type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0 || !offload || n_stream != 1) {
+            throw std::invalid_argument("TURBO_K_MEAN_CENTER requires offloaded turbo4/turbo4 KV with one stream");
+        }
+        LLAMA_LOG_INFO("%s: Turbo4 K mean centering mode %d enabled with 32 warmup tokens\n", __func__,
+                       turbo_k_mean_center);
+    }
+
     // create a context for each buffer type
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
+                /*.mem_size   =*/size_t(2u * (1 + n_stream) + (turbo_k_mean_center ? 1u : 0u)) * n_layer_kv *
+                    ggml_tensor_overhead(),
+                /*.mem_buffer =*/NULL,
+                /*.no_alloc   =*/true,
             };
 
             ggml_context * ctx = ggml_init(params);
@@ -125,9 +145,15 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_tensor * k;
         ggml_tensor * v;
+        ggml_tensor * k_mean = nullptr;
 
         k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
         v = ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+
+        if (turbo_k_mean_center) {
+            k_mean = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd_k_gqa);
+            ggml_format_name(k_mean, "cache_k_mean_l%d", il);
+        }
 
         ggml_format_name(k, "cache_k_l%d", il);
         ggml_format_name(v, "cache_v_l%d", il);
@@ -142,7 +168,14 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({
+            il,
+            k,
+            v,
+            k_mean,
+            k_stream,
+            v_stream,
+        });
     }
 
     if (reuse) {
@@ -1025,6 +1058,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_tokens    = k_cur->ne[2];
 
     const int64_t n_embd_gqa = n_embd_head*n_head;
+
+    if (turbo_k_mean_center) {
+        GGML_ASSERT(layers[ikv].k_mean);
+        k_cur = ggml_turbo_k_mean_center(ctx, k_cur, k_idxs, layers[ikv].k_mean, 32, turbo_k_mean_center == 2);
+    }
 
     // we can merge dims 0 and 1
     // TODO: add ggml helper function for this?

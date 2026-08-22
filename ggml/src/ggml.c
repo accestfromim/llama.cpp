@@ -1200,6 +1200,7 @@ static const char * GGML_OP_NAME[] = {
     "ROW4_LINEAR",
     "W8A8_LINEAR",
     "TURBO_WHT",
+    "TURBO_K_MEAN_CENTER",
 };
 
 static_assert(sizeof(GGML_OP_NAME) / sizeof(GGML_OP_NAME[0]) == GGML_OP_COUNT, "GGML_OP_NAME must match GGML_OP_COUNT");
@@ -1329,6 +1330,7 @@ static const char * GGML_OP_SYMBOL[] = {
     "row4_linear(x,codes,scales)",
     "w8a8_linear(x,codes,scales)",
     "turbo_wht(x)",
+    "turbo_k_mean_center(k,indices,sum)",
 };
 
 static_assert(sizeof(GGML_OP_SYMBOL) / sizeof(GGML_OP_SYMBOL[0]) == GGML_OP_COUNT,
@@ -5876,6 +5878,16 @@ bool ggml_flash_attn_ext_get_fairy2i_flash3(const struct ggml_tensor * a) {
     return ggml_get_op_params_i32(a, 4) == 2;
 }
 
+void ggml_flash_attn_ext_set_turbo4_fused(struct ggml_tensor * a, bool fused) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 5, fused ? 1 : 0);
+}
+
+bool ggml_flash_attn_ext_get_turbo4_fused(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
+
 struct ggml_tensor * ggml_turbo_wht(struct ggml_context * ctx,
                                     struct ggml_tensor *  a,
                                     int                   direction,
@@ -5898,6 +5910,30 @@ struct ggml_tensor * ggml_turbo_wht(struct ggml_context * ctx,
 
     ggml_set_op_params_i32(result, 0, direction);
     ggml_set_op_params_i32(result, 1, group_size);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_turbo_k_mean_center(struct ggml_context * ctx,
+                                              struct ggml_tensor *  k,
+                                              struct ggml_tensor *  indices,
+                                              struct ggml_tensor *  sum,
+                                              int                   warmup,
+                                              bool                  center_warmup) {
+    GGML_ASSERT(k->type == GGML_TYPE_F32 && ggml_is_contiguous(k));
+    GGML_ASSERT(indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64);
+    GGML_ASSERT(sum->type == GGML_TYPE_F32 && ggml_is_contiguous(sum));
+    GGML_ASSERT(k->ne[2] == ggml_nelements(indices) && k->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] * k->ne[1] == ggml_nelements(sum));
+    GGML_ASSERT(warmup > 0);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, k);
+    result->op                  = GGML_OP_TURBO_K_MEAN_CENTER;
+    result->src[0]              = k;
+    result->src[1]              = indices;
+    result->src[2]              = sum;
+    ggml_set_op_params_i32(result, 0, warmup);
+    ggml_set_op_params_i32(result, 1, center_warmup ? 1 : 0);
 
     return result;
 }

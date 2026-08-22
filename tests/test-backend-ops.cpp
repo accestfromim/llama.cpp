@@ -2207,6 +2207,60 @@ struct test_turbo_wht : public test_case {
     }
 };
 
+// GGML_OP_TURBO_K_MEAN_CENTER
+struct test_turbo_k_mean_center : public test_case {
+    const ggml_type type_idx;
+    const bool      center_warmup;
+
+    std::string vars() override {
+        return VARS_TO_STR2(type_idx, center_warmup) + ",head_dim=128,n_heads=8,n_tokens=64,warmup=32";
+    }
+
+    double max_nmse_err() override { return 1e-7; }
+
+    test_turbo_k_mean_center(ggml_type type_idx, bool center_warmup) :
+        type_idx(type_idx),
+        center_warmup(center_warmup) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 8, 64);
+        ggml_set_name(input, "input");
+        ggml_tensor * indices = ggml_new_tensor_1d(ctx, type_idx, 64);
+        ggml_set_name(indices, "indices");
+        ggml_tensor * sum = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128LL * 8);
+        ggml_set_name(sum, "sum");
+
+        ggml_tensor * out = ggml_turbo_k_mean_center(ctx, input, indices, sum, 32, center_warmup);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "indices") == 0) {
+                if (type_idx == GGML_TYPE_I64) {
+                    std::vector<int64_t> data(64);
+                    for (int64_t i = 0; i < 64; ++i) {
+                        data[i] = i;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(data[0]));
+                } else {
+                    std::vector<int32_t> data(64);
+                    for (int32_t i = 0; i < 64; ++i) {
+                        data[i] = i;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(data[0]));
+                }
+            } else if (strcmp(t->name, "sum") == 0) {
+                std::vector<float> data(size_t(128) * 8, 0.0f);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(data[0]));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SET_ROWS with a TurboQuant destination
 struct test_set_rows_turbo : public test_case {
     const ggml_type type_dst;
@@ -5666,10 +5720,15 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type        type_K;
     const ggml_type        type_V;
     std::array<int32_t, 4> permute;
+    const bool             turbo_chain;
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
-                             permute);
+        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
+                             permute, turbo_chain);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        return turbo_chain ? "FLASH_ATTN_EXT_TURBO4_FUSED" : test_case::op_desc(t);
     }
 
     double max_nmse_err() override {
@@ -5695,7 +5754,8 @@ struct test_flash_attn_ext : public test_case {
                         float                  logit_softcap = 0.0f,
                         ggml_prec              prec          = GGML_PREC_F32,
                         ggml_type              type_KV       = GGML_TYPE_F16,
-                        std::array<int32_t, 4> permute       = { 0, 1, 2, 3 }) :
+                        std::array<int32_t, 4> permute       = { 0, 1, 2, 3 },
+                        bool                   turbo_chain   = false) :
         hsk(hsk),
         hsv(hsv),
         nh(nh),
@@ -5709,7 +5769,8 @@ struct test_flash_attn_ext : public test_case {
         prec(prec),
         type_K(type_KV),
         type_V(type_KV),
-        permute(permute) {}
+        permute(permute),
+        turbo_chain(turbo_chain) {}
 
     test_flash_attn_ext(int64_t                hsk,
                         int64_t                hsv,
@@ -5723,7 +5784,8 @@ struct test_flash_attn_ext : public test_case {
                         float                  logit_softcap,
                         ggml_prec              prec,
                         ggml_type              type_K,
-                        ggml_type              type_V) :
+                        ggml_type              type_V,
+                        bool                   turbo_chain = false) :
         hsk(hsk),
         hsv(hsv),
         nh(nh),
@@ -5737,7 +5799,8 @@ struct test_flash_attn_ext : public test_case {
         prec(prec),
         type_K(type_K),
         type_V(type_V),
-        permute({ 0, 1, 2, 3 }) {}
+        permute({ 0, 1, 2, 3 }),
+        turbo_chain(turbo_chain) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -5788,6 +5851,9 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        if (turbo_chain) {
+            ggml_flash_attn_ext_set_turbo4_fused(out, true);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -6514,6 +6580,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_turbo_wht(head_dim, n_heads, 0, true));
         }
     }
+    for (bool center_warmup : { false, true }) {
+        test_cases.emplace_back(new test_turbo_k_mean_center(GGML_TYPE_I32, center_warmup));
+        test_cases.emplace_back(new test_turbo_k_mean_center(GGML_TYPE_I64, center_warmup));
+    }
 
     for (ggml_type type_dst : { GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0 }) {
         for (ggml_type type_idx : { GGML_TYPE_I32, GGML_TYPE_I64 }) {
@@ -6869,6 +6939,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO4_0, GGML_TYPE_F16, { 128, 8, 32, 1 }, { 0, 2, 1, 3 }));
 
     test_cases.emplace_back(new test_cont());
     test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {2, 1, 1 ,1}));
@@ -7506,6 +7577,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                             GGML_PREC_F32, type_k, GGML_TYPE_Q8_0));
         }
     }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, 1, true, false, 0.0f, 0.0f,
+                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
+    if (getenv("LLAMA_TURBO_KV_LONG_CORRECTNESS")) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 32768, 1, true, false, 0.0f, 0.0f,
+                                                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 8192, 32, true, false, 0.0f, 0.0f,
+                                                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -7618,6 +7697,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {3072, 512, 2, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_Q4_0, {8192, 512, 2, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32,  {8192, 512, 2, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO4_0, GGML_TYPE_F16, { 128, 8, 512, 1 }, { 0, 2, 1, 3 }));
 
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {12888, 256, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
@@ -7684,6 +7764,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int nr : { 1, 4, }) {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {nr, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16));
             }
+        }
+    }
+
+    const char * turbo_kv_perf_shapes = getenv("LLAMA_TURBO_KV_PERF_SHAPES");
+    if (turbo_kv_perf_shapes && strcmp(turbo_kv_perf_shapes, "0") != 0) {
+        test_cases.emplace_back(new test_turbo_wht(128, 32, 0));
+        test_cases.emplace_back(new test_turbo_wht(128, 32, 1));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_BF16, { 128, 32, 1, 1 }));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_F32, { 128, 32, 1, 1 }));
+        for (int kv : { 8192, 16384, 32768, 49152, 65536 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 1, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_BF16));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 1, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 1, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0,
+                                                            true));
+        }
+        for (int kv : { 8192, 65536 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 512, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_BF16));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 512, true, false, 0, 0,
+                                                            GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
         }
     }
 

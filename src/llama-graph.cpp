@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "ggml.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-impl.h"
@@ -1305,7 +1306,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
                                                 float         kq_scale,
                                                 int           il,
                                                 bool          fairy2i_exact,
-                                                bool          fairy2i_flash3) const {
+                                                bool          fairy2i_flash3,
+                                                bool          turbo4_fused) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1395,6 +1397,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,
         } else {
             ggml_flash_attn_ext_set_fairy2i_exact(cur, fairy2i_exact);
         }
+        ggml_flash_attn_ext_set_turbo4_fused(cur, turbo4_fused);
 
         if (v_mla) {
 #if 0
@@ -1713,6 +1716,7 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
     const bool turbo_k  = llm_is_turbo_kv_type(k->type);
     const bool turbo_v  = llm_is_turbo_kv_type(v->type);
     const bool turbo_kv = turbo_k || turbo_v;
+    const bool turbo4_fused = k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0 && q_cur->ne[2] == 1;
 
     if (turbo_kv) {
         GGML_ASSERT(arch == LLM_ARCH_QWEN3);
@@ -1741,22 +1745,35 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
 
     const auto & kq_mask = inp->get_kq_mask(fairy2i_exact && (!fairy2i_flash3 || !cparams.flash_attn));
 
+    const int64_t turbo4_kv_capacity = k->view_src ? k->view_src->ne[1] : k->ne[2];
+    const bool    turbo4_predequant  = k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0 &&
+                                       q_cur->ne[2] >= 20 && turbo4_kv_capacity > 512 && turbo4_kv_capacity < 32768;
+
     ggml_tensor * q = q_cur;
-    if (turbo_k) {
+    if (turbo_k && !turbo4_fused) {
         q = ggml_turbo_wht(ctx0, q, 0, 128, nullptr);
         cb(q, "turbo_q_wht", il);
     }
 
-    ggml_tensor * cur =
-        build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, fairy2i_exact, fairy2i_flash3);
+    ggml_tensor * k_attn = k;
+    ggml_tensor * v_attn = v;
+    if (turbo4_predequant) {
+        k_attn = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        v_attn = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        cb(k_attn, "turbo_k_f16", il);
+        cb(v_attn, "turbo_v_f16", il);
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k_attn, v_attn, kq_b, kq_mask, sinks, v_mla, kq_scale, il, fairy2i_exact,
+                                       fairy2i_flash3, turbo4_fused);
     cb(cur, "kqv_out", il);
 
-    if (turbo_v) {
+    if (turbo_v && !turbo4_fused) {
         cur = ggml_turbo_wht(ctx0, cur, 1, 128, nullptr);
         cb(cur, "turbo_v_wht_inv", il);
     }
 
-    if (turbo_kv) {
+    if (turbo_kv && !turbo4_fused) {
         cur = llm_fairy2i_bf16_roundtrip(ctx0, cur);
         cb(cur, "turbo_attn_bf16_output", il);
     }

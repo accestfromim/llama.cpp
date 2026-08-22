@@ -592,6 +592,7 @@ extern "C" {
         GGML_OP_ROW4_LINEAR,
         GGML_OP_W8A8_LINEAR,
         GGML_OP_TURBO_WHT,
+        GGML_OP_TURBO_K_MEAN_CENTER,
 
         GGML_OP_COUNT,
     };
@@ -2398,6 +2399,10 @@ extern "C" {
 
     GGML_API bool ggml_flash_attn_ext_get_fairy2i_flash3(const struct ggml_tensor * a);
 
+    GGML_API void ggml_flash_attn_ext_set_turbo4_fused(struct ggml_tensor * a, bool fused);
+
+    GGML_API bool ggml_flash_attn_ext_get_turbo4_fused(const struct ggml_tensor * a);
+
     // Signed Walsh-Hadamard rotation for TurboQuant KV cache tensors.
     // direction: 0 = forward, 1 = inverse. group_size must be 128 for Turbo KV.
     GGML_API struct ggml_tensor * ggml_turbo_wht(struct ggml_context * ctx,
@@ -2405,6 +2410,13 @@ extern "C" {
                                                  int                   direction,
                                                  int                   group_size,
                                                  struct ggml_tensor *  scale);
+
+    GGML_API struct ggml_tensor * ggml_turbo_k_mean_center(struct ggml_context * ctx,
+                                                           struct ggml_tensor *  k,
+                                                           struct ggml_tensor *  indices,
+                                                           struct ggml_tensor *  sum,
+                                                           int                   warmup,
+                                                           bool                  center_warmup);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

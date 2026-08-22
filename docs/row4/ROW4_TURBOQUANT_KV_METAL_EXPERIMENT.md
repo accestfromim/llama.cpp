@@ -118,6 +118,42 @@ KV memory was measured with context 8192. Performance used `llama-bench` with `p
 
 The port achieves the intended KV-memory reduction, but the generic Metal FA path is slower than the Row4 BF16 exact path on this device. This first version intentionally does not include the source repository's experimental TurboFlash kernels.
 
+## Long-context Metal optimization follow-up
+
+The first port dequantized the same K/V data once for every GQA query head and used the generic quantized Flash Attention schedule. Profiling identified four avoidable costs:
+
+- Turbo4 K/V dequantization was repeated for all four query heads that share one KV head.
+- The decode path did not use the vector Flash Attention schedule.
+- Turbo4 SET_ROWS packed a 128-element row serially.
+- Long decode used too few partial workgroups.
+
+The follow-up Metal path adds:
+
+- A D128 GQA4 prefill kernel that dequantizes each Turbo4 K/V tile once and reuses it across four query heads.
+- Half-precision QK, probability, and output matrices with about 23 KiB threadgroup memory.
+- A fused decode chain for Q WHT, Turbo4/Turbo4 vector Flash Attention, inverse WHT, and BF16 output rounding.
+- A GQA4 decode kernel with 64 partial workgroups at 32K and above.
+- SIMD32 Turbo4 SET_ROWS packing.
+- A configured-capacity route that dequantizes K/V once to F16 for prefill when the KV capacity is above 512 and below 32K. The graph cache makes the configured KV capacity the safe routing key; the current used length is not safe at graph-build time.
+
+The specialized prefill path passed the existing `5e-4` NMSE budget at KV lengths 512 and 8192. The 8192 test uses 32 query tokens, 32 query heads, and 8 KV heads and ran as 1/1, not as a skipped case.
+
+The following curves use `pp512` and `tg128`, full Metal offload, Flash Attention, batch 2048, ubatch 512, and one timed sample per context point. Each Turbo4 prefill capacity was run in a separate process so that the capacity-dependent route was measured correctly.
+
+| Context | BF16 pp512 | Turbo4 pp512 | Delta | BF16 tg128 | Turbo4 tg128 | Delta |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 3518.875 | 3114.633 | -11.49% | 101.023 | 100.388 | -0.63% |
+| 1024 | 3226.302 | 3065.381 | -4.99% | 82.565 | 76.840 | -6.93% |
+| 2048 | 2161.660 | 2594.905 | +20.04% | 75.441 | 79.430 | +5.29% |
+| 4096 | 1680.959 | 2013.487 | +19.78% | 79.141 | 80.272 | +1.43% |
+| 8192 | 1192.068 | 1343.258 | +12.68% | 71.450 | 71.985 | +0.75% |
+| 16384 | 698.739 | 737.669 | +5.57% | 56.007 | 58.141 | +3.81% |
+| 32768 | 337.949 | 364.324 | +7.80% | 41.147 | 43.916 | +6.73% |
+| 49152 | 199.195 | 240.158 | +20.56% | 31.658 | 33.524 | +5.89% |
+| 65536 | 140.583 | 196.231 | +39.58% | 25.906 | 27.270 | +5.27% |
+
+The 64K prefill endpoint was also repeated three times with both cache types. BF16 was `143.740 +/- 1.576` token/s and Turbo4 was `203.441 +/- 1.453` token/s, a 41.5% improvement. The remaining regressions are limited to 0 and 1K context, where fixed WHT and dequantization startup costs dominate.
+
 ## Fixed generation outputs
 
 The fixed 32-token greedy completions were:
@@ -150,6 +186,41 @@ Perplexity used `wiki.test.raw`, context 2048, 16 chunks, full Metal offload, an
 
 The asymmetric q8/Turbo configurations remain close to the BF16 result in this 16-chunk run. Symmetric turbo2 and turbo3 show substantial degradation; symmetric turbo4 is much closer but still worse than BF16. The result is reported as measured and is not treated as a pass/fail gate.
 
+## Long-context logits quality
+
+BF16/BF16 logits are the reference. The harness fills WikiText-2 context in 512-token batches, evaluates a fixed 512-token suffix beginning at source token 70000, and compares the last 256 rows. It reports mean KL divergence and top-1 logit agreement.
+
+| Context | q8/turbo2 KL | q8/turbo2 top1 | q8/turbo3 KL | q8/turbo3 top1 | turbo4/turbo4 KL | turbo4/turbo4 top1 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 0.0788 | 87.1% | 0.0299 | 93.0% | 0.1552 | 77.3% |
+| 4096 | 0.0675 | 83.6% | 0.0269 | 91.4% | 0.1546 | 81.6% |
+| 8192 | 0.0688 | 84.8% | 0.0264 | 91.4% | 0.1343 | 81.6% |
+| 16384 | 0.0688 | 84.0% | 0.0244 | 90.6% | 0.1292 | 82.4% |
+| 32768 | 0.0626 | 86.7% | 0.0234 | 91.4% | 0.1189 | 83.2% |
+| 65536 | 0.0821 | 83.6% | 0.0331 | 86.7% | 0.2491 | 75.4% |
+
+`q8/turbo3` has the smallest quality change in this set. `q8/turbo2` remains moderate. Symmetric Turbo4 has a larger distribution shift, especially at 64K. The half-precision GQA4 prefill accumulator increased the measured 64K Turbo4 KL from the earlier generic-kernel result of 0.1779 to 0.2491 while providing the long-context speedup.
+
+## K mean-centering experiment
+
+`TURBO_K_MEAN_CENTER` is default-off and supports two experimental modes for Turbo4/Turbo4 with one fully offloaded Metal stream:
+
+- `TURBO_K_MEAN_CENTER=1` implements the initial proposal exactly. It leaves the first 32 K vectors unchanged and subtracts their mean from later K vectors.
+- `TURBO_K_MEAN_CENTER=2` subtracts the completed first-32 mean from all K vectors in the initial prefill batch and from every later K vector.
+
+Mode 1 is not softmax invariant. It shifts only the logits for keys after position 31 relative to the warmup keys and causes severe quality loss. Mode 2 applies one common K translation to every key. For any query, this subtracts the same scalar from every exact attention logit, so softmax is unchanged before quantization. The residual K vectors have a smaller common component and quantize more accurately.
+
+| Context | Turbo4 base KL | Turbo4 base top1 | Mode 1 KL | Mode 1 top1 | Mode 2 KL | Mode 2 top1 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 0.1552 | 77.3% | 2.1684 | 32.4% | 0.0355 | 91.0% |
+| 4096 | 0.1546 | 81.6% | 2.1493 | 36.7% | 0.0418 | 89.8% |
+| 8192 | 0.1343 | 81.6% | 2.2672 | 34.8% | 0.0389 | 89.5% |
+| 16384 | 0.1292 | 82.4% | 2.3313 | 31.6% | 0.0382 | 88.7% |
+| 32768 | 0.1189 | 83.2% | 2.4717 | 29.7% | 0.0505 | 85.9% |
+| 65536 | 0.2491 | 75.4% | 2.7140 | 18.8% | 0.1108 | 82.4% |
+
+Mode 1 should not be used. Mode 2 is materially better than uncentered symmetric Turbo4 across every tested context. It requires the initial prefill batch to contain all 32 warmup tokens. It does not retroactively rewrite warmup rows when the first 32 tokens arrive in smaller batches, and cache shifting or physical-row reuse is outside this experiment's scope.
+
 ## Known limits
 
 - Metal only, full model offload only, D128 Turbo FA only.
@@ -159,6 +230,6 @@ The asymmetric q8/Turbo configurations remain close to the BF16 result in this 1
 - No TQ3/TQ4 weight formats and no changes to GGUF serialization.
 - No CUDA, HIP, Vulkan, or SYCL kernels.
 - No TurboFlash, Sparse-V, profiling, layer-adaptive cache precision, InnerQ, or optional source-repository environment knobs.
-- Turbo cache dequantization is fused into Metal Flash Attention. A standalone Metal Turbo-to-F32 copy kernel is not part of this port.
+- Turbo cache dequantization is fused into Metal Flash Attention. The follow-up also includes a Turbo4-to-F16 copy path used by the configured-capacity prefill route.
 
 Raw commands, JSON, fixed generations, test logs, and perplexity logs are left untracked under `tmp/row4-turboquant-kv/`.

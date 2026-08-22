@@ -1065,6 +1065,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->src[0] && !op->src[1] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->ne[0] % 128 == 0 && ggml_get_op_params_i32(op, 1) == 128 &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_TURBO_K_MEAN_CENTER:
+            return op->src[0] && op->src[1] && op->src[2] && op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64) &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && op->src[0]->ne[2] == ggml_nelements(op->src[1]) &&
+                   op->src[0]->ne[3] == 1 && op->src[0]->ne[0] * op->src[0]->ne[1] == ggml_nelements(op->src[2]) &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
@@ -1124,6 +1131,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             default:
                                 return false;
                         }
+                    case GGML_TYPE_TURBO4_0:
+                        return op->type == GGML_TYPE_F16;
                     case GGML_TYPE_I32:
                         return op->type == GGML_TYPE_F32;
                     default:

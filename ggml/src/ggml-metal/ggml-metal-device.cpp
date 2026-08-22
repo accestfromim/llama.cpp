@@ -218,6 +218,16 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_libra
     return ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
 }
 
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_k_mean_center(ggml_metal_library_t lib) {
+    constexpr const char * name = "kernel_turbo_k_mean_center";
+    ggml_metal_pipeline_t  res  = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    return ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+}
+
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_repeat(ggml_metal_library_t lib, ggml_type tsrc) {
     char base[256];
     char name[256];
@@ -964,14 +974,14 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_argsort(ggml_metal_library
     return res;
 }
 
-ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(
-        ggml_metal_library_t lib,
-        const ggml_tensor * op,
-        bool    has_mask,
-        bool    has_sinks,
-        bool    has_bias,
-        bool    has_scap,
-        int32_t nsg) {
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_library_t lib,
+                                                                     const ggml_tensor *  op,
+                                                                     bool                 has_mask,
+                                                                     bool                 has_sinks,
+                                                                     bool                 has_bias,
+                                                                     bool                 has_scap,
+                                                                     int32_t              nsg,
+                                                                     bool                 turbo_gqa4) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -988,7 +998,10 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(
     const bool turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
                        type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
 
-    if (turbo) {
+    if (turbo_gqa4) {
+        GGML_ASSERT(type_k == GGML_TYPE_TURBO4_0 && type_v == GGML_TYPE_TURBO4_0 && dk == 128 && dv == 128);
+        snprintf(base, 256, "kernel_flash_attn_ext_kturbo4_vturbo4_gqa4_half_dk128_dv128");
+    } else if (turbo) {
         snprintf(base, 256, "kernel_flash_attn_ext_k%s_v%s_dk%d_dv%d", ggml_type_name(type_k), ggml_type_name(type_v),
                  dk, dv);
     } else {
@@ -1029,15 +1042,16 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(
     return res;
 }
 
-ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(
-        ggml_metal_library_t lib,
-        const ggml_tensor * op,
-        bool    has_mask,
-        bool    has_sinks,
-        bool    has_bias,
-        bool    has_scap,
-        int32_t nsg,
-        int32_t nwg) {
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(ggml_metal_library_t lib,
+                                                                         const ggml_tensor *  op,
+                                                                         bool                 has_mask,
+                                                                         bool                 has_sinks,
+                                                                         bool                 has_bias,
+                                                                         bool                 has_scap,
+                                                                         int32_t              nsg,
+                                                                         int32_t              nwg,
+                                                                         bool                 turbo_fused,
+                                                                         bool                 turbo_gqa4) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1049,8 +1063,14 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
-    const char * type_name =
-        ggml_flash_attn_ext_get_fairy2i_flash3(op) ? "fairy_bf16" : ggml_type_name(op->src[1]->type);
+    const char * type_name = ggml_type_name(op->src[1]->type);
+    if (turbo_gqa4) {
+        type_name = "turbo4_gqa4_fused";
+    } else if (turbo_fused) {
+        type_name = "turbo4_fused";
+    } else if (ggml_flash_attn_ext_get_fairy2i_flash3(op)) {
+        type_name = "fairy_bf16";
+    }
 
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d", "flash_attn_ext_vec", type_name, dk, dv);
 

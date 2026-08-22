@@ -702,6 +702,22 @@ typedef struct {
 } ggml_metal_kargs_turbo_wht;
 
 typedef struct {
+    int64_t  n_features;
+    int64_t  n_tokens;
+    int64_t  ne00;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb10;
+    int32_t  warmup;
+    int32_t  index_i64;
+    int32_t  center_warmup;
+} ggml_metal_kargs_turbo_k_mean_center;
+
+typedef struct {
     int64_t  ne00;
     int64_t  ne01;
     int64_t  ne02;

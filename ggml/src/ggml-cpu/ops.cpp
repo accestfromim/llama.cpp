@@ -541,6 +541,55 @@ static void ggml_compute_forward_dup_from_q(
     }
 }
 
+static void ggml_compute_forward_dup_from_q_f16(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_TURBO4_0);
+    const ggml_to_float_t dequantize_row_q = ggml_get_type_traits(src0->type)->to_float;
+
+    const int64_t qk = ggml_blck_size(src0->type);
+    const int64_t nr = (int64_t) ggml_nelements(src1) / qk;
+
+    GGML_ASSERT(qk == 128);
+    GGML_ASSERT(nb10 == sizeof(ggml_fp16_t));
+    GGML_ASSERT((ne10 % qk) == 0 || ggml_is_contiguous(dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    float values[128];
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i = ir * qk;
+
+        const int64_t i03      = i / (ne00 * ne01 * ne02);
+        const int64_t i02      = (i - i03 * ne00 * ne01 * ne02) / (ne00 * ne01);
+        const int64_t i01      = (i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00) / ne00;
+        const int64_t i00      = i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
+        const size_t  x_offset = (i00 / qk) * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03;
+
+        const int64_t i13        = i / (ne10 * ne11 * ne12);
+        const int64_t i12        = (i - i13 * ne10 * ne11 * ne12) / (ne10 * ne11);
+        const int64_t i11        = (i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11) / ne10;
+        const int64_t i10        = i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
+        const size_t  dst_offset = i10 * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
+
+        dequantize_row_q((const char *) src0->data + x_offset, values, qk);
+
+        ggml_fp16_t * dst_ptr = (ggml_fp16_t *) ((char *) dst->data + dst_offset);
+        for (int64_t j = 0; j < qk; ++j) {
+            dst_ptr[j] = ggml_fp32_to_fp16(values[j]);
+        }
+    }
+}
+
 void ggml_compute_forward_dup(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -584,6 +633,10 @@ void ggml_compute_forward_dup(
             {
                 if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
                     ggml_compute_forward_dup_from_q(params, dst);
+                    break;
+                }
+                if (src0->type == GGML_TYPE_TURBO4_0 && dst->type == GGML_TYPE_F16) {
+                    ggml_compute_forward_dup_from_q_f16(params, dst);
                     break;
                 }
                 GGML_ABORT("fatal error");
@@ -8844,6 +8897,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DK = nek0;
     const int64_t DV = nev0;
     const int64_t N  = neq1;
+    const bool    turbo4_fused = ggml_flash_attn_ext_get_turbo4_fused(dst);
+
+    GGML_ASSERT(!turbo4_fused ||
+                (DK == 128 && DV == 128 && N == 1 && k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0));
 
     GGML_ASSERT(ne0 == DV);
     GGML_ASSERT(ne2 == N);
@@ -8945,6 +9002,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+        float         turbo_q[128];
+        if (turbo4_fused) {
+            memcpy(turbo_q, pq, sizeof(turbo_q));
+            turbo_cpu_fwht_forward(turbo_q, 128);
+            pq = turbo_q;
+        }
         q_to_vec_dot(pq, Q_q, DK);
 
         // online softmax / attention
@@ -9049,6 +9112,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             GGML_ABORT("inf discovered in flash attention");
         }
         ggml_vec_scale_f32(DV, VKQ32, S_inv);
+
+        if (turbo4_fused) {
+            turbo_cpu_fwht_inverse(VKQ32, 128);
+            for (int64_t d = 0; d < DV; ++d) {
+                VKQ32[d] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(VKQ32[d]));
+            }
+        }
 
         // dst indices
         const int i1 = iq1;
@@ -11168,6 +11238,61 @@ void ggml_compute_forward_turbo_wht(const ggml_compute_params * params, ggml_ten
             for (int i = 0; i < group_size; ++i) {
                 out[i] *= scale_data[i];
             }
+        }
+    }
+}
+
+void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src           = dst->src[0];
+    const ggml_tensor * indices       = dst->src[1];
+    ggml_tensor *       sum           = dst->src[2];
+    const int32_t       warmup        = ggml_get_op_params_i32(dst, 0);
+    const bool          center_warmup = ggml_get_op_params_i32(dst, 1) != 0;
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT((indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64) && sum->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->ne[2] == ggml_nelements(indices) && src->ne[3] == 1);
+    GGML_ASSERT(src->ne[0] * src->ne[1] == ggml_nelements(sum));
+    GGML_ASSERT(warmup > 0);
+
+    const int64_t n_features = src->ne[0] * src->ne[1];
+    const int64_t n_tokens   = src->ne[2];
+    const int64_t begin      = n_features * params->ith / params->nth;
+    const int64_t end        = n_features * (params->ith + 1) / params->nth;
+
+    const auto get_index = [&](int64_t token) {
+        const char * ptr = (const char *) indices->data + token * indices->nb[0];
+        return indices->type == GGML_TYPE_I64 ? *(const int64_t *) ptr : (int64_t) *(const int32_t *) ptr;
+    };
+
+    bool reset    = false;
+    bool complete = false;
+    for (int64_t it = 0; it < n_tokens; ++it) {
+        const int64_t index = get_index(it);
+        reset |= index == 0;
+        complete |= index >= warmup - 1;
+    }
+
+    for (int64_t feature = begin; feature < end; ++feature) {
+        const int64_t i0  = feature % src->ne[0];
+        const int64_t i1  = feature / src->ne[0];
+        float         acc = reset ? 0.0f : ((float *) sum->data)[feature];
+
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            const int64_t index = get_index(it);
+            if (index < warmup) {
+                acc +=
+                    *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
+            }
+        }
+        ((float *) sum->data)[feature] = acc;
+
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            const int64_t index = get_index(it);
+            const float   value =
+                *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
+            *(float *) ((char *) dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + it * dst->nb[2]) =
+                complete && (center_warmup || index >= warmup) ? value - acc / (float) warmup : value;
         }
     }
 }
