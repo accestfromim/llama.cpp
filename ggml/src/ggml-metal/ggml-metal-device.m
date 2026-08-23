@@ -597,9 +597,13 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                     "kernel_row4_m5_preexpand_int4_pair2",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
+                    "kernel_row4_w1a8_m5_tensorops_decode_m16n64_sg4",
+                    "kernel_row4_w1a8_m5_tensorops_decode_m8n128",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m64n64",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m128n32",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m256n32",
+                    "kernel_row8_w8a8_m5_tensorops_m16n128",
+                    "kernel_row8_w8a8_m5_tensorops_m8n128",
                 };
                 for (size_t i = 0; i < sizeof(mpp_pipeline_names) / sizeof(mpp_pipeline_names[0]); ++i) {
                     const char * name = mpp_pipeline_names[i];
@@ -1071,7 +1075,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64) &&
                    op->src[2]->type == GGML_TYPE_F32 &&
                    op->type == GGML_TYPE_F32 && op->src[0]->ne[2] == ggml_nelements(op->src[1]) &&
-                   op->src[0]->ne[3] == 1 && op->src[0]->ne[0] * op->src[0]->ne[1] + 1 == ggml_nelements(op->src[2]) &&
+                   op->src[0]->ne[3] == 1 && op->src[0]->ne[0] * op->src[0]->ne[1] + 1 == op->src[2]->ne[0] &&
+                   ggml_get_op_params_i32(op, 2) > 0 && ggml_get_op_params_i32(op, 3) > 0 &&
+                   op->src[0]->ne[2] % ggml_get_op_params_i32(op, 3) == 0 &&
+                   op->src[0]->ne[2] / ggml_get_op_params_i32(op, 3) <= op->src[2]->ne[1] &&
                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:

@@ -712,9 +712,13 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb10;
+    uint64_t nb11;
     int32_t  warmup;
     int32_t  index_i64;
     int32_t  center_warmup;
+    int32_t  kv_size;
+    int32_t  n_seq_tokens;
+    int32_t  n_active_streams;
 } ggml_metal_kargs_turbo_k_mean_center;
 
 typedef struct {

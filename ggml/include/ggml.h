@@ -2416,7 +2416,9 @@ extern "C" {
                                                            struct ggml_tensor *  indices,
                                                            struct ggml_tensor *  sum,
                                                            int                   warmup,
-                                                           bool                  center_warmup);
+                                                           bool                  center_warmup,
+                                                           int64_t               kv_size,
+                                                           int64_t               n_seq_tokens);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

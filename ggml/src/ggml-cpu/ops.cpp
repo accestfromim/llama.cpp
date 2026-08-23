@@ -8899,8 +8899,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t N  = neq1;
     const bool    turbo4_fused = ggml_flash_attn_ext_get_turbo4_fused(dst);
 
-    GGML_ASSERT(!turbo4_fused ||
-                (DK == 128 && DV == 128 && N == 1 && k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0));
+    GGML_ASSERT(!turbo4_fused || (DK == 128 && DV == 128 && N >= 1 && N <= 16 && k->type == GGML_TYPE_TURBO4_0 &&
+                                  v->type == GGML_TYPE_TURBO4_0));
 
     GGML_ASSERT(ne0 == DV);
     GGML_ASSERT(ne2 == N);
@@ -11248,54 +11248,64 @@ void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params
     ggml_tensor *       sum           = dst->src[2];
     const int32_t       warmup        = ggml_get_op_params_i32(dst, 0);
     const bool          center_warmup = ggml_get_op_params_i32(dst, 1) != 0;
+    const int32_t       kv_size       = ggml_get_op_params_i32(dst, 2);
+    const int32_t       n_seq_tokens  = ggml_get_op_params_i32(dst, 3);
 
     GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT((indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64) && sum->type == GGML_TYPE_F32);
     GGML_ASSERT(src->ne[2] == ggml_nelements(indices) && src->ne[3] == 1);
-    GGML_ASSERT(src->ne[0] * src->ne[1] + 1 == ggml_nelements(sum));
-    GGML_ASSERT(warmup > 0);
+    GGML_ASSERT(src->ne[0] * src->ne[1] + 1 == sum->ne[0]);
+    GGML_ASSERT(warmup > 0 && kv_size > 0 && n_seq_tokens > 0 && src->ne[2] % n_seq_tokens == 0);
 
-    const int64_t n_features = src->ne[0] * src->ne[1];
-    const int64_t n_tokens   = src->ne[2];
-    const int64_t begin      = n_features * params->ith / params->nth;
-    const int64_t end        = n_features * (params->ith + 1) / params->nth;
+    const int64_t n_features       = src->ne[0] * src->ne[1];
+    const int64_t n_active_streams = src->ne[2] / n_seq_tokens;
+    const int64_t n_jobs           = n_features * n_active_streams;
+    const int64_t begin            = n_jobs * params->ith / params->nth;
+    const int64_t end              = n_jobs * (params->ith + 1) / params->nth;
 
     const auto get_index = [&](int64_t token) {
         const char * ptr = (const char *) indices->data + token * indices->nb[0];
         return indices->type == GGML_TYPE_I64 ? *(const int64_t *) ptr : (int64_t) *(const int32_t *) ptr;
     };
 
-    bool    reset     = false;
-    int64_t max_index = -1;
-    for (int64_t it = 0; it < n_tokens; ++it) {
-        const int64_t index = get_index(it);
-        reset |= index == 0;
-        max_index = MAX(max_index, index);
-    }
-    const int32_t effective_warmup = center_warmup ? (reset ? MIN(warmup, (int32_t) max_index + 1) :
-                                                              MAX(1, (int32_t) ((float *) sum->data)[n_features])) :
-                                                     warmup;
-    const bool    complete         = max_index >= effective_warmup - 1;
-    if (params->ith == 0) {
-        ((float *) sum->data)[n_features] = (float) effective_warmup;
-    }
+    for (int64_t job = begin; job < end; ++job) {
+        const int64_t active_stream = job / n_features;
+        const int64_t feature       = job % n_features;
+        const int64_t token_begin   = active_stream * n_seq_tokens;
+        const int64_t token_end     = token_begin + n_seq_tokens;
+        const int64_t stream        = get_index(token_begin) / kv_size;
+        float *       stream_sum    = (float *) ((char *) sum->data + stream * sum->nb[1]);
 
-    for (int64_t feature = begin; feature < end; ++feature) {
+        bool    reset     = false;
+        int64_t max_index = -1;
+        for (int64_t it = token_begin; it < token_end; ++it) {
+            const int64_t index = get_index(it) % kv_size;
+            reset |= index == 0;
+            max_index = MAX(max_index, index);
+        }
+        const int32_t effective_warmup =
+            center_warmup ? (reset ? MIN(warmup, (int32_t) max_index + 1) : MAX(1, (int32_t) stream_sum[n_features])) :
+                            warmup;
+        const bool complete = max_index >= effective_warmup - 1;
+        if (feature == 0 && center_warmup && reset) {
+            stream_sum[n_features] = (float) effective_warmup;
+        }
+
         const int64_t i0  = feature % src->ne[0];
         const int64_t i1  = feature / src->ne[0];
-        float         acc = reset ? 0.0f : ((float *) sum->data)[feature];
+        float         acc = reset ? 0.0f : stream_sum[feature];
 
-        for (int64_t it = 0; it < n_tokens; ++it) {
-            const int64_t index = get_index(it);
+        for (int64_t it = token_begin; it < token_end; ++it) {
+            const int64_t index = get_index(it) % kv_size;
             if (index < effective_warmup) {
                 acc +=
                     *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
             }
         }
-        ((float *) sum->data)[feature] = acc;
+        stream_sum[feature] = acc;
 
-        for (int64_t it = 0; it < n_tokens; ++it) {
-            const int64_t index = get_index(it);
+        for (int64_t it = token_begin; it < token_end; ++it) {
+            const int64_t index = get_index(it) % kv_size;
             const float   value =
                 *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
             *(float *) ((char *) dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + it * dst->nb[2]) =

@@ -848,6 +848,16 @@ kernel void kernel_row4_quantize_activation_i8(
     const uint simd_group = tid >> 5;
     const ulong row_base  = (ulong) token * (ulong) args.k;
 
+    if (token >= (uint) args.act_rows) {
+        for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+            *(device char4 *) (act_q + row_base + i) = char4(0);
+        }
+        if (tid == 0U) {
+            act_scales[token] = 1.0f;
+        }
+        return;
+    }
+
     // ROW4/W8A8 require K to be a multiple of 128, so every row and loop
     // iteration is naturally aligned for four-wide loads. Max reduction is
     // exact for the finite BF16 carriers accepted by the numeric profile.
@@ -998,6 +1008,16 @@ kernel void kernel_row4_quantize_activation_i8_packed_bf16(
     const uint simd_lane  = tid & 31U;
     const uint simd_group = tid >> 5;
     const ulong row_base  = (ulong) token * (ulong) args.k;
+
+    if (token >= (uint) args.act_rows) {
+        for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
+            *(device char4 *) (act_q + row_base + i) = char4(0);
+        }
+        if (tid == 0U) {
+            act_scales[token] = 1.0f;
+        }
+        return;
+    }
 
     float thread_max = 0.0f;
     for (uint i = tid * 4U; i < (uint) args.k; i += 256U * 4U) {
@@ -1434,8 +1454,10 @@ kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128(
             const auto coordinate = acc.get_multidimensional_index(i);
             const uint output     = output_base + (uint) coordinate[0];
             const uint row        = row_base + (uint) coordinate[1];
-            dst[(ulong) row * (ulong) args.m + (ulong) output] =
-                row4_finish_i32(acc[i], act_scales[row], scales[output]);
+            if (row < (uint) args.act_rows) {
+                dst[(ulong) row * (ulong) args.m + (ulong) output] =
+                    row4_finish_i32(acc[i], act_scales[row], scales[output]);
+            }
         }
     }
 }
@@ -1527,8 +1549,10 @@ static inline void row4_w1a8_m5_tensorops_prefill_impl(
             const auto coordinate = acc.get_multidimensional_index(i);
             const uint output     = output_base + (uint) coordinate[0];
             const uint row        = row_base + (uint) coordinate[1];
-            dst[(ulong) row * (ulong) args.m + (ulong) output] =
-                row4_finish_i32(acc[i], act_scales[row], scales[output]);
+            if (row < (uint) args.act_rows) {
+                dst[(ulong) row * (ulong) args.m + (ulong) output] =
+                    row4_finish_i32(acc[i], act_scales[row], scales[output]);
+            }
         }
     }
 }
@@ -1549,10 +1573,105 @@ kernel void kernel_name(                                                        
 }
 
 template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m32n128,  32, 128, 4)
+template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_decode_m16n64_sg4, 16,  64, 4)
+template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_decode_m8n128,      8, 128, 4)
 template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m64n64,    64,  64, 4)
 template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m128n32,  128,  32, 4)
 template_row4_m5_tensorops_prefill(kernel_row4_w1a8_m5_tensorops_prefill_m256n32,  256,  32, 8)
 #undef template_row4_m5_tensorops_prefill
+
+template<int row_tile>
+static inline void row8_w8a8_m5_tensorops_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const char * codes,
+        device const float * scales,
+        device int8_t * act_q,
+        device const float * act_scales,
+        device float * dst,
+        threadgroup int8_t * weight_i8,
+        uint3 tgpig,
+        uint tid) {
+    constexpr int output_tile         = 128;
+    constexpr int k_tile              = 128;
+    constexpr int n_simdgroups        = 4;
+    constexpr int threadgroup_threads = n_simdgroups * 32;
+
+    constexpr auto desc = matmul2d_descriptor(
+        row_tile,
+        output_tile,
+        k_tile,
+        false,
+        false,
+        false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<n_simdgroups>> op;
+
+    using activation_tensor = tensor<device int8_t, dextents<int, 2>, tensor_inline>;
+    using weight_tensor     = tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline>;
+
+    auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    const uint output_base = tgpig.x * output_tile;
+    const uint row_base    = tgpig.y * row_tile;
+    const uint k_tiles     = (uint) args.k >> 7;
+    for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
+        for (uint work = tid; work < output_tile * k_tile; work += threadgroup_threads) {
+            const uint output = work & (output_tile - 1U);
+            const uint k      = work >> 7;
+            weight_i8[work] = (int8_t) w8a8_weight_at(
+                codes, (int) k_tiles, (int) (output_base + output), (int) (k_base + k));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        activation_tensor activation(
+            act_q + (ulong) row_base * (ulong) args.k + (ulong) k_base,
+            dextents<int, 2>(k_tile, row_tile),
+            array<int, 2>{ 1, args.k });
+        weight_tensor weight(
+            weight_i8,
+            dextents<int, 2>(output_tile, k_tile),
+            array<int, 2>{ 1, output_tile });
+        op.run(activation, weight, acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto coordinate = acc.get_multidimensional_index(i);
+            const uint output     = output_base + (uint) coordinate[0];
+            const uint row        = row_base + (uint) coordinate[1];
+            if (row < (uint) args.act_rows) {
+                dst[(ulong) row * (ulong) args.m + (ulong) output] =
+                    w8a8_finish_i32(acc[i], act_scales[row], scales[output]);
+            }
+        }
+    }
+}
+
+#define template_row8_m5_tensorops(kernel_name, row_tile)                                                          \
+kernel void kernel_name(                                                                                           \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],                                           \
+        device const char * codes                         [[buffer(1)]],                                           \
+        device const float * scales                       [[buffer(2)]],                                           \
+        device int8_t * act_q                             [[buffer(3)]],                                           \
+        device const float * act_scales                   [[buffer(4)]],                                           \
+        device float * dst                                [[buffer(5)]],                                           \
+        threadgroup int8_t * weight_i8                    [[threadgroup(0)]],                                      \
+        uint3 tgpig                                       [[threadgroup_position_in_grid]],                        \
+        uint tid                                          [[thread_index_in_threadgroup]]) {                       \
+    row8_w8a8_m5_tensorops_impl<row_tile>(args, codes, scales, act_q, act_scales, dst, weight_i8, tgpig, tid);     \
+}
+
+template_row8_m5_tensorops(kernel_row8_w8a8_m5_tensorops_m16n128, 16)
+template_row8_m5_tensorops(kernel_row8_w8a8_m5_tensorops_m8n128,   8)
+#undef template_row8_m5_tensorops
 
 #endif
 
@@ -14615,14 +14734,11 @@ kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
     const short iq2 = 4 * ikv2 + sgitg;
     const short iq1 = tgpig.x;
 
-    threadgroup half4 * sq4 = (threadgroup half4 *) shmem_f16;
-    threadgroup half4 * sk4 = sq4 + 4 * D4;
-    threadgroup half4 * sv4 = sk4 + C * D4;
+    threadgroup half4 * skv4 = (threadgroup half4 *) shmem_f16;
 
     device const float4 * q4 = (device const float4 *)
         (q + iq1 * args.nb01 + iq2 * args.nb02 + iq3 * args.nb03);
-    float4 qv = turbo_rotate_forward_simd(q4[tiisg], tiisg);
-    sq4[sgitg * D4 + tiisg] = half4(qv);
+    const float4 qv = float4(half4(turbo_rotate_forward_simd(q4[tiisg], tiisg)));
 
     const short ikv3 = iq3 / (args.ne03 / args.ne_12_3);
     k += ikv2 * args.nb12 + ikv3 * args.nb13;
@@ -14636,26 +14752,28 @@ kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
     float M = -FLT_MAX / 2;
     const short tid = 32 * sgitg + tiisg;
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
     for (int ic = (int) iwg * C; ic < args.ne11; ic += (int) FC_flash_attn_ext_vec_nwg * C) {
+        const half mask_value = pm[ic + tiisg];
+        if (simd_max(mask_value) == -INFINITY) {
+            continue;
+        }
+
         for (short item = tid; item < C * D4; item += 128) {
             const short token = item / D4;
             const short d4 = item % D4;
             half4 value;
             dequantize_turbo4_0_t4((device const block_turbo4_0 *) (k + (ic + token) * args.nb11), d4, value);
-            sk4[item] = value;
-            dequantize_turbo4_0_t4((device const block_turbo4_0 *) (v + (ic + token) * args.nb21), d4, value);
-            sv4[item] = value;
+            skv4[item] = value;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float score = 0.0f;
         FOR_UNROLL (short d4 = 0; d4 < D4; ++d4) {
-            score += dot(float4(sk4[tiisg * D4 + d4]), float4(sq4[sgitg * D4 + d4]));
+            const float4 qd = simd_shuffle(qv, d4);
+            score += dot(float4(skv4[tiisg * D4 + d4]), qd);
         }
-        score = fma(score, args.scale, float(pm[ic + tiisg]));
+        score = fma(score, args.scale, float(mask_value));
 
         const float old_M = M;
         M = simd_max(max(M, score));
@@ -14664,8 +14782,20 @@ kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
         S = S * ms + simd_sum(vs);
         O *= ms;
 
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short item = tid; item < C * D4; item += 128) {
+            const short token = item / D4;
+            const short d4 = item % D4;
+            half4 value;
+            dequantize_turbo4_0_t4((device const block_turbo4_0 *) (v + (ic + token) * args.nb21), d4, value);
+            skv4[item] = value;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         FOR_UNROLL (short token = 0; token < C; ++token) {
-            O += float4(sv4[token * D4 + tiisg]) * simd_shuffle(vs, token);
+            O += float4(skv4[token * D4 + tiisg]) * simd_shuffle(vs, token);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -17002,42 +17132,51 @@ kernel void kernel_turbo_k_mean_center(constant ggml_metal_kargs_turbo_k_mean_ce
                                        uint                                            tgpig [[threadgroup_position_in_grid]],
                                        uint                                            tiitg [[thread_index_in_threadgroup]],
                                        uint                                            ntg [[threads_per_threadgroup]]) {
-    const int64_t feature = int64_t(tgpig) * ntg + tiitg;
-    if (feature >= args.n_features) {
+    const int64_t job = int64_t(tgpig) * ntg + tiitg;
+    if (job >= args.n_features * args.n_active_streams) {
         return;
     }
 
+    const int64_t active_stream = job / args.n_features;
+    const int64_t feature = job % args.n_features;
+    const int64_t token_begin = active_stream * args.n_seq_tokens;
+    const int64_t token_end = token_begin + args.n_seq_tokens;
+    const int64_t global_index = args.index_i64 ? *(const device int64_t *) (indices + token_begin * args.nb10) :
+                                                  *(const device int32_t *) (indices + token_begin * args.nb10);
+    const int64_t stream = global_index / args.kv_size;
+    device float * stream_sum = (device float *) ((device char *) sum + stream * args.nb11);
+
     bool reset = false;
     int64_t max_index = -1;
-    for (int64_t token = 0; token < args.n_tokens; ++token) {
-        const int64_t index = args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
-                                               *(const device int32_t *) (indices + token * args.nb10);
+    for (int64_t token = token_begin; token < token_end; ++token) {
+        const int64_t index = (args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
+                                                *(const device int32_t *) (indices + token * args.nb10)) % args.kv_size;
         reset |= index == 0;
         max_index = max(max_index, index);
     }
     const int effective_warmup = args.center_warmup ?
-                                     (reset ? min(args.warmup, int(max_index) + 1) : max(1, int(sum[args.n_features]))) :
+                                     (reset ? min(args.warmup, int(max_index) + 1) : max(1, int(stream_sum[args.n_features]))) :
                                      args.warmup;
     const bool complete = max_index >= effective_warmup - 1;
-    if (feature == 0) {
-        sum[args.n_features] = float(effective_warmup);
+    if (feature == 0 && args.center_warmup && reset) {
+        stream_sum[args.n_features] = float(effective_warmup);
     }
 
     const int64_t i0 = feature % args.ne00;
     const int64_t i1 = feature / args.ne00;
-    float acc = reset ? 0.0f : sum[feature];
-    for (int64_t token = 0; token < args.n_tokens; ++token) {
-        const int64_t index = args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
-                                               *(const device int32_t *) (indices + token * args.nb10);
+    float acc = reset ? 0.0f : stream_sum[feature];
+    for (int64_t token = token_begin; token < token_end; ++token) {
+        const int64_t index = (args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
+                                                *(const device int32_t *) (indices + token * args.nb10)) % args.kv_size;
         if (index < effective_warmup) {
             acc += *(const device float *) (src + i0 * args.nb00 + i1 * args.nb01 + token * args.nb02);
         }
     }
-    sum[feature] = acc;
+    stream_sum[feature] = acc;
 
-    for (int64_t token = 0; token < args.n_tokens; ++token) {
-        const int64_t index = args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
-                                               *(const device int32_t *) (indices + token * args.nb10);
+    for (int64_t token = token_begin; token < token_end; ++token) {
+        const int64_t index = (args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
+                                                *(const device int32_t *) (indices + token * args.nb10)) % args.kv_size;
         const float value = *(const device float *) (src + i0 * args.nb00 + i1 * args.nb01 + token * args.nb02);
         *(device float *) (dst + i0 * args.nb0 + i1 * args.nb1 + token * args.nb2) =
             complete && (args.center_warmup || index >= effective_warmup) ? value - acc / effective_warmup : value;

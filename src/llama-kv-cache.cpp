@@ -49,8 +49,8 @@ llama_kv_cache::llama_kv_cache(
         turbo_k_mean_center = (int) mode;
     }
     if (turbo_k_mean_center) {
-        if (type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0 || !offload || n_stream != 1) {
-            throw std::invalid_argument("TURBO_K_MEAN_CENTER requires offloaded turbo4/turbo4 KV with one stream");
+        if (type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0 || !offload) {
+            throw std::invalid_argument("TURBO_K_MEAN_CENTER requires offloaded turbo4/turbo4 KV");
         }
         const char * turbo_k_mean_warmup_env = getenv("TURBO_K_MEAN_WARMUP");
         if (turbo_k_mean_warmup_env) {
@@ -182,7 +182,7 @@ llama_kv_cache::llama_kv_cache(
         v = ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa, kv_size, n_stream);
 
         if (turbo_k_mean_center && !boundary_bf16) {
-            k_mean = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd_k_gqa + 1);
+            k_mean = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_k_gqa + 1, n_stream);
             ggml_format_name(k_mean, "cache_k_mean_l%d", il);
         }
 
@@ -1087,12 +1087,15 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
     const int64_t n_tokens    = k_cur->ne[2];
+    const int64_t n_seq_tokens = n_tokens / sinfo.n_stream();
+
+    GGML_ASSERT(n_tokens % sinfo.n_stream() == 0);
 
     const int64_t n_embd_gqa = n_embd_head*n_head;
 
     if (layers[ikv].k_mean) {
         k_cur = ggml_turbo_k_mean_center(ctx, k_cur, k_idxs, layers[ikv].k_mean, turbo_k_mean_warmup,
-                                         turbo_k_mean_center == 2);
+                                         turbo_k_mean_center == 2, get_size(), n_seq_tokens);
     }
 
     // we can merge dims 0 and 1

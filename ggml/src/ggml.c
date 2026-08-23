@@ -5919,13 +5919,17 @@ struct ggml_tensor * ggml_turbo_k_mean_center(struct ggml_context * ctx,
                                               struct ggml_tensor *  indices,
                                               struct ggml_tensor *  sum,
                                               int                   warmup,
-                                              bool                  center_warmup) {
+                                              bool                  center_warmup,
+                                              int64_t               kv_size,
+                                              int64_t               n_seq_tokens) {
     GGML_ASSERT(k->type == GGML_TYPE_F32 && ggml_is_contiguous(k));
     GGML_ASSERT(indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64);
     GGML_ASSERT(sum->type == GGML_TYPE_F32 && ggml_is_contiguous(sum));
     GGML_ASSERT(k->ne[2] == ggml_nelements(indices) && k->ne[3] == 1);
-    GGML_ASSERT(k->ne[0] * k->ne[1] + 1 == ggml_nelements(sum));
+    GGML_ASSERT(k->ne[0] * k->ne[1] + 1 == sum->ne[0]);
     GGML_ASSERT(warmup > 0);
+    GGML_ASSERT(kv_size > 0 && n_seq_tokens > 0 && k->ne[2] % n_seq_tokens == 0);
+    GGML_ASSERT(k->ne[2] / n_seq_tokens <= sum->ne[1]);
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, k);
     result->op                  = GGML_OP_TURBO_K_MEAN_CENTER;
@@ -5934,6 +5938,8 @@ struct ggml_tensor * ggml_turbo_k_mean_center(struct ggml_context * ctx,
     result->src[2]              = sum;
     ggml_set_op_params_i32(result, 0, warmup);
     ggml_set_op_params_i32(result, 1, center_warmup ? 1 : 0);
+    ggml_set_op_params_i32(result, 2, (int32_t) kv_size);
+    ggml_set_op_params_i32(result, 3, (int32_t) n_seq_tokens);
 
     return result;
 }

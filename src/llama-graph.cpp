@@ -1716,7 +1716,8 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
     const bool turbo_k  = llm_is_turbo_kv_type(k->type);
     const bool turbo_v  = llm_is_turbo_kv_type(v->type);
     const bool turbo_kv = turbo_k || turbo_v;
-    const bool turbo4_fused = k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0 && q_cur->ne[2] == 1;
+    const bool turbo4_fused = k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0 &&
+                              q_cur->ne[2] >= 1 && q_cur->ne[2] <= 32;
 
     if (turbo_kv) {
         GGML_ASSERT(arch == LLM_ARCH_QWEN3);
