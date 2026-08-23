@@ -77,7 +77,7 @@ The Release Metal build ran the following nonzero test sets on the Apple M5 Max:
 | `TURBO_WHT`, forward/inverse and roundtrip, D128/256/512 | 27 | Pass |
 | `SET_ROWS_TURBO2/3/4`, I32/I64, small and large rows | 57 | Pass |
 | Row4-shaped `FLASH_ATTN_EXT`, decode and prefill | 32 | Pass |
-| `TURBO_K_MEAN_CENTER`, I32/I64 and short initial batch | 6 | Pass |
+| `TURBO_K_MEAN_CENTER`, I32/I64, one and four streams | 8 | Pass |
 
 The FA set uses D128, 32 Q heads, 8 KV heads and covers all 9 Turbo/Turbo pairs, both q8/Turbo directions for each Turbo type, and q4_0/Turbo4. No selected case printed `not supported`, `0/0`, or `FAIL`. FA uses the existing `5e-4` NMSE budget and SET_ROWS uses `0.05`.
 
@@ -158,6 +158,59 @@ The 64K prefill endpoint was also repeated three times with both cache types. BF
 
 Two additional scheduling changes were measured after the curve above. Routing a 512-cell prefill capacity through the one-time F16 dequantization path improved context-zero Turbo4 `pp512` from `3455.706` to `3696.281` token/s, a 6.96% gain. The contemporaneous BF16 measurement was `3932.389` token/s, so the remaining short-context gap was about 6.0%. Increasing the 64K fused-decode schedule from 64 to 128 partial workgroups reduced the D128 GQA4 attention microkernel from `556.07` to `524.68` microseconds per run. The first three-run full-model `tg128` measurement reached `32.152 +/- 0.386` token/s, 17.9% above the 64-workgroup Turbo4 point and 24.1% above the earlier BF16 64K point. The final rebuilt binary repeated at `31.886 +/- 0.165` token/s, within 0.83% of that result and still 23.1% above the earlier BF16 point. The 64K 128-workgroup path passed the CPU-reference Flash Attention check as a real 1/1 Metal case.
 
+## Continuous-batch decode optimization
+
+The first multi-slot server used the generic Turbo4 vector kernel whenever a decode graph contained more than one token. The D128 GQA4 fused kernel already indexed independent queries, but the host selector restricted it to one row.
+The continuous-batch path now fuses decode graphs with up to 32 total stream rows and combines:
+
+- one Turbo4 K/V dequantization for all four query heads in a GQA group;
+- Q forward WHT, attention, V inverse WHT, and BF16 output rounding;
+- complete 32-token mask-block rejection before K/V dequantization; and
+- the M8/M16 Row4 and W8A8 TensorOps paths described in
+  `ROW4_M5_METAL_TENSOROPS.md`.
+
+The fused attention kernel passed Metal comparison against the CPU reference for 1, 2, 8, and 16 query rows in one stream, plus 16 and 32 independent streams. The multi-row cases include blocks that are entirely masked for each query, so the early-rejection branch is exercised rather than only compiled.
+
+| Total KV cells | Generic Turbo4 FA | Fused GQA4 FA | Speedup |
+| ---: | ---: | ---: | ---: |
+| 8192 | 615.74 us | 408.82 us | 1.51x |
+| 32768 | 1557.51 us | 1087.35 us | 1.43x |
+| 65536 | 2714.25 us | 1979.06 us | 1.37x |
+
+At 256 KV cells the fused path is slightly slower, 116.12 us versus 106.08 us. This is expected: fixed rotation, staging, and reduction costs dominate before KV bandwidth is large enough to amortize them. A 16-slot, 128-token server smoke reached a stable 43.53 ms/decode step, or 367.6 generated token/s in aggregate. Full-server long-context results are measured only after the 64K evaluation finishes so one rollout set never mixes two binaries.
+
+The final multi-stream pass keeps the rotated FP16 query values in registers and broadcasts them with SIMD shuffle instead of copying four query heads through threadgroup memory. It then reuses one K/V staging tile: K is consumed before V overwrites the same storage. Dynamic threadgroup memory falls first from about 17 KiB to 16 KiB with register Q, then to 8 KiB with sequential K/V staging. The scheduler uses 32 partial workgroups below 32K and 64 from 32K onward. These measurements cover one query token in each of 16 independent streams, eight KV heads per stream, and the complete fused Q-WHT/attention/inverse-WHT chain:
+
+| KV cells per stream | Before register-Q pass | Register Q, 16 KiB | Shared K/V tile, 8 KiB | Total improvement |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 1.190 ms | 0.917 ms | 0.876 ms | 26.4% |
+| 32768 | 4.070 ms | 3.595 ms | 3.449 ms | 15.3% |
+| 65536 | 7.881 ms | 7.090 ms | 6.838 ms | 13.2% |
+
+The register path preserves the original FP16 rounding of Q before the dot products. Sequential staging does not change the QK, softmax, PV, inverse-WHT, or BF16 rounding order. All six dedicated fused cases pass against the CPU reference after the 8 KiB change, and the suite reports 14715/14715 cases rather than a skipped 0/0 result.
+
+A 32-slot server fits in memory but is not the fastest long-context configuration. Thirty active AIME requests reached about 393 generated token/s near 400 tokens and 358 token/s near 1.3K, but fell to about 119 token/s with 28 requests near 11.7K. The 16-slot run previously sustained about 176-192 token/s near the same length. The 32-slot evaluation was therefore stopped after two correct first-rollout answers and retained only as a rejected throughput experiment. The final 64K evaluation uses 16 slots.
+
+The roughly 3800 token/s `pp512` result is not a decode ceiling. Prefill reuses each loaded weight tile across hundreds of token rows and runs large cooperative matrices. Sixteen-way decode reuses it across only 16 rows, must complete one autoregressive step before the next, and at 64K reads one complete K/V history per stream on every layer. The fixed-token smoke and context-matched attention curves are therefore the relevant comparisons.
+
+The 36-layer model reads at least 2.49 GB of Turbo4 K/V per generated token and stream at 64K. Sixteen full 64K streams therefore require about 39.9 GB of KV reads per decode step. The measured 546.1 GB/s device read rate gives an ideal KV-only floor near 73 ms per step. Adding the measured 16-row short-context graph floor near 47 ms limits an idealized full-model result to roughly 133 aggregate token/s before Turbo4 unpack, QK/PV arithmetic, softmax, or dispatch cost. A sustained 200 aggregate token/s at 16 x 64K is therefore above the measured hardware roof for this model layout.
+
+The formal AIME telemetry records heterogeneous live requests rather than equal synthetic contexts. Instantaneous throughput was reconstructed from the change in `n_decoded` for the same task between adjacent five-second samples. The cumulative `/metrics` throughput gauge was not used as an instantaneous measurement.
+
+| Active streams | Median context per stream | Aggregate token/s | Decode step/s |
+| ---: | ---: | ---: | ---: |
+| 16 | 2291 | 302.4 | 18.90 |
+| 16 | 6819 | 205.8 | 12.86 |
+| 16 | 10955 | 160.0 | 10.01 |
+| 16 | 15059 | 130.2 | 8.14 |
+| 16 | 17661 | 114.6 | 7.17 |
+| 1 | 35777 | 39.17 | 39.17 |
+| 1 | 47082 | 34.06 | 34.06 |
+| 1 | 55296 | 31.02 | 31.02 |
+| 1 | 63370 | 28.55 | 28.55 |
+
+The active-stream count falls as problems finish, so aggregate throughput in the tail is not comparable to the 16-stream steady state. The 8 KiB staging optimization was implemented after this formal evaluation. Its microbenchmark and correctness results are reported above; the table in this section remains evidence from the exact evaluated binary.
+
 ## Fixed generation outputs
 
 The fixed 32-token greedy completions were:
@@ -219,7 +272,7 @@ Plain int4 K is better at 1K, close at 8K, and effectively tied in KL at 64K. Th
 
 ## K mean-centering experiment
 
-`TURBO_K_MEAN_CENTER` is default-off and supports two experimental modes for Turbo4/Turbo4 with one fully offloaded Metal stream:
+`TURBO_K_MEAN_CENTER` is default-off and supports two experimental modes for fully offloaded Turbo4/Turbo4 Metal streams. Each stream owns an independent warmup sum and completed mean:
 
 - Mode 1 leaves the warmup K vectors unchanged and subtracts their mean from later K vectors.
 - Mode 2 subtracts one completed warmup mean from every K vector in the initial prompt and from all later K vectors.
@@ -258,9 +311,9 @@ This is the best measured strategy. At 64K it reduces KL by 71.2% relative to un
 
 Server prompt-cache reuse is not supported by this mean-centering experiment. A reused partial prompt carries a K translation computed from the old prompt, while a new suffix changes the intended warmup mean. Evaluations and applications that enable mode 2 must send `"cache_prompt": false`; changing slot-selection similarity alone is not sufficient.
 
-## AIME 2026 rollout-3
+## Invalid 8K AIME pilot
 
-The best quality strategy was evaluated on all 30 problems from [MathArena/aime_2026](https://huggingface.co/datasets/MathArena/aime_2026). Each problem used an independent cache, temperature 0.6, top-p 0.95, top-k 20, a fixed per-problem/per-rollout seed, and an 8192-token generation limit. The evaluator stops a streaming request when it sees a complete numeric `boxed` answer; otherwise it uses the last integer at the length limit. A solved problem skips the remaining rollouts.
+This pilot used an 8192-token generation limit and is invalid for the requested 64K protocol. It is retained only to document why the run was rejected. Several replacement first rollouts require more than 8192 generated tokens.
 
 | Problem | Expected | Parsed answers by rollout | Result |
 | ---: | ---: | --- | --- |
@@ -295,7 +348,56 @@ The best quality strategy was evaluated on all 30 problems from [MathArena/aime_
 | 29 | 157 | 2, 2, 12 | Wrong |
 | 30 | 393 | 2, 0, 1 | Wrong |
 
-The cumulative result is 2/30 after rollout 1, 3/30 after rollout 2, and 4/30 after rollout 3, or 13.3% pass-at-up-to-3. Early stopping skipped five attempts, so 85 requests ran. Two correct answers were boxed and two used the last-integer fallback. Total request wall time was 9660.6 seconds. This is an end-to-end score for the quantized strategy, not a quantization delta; no BF16 AIME run was requested, so the score must not be attributed to TurboQuant alone.
+The discarded pilot produced 4/30 pass-at-up-to-3. It must not be reported as the 64K AIME result or used to attribute a quality change to TurboQuant.
+
+## AIME 2026 64K rollout-3
+
+The replacement evaluation gives every request an independent 65536-token context and a 65536-token generation limit, uses 16 concurrent slots, and keeps the best quality strategy:
+
+```text
+TURBO_K_MEAN_CENTER=2
+TURBO_K_MEAN_WARMUP=128
+TURBO_KV_BOUNDARY_BF16_LAYERS=2
+cache K/V = turbo4/turbo4
+```
+
+Sampling remains temperature 0.6, top-p 0.95, top-k 20, with fixed per-problem/per-rollout seeds. Each problem gets up to three sequential rollouts and stops after its first correct answer. `cache_prompt` is false.
+The run completed 59 attempts in about 8 hours 26 minutes. It solved 18/30 problems, or 60.0% pass-at-up-to-3. Fifteen problems were solved on rollout 1, one additional problem on rollout 2, and two additional problems on rollout 3. Fifty-two attempts stopped after a complete boxed numeric answer, five stopped normally without one, and two reached the generation length limit. The server reported 755694 generated tokens over the complete run.
+
+| Problem | Expected | Rollout answers | Result |
+| ---: | ---: | --- | --- |
+| 1 | 277 | 277 | Correct on 1 |
+| 2 | 62 | 62 | Correct on 1 |
+| 3 | 79 | 79 | Correct on 1 |
+| 4 | 70 | 70 | Correct on 1 |
+| 5 | 65 | 65 | Correct on 1 |
+| 6 | 441 | 441 | Correct on 1 |
+| 7 | 396 | 256, 1, 396 | Correct on 3 |
+| 8 | 244 | 244 | Correct on 1 |
+| 9 | 29 | 127, 133, 1 | Wrong |
+| 10 | 156 | 12, 42, 49 | Wrong |
+| 11 | 896 | 804, 584, 764 | Wrong |
+| 12 | 161 | 161 | Correct on 1 |
+| 13 | 39 | 1, 0, 500 | Wrong |
+| 14 | 681 | 101, 281, none | Wrong |
+| 15 | 83 | 1, 0, 14 | Wrong |
+| 16 | 178 | 178 | Correct on 1 |
+| 17 | 243 | 1, 5, 32 | Wrong |
+| 18 | 503 | 503 | Correct on 1 |
+| 19 | 279 | 279 | Correct on 1 |
+| 20 | 190 | 190 | Correct on 1 |
+| 21 | 50 | 50 | Correct on 1 |
+| 22 | 754 | 227, 754 | Correct on 2 |
+| 23 | 245 | 245 | Correct on 1 |
+| 24 | 669 | 669 | Correct on 1 |
+| 25 | 850 | 85, 170, 850 | Correct on 3 |
+| 26 | 132 | 12, 0, 79 | Wrong |
+| 27 | 223 | 1, 36, 2 | Wrong |
+| 28 | 107 | 12, none, 12 | Wrong |
+| 29 | 157 | 0, 12, 3 | Wrong |
+| 30 | 393 | 687, none, none | Wrong |
+
+The exact evaluated binary used the register-Q kernel with separate 16 KiB K/V staging. The later 8 KiB shared-tile optimization preserves the arithmetic order and passes the same CPU-reference tests, but the 8.4-hour AIME run was not repeated and no throughput from the earlier run is attributed to the later kernel.
 
 ## Known limits
 
@@ -306,7 +408,7 @@ The cumulative result is 2/30 after rollout 1, 3/30 after rollout 2, and 4/30 af
 - No TQ3/TQ4 weight formats and no changes to GGUF serialization.
 - No CUDA, HIP, Vulkan, or SYCL kernels.
 - No source-fork TurboFlash experiment, Sparse-V, profiling, generic layer-adaptive cache precision, InnerQ, or other source-repository environment knobs. The first/last BF16 option is the only mixed-layer policy.
-- Mean centering requires `cache_prompt=false` for server requests and does not support cache shifting, state save/restore, or partial-prompt reuse.
+- Mean centering keeps separate state for each KV stream, requires `cache_prompt=false` for server requests, and does not support cache shifting, state save/restore, or partial-prompt reuse.
 - Turbo cache dequantization is fused into Metal Flash Attention. The follow-up also includes a Turbo4-to-F16 copy path used by the configured-capacity prefill route.
 
 Raw commands, JSON, fixed generations, test logs, and perplexity logs are left untracked under `tmp/row4-turboquant-kv/`.

@@ -147,8 +147,7 @@ and complete M/N tiles. Schema v1 requires K divisible by 128. Pair2 schema v2
 requires K divisible by 256 and only selects the device-preexpanded route for B
 at least 512; its smaller batches stay on the layout-aware portable path because
 the online MPP staging kernels decode the schema v1 physical layout.
-Unsupported shapes use the existing portable Metal path. W8A8 is not routed
-through this selector.
+Unsupported shapes use the existing portable Metal path. The W8A8 output head uses separate M8N128 and M16N128 `INT8 x INT8 -> INT32` TensorOps kernels for continuous batches of 2-16 rows.
 
 Set this environment variable to make an explicit same-binary comparison:
 
@@ -166,6 +165,8 @@ The measured selector is:
 | divisible by 128 | `O % 32 == 0` | M128N32 | 4 | 128 |
 | divisible by 64 | `O % 64 == 0` | M64N64 | 4 | 128 |
 | divisible by 32 | `O % 128 == 0` | M32N128 | 4 | 128 |
+| 9-16 decode rows | `O % 64 == 0` | M16N64 | 4 | 128 |
+| 2-8 decode rows, or complete M8 groups above 16 | `O % 128 == 0` | M8N128 | 4 | 128 |
 
 For B at least 512 and divisible by 32, `O % 128 == 0` selects layout-specific
 device pre-expansion plus direct M32N128 TensorOps before this online-staging
@@ -180,7 +181,7 @@ sweeps. The pre-expanded path additionally swept all 32 combinations of
 TM={32,64,128,256}, TN={32,64,128,256}, and SG={4,8}; M32N128/SG4 was the
 common winner. Every route is covered by opt-in markers and bit-exact tests.
 
-## Why decode stays on the Row4 codebook kernel
+## Single-stream and continuous-batch decode
 
 MPP cooperative TensorOps require M to be a legal multiple of at least 8 for
 this integer combination. M1, M2, and M4 are rejected at compile time; the
@@ -203,7 +204,7 @@ minimum decode stream is about 4.099 GB/token instead of 1.495 GB/token. With a
 measured sustained read roof of 546.1 GB/s, its memory-only upper bound is about
 133 tok/s. It is therefore not a sound default for decode.
 
-The compressed-code decode sweep selected
+Single-stream decode stays on the compressed-code kernel. The sweep selected
 `kernel_row4_w1a8_decode_o16_o4_staged_act`: four SIMDgroups/128 threads cover
 one O16 tile while preserving the branchless basis/I32/BF16 implementation.
 The K loop statically interleaves four BK128 blocks into four independent I32
@@ -213,7 +214,7 @@ independent weight reads and dependency chains to overlap. Across the four
 real projections the final implementation lowers summed operator latency by
 6.43% versus O32. Full-model tg128 reaches 104.458 tok/s, 3.17% above the
 previous O16 path and 7.03% above the initial M4-tuned path.
-W8A8 output continues through the INT32 O128 kernel.
+Single-stream W8A8 output continues through the INT32 O128 kernel.
 
 The tempting load-overlap alternatives were measured and rejected. Software
 prefetch distances 2/4/8 increased summed kernel latency by about 5-6%; staging
@@ -230,19 +231,16 @@ bit-exact but slowed the four decode shapes by about 0.97-7.91%; the scalar
 texture-read/coordinate overhead outweighed any compression benefit, so model
 weights remain ordinary buffers.
 
-For continuous batching the conclusion changes. A bit-exact padded M8
-TensorOps prototype is not competitive for one or two rows, but at eight real
-independent rows the four main Row4 projections take about 551 us versus 1278
-us for eight separate native rows. A future multi-sequence selector should use
-TensorOps in complete eight-row groups while preserving the compressed native
-path for single-stream latency.
+For continuous batching the conclusion changes. The production selector uses M8N128 for 2-8 rows and M16N64/SG4 for 9-16 rows. Missing rows are quantized as zero and padded only in backend scratch; the epilogue does not write them to the graph tensor. A seven-candidate M16 tile sweep selected M16N64/SG4. Across qkv, attention output, gate/up, and down it takes about 774 us per layer, versus 989 us for M16N128/SG4, a 21.7% reduction.
+
+The W8A8 output head has matching M8N128 and M16N128 integer TensorOps paths. For O151936/K4096, M8 falls from 13.91 ms on the portable kernel to 2.87 ms, and M16 falls from 3.84 ms to 2.70 ms. All paths keep the original I32 scale and BF16-RNE epilogue. On the 16-slot Turbo4 server, the final M16 kernels sustain about 21.4 decode steps/s, or 342.6 generated token/s in aggregate. The same binary sustains about 21.0 steps/s for 14 real rows padded to M16.
 
 ## Correctness evidence
 
 `tests/test-row4.cpp` uses bit comparisons, not floating-point tolerances. The
 final test matrix covers:
 
-- B = 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, and 512;
+- B = 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 256, and 512;
 - all four schema v1 online M5 tiles plus both layout-specific pre-expanded
   paths, with a required Pair2 B512 `device-preexpand` marker;
 - real qkv O6144/K4096, output O4096/K4096, gate/up O24576/K4096, and down
@@ -368,8 +366,7 @@ evidence and are not model or repository assets.
 
 ## Current limitations
 
-- Only complete Row4 prefill tiles use MPP. Decode uses the tuned compressed O16
-  kernel; small batches and W8A8 retain their integer kernels.
+- Single-stream decode uses the tuned compressed O16 Row4 kernel and O128 W8A8 kernel. Continuous batches of 2-16 rows use padded M8/M16 TensorOps kernels.
 - The portable precompiled metallib does not contain MSL 4 TensorOps kernels;
   runtime source compilation is required.
 - Online staging is fixed at 16 KiB. BK256 would consume the full 32 KiB
