@@ -199,14 +199,29 @@ With mean centering at 128 tokens and two protected layers at each boundary, ful
 
 When requests complete, a 16-slot server produces decode batches with fewer than 16 active rows. The old selector routed 2-8 rows to M8 Row4 and W8 TensorOps kernels, then switched to M16 at 9 rows. Real model-shape microbenchmarks showed that M16 was faster despite computing padded zero rows: at two rows, QKV fell from about 164 to 107 microseconds, attention/output from 145 to 103 microseconds, and FFN down from 421 to 297 microseconds. Only FFN gate/up was slightly slower, about 251 versus 240 microseconds.
 
-The final selector uses the M16 Row4 and W8 TensorOps kernels for every batch from 2 through 16 rows. Activation quantization pads missing rows with zeros and output stores remain bounded by the real row count. A 16-slot server with short identical prompts and 256 generated tokens per request measured:
+M16 improved the original selector but still did complete matrix products for 14 unused rows at batch 2 and 12 unused rows at batch 4. The final path extends the optimized one-row Row4 and W8 kernels with a token grid dimension. Batches 2-4 now launch only real rows. Each Row4 threadgroup stages one row of quantized activation, and each W8 threadgroup uses the matching row activation and scale. The largest batch-4 gate/up matrix remains on M16 because its measured 250.98 microseconds is faster than 279.88 microseconds with four independent rows. Batches 5-16 also remain on M16.
 
-| Active streams | Old M8/M16 selector | M16 for 2-16 | Change |
+The real-shape microbenchmarks show the removed work directly:
+
+| Operator | M16 batch 2 | Effective rows batch 2 | M16 batch 4 | Final hybrid batch 4 |
+| --- | ---: | ---: | ---: | ---: |
+| Row4 QKV, O6144 K4096 | 106.70 us | 44.43 us | 106.70 us | 78.06 us |
+| Row4 attention/output, O4096 K4096 | 102.55 us | 32.49 us | 102.55 us | 55.19 us |
+| Row4 gate/up, O24576 K4096 | 250.83 us | 145.16 us | 250.83 us | 250.98 us |
+| Row4 down, O4096 K12288 | 296.88 us | 80.98 us | 296.88 us | 144.61 us |
+| W8 lm_head, O151936 K4096 | 2789.87 us | 1141.12 us | 2789.01 us | 1795.93 us |
+
+A 16-slot server with 65536 tokens of capacity per slot, short prompts, and 256 generated tokens per request measured wall-clock aggregate throughput. The prompt and request overhead are included in every point:
+
+| Active streams | Padded M16 | Effective-row hybrid | Change |
 | ---: | ---: | ---: | ---: |
-| 2 | 36.20 token/s | 49.31 token/s | +36.22% |
-| 4 | 71.86 token/s | 96.91 token/s | +34.86% |
-| 8 | 139.62 token/s | 192.54 token/s | +37.90% |
-| 16 | 357.54 token/s | 358.10 token/s | +0.16% |
+| 1 | not measured | 87.62 token/s | - |
+| 2 | 49.31 token/s | 132.02 token/s | +167.7% |
+| 4 | 96.91 token/s | 159.22 token/s | +64.3% |
+| 8 | 192.54 token/s | 193.67 token/s | +0.6% |
+| 16 | 358.10 token/s | 369.09 token/s | +3.1% |
+
+The aggregate curve is now monotonic at the problematic tail: batch 2 exceeds batch 1 by 50.7%, and batch 4 exceeds batch 2 by 20.6%. A context-matched 64K check measured 31.22 token/s for one active stream. Once both independent 64K prompts were filled, two streams generated 64 tokens in about 0.922 seconds of shared decode, or about 69.4 token/s aggregate. The server processed the two long prefills mostly one slot at a time, so prefill wall time is not included in these decode rates.
 
 The correctness sweep includes real Row4 QKV, attention/output, gate/up, and down shapes at 2, 4, and 8 rows, plus the complete 151936-output W8 lm_head at the same tail sizes. It reports 14776/14776 Metal cases with no skipped or unsupported selected case.
 

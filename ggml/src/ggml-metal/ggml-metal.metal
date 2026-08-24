@@ -2220,11 +2220,15 @@ kernel void kernel_row4_w1a8_decode_o16_o4_staged_act(
     constexpr int code_tile_bytes     = 256;
     constexpr int copy_bytes          = 32;
     constexpr int threads_per_tg      = 128;
+    const ulong token                 = (ulong) tgpig.y;
+    device const char * act_row        = act_q + token * (ulong) args.k;
+    device float * dst_row             = dst + token * (ulong) args.m;
 
     for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
          byte_offset += threads_per_tg * copy_bytes) {
-        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
-        *((threadgroup uint4 *) (act_tg + byte_offset + 16)) = *((device const uint4 *) (act_q + byte_offset + 16));
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_row + byte_offset));
+        *((threadgroup uint4 *) (act_tg + byte_offset + 16)) =
+            *((device const uint4 *) (act_row + byte_offset + 16));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2287,11 +2291,11 @@ kernel void kernel_row4_w1a8_decode_o16_o4_staged_act(
     const int sum_v_imag = simd_sum(merged_v_imag);
     if (simd_lane == 0U) {
         const int output = output_tile * groups_per_tile * rows_per_group + output_group_in_tile * rows_per_group;
-        const float sx = act_scales[0];
-        dst[output + 0] = row4_finish_i32(sum_u_real + sum_v_real, sx, scales[output + 0]);
-        dst[output + 1] = row4_finish_i32(-sum_u_imag + sum_v_imag, sx, scales[output + 1]);
-        dst[output + 2] = row4_finish_i32(sum_u_imag + sum_v_imag, sx, scales[output + 2]);
-        dst[output + 3] = row4_finish_i32(sum_u_real - sum_v_real, sx, scales[output + 3]);
+        const float sx = act_scales[token];
+        dst_row[output + 0] = row4_finish_i32(sum_u_real + sum_v_real, sx, scales[output + 0]);
+        dst_row[output + 1] = row4_finish_i32(-sum_u_imag + sum_v_imag, sx, scales[output + 1]);
+        dst_row[output + 2] = row4_finish_i32(sum_u_imag + sum_v_imag, sx, scales[output + 2]);
+        dst_row[output + 3] = row4_finish_i32(sum_u_real - sum_v_real, sx, scales[output + 3]);
     }
 }
 
@@ -2754,12 +2758,15 @@ kernel void kernel_row8_w8a8_decode_o128_rows16(
     constexpr int rows_per_tile       = 16;
     constexpr int k_tile              = 128;
     constexpr int code_tile_bytes     = rows_per_tile * k_tile;
+    const ulong token                 = (ulong) tgpig.y;
+    device const char * act_row        = act_q + token * (ulong) args.k;
+    device float * dst_row             = dst + token * (ulong) args.m;
 
     const int output_tile = (int) tgpig.x * output_tiles_per_tg + (int) output_group;
     const int k_tiles     = args.k / k_tile;
     device const char * weight_ptr = codes +
         (ulong) output_tile * (ulong) k_tiles * (ulong) code_tile_bytes + (ulong) simd_lane * 4UL;
-    device const char * act_ptr = act_q + simd_lane * 4U;
+    device const char * act_ptr = act_row + simd_lane * 4U;
 
     int acc0  = 0;
     int acc1  = 0;
@@ -2817,23 +2824,23 @@ kernel void kernel_row8_w8a8_decode_o128_rows16(
     acc15 = simd_sum(acc15);
     if (simd_lane == 0U) {
         const int output = output_tile * rows_per_tile;
-        const float sx = act_scales[0];
-        dst[output +  0] = w8a8_finish_i32(acc0,  sx, scales[output +  0]);
-        dst[output +  1] = w8a8_finish_i32(acc1,  sx, scales[output +  1]);
-        dst[output +  2] = w8a8_finish_i32(acc2,  sx, scales[output +  2]);
-        dst[output +  3] = w8a8_finish_i32(acc3,  sx, scales[output +  3]);
-        dst[output +  4] = w8a8_finish_i32(acc4,  sx, scales[output +  4]);
-        dst[output +  5] = w8a8_finish_i32(acc5,  sx, scales[output +  5]);
-        dst[output +  6] = w8a8_finish_i32(acc6,  sx, scales[output +  6]);
-        dst[output +  7] = w8a8_finish_i32(acc7,  sx, scales[output +  7]);
-        dst[output +  8] = w8a8_finish_i32(acc8,  sx, scales[output +  8]);
-        dst[output +  9] = w8a8_finish_i32(acc9,  sx, scales[output +  9]);
-        dst[output + 10] = w8a8_finish_i32(acc10, sx, scales[output + 10]);
-        dst[output + 11] = w8a8_finish_i32(acc11, sx, scales[output + 11]);
-        dst[output + 12] = w8a8_finish_i32(acc12, sx, scales[output + 12]);
-        dst[output + 13] = w8a8_finish_i32(acc13, sx, scales[output + 13]);
-        dst[output + 14] = w8a8_finish_i32(acc14, sx, scales[output + 14]);
-        dst[output + 15] = w8a8_finish_i32(acc15, sx, scales[output + 15]);
+        const float sx = act_scales[token];
+        dst_row[output +  0] = w8a8_finish_i32(acc0,  sx, scales[output +  0]);
+        dst_row[output +  1] = w8a8_finish_i32(acc1,  sx, scales[output +  1]);
+        dst_row[output +  2] = w8a8_finish_i32(acc2,  sx, scales[output +  2]);
+        dst_row[output +  3] = w8a8_finish_i32(acc3,  sx, scales[output +  3]);
+        dst_row[output +  4] = w8a8_finish_i32(acc4,  sx, scales[output +  4]);
+        dst_row[output +  5] = w8a8_finish_i32(acc5,  sx, scales[output +  5]);
+        dst_row[output +  6] = w8a8_finish_i32(acc6,  sx, scales[output +  6]);
+        dst_row[output +  7] = w8a8_finish_i32(acc7,  sx, scales[output +  7]);
+        dst_row[output +  8] = w8a8_finish_i32(acc8,  sx, scales[output +  8]);
+        dst_row[output +  9] = w8a8_finish_i32(acc9,  sx, scales[output +  9]);
+        dst_row[output + 10] = w8a8_finish_i32(acc10, sx, scales[output + 10]);
+        dst_row[output + 11] = w8a8_finish_i32(acc11, sx, scales[output + 11]);
+        dst_row[output + 12] = w8a8_finish_i32(acc12, sx, scales[output + 12]);
+        dst_row[output + 13] = w8a8_finish_i32(acc13, sx, scales[output + 13]);
+        dst_row[output + 14] = w8a8_finish_i32(acc14, sx, scales[output + 14]);
+        dst_row[output + 15] = w8a8_finish_i32(acc15, sx, scales[output + 15]);
     }
 }
 

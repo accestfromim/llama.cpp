@@ -2384,11 +2384,18 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const int32_t                             m                 = ggml_get_op_params_i32(op, 1);
     const int32_t                             layout            = ggml_get_op_params_i32(op, 0);
     const int32_t                             act_rows          = (int32_t) ggml_nrows(x);
-    const ggml_metal_row4_m5_tensorops_config row4_m5_tensorops = ggml_metal_row4_m5_tensorops_select(
-        op->op == GGML_OP_ROW4_LINEAR && ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops,
-        qat_residual_add != nullptr, layout, act_rows, m, k);
+    const uint64_t                            row4_problem_size = (uint64_t) m * (uint64_t) k;
+    const bool row4_independent_rows = op->op == GGML_OP_ROW4_LINEAR && layout == 1 && act_rows >= 2 && act_rows <= 4 &&
+                                       m % 16 == 0 && (k == 4096 || k == 12288) &&
+                                       (act_rows < 4 || row4_problem_size <= 64U * 1024U * 1024U);
+    const bool w8_independent_rows =
+        op->op == GGML_OP_W8A8_LINEAR && act_rows >= 2 && act_rows <= 4 && m % 128 == 0 && k % 128 == 0;
+    const ggml_metal_row4_m5_tensorops_config row4_m5_tensorops =
+        ggml_metal_row4_m5_tensorops_select(op->op == GGML_OP_ROW4_LINEAR && !row4_independent_rows &&
+                                                ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops,
+                                            qat_residual_add != nullptr, layout, act_rows, m, k);
     const bool row4_m5_tensorops_prefill = row4_m5_tensorops.pipeline_name != nullptr;
-    const bool w8_m5_tensorops_m16       = op->op == GGML_OP_W8A8_LINEAR &&
+    const bool w8_m5_tensorops_m16       = op->op == GGML_OP_W8A8_LINEAR && !w8_independent_rows &&
                                      ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops && act_rows >= 2 &&
                                      act_rows <= 16 && m % 128 == 0 && k % 128 == 0;
     const int32_t staged_rows =
@@ -2491,13 +2498,14 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     GGML_ASSERT(!pair2_decode || k % 256 == 0);
     GGML_ASSERT(pair2_decode_tgmem_ok);
     const char * suffix = path == PATH_DECODE ? "decode" : path == PATH_SMALL_BATCH ? "small_batch" : "prefill";
-    const bool   row4_decode_o16_o4_staged_act = row4 && !row4_v2 && path == PATH_DECODE && (k == 4096 || k == 12288);
+    const bool   row4_decode_o16_o4_staged_act =
+        row4 && !row4_v2 && (path == PATH_DECODE || row4_independent_rows) && (k == 4096 || k == 12288);
     // The O16 v1 kernel statically interleaves four BK128 blocks so their
     // device loads overlap independent I32 accumulator chains. Pair2 keeps
     // master's LUT16 O32 decode path.
     GGML_ASSERT(!row4_decode_o16_o4_staged_act || k % (4 * 128) == 0);
     const bool row4_decode_o32_segmented16 = row4 && !row4_v2 && path == PATH_DECODE && !row4_decode_o16_o4_staged_act;
-    const bool w8_decode_o128_rows16       = !row4 && path == PATH_DECODE && m % 128 == 0;
+    const bool w8_decode_o128_rows16       = !row4 && (path == PATH_DECODE || w8_independent_rows) && m % 128 == 0;
     const bool w8_decode_o64_rows8         = !row4 && path == PATH_DECODE && !w8_decode_o128_rows16;
     const bool row4_prefill_m64n32_native_layout_dualw_direct_act = row4_direct_act;
     const bool row4_prefill_m64n32_native_layout_dualw =
@@ -2705,7 +2713,8 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         GGML_ASSERT(stage_bytes <= props_dev->max_theadgroup_memory_size &&
                     scratch_bytes <= props_dev->max_theadgroup_memory_size - stage_bytes);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, stage_bytes, 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, m / rows_per_tg, 1, 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, m / rows_per_tg, row4_independent_rows ? act_rows : 1, 1, nth, 1,
+                                                 1);
     } else if (row4_decode_o32_segmented16) {
         // Four SIMD-groups cover two canonical O16 tiles.  Each SIMD-group
         // uses two sixteen-lane halves to independently reduce two O4s.
@@ -2719,7 +2728,8 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         constexpr int rows_per_tg = 128;
         constexpr int nth         = 8 * 32;
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-        ggml_metal_encoder_dispatch_threadgroups(enc, m / rows_per_tg, 1, 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, m / rows_per_tg, w8_independent_rows ? act_rows : 1, 1, nth, 1,
+                                                 1);
     } else if (w8_decode_o64_rows8) {
         // Eight SIMD-groups cover four O16 tiles; each group reuses one
         // activation char4 across eight contiguous output rows.
