@@ -208,6 +208,23 @@ GGML_API size_t quantize_turbo4_0(const float * GGML_RESTRICT src,
                                   int64_t                     n_per_row,
                                   const float *               imatrix);
 
+#define DECLARE_TURBO2M4_CODEC(suffix, block_type)                                                                    \
+    GGML_API void   quantize_row_turbo2m4_##suffix##_ref(const float * GGML_RESTRICT x, block_type * GGML_RESTRICT y, \
+                                                         int64_t k);                                                  \
+    GGML_API void   dequantize_row_turbo2m4_##suffix(const block_type * GGML_RESTRICT x, float * GGML_RESTRICT y,     \
+                                                     int64_t k);                                                      \
+    GGML_API size_t quantize_turbo2m4_##suffix(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,             \
+                                               int64_t nrows, int64_t n_per_row, const float * imatrix)
+
+DECLARE_TURBO2M4_CODEC(s4, block_turbo2m4_s4);
+DECLARE_TURBO2M4_CODEC(s8, block_turbo2m4_s8);
+DECLARE_TURBO2M4_CODEC(s16, block_turbo2m4_s16);
+DECLARE_TURBO2M4_CODEC(g4, block_turbo2m4_g4);
+DECLARE_TURBO2M4_CODEC(g8, block_turbo2m4_g8);
+DECLARE_TURBO2M4_CODEC(g16, block_turbo2m4_g16);
+
+#undef DECLARE_TURBO2M4_CODEC
+
 GGML_API void iq2xs_init_impl(enum ggml_type type);
 GGML_API void iq2xs_free_impl(enum ggml_type type);
 GGML_API void iq3xs_init_impl(int grid_size);

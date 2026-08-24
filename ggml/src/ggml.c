@@ -1031,6 +1031,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
     },
+#define TURBO2M4_TYPE_TRAITS(type, name, block_type, suffix)                        \
+    [type] = {                                                                      \
+        .type_name      = name,                                                     \
+        .blck_size      = QK_TURBO2M4,                                              \
+        .type_size      = sizeof(block_type),                                       \
+        .is_quantized   = true,                                                     \
+        .to_float       = (ggml_to_float_t) dequantize_row_turbo2m4_##suffix,       \
+        .from_float_ref = (ggml_from_float_t) quantize_row_turbo2m4_##suffix##_ref, \
+    }
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S4, "turbo2m4_s4", block_turbo2m4_s4, s4),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S8, "turbo2m4_s8", block_turbo2m4_s8, s8),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S16, "turbo2m4_s16", block_turbo2m4_s16, s16),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G4, "turbo2m4_g4", block_turbo2m4_g4, g4),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G8, "turbo2m4_g8", block_turbo2m4_g8, g8),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G16, "turbo2m4_g16", block_turbo2m4_g16, g16),
+#undef TURBO2M4_TYPE_TRAITS
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -8071,6 +8087,24 @@ size_t ggml_quantize_chunk(
             break;
         case GGML_TYPE_TURBO4_0:
             result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_S4:
+            result = quantize_turbo2m4_s4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_S8:
+            result = quantize_turbo2m4_s8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_S16:
+            result = quantize_turbo2m4_s16(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_G4:
+            result = quantize_turbo2m4_g4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_G8:
+            result = quantize_turbo2m4_g8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_G16:
+            result = quantize_turbo2m4_g16(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
             break;
         case GGML_TYPE_F16:
             {

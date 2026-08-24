@@ -304,6 +304,45 @@ typedef struct {
 
 static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
 
+#        define QK_TURBO2M4 128
+
+#        pragma pack(push, 1)
+
+#        define DECLARE_BLOCK_TURBO2M4_SCALAR(name, n) \
+            typedef struct {                           \
+                ggml_half norm;                        \
+                uint8_t   qs[QK_TURBO2M4 / 4];         \
+                uint8_t   positions[n];                \
+                uint8_t   qh[n / 2];                   \
+            } name
+
+#        define DECLARE_BLOCK_TURBO2M4_GROUP(name, n_groups) \
+            typedef struct {                                 \
+                ggml_half norm;                              \
+                uint8_t   qs[QK_TURBO2M4 / 4];               \
+                uint8_t   positions[n_groups];               \
+                uint8_t   qh[2 * n_groups];                  \
+            } name
+
+DECLARE_BLOCK_TURBO2M4_SCALAR(block_turbo2m4_s4, 4);
+DECLARE_BLOCK_TURBO2M4_SCALAR(block_turbo2m4_s8, 8);
+DECLARE_BLOCK_TURBO2M4_SCALAR(block_turbo2m4_s16, 16);
+DECLARE_BLOCK_TURBO2M4_GROUP(block_turbo2m4_g4, 1);
+DECLARE_BLOCK_TURBO2M4_GROUP(block_turbo2m4_g8, 2);
+DECLARE_BLOCK_TURBO2M4_GROUP(block_turbo2m4_g16, 4);
+
+#        pragma pack(pop)
+
+static_assert(sizeof(block_turbo2m4_s4) == 40, "wrong turbo2m4_s4 block size");
+static_assert(sizeof(block_turbo2m4_s8) == 46, "wrong turbo2m4_s8 block size");
+static_assert(sizeof(block_turbo2m4_s16) == 58, "wrong turbo2m4_s16 block size");
+static_assert(sizeof(block_turbo2m4_g4) == 37, "wrong turbo2m4_g4 block size");
+static_assert(sizeof(block_turbo2m4_g8) == 40, "wrong turbo2m4_g8 block size");
+static_assert(sizeof(block_turbo2m4_g16) == 46, "wrong turbo2m4_g16 block size");
+
+#        undef DECLARE_BLOCK_TURBO2M4_SCALAR
+#        undef DECLARE_BLOCK_TURBO2M4_GROUP
+
 // ifairy_model
 // 每个块处理 QK_IFAIRY 个 2-bit 值
 // 每个复数用一个 2-bit 值表示（离散化到 4 个复数值）

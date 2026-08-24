@@ -38,6 +38,10 @@ static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.13
 static const float CENTROIDS_3BIT[8] = { -0.190207f, -0.118786f, -0.066822f, -0.021663f,
                                          0.021663f,  0.066822f,  0.118786f,  0.190207f };
 
+static const float CENTROIDS_4BIT[16] = { -0.241529f, -0.182877f, -0.143016f, -0.111036f, -0.083292f, -0.058050f,
+                                          -0.034299f, -0.011349f, 0.011349f,  0.034299f,  0.058050f,  0.083292f,
+                                          0.111036f,  0.143016f,  0.182877f,  0.241529f };
+
 /* ---------- nearest centroid ---------- */
 
 static int nearest_centroid_2bit(float val) {
@@ -437,11 +441,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         turbo_cpu_fwht_forward(rotated, d);
 
         /* Step 3: 4-bit quantization (16 centroids) */
-        static const float CENTROIDS_4BIT[16] = { -0.241529f, -0.182877f, -0.143016f, -0.111036f,
-                                                  -0.083292f, -0.058050f, -0.034299f, -0.011349f,
-                                                  0.011349f,  0.034299f,  0.058050f,  0.083292f,
-                                                  0.111036f,  0.143016f,  0.182877f,  0.241529f };
-        uint8_t            indices[TURBO_D];
+        uint8_t indices[TURBO_D];
         for (int i = 0; i < d; i++) {
             indices[i] = (uint8_t) nearest_centroid_4bit(rotated[i]);
         }
@@ -471,9 +471,6 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
     const int d  = QK_TURBO4;
 
     /* 4-bit PolarQuant: nibble unpack, centroid lookup and scale. */
-    static const float CENTROIDS_4BIT[16] = { -0.241529f, -0.182877f, -0.143016f, -0.111036f, -0.083292f, -0.058050f,
-                                              -0.034299f, -0.011349f, 0.011349f,  0.034299f,  0.058050f,  0.083292f,
-                                              0.111036f,  0.143016f,  0.182877f,  0.241529f };
     for (int block = 0; block < nb; block++) {
         float   norm = GGML_FP16_TO_FP32(x[block].norm);
         float * dst  = y + block * d;
@@ -499,3 +496,194 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src,
     }
     return nrows * row_size;
 }
+
+static void turbo2m4_sort_positions(uint8_t * positions, int n) {
+    for (int i = 1; i < n; ++i) {
+        const uint8_t value = positions[i];
+        int           j     = i;
+        while (j > 0 && positions[j - 1] > value) {
+            positions[j] = positions[j - 1];
+            --j;
+        }
+        positions[j] = value;
+    }
+}
+
+static void turbo2m4_select_scalar(const float * x, uint8_t * positions, int n) {
+    uint8_t selected[QK_TURBO2M4] = { 0 };
+    for (int rank = 0; rank < n; ++rank) {
+        int   best       = -1;
+        float best_score = -1.0f;
+        for (int i = 0; i < QK_TURBO2M4; ++i) {
+            const float score = fabsf(x[i]);
+            if (!selected[i] && score > best_score) {
+                best       = i;
+                best_score = score;
+            }
+        }
+        assert(best >= 0);
+        selected[best]  = 1;
+        positions[rank] = (uint8_t) best;
+    }
+    turbo2m4_sort_positions(positions, n);
+}
+
+static void turbo2m4_select_group(const float * x, uint8_t * positions, int n_groups) {
+    uint8_t selected[QK_TURBO2M4 / 4] = { 0 };
+    for (int rank = 0; rank < n_groups; ++rank) {
+        int   best       = -1;
+        float best_score = -1.0f;
+        for (int group = 0; group < QK_TURBO2M4 / 4; ++group) {
+            float score = 0.0f;
+            for (int lane = 0; lane < 4; ++lane) {
+                score = fmaxf(score, fabsf(x[4 * group + lane]));
+            }
+            if (!selected[group] && score > best_score) {
+                best       = group;
+                best_score = score;
+            }
+        }
+        assert(best >= 0);
+        selected[best]  = 1;
+        positions[rank] = (uint8_t) best;
+    }
+    turbo2m4_sort_positions(positions, n_groups);
+}
+
+static void quantize_row_turbo2m4_ref_impl(const float * GGML_RESTRICT x,
+                                           void * GGML_RESTRICT        vy,
+                                           int64_t                     k,
+                                           int                         n,
+                                           int                         group,
+                                           size_t                      block_size) {
+    assert(k % QK_TURBO2M4 == 0);
+    const int nblocks = (int) (k / QK_TURBO2M4);
+
+    for (int block = 0; block < nblocks; ++block) {
+        const float * src         = x + block * QK_TURBO2M4;
+        uint8_t *     dst         = (uint8_t *) vy + block * block_size;
+        uint8_t *     qs          = dst + sizeof(ggml_half);
+        uint8_t *     positions   = qs + QK_TURBO2M4 / 4;
+        const int     n_positions = group ? n / 4 : n;
+        uint8_t *     qh          = positions + n_positions;
+        float         rotated[QK_TURBO2M4];
+        float         norm_sq = 0.0f;
+
+        for (int i = 0; i < QK_TURBO2M4; ++i) {
+            rotated[i] = src[i];
+            norm_sq += src[i] * src[i];
+        }
+        const float norm     = sqrtf(norm_sq);
+        const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+        for (int i = 0; i < QK_TURBO2M4; ++i) {
+            rotated[i] *= inv_norm;
+        }
+        turbo_cpu_fwht_forward(rotated, QK_TURBO2M4);
+
+        memset(qs, 0, QK_TURBO2M4 / 4);
+        memset(qh, 0, (size_t) n / 2);
+        float recon_sq = 0.0f;
+        for (int i = 0; i < QK_TURBO2M4; ++i) {
+            const int q = nearest_centroid_2bit(rotated[i]);
+            qs[i / 4] |= (uint8_t) (q << (2 * (i % 4)));
+            recon_sq += CENTROIDS_2BIT[q] * CENTROIDS_2BIT[q];
+        }
+
+        if (group) {
+            turbo2m4_select_group(rotated, positions, n_positions);
+            for (int slot = 0; slot < n_positions; ++slot) {
+                const int base = 4 * positions[slot];
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int i  = base + lane;
+                    const int q2 = (qs[i / 4] >> (2 * (i % 4))) & 0x3;
+                    const int q4 = nearest_centroid_4bit(rotated[i]);
+                    recon_sq += CENTROIDS_4BIT[q4] * CENTROIDS_4BIT[q4] - CENTROIDS_2BIT[q2] * CENTROIDS_2BIT[q2];
+                    qh[2 * slot + lane / 2] |= (uint8_t) (q4 << (4 * (lane % 2)));
+                }
+            }
+        } else {
+            turbo2m4_select_scalar(rotated, positions, n);
+            for (int slot = 0; slot < n; ++slot) {
+                const int i  = positions[slot];
+                const int q2 = (qs[i / 4] >> (2 * (i % 4))) & 0x3;
+                const int q4 = nearest_centroid_4bit(rotated[i]);
+                recon_sq += CENTROIDS_4BIT[q4] * CENTROIDS_4BIT[q4] - CENTROIDS_2BIT[q2] * CENTROIDS_2BIT[q2];
+                qh[slot / 2] |= (uint8_t) (q4 << (4 * (slot % 2)));
+            }
+        }
+
+        const float     recon_norm = sqrtf(recon_sq);
+        const ggml_half d          = GGML_FP32_TO_FP16(recon_norm > 1e-10f ? norm / recon_norm : norm);
+        memcpy(dst, &d, sizeof(d));
+    }
+}
+
+static void dequantize_row_turbo2m4_impl(const void * GGML_RESTRICT vx,
+                                         float * GGML_RESTRICT      y,
+                                         int64_t                    k,
+                                         int                        n,
+                                         int                        group,
+                                         size_t                     block_size) {
+    assert(k % QK_TURBO2M4 == 0);
+    const int nblocks = (int) (k / QK_TURBO2M4);
+
+    for (int block = 0; block < nblocks; ++block) {
+        const uint8_t * src = (const uint8_t *) vx + block * block_size;
+        ggml_half       d;
+        memcpy(&d, src, sizeof(d));
+        const float     norm        = GGML_FP16_TO_FP32(d);
+        const uint8_t * qs          = src + sizeof(ggml_half);
+        const uint8_t * positions   = qs + QK_TURBO2M4 / 4;
+        const int       n_positions = group ? n / 4 : n;
+        const uint8_t * qh          = positions + n_positions;
+        float *         dst         = y + block * QK_TURBO2M4;
+
+        for (int i = 0; i < QK_TURBO2M4; ++i) {
+            const int q = (qs[i / 4] >> (2 * (i % 4))) & 0x3;
+            dst[i]      = norm * CENTROIDS_2BIT[q];
+        }
+        if (group) {
+            for (int slot = 0; slot < n_positions; ++slot) {
+                const int base = 4 * positions[slot];
+                for (int lane = 0; lane < 4; ++lane) {
+                    const int q      = (qh[2 * slot + lane / 2] >> (4 * (lane % 2))) & 0xf;
+                    dst[base + lane] = norm * CENTROIDS_4BIT[q];
+                }
+            }
+        } else {
+            for (int slot = 0; slot < n; ++slot) {
+                const int q          = (qh[slot / 2] >> (4 * (slot % 2))) & 0xf;
+                dst[positions[slot]] = norm * CENTROIDS_4BIT[q];
+            }
+        }
+    }
+}
+
+#define DEFINE_TURBO2M4_CODEC(suffix, block_type, n, group)                                                         \
+    void quantize_row_turbo2m4_##suffix##_ref(const float * GGML_RESTRICT x, block_type * GGML_RESTRICT y,          \
+                                              int64_t k) {                                                          \
+        quantize_row_turbo2m4_ref_impl(x, y, k, n, group, sizeof(block_type));                                      \
+    }                                                                                                               \
+    void dequantize_row_turbo2m4_##suffix(const block_type * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { \
+        dequantize_row_turbo2m4_impl(x, y, k, n, group, sizeof(block_type));                                        \
+    }                                                                                                               \
+    size_t quantize_turbo2m4_##suffix(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows,     \
+                                      int64_t n_per_row, const float * imatrix) {                                   \
+        GGML_UNUSED(imatrix);                                                                                       \
+        assert(n_per_row % QK_TURBO2M4 == 0);                                                                       \
+        const size_t row_size = (size_t) (n_per_row / QK_TURBO2M4) * sizeof(block_type);                            \
+        for (int64_t row = 0; row < nrows; ++row) {                                                                 \
+            quantize_row_turbo2m4_##suffix##_ref(src + row * n_per_row,                                             \
+                                                 (block_type *) ((char *) dst + row * row_size), n_per_row);        \
+        }                                                                                                           \
+        return (size_t) nrows * row_size;                                                                           \
+    }
+
+DEFINE_TURBO2M4_CODEC(s4, block_turbo2m4_s4, 4, 0)
+DEFINE_TURBO2M4_CODEC(s8, block_turbo2m4_s8, 8, 0)
+DEFINE_TURBO2M4_CODEC(s16, block_turbo2m4_s16, 16, 0)
+DEFINE_TURBO2M4_CODEC(g4, block_turbo2m4_g4, 4, 1)
+DEFINE_TURBO2M4_CODEC(g8, block_turbo2m4_g8, 8, 1)
+DEFINE_TURBO2M4_CODEC(g16, block_turbo2m4_g16, 16, 1)
+
+#undef DEFINE_TURBO2M4_CODEC

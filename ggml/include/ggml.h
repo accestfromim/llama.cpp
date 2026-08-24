@@ -427,7 +427,13 @@ extern "C" {
         GGML_TYPE_TURBO2_0             = 49,  // runtime-only TurboQuant 2-bit KV cache
         GGML_TYPE_TURBO3_0             = 50,  // runtime-only TurboQuant 3-bit KV cache
         GGML_TYPE_TURBO4_0             = 51,  // runtime-only TurboQuant 4-bit KV cache
-        GGML_TYPE_COUNT                = 52,
+        GGML_TYPE_TURBO2M4_S4          = 52,  // runtime-only scalar top-4 Turbo2/Turbo4 KV cache
+        GGML_TYPE_TURBO2M4_S8          = 53,  // runtime-only scalar top-8 Turbo2/Turbo4 KV cache
+        GGML_TYPE_TURBO2M4_S16         = 54,  // runtime-only scalar top-16 Turbo2/Turbo4 KV cache
+        GGML_TYPE_TURBO2M4_G4          = 55,  // runtime-only group top-4 Turbo2/Turbo4 KV cache
+        GGML_TYPE_TURBO2M4_G8          = 56,  // runtime-only group top-8 Turbo2/Turbo4 KV cache
+        GGML_TYPE_TURBO2M4_G16         = 57,  // runtime-only group top-16 Turbo2/Turbo4 KV cache
+        GGML_TYPE_COUNT                = 58,
     };
 
     // precision

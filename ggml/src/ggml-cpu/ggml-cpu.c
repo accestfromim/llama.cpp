@@ -259,6 +259,20 @@ static void ggml_vec_dot_turbo4_0_f32(int                        n,
                                       size_t                     by,
                                       int                        nrc);
 
+#define DECLARE_VEC_DOT_TURBO2M4(suffix)                                                        \
+    static void ggml_vec_dot_turbo2m4_##suffix##_f32(int n, float * GGML_RESTRICT s, size_t bs, \
+                                                     const void * GGML_RESTRICT vx, size_t bx,  \
+                                                     const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+DECLARE_VEC_DOT_TURBO2M4(s4)
+DECLARE_VEC_DOT_TURBO2M4(s8)
+DECLARE_VEC_DOT_TURBO2M4(s16)
+DECLARE_VEC_DOT_TURBO2M4(g4)
+DECLARE_VEC_DOT_TURBO2M4(g8)
+DECLARE_VEC_DOT_TURBO2M4(g16)
+
+#undef DECLARE_VEC_DOT_TURBO2M4
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -491,6 +505,20 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+#define TURBO2M4_CPU_TYPE_TRAITS(type, suffix)                                    \
+    [type] = {                                                                    \
+        .from_float   = (ggml_from_float_t) quantize_row_turbo2m4_##suffix##_ref, \
+        .vec_dot      = (ggml_vec_dot_t) ggml_vec_dot_turbo2m4_##suffix##_f32,    \
+        .vec_dot_type = GGML_TYPE_F32,                                            \
+        .nrows        = 1,                                                        \
+    }
+    TURBO2M4_CPU_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S4, s4),
+    TURBO2M4_CPU_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S8, s8),
+    TURBO2M4_CPU_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S16, s16),
+    TURBO2M4_CPU_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G4, g4),
+    TURBO2M4_CPU_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G8, g8),
+    TURBO2M4_CPU_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G16, g16),
+#undef TURBO2M4_CPU_TYPE_TRAITS
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
@@ -3671,6 +3699,26 @@ static void ggml_vec_dot_turbo4_0_f32(int                        n,
     GGML_UNUSED(by);
     ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO4_0, n, s, vx, vy);
 }
+
+#define DEFINE_VEC_DOT_TURBO2M4(suffix, type)                                                             \
+    static void ggml_vec_dot_turbo2m4_##suffix##_f32(int n, float * GGML_RESTRICT s, size_t bs,           \
+                                                     const void * GGML_RESTRICT vx, size_t bx,            \
+                                                     const void * GGML_RESTRICT vy, size_t by, int nrc) { \
+        GGML_ASSERT(nrc == 1);                                                                            \
+        GGML_UNUSED(bs);                                                                                  \
+        GGML_UNUSED(bx);                                                                                  \
+        GGML_UNUSED(by);                                                                                  \
+        ggml_vec_dot_turbo_f32_impl(type, n, s, vx, vy);                                                  \
+    }
+
+DEFINE_VEC_DOT_TURBO2M4(s4, GGML_TYPE_TURBO2M4_S4)
+DEFINE_VEC_DOT_TURBO2M4(s8, GGML_TYPE_TURBO2M4_S8)
+DEFINE_VEC_DOT_TURBO2M4(s16, GGML_TYPE_TURBO2M4_S16)
+DEFINE_VEC_DOT_TURBO2M4(g4, GGML_TYPE_TURBO2M4_G4)
+DEFINE_VEC_DOT_TURBO2M4(g8, GGML_TYPE_TURBO2M4_G8)
+DEFINE_VEC_DOT_TURBO2M4(g16, GGML_TYPE_TURBO2M4_G16)
+
+#undef DEFINE_VEC_DOT_TURBO2M4
 
 void ggml_cpu_fp32_to_fp32(const float * x, float * y, int64_t n) {
     memcpy(y, x, n * sizeof(float));

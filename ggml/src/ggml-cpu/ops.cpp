@@ -5986,6 +5986,12 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO2M4_S4:
+        case GGML_TYPE_TURBO2M4_S8:
+        case GGML_TYPE_TURBO2M4_S16:
+        case GGML_TYPE_TURBO2M4_G4:
+        case GGML_TYPE_TURBO2M4_G8:
+        case GGML_TYPE_TURBO2M4_G16:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");
