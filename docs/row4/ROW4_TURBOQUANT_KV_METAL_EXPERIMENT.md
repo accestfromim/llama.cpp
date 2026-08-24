@@ -418,7 +418,47 @@ The table below uses BF16/BF16 logits as the reference. Top5 overlap is the aver
 | 32768 | 0.03813 | 89.1% | 88.0% | 100.0% |
 | 65536 | 0.07177 | 84.8% | 84.8% | 98.8% |
 
-This is the best measured strategy. At 64K it reduces KL by 71.2% relative to uncentered Turbo4/Turbo4 and raises top1 agreement from 75.4% to 84.8%. Top1 exact agreement is deliberately strict: even at 64K, the BF16 top1 token remains within the candidate top five for 98.8% of evaluated rows.
+This was selected as the best measured quality and memory tradeoff before the layer-count ablation below. At 64K it reduces KL by 71.2% relative to uncentered Turbo4/Turbo4 and raises top1 agreement from 75.4% to 84.8%. Top1 exact agreement is deliberately strict: even at 64K, the BF16 top1 token remains within the candidate top five for 98.8% of evaluated rows.
+
+### Boundary-layer count ablation
+
+This ablation holds Turbo4/Turbo4, mean-centering mode 2, and the 128-token warmup constant. Only the number of BF16 layers at each edge changes from 0 to 4. All logits runs allocate a 66048-token context, use the same saved BF16/BF16 references, fill 1K, 8K, or 64K WikiText-2 tokens, and compare the final 256 rows of the fixed suffix. Each layer-count setting runs in a separate process, and `clear(true)` resets all KV and K-mean buffers between depths. An independent 8K repeat of the two-layer setting reproduced every reported metric.
+
+Each added pair of protected layers increases KV memory by about 16% relative to pure Turbo4. Memory scales linearly with context length:
+
+| BF16 layers at each edge | Total BF16 layers | KV at 8K | KV at 64K | Increase over Turbo4 | Saving versus BF16 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 297.0 MiB | 2.320 GiB | +0.0% | 74.2% |
+| 1 | 2 | 344.5 MiB | 2.691 GiB | +16.0% | 70.1% |
+| 2 | 4 | 392.0 MiB | 3.062 GiB | +32.0% | 66.0% |
+| 3 | 6 | 439.5 MiB | 3.434 GiB | +48.0% | 61.8% |
+| 4 | 8 | 487.0 MiB | 3.805 GiB | +64.0% | 57.7% |
+
+The primary 64K result shows a clear distribution-quality gain:
+
+| BF16 layers at each edge | KL +/- SEM | KL reduction versus no protection | Top1 agreement | Top5 overlap | Exact top5 set | BF16 top1 in candidate top5 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 0.11084 +/- 0.00813 | 0.0% | 81.25% | 82.73% | 33.98% | 98.05% |
+| 1 | 0.07691 +/- 0.00387 | 30.6% | 85.94% | 85.00% | 38.28% | 100.00% |
+| 2 | 0.07177 +/- 0.00464 | 35.2% | 84.77% | 84.84% | 36.33% | 98.83% |
+| 3 | 0.06477 +/- 0.00440 | 41.6% | 85.55% | 87.42% | 46.88% | 99.22% |
+| 4 | 0.05449 +/- 0.00287 | 50.8% | 87.11% | 86.72% | 43.75% | 99.22% |
+
+The first protected pair is the most memory-efficient point: +16% KV buys a 30.6% KL reduction and +4.69 percentage points of top1 agreement. The requested two-layer setting costs +32% KV and buys a 35.2% KL reduction, +3.52 points of top1, and +2.11 points of top5 overlap. Its second protected pair contributes only another 6.7% KL reduction relative to the one-layer setting. Four layers at each edge give the lowest KL and highest 64K top1, but require +64% KV.
+
+At shorter filled lengths the ranking is noisy and not monotonic. KL for 0/1/2/3/4 layers is 0.03237/0.03315/0.02858/0.03219/0.02822 at 1K and 0.03887/0.03344/0.03652/0.02933/0.02741 at 8K. This suggests that boundary protection matters more consistently after long-context error has accumulated. These points use the same 66048-token allocation as the 64K run; older per-depth-sized context results above use a different kernel and allocation shape and are not direct ablation controls.
+
+WikiText-2 PPL uses context 2048 and 16 chunks, with one independent process per setting:
+
+| BF16 layers at each edge | PPL |
+| ---: | ---: |
+| 0 | 32.3118 +/- 0.82923 |
+| 1 | 32.1499 +/- 0.82354 |
+| 2 | 32.3035 +/- 0.82888 |
+| 3 | 32.2495 +/- 0.82754 |
+| 4 | 32.2044 +/- 0.82699 |
+
+All PPL intervals overlap, so this 16-chunk sample cannot distinguish the settings. The measurable benefit is in the long-context logits distribution. For the best quality per byte, protect one layer at each edge. The two-layer policy remains reasonable if a further KL reduction is worth another 16% KV, but it is already on the diminishing-return part of the curve.
 
 ### Turbo4 K with Turbo3 V
 
