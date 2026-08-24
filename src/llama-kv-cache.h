@@ -201,6 +201,7 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_mean_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed

@@ -8905,8 +8905,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t N  = neq1;
     const bool    turbo4_fused = ggml_flash_attn_ext_get_turbo4_fused(dst);
 
-    GGML_ASSERT(!turbo4_fused || (DK == 128 && DV == 128 && N >= 1 && N <= 16 && k->type == GGML_TYPE_TURBO4_0 &&
-                                  v->type == GGML_TYPE_TURBO4_0));
+    const bool turbo4_fused_v = v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2M4_S4 ||
+                                v->type == GGML_TYPE_TURBO2M4_S8 || v->type == GGML_TYPE_TURBO2M4_G4 ||
+                                v->type == GGML_TYPE_TURBO2M4_G8;
+    GGML_ASSERT(!turbo4_fused ||
+                (DK == 128 && DV == 128 && N >= 1 && N <= 16 && k->type == GGML_TYPE_TURBO4_0 && turbo4_fused_v));
 
     GGML_ASSERT(ne0 == DV);
     GGML_ASSERT(ne2 == N);

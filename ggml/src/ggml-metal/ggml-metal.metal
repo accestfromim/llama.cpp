@@ -7829,30 +7829,88 @@ void dequantize_turbo2m4_bytes(const device uint8_t * xb, short il, int variant,
         const int  n     = turbo2m4_variant_n(variant);
         const bool group = variant >= 5;
         const int  n_pos = group ? n / 4 : n;
-        for (int i = 0; i < 16; ++i) {
-            const int     j  = base + i;
-            const uint8_t q2 = (xb[2 + j / 4] >> (2 * (j % 4))) & 0x3;
-            float value = turbo_centroids_2bit[q2];
+        for (int row = 0; row < 4; ++row) {
+            const int     j0 = base + 4 * row;
+            const uint8_t q2 = xb[2 + j0 / 4];
+            float4 value = float4(turbo_centroids_2bit[q2 & 0x3], turbo_centroids_2bit[(q2 >> 2) & 0x3],
+                                  turbo_centroids_2bit[(q2 >> 4) & 0x3], turbo_centroids_2bit[q2 >> 6]);
             if (group) {
+                int selected = -1;
                 for (int slot = 0; slot < n_pos; ++slot) {
-                    if (xb[34 + slot] == j / 4) {
-                        const int     lane = j % 4;
-                        const uint8_t q4 = (xb[34 + n_pos + 2 * slot + lane / 2] >> (4 * (lane % 2))) & 0xf;
-                        value = turbo_centroids_4bit[q4];
+                    if (xb[34 + slot] == j0 / 4) {
+                        selected = slot;
+                        break;
                     }
+                }
+                if (selected >= 0) {
+                    const uint8_t q40 = xb[34 + n_pos + 2 * selected];
+                    const uint8_t q41 = xb[35 + n_pos + 2 * selected];
+                    value = float4(turbo_centroids_4bit[q40 & 0xf], turbo_centroids_4bit[q40 >> 4],
+                                   turbo_centroids_4bit[q41 & 0xf], turbo_centroids_4bit[q41 >> 4]);
                 }
             } else {
                 for (int slot = 0; slot < n; ++slot) {
-                    if (xb[34 + slot] == j) {
+                    const int pos = xb[34 + slot];
+                    if (pos >= j0 + 4) {
+                        break;
+                    }
+                    if (pos >= j0) {
                         const uint8_t q4 = (xb[34 + n + slot / 2] >> (4 * (slot % 2))) & 0xf;
-                        value = turbo_centroids_4bit[q4];
+                        value[pos - j0] = turbo_centroids_4bit[q4];
                     }
                 }
             }
-            values[i / 4][i % 4] = norm * value;
+            values[row] = norm * value;
         }
     }
     reg = (type4x4) values;
+}
+
+template <typename type4>
+void dequantize_turbo2m4_bytes_t4(const device uint8_t * xb, short il, int variant, thread type4 & reg) {
+    if (variant == 1) {
+        dequantize_turbo4_0_t4((const device block_turbo4_0 *) xb, il, reg);
+        return;
+    }
+
+    const ushort norm_bits = ushort(xb[0]) | (ushort(xb[1]) << 8);
+    const float  norm      = float(as_type<half>(norm_bits));
+    const int    base      = 4 * il;
+    float4       values;
+    const int    n     = turbo2m4_variant_n(variant);
+    const bool   group = variant >= 5;
+    const int    n_pos = group ? n / 4 : n;
+
+    const uint8_t q2 = xb[2 + il];
+    values = float4(turbo_centroids_2bit[q2 & 0x3], turbo_centroids_2bit[(q2 >> 2) & 0x3],
+                    turbo_centroids_2bit[(q2 >> 4) & 0x3], turbo_centroids_2bit[q2 >> 6]);
+    if (group) {
+        int selected = -1;
+        for (int slot = 0; slot < n_pos; ++slot) {
+            if (xb[34 + slot] == il) {
+                selected = slot;
+                break;
+            }
+        }
+        if (selected >= 0) {
+            const uint8_t q40 = xb[34 + n_pos + 2 * selected];
+            const uint8_t q41 = xb[35 + n_pos + 2 * selected];
+            values = float4(turbo_centroids_4bit[q40 & 0xf], turbo_centroids_4bit[q40 >> 4],
+                            turbo_centroids_4bit[q41 & 0xf], turbo_centroids_4bit[q41 >> 4]);
+        }
+    } else {
+        for (int slot = 0; slot < n; ++slot) {
+            const int pos = xb[34 + slot];
+            if (pos >= base + 4) {
+                break;
+            }
+            if (pos >= base) {
+                const uint8_t q4 = (xb[34 + n + slot / 2] >> (4 * (slot % 2))) & 0xf;
+                values[pos - base] = turbo_centroids_4bit[q4];
+            }
+        }
+    }
+    reg = (type4) (norm * values);
 }
 
 template <typename type4x4>
@@ -12688,6 +12746,10 @@ void dequantize_turbo2m4_v(const device uint8_t * xb, short il, thread type4x4 &
     dequantize_turbo2m4_bytes(xb, il, FC_flash_attn_ext_turbo_v_variant, reg);
 }
 
+template <typename type4> void dequantize_turbo2m4_v_t4(const device uint8_t * xb, short il, thread type4 & reg) {
+    dequantize_turbo2m4_bytes_t4(xb, il, FC_flash_attn_ext_turbo_v_variant, reg);
+}
+
 #if defined(GGML_METAL_HAS_BF16)
 template<short DK>
 static inline void fairy2i_flash_attn_exact_qk_tile(
@@ -14231,6 +14293,19 @@ template [[host_name("kernel_flash_attn_ext_kturbo4_vturbo4_gqa4_half_dk128_dv12
                           8,
                           64,
                           4>;
+template [[host_name("kernel_flash_attn_ext_kturbo4_vturbo2m4_gqa4_half_dk128_dv128")]] kernel flash_attn_ext_t
+    kernel_flash_attn_ext<FA_TYPES_TURBO_GQA,
+                          block_turbo4_0,
+                          8,
+                          dequantize_turbo4_0,
+                          uint8_t,
+                          8,
+                          dequantize_turbo2m4_v,
+                          128,
+                          128,
+                          8,
+                          64,
+                          4>;
 template [[host_name("kernel_flash_attn_ext_turbo2m4_dk128_dv128")]] kernel flash_attn_ext_t
     kernel_flash_attn_ext<FA_TYPES,
                           uint8_t,
@@ -14810,6 +14885,17 @@ template [[host_name("kernel_flash_attn_ext_vec_q5_0_dk128_dv128")]] kernel flas
 template [[host_name("kernel_flash_attn_ext_vec_q5_1_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q5_1, 8, dequantize_q5_1_t4, block_q5_1,  8, dequantize_q5_1_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q8_0, 8, dequantize_q8_0_t4, block_q8_0,  8, dequantize_q8_0_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_turbo4_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 128, 128, 1>;
+template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vturbo2m4_dk128_dv128")]] kernel flash_attn_ext_vec_t
+    kernel_flash_attn_ext_vec<FA_TYPES,
+                              block_turbo4_0,
+                              32,
+                              dequantize_turbo4_0_t4,
+                              uint8_t,
+                              32,
+                              dequantize_turbo2m4_v_t4,
+                              128,
+                              128,
+                              1>;
 template [[host_name("kernel_flash_attn_ext_vec_kq4_0_vturbo4_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_q4_0, 8, dequantize_q4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_turbo4_fused_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 128, 128, 1, 1, 32, true>;
 
@@ -14888,7 +14974,8 @@ kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
             const short token = item / D4;
             const short d4 = item % D4;
             half4 value;
-            dequantize_turbo4_0_t4((device const block_turbo4_0 *) (v + (ic + token) * args.nb21), d4, value);
+            dequantize_turbo2m4_bytes_t4((const device uint8_t *) (v + (ic + token) * args.nb21), d4,
+                                         FC_flash_attn_ext_turbo_v_variant, value);
             skv4[item] = value;
         }
 

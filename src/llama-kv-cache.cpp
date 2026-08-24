@@ -103,7 +103,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/size_t(2u * (1 + n_stream) + (turbo_k_mean_center ? 1u : 0u)) * n_layer_kv *
+                /*.mem_size   =*/size_t(2u * (1 + n_stream) + (turbo_k_mean_center ? 1u + n_stream : 0u)) * n_layer_kv *
                     ggml_tensor_overhead(),
                 /*.mem_buffer =*/NULL,
                 /*.no_alloc   =*/true,
@@ -207,10 +207,14 @@ llama_kv_cache::llama_kv_cache(
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+        std::vector<ggml_tensor *> k_mean_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]));
             v_stream.push_back(ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]));
+            if (k_mean) {
+                k_mean_stream.push_back(ggml_view_1d(ctx, k_mean, n_embd_k_gqa + 1, s * k_mean->nb[1]));
+            }
         }
 
         map_layer_ids[il] = layers.size();
@@ -222,6 +226,7 @@ llama_kv_cache::llama_kv_cache(
             k_mean,
             k_stream,
             v_stream,
+            k_mean_stream,
         });
     }
 
@@ -696,6 +701,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
                 ggml_backend_tensor_copy(layer.k_stream[ssrc], layer.k_stream[sdst]);
                 ggml_backend_tensor_copy(layer.v_stream[ssrc], layer.v_stream[sdst]);
+                if (layer.k_mean) {
+                    ggml_backend_tensor_copy(layer.k_mean_stream[ssrc], layer.k_mean_stream[sdst]);
+                }
             }
         }
     }

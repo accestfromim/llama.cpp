@@ -7691,6 +7691,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    const ggml_type turbo2m4_pareto_v_types[] = {
+        GGML_TYPE_TURBO2M4_S4,
+        GGML_TYPE_TURBO2M4_S8,
+        GGML_TYPE_TURBO2M4_G4,
+        GGML_TYPE_TURBO2M4_G8,
+    };
+    for (ggml_type type_v : turbo2m4_pareto_v_types) {
+        for (int64_t nb : { 1, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 512, nb, true, false, 0.0f, 0.0f,
+                                                            GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true));
+        }
+        for (int64_t nb : { 1, 4, 16, 32 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 512, nb, true, false, 0.0f, 0.0f,
+                                                            GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true, -1, true));
+        }
+        for (int64_t n_streams : { 4, 16 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, n_streams }, 512, 1, true, false, 0.0f,
+                                                            0.0f, GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true, 256,
+                                                            true));
+        }
+    }
     for (int64_t nb : { 1, 2, 8, 16, 32 }) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, nb, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
@@ -7717,6 +7738,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 8192, 32, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        for (ggml_type type_v : turbo2m4_pareto_v_types) {
+            for (int64_t kv : { 32768, 65536 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 1, true, false, 0.0f, 0.0f,
+                                                                GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 8192, 32, true, false, 0.0f, 0.0f,
+                                                            GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true, -1, true));
+        }
     }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -7920,6 +7949,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     const char * turbo_kv_perf_shapes = getenv("LLAMA_TURBO_KV_PERF_SHAPES");
     if (turbo_kv_perf_shapes && strcmp(turbo_kv_perf_shapes, "0") != 0) {
+        const ggml_type turbo2m4_pareto_v_types[] = {
+            GGML_TYPE_TURBO2M4_S4,
+            GGML_TYPE_TURBO2M4_S8,
+            GGML_TYPE_TURBO2M4_G4,
+            GGML_TYPE_TURBO2M4_G8,
+        };
         test_cases.emplace_back(new test_turbo_wht(128, 32, 0));
         test_cases.emplace_back(new test_turbo_wht(128, 32, 1));
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_BF16, { 128, 32, 1, 1 }));
@@ -7960,6 +7995,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                             GGML_PREC_F32, GGML_TYPE_BF16));
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 512, true, false, 0, 0,
                                                             GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        }
+        for (ggml_type type_v : turbo2m4_pareto_v_types) {
+            for (int64_t rows : { 1, 32, 512 }) {
+                test_cases.emplace_back(new test_set_rows_turbo(type_v, GGML_TYPE_I32, 128, 65536 * 8, rows));
+            }
+            for (int64_t kv : { 8192, 65536 }) {
+                for (int64_t nb : { 1, 32, 512 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, nb, true, false, 0.0f,
+                                                                    0.0f, GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v,
+                                                                    true));
+                }
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 1, true, false, 0.0f, 0.0f,
+                                                                GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true, -1,
+                                                                true));
+            }
+            for (int64_t n_streams : { 4, 16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, n_streams }, 65536, 1, true, false,
+                                                                0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v,
+                                                                true, -1, true));
+            }
         }
     }
 
