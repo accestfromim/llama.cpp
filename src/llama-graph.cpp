@@ -1293,7 +1293,8 @@ static ggml_tensor * llm_fairy2i_bf16_roundtrip(ggml_context * ctx, ggml_tensor 
 }
 
 static bool llm_is_turbo_kv_type(ggml_type type) {
-    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+           (type >= GGML_TYPE_TURBO2M4_S4 && type <= GGML_TYPE_TURBO2M4_G16);
 }
 
 ggml_tensor * llm_graph_context::build_attn_mha(ggml_tensor * q,

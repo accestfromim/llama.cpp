@@ -2364,27 +2364,40 @@ llama_context * llama_init_from_model(
     }
 
     const auto is_turbo_kv = [](ggml_type type) {
-        return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+        return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+               (type >= GGML_TYPE_TURBO2M4_S4 && type <= GGML_TYPE_TURBO2M4_G16);
+    };
+    const auto is_turbo2m4 = [](ggml_type type) {
+        return type >= GGML_TYPE_TURBO2M4_S4 && type <= GGML_TYPE_TURBO2M4_G16;
     };
     const bool row4_turbo_runtime = row4_runtime && (is_turbo_kv(params.type_k) || is_turbo_kv(params.type_v));
-    const bool row4_turbo_pair =
+    const bool row4_mixed_pair    = (params.type_k == GGML_TYPE_TURBO4_0 || is_turbo2m4(params.type_k)) &&
+                                 (params.type_v == GGML_TYPE_TURBO3_0 || is_turbo2m4(params.type_v));
+    const bool row4_legacy_turbo_pair =
         (is_turbo_kv(params.type_k) && (is_turbo_kv(params.type_v) || params.type_v == GGML_TYPE_Q8_0)) ||
         (params.type_k == GGML_TYPE_Q8_0 && is_turbo_kv(params.type_v)) ||
         (params.type_k == GGML_TYPE_Q4_0 && params.type_v == GGML_TYPE_TURBO4_0);
+    const bool row4_turbo_pair =
+        is_turbo2m4(params.type_k) || is_turbo2m4(params.type_v) ? row4_mixed_pair : row4_legacy_turbo_pair;
     const bool row4_bf16_pair = params.type_k == GGML_TYPE_BF16 && params.type_v == GGML_TYPE_BF16;
 
     if (row4_runtime && !row4_bf16_pair && !row4_turbo_pair) {
         LLAMA_LOG_ERROR(
             "%s: Qwen3 Row4 supports bf16/bf16 or explicit TurboQuant pairs turboN/turboM, "
-            "q8_0/turboN, turboN/q8_0, and q4_0/turbo4; got type_k=%s type_v=%s\n",
+            "q8_0/turboN, turboN/q8_0, q4_0/turbo4, and turbo4-or-mixed/mixed-or-turbo3; "
+            "got type_k=%s type_v=%s\n",
             __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
     }
 
     if (row4_turbo_runtime) {
-        if (model->hparams.n_embd_head_k % 128 != 0 || model->hparams.n_embd_head_v % 128 != 0) {
-            LLAMA_LOG_ERROR("%s: Qwen3 Row4 TurboQuant requires K/V head dimensions divisible by 128, got K=%u V=%u\n",
-                            __func__, model->hparams.n_embd_head_k, model->hparams.n_embd_head_v);
+        const bool mixed = is_turbo2m4(params.type_k) || is_turbo2m4(params.type_v);
+        if ((mixed && (model->hparams.n_embd_head_k != 128 || model->hparams.n_embd_head_v != 128)) ||
+            (!mixed && (model->hparams.n_embd_head_k % 128 != 0 || model->hparams.n_embd_head_v % 128 != 0))) {
+            LLAMA_LOG_ERROR(
+                "%s: Qwen3 Row4 mixed TurboQuant requires K/V D128; other TurboQuant types require "
+                "dimensions divisible by 128, got K=%u V=%u\n",
+                __func__, model->hparams.n_embd_head_k, model->hparams.n_embd_head_v);
             return nullptr;
         }
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {

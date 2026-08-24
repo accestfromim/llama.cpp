@@ -18,6 +18,15 @@
 // llama_kv_cache
 //
 
+static bool llama_is_turbo2m4_type(ggml_type type) {
+    return type >= GGML_TYPE_TURBO2M4_S4 && type <= GGML_TYPE_TURBO2M4_G16;
+}
+
+static bool llama_is_turbo_kv_type(ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+           llama_is_turbo2m4_type(type);
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
                 ggml_type   type_k,
@@ -49,9 +58,11 @@ llama_kv_cache::llama_kv_cache(
         turbo_k_mean_center = (int) mode;
     }
     if (turbo_k_mean_center) {
-        if (type_k != GGML_TYPE_TURBO4_0 || (type_v != GGML_TYPE_TURBO3_0 && type_v != GGML_TYPE_TURBO4_0) ||
-            !offload) {
-            throw std::invalid_argument("TURBO_K_MEAN_CENTER requires offloaded turbo4/turbo3 or turbo4/turbo4 KV");
+        const bool supported_k = type_k == GGML_TYPE_TURBO4_0 || llama_is_turbo2m4_type(type_k);
+        const bool supported_v =
+            type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || llama_is_turbo2m4_type(type_v);
+        if (!supported_k || !supported_v || !offload) {
+            throw std::invalid_argument("TURBO_K_MEAN_CENTER requires supported offloaded TurboQuant K/V types");
         }
         const char * turbo_k_mean_warmup_env = getenv("TURBO_K_MEAN_WARMUP");
         if (turbo_k_mean_warmup_env) {
@@ -76,10 +87,12 @@ llama_kv_cache::llama_kv_cache(
         turbo_boundary_bf16_layers = (int) n_layers;
     }
     if (turbo_boundary_bf16_layers) {
-        if (!model.row4_enabled || type_k != GGML_TYPE_TURBO4_0 ||
-            (type_v != GGML_TYPE_TURBO3_0 && type_v != GGML_TYPE_TURBO4_0) || !offload) {
+        const bool supported_k = type_k == GGML_TYPE_TURBO4_0 || llama_is_turbo2m4_type(type_k);
+        const bool supported_v =
+            type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || llama_is_turbo2m4_type(type_v);
+        if (!model.row4_enabled || !supported_k || !supported_v || !offload) {
             throw std::invalid_argument(
-                "TURBO_KV_BOUNDARY_BF16_LAYERS requires offloaded Row4 turbo4/turbo3 or turbo4/turbo4 KV");
+                "TURBO_KV_BOUNDARY_BF16_LAYERS requires supported offloaded Row4 TurboQuant K/V types");
         }
         LLAMA_LOG_INFO("%s: first and last %d Row4 KV layers use BF16\n", __func__, turbo_boundary_bf16_layers);
     }
@@ -1120,7 +1133,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // store the current K values into the cache
     ggml_tensor * result = ggml_set_rows(ctx, k, k_cur, k_idxs);
-    if (k->type == GGML_TYPE_TURBO2_0 || k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
+    if (llama_is_turbo_kv_type(k->type)) {
         result->op_params[1] = 128;
     }
     return result;
@@ -1191,7 +1204,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         }
 
         ggml_tensor * result = ggml_set_rows(ctx, v, v_cur, v_idxs);
-        if (v->type == GGML_TYPE_TURBO2_0 || v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) {
+        if (llama_is_turbo_kv_type(v->type)) {
             result->op_params[1] = 128;
         }
         return result;

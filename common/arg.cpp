@@ -1037,8 +1037,10 @@ static handle_model_result common_params_handle_model(
 }
 
 const std::vector<ggml_type> kv_cache_types = {
-    GGML_TYPE_F32,      GGML_TYPE_F16,  GGML_TYPE_BF16, GGML_TYPE_Q8_0,   GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0,
-    GGML_TYPE_TURBO4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0,     GGML_TYPE_Q5_1,
+    GGML_TYPE_F32,         GGML_TYPE_F16,         GGML_TYPE_BF16,         GGML_TYPE_Q8_0,        GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,    GGML_TYPE_TURBO4_0,    GGML_TYPE_TURBO2M4_S4,  GGML_TYPE_TURBO2M4_S8, GGML_TYPE_TURBO2M4_S16,
+    GGML_TYPE_TURBO2M4_G4, GGML_TYPE_TURBO2M4_G8, GGML_TYPE_TURBO2M4_G16, GGML_TYPE_Q4_0,        GGML_TYPE_Q4_1,
+    GGML_TYPE_IQ4_NL,      GGML_TYPE_Q5_0,        GGML_TYPE_Q5_1,
 };
 
 static const char * kv_cache_type_name(ggml_type type) {
