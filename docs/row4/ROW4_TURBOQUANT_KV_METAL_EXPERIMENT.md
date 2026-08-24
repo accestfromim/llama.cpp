@@ -473,6 +473,23 @@ The equivalent centered and boundary-protected Turbo4/Turbo4 results were KL 0.0
 
 The 2048-context WikiText-2 run used 16 chunks. Turbo4/Turbo3 reached PPL 31.7521 +/- 0.81273, compared with BF16/BF16 at 31.8656 +/- 0.81957 and centered, boundary-protected Turbo4/Turbo4 at 32.3035 +/- 0.82888. The error intervals overlap, so the lower Turbo4/Turbo3 point estimate is not evidence that quantization improves the model. It does show no PPL regression in this test.
 
+#### One-layer protection at long context
+
+The one-layer variant protects the first and last layer, uses mean-centering mode 2 with 128 warmup tokens, and allocates a 66048-token context. Its long-context results are:
+
+| Context | KL +/- SEM | Top1 agreement | Top5 overlap | Exact top5 set | BF16 top1 in candidate top5 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32768 | 0.04010 +/- 0.00248 | 88.28% | 87.97% | 47.27% | 99.61% |
+| 65536 | 0.06119 +/- 0.00425 | 86.33% | 86.64% | 42.19% | 99.22% |
+
+At 64K this uses 2.426 GiB of KV, versus 2.039 GiB without protection, 2.691 GiB for Turbo4/Turbo4 with one protected layer at each edge, and 9.000 GiB for BF16/BF16. Protection therefore adds 19.0% over pure Turbo4/Turbo3 while retaining a 73.0% saving versus BF16.
+
+The matched Turbo4/Turbo3 control with the same centering but no protected layers reached KL 0.05852 +/- 0.00583, top1 83.98%, top5 overlap 86.88%, exact top5 45.70%, and reference-top1-in-top5 99.61% at 64K. One-layer protection raises top1 by 2.34 percentage points, but KL is 4.6% higher and top5 overlap is 0.23 points lower. The metric directions therefore disagree: the protected pair stabilizes the winning token in this window but does not improve the full probability distribution.
+
+The matching 16-chunk, 2048-context PPL values are 31.8328 +/- 0.81334 without protection and 31.5767 +/- 0.80681 with one protected layer at each edge. Both overlap BF16/BF16 at 31.8656 +/- 0.81957. The sample shows no PPL regression, but it cannot establish a significant PPL gain.
+
+Compared with Turbo4/Turbo4 using the same one-layer policy, Turbo4/Turbo3 has 9.9% less KV at 64K and, in this fixed suffix, lower KL (0.06119 versus 0.07691), slightly higher top1 (86.33% versus 85.94%), and higher top5 overlap (86.64% versus 85.00%). This single suffix is not enough to conclude that Turbo3 V is intrinsically more accurate than Turbo4 V.
+
 Server prompt-cache reuse is not supported by this mean-centering experiment. A reused partial prompt carries a K translation computed from the old prompt, while a new suffix changes the intended warmup mean. Evaluations and applications that enable mode 2 must send `"cache_prompt": false`; changing slot-selection similarity alone is not sufficient.
 
 ## Invalid 8K AIME pilot
