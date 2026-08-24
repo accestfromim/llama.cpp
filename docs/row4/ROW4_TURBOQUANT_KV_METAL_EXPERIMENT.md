@@ -247,6 +247,55 @@ The formal AIME telemetry records heterogeneous live requests rather than equal 
 
 The active-stream count falls as problems finish, so aggregate throughput in the tail is not comparable to the 16-stream steady state. The 8 KiB staging optimization was implemented after this formal evaluation. Its microbenchmark and correctness results are reported above; the table in this section remains evidence from the exact evaluated binary.
 
+## Row4 v2 Pair2 multi-batch LUT follow-up
+
+The production v2 model stores Row4 weights in the lossless `m32k256_pair2_split8_v2` permutation and keeps the W8 lm_head:
+
+```text
+qwen3-row4-v2-pair2.gguf
+SHA-256 7ede7350097357dce67929c05f9d65c7afd2bd0aaa9cff246f6b6e749a2a6c39
+```
+
+The original Pair2 LUT kernel was restricted to one activation row. Batches 2-16 therefore fell into generic small-batch or prefill kernels even though the B1 kernel already had the required exact arithmetic. The follow-up maps the Metal threadgroup grid Y dimension to the activation row, offsets the activation, scale, output, residual, and fused-add buffers by that row, and launches only real rows. The Pair2 LUT route is selected for 2-16 rows when O is divisible by 32, K is divisible by 256, and K is at most 65536. Large prefill batches keep their existing path.
+
+The host selector must exclude this route from both M5 TensorOps and the generic M64 prefill geometry. An initial implementation selected the Pair2 pipeline but dispatched the generic geometry for 9-16 rows; exact tests caught zero output tiles and partial K accumulation before benchmarking. The final `test-row4` matrix covers Pair2 rows 1, 2, 4, 8, 9, and 16 for real QKV, attention/output, gate/up, and down shapes. The complete required Metal run reports `All Row4 tests PASSED (0 failed)`.
+
+Real-shape operator timing shows the removed generic work. Values are microseconds per complete matrix operation:
+
+| Operator | Old B8 | Pair2 LUT B8 | Old B16 | Pair2 LUT B16 |
+| --- | ---: | ---: | ---: | ---: |
+| QKV, O6144 K4096 | 1437.95 | 62.69 | 201.77 | 113.37 |
+| Attention/output, O4096 K4096 | 974.22 | 44.92 | 176.60 | 79.29 |
+| Gate/up, O24576 K4096 | 5576.13 | 216.43 | 530.26 | 421.02 |
+| Down, O4096 K12288 | 2901.30 | 106.59 | 508.50 | 196.37 |
+
+The end-to-end curve uses the v2 model, the best measured Turbo4 quality policy, 16 server slots, 65792 tokens per slot, `-b 2048`, `-ub 512`, and 128 generated tokens per active stream:
+
+```text
+TURBO_K_MEAN_CENTER=2
+TURBO_K_MEAN_WARMUP=128
+TURBO_KV_BOUNDARY_BF16_LAYERS=2
+cache K/V = turbo4/turbo4
+```
+
+Each point is wall-clock aggregate throughput over three repetitions. Prompts contain one fixed non-special token after BOS and use exact lengths; the context-zero point contains only BOS. `ignore_eos=true` forces all requests to generate the same number of tokens. Every timed response reported `prompt_n=1`, so prompt processing is outside the timing window.
+
+| Context | Batch 1 | Batch 2 | Batch 4 | Batch 8 | Batch 16 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 118.12 +/- 7.16 | 191.59 +/- 3.15 | 273.63 +/- 5.20 | 331.23 +/- 15.66 | 413.56 +/- 4.78 |
+| 1024 | 118.68 +/- 9.19 | 169.51 +/- 14.57 | 237.13 +/- 10.15 | 278.45 +/- 9.40 | 306.24 +/- 0.71 |
+| 2048 | 109.39 +/- 8.48 | 165.04 +/- 15.47 | 245.20 +/- 1.28 | 270.55 +/- 20.13 | 286.97 +/- 6.80 |
+| 4096 | 106.63 +/- 1.31 | 156.22 +/- 3.58 | 208.01 +/- 5.34 | 223.89 +/- 12.60 | 240.80 +/- 0.66 |
+| 8192 | 83.12 +/- 5.35 | 122.17 +/- 12.82 | 160.59 +/- 11.22 | 165.07 +/- 0.17 | 178.04 +/- 0.56 |
+| 16384 | 69.35 +/- 2.01 | 97.11 +/- 3.63 | 107.44 +/- 0.14 | 113.02 +/- 0.56 | 118.45 +/- 1.12 |
+| 32768 | 51.45 +/- 2.36 | 60.31 +/- 0.31 | 64.48 +/- 1.80 | 68.52 +/- 0.39 | 70.51 +/- 0.68 |
+| 49152 | 41.36 +/- 1.73 | 47.39 +/- 0.73 | 50.33 +/- 0.50 | 52.89 +/- 0.25 | 55.31 +/- 0.36 |
+| 65536 | 35.71 +/- 1.60 | 40.18 +/- 0.14 | 41.75 +/- 0.47 | 42.49 +/- 0.14 | 43.47 +/- 0.48 |
+
+The aggregate curve is monotonic at every measured context. At context zero, batch 16 is 3.50x batch 1. At 49K the gain is 1.34x, and at 64K it is 1.22x. The final 64K increase from batch 8 to batch 16 is only 2.3%, so extra concurrency is almost fully hidden by Flash Attention and KV bandwidth at that depth. The v2 LUT change fixes the short-context Row4 projection collapse; it does not remove the long-context cost of scanning one full K/V history per stream.
+
+The 49K and 64K prompts were filled independently in every slot. A diagnostic attempt to clone one saved slot was rejected from the reported data because the experimental K mean state is not part of llama slot serialization. Cloned KV tensors alone do not preserve the complete centering state for subsequently generated tokens.
+
 ## Fixed generation outputs
 
 The fixed 32-token greedy completions were:

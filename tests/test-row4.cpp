@@ -2588,7 +2588,7 @@ static bool test_metal_real_shape_matrix() {
 
         const std::vector<float> input_two    = make_input(shape.k, 2);
         const std::vector<float> expected_two = oracle_row4_linear(input_two, codes, scales, shape.o, shape.k, 2);
-        for (int64_t tokens : { 1, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
+        for (int64_t tokens : { 1, 2, 4, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
             if (!shape.packed_n32_boundaries && tokens != 1 && tokens != 8 && tokens != 9 && tokens != 16 &&
                 tokens != 32 && tokens != 256 && tokens != 512) {
                 continue;

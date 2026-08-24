@@ -736,9 +736,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         }
 
         if (op->op == GGML_OP_ROW4_LINEAR) {
-            // Pair2 B1 stages the full-K activation in threadgroup memory and
-            // accumulates LUT-decoded integer values in F32. Every integer is
-            // exactly representable through K=65536 (worst case 2^24).
+            // Pair2 decode stages one activation row and uses an exact F32 integer sum through K=65536.
             const bool pair2_decode_ok = ggml_nrows(x) != 1 ||
                                          (k <= 65536 &&
                                           (size_t) k * sizeof(int8_t) <= dev->props.max_theadgroup_memory_size);

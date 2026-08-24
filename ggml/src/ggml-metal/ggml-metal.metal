@@ -2544,10 +2544,13 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
     constexpr int rows_per_pair  = 8;
     constexpr int copy_bytes     = 16;
     constexpr int threads_per_tg = 128;
+    const ulong token            = (ulong) tgpig.y;
+    device const char * act_row  = act_q + token * (ulong) args.k;
+    device float * dst_row       = dst + token * (ulong) args.m;
 
     for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
          byte_offset += threads_per_tg * copy_bytes) {
-        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_row + byte_offset));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2559,21 +2562,21 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
     const int4 sum0 = int4(simd_sum(acc0));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
-        const float sx = act_scales[0];
-        dst[output + 0] = row4_finish_i32(sum0.x, sx, scales[output + 0]);
-        dst[output + 1] = row4_finish_i32(sum0.y, sx, scales[output + 1]);
-        dst[output + 2] = row4_finish_i32(sum0.z, sx, scales[output + 2]);
-        dst[output + 3] = row4_finish_i32(sum0.w, sx, scales[output + 3]);
+        const float sx = act_scales[token];
+        dst_row[output + 0] = row4_finish_i32(sum0.x, sx, scales[output + 0]);
+        dst_row[output + 1] = row4_finish_i32(sum0.y, sx, scales[output + 1]);
+        dst_row[output + 2] = row4_finish_i32(sum0.z, sx, scales[output + 2]);
+        dst_row[output + 3] = row4_finish_i32(sum0.w, sx, scales[output + 3]);
     }
 
     const int4 sum1 = int4(simd_sum(acc1));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
-        const float sx = act_scales[0];
-        dst[output + 0] = row4_finish_i32(sum1.x, sx, scales[output + 0]);
-        dst[output + 1] = row4_finish_i32(sum1.y, sx, scales[output + 1]);
-        dst[output + 2] = row4_finish_i32(sum1.z, sx, scales[output + 2]);
-        dst[output + 3] = row4_finish_i32(sum1.w, sx, scales[output + 3]);
+        const float sx = act_scales[token];
+        dst_row[output + 0] = row4_finish_i32(sum1.x, sx, scales[output + 0]);
+        dst_row[output + 1] = row4_finish_i32(sum1.y, sx, scales[output + 1]);
+        dst_row[output + 2] = row4_finish_i32(sum1.z, sx, scales[output + 2]);
+        dst_row[output + 3] = row4_finish_i32(sum1.w, sx, scales[output + 3]);
     }
 }
 
@@ -2595,10 +2598,15 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
     constexpr int rows_per_pair  = 8;
     constexpr int copy_bytes     = 16;
     constexpr int threads_per_tg = 128;
+    const ulong token            = (ulong) tgpig.y;
+    device const char * act_row  = act_q + token * (ulong) args.k;
+    device float * dst_row       = dst + token * (ulong) args.m;
+    device const uint * residual_row = residual + token * (ulong) args.m;
+    device uint * add_dst_row         = add_dst + token * (ulong) args.m;
 
     for (int byte_offset = (int) tid * copy_bytes; byte_offset < args.k;
          byte_offset += threads_per_tg * copy_bytes) {
-        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_q + byte_offset));
+        *((threadgroup uint4 *) (act_tg + byte_offset)) = *((device const uint4 *) (act_row + byte_offset));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2610,46 +2618,46 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
     const int4 sum0 = int4(simd_sum(acc0));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
-        const float sx = act_scales[0];
+        const float sx = act_scales[token];
         const float4 value = {
             row4_finish_i32(sum0.x, sx, scales[output + 0]),
             row4_finish_i32(sum0.y, sx, scales[output + 1]),
             row4_finish_i32(sum0.z, sx, scales[output + 2]),
             row4_finish_i32(sum0.w, sx, scales[output + 3]),
         };
-        *((device float4 *) (dst + output)) = value;
+        *((device float4 *) (dst_row + output)) = value;
 
         for (int i = 0; i < rows_per_group; ++i) {
-            const uint a = *((device volatile uint *) (dst + output + i));
-            const uint b = residual[output + i];
+            const uint a = *((device volatile uint *) (dst_row + output + i));
+            const uint b = residual_row[output + i];
             const float real = fairy2i_bf16_to_f32((ushort) (a & 0xffffU)) +
                                fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
             const float imag = fairy2i_bf16_to_f32((ushort) (a >> 16)) +
                                fairy2i_bf16_to_f32((ushort) (b >> 16));
-            add_dst[output + i] = fairy2i_pack_bf16_pair(real, imag);
+            add_dst_row[output + i] = fairy2i_pack_bf16_pair(real, imag);
         }
     }
 
     const int4 sum1 = int4(simd_sum(acc1));
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
-        const float sx = act_scales[0];
+        const float sx = act_scales[token];
         const float4 value = {
             row4_finish_i32(sum1.x, sx, scales[output + 0]),
             row4_finish_i32(sum1.y, sx, scales[output + 1]),
             row4_finish_i32(sum1.z, sx, scales[output + 2]),
             row4_finish_i32(sum1.w, sx, scales[output + 3]),
         };
-        *((device float4 *) (dst + output)) = value;
+        *((device float4 *) (dst_row + output)) = value;
 
         for (int i = 0; i < rows_per_group; ++i) {
-            const uint a = *((device volatile uint *) (dst + output + i));
-            const uint b = residual[output + i];
+            const uint a = *((device volatile uint *) (dst_row + output + i));
+            const uint b = residual_row[output + i];
             const float real = fairy2i_bf16_to_f32((ushort) (a & 0xffffU)) +
                                fairy2i_bf16_to_f32((ushort) (b & 0xffffU));
             const float imag = fairy2i_bf16_to_f32((ushort) (a >> 16)) +
                                fairy2i_bf16_to_f32((ushort) (b >> 16));
-            add_dst[output + i] = fairy2i_pack_bf16_pair(real, imag);
+            add_dst_row[output + i] = fairy2i_pack_bf16_pair(real, imag);
         }
     }
 }
