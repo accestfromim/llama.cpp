@@ -193,6 +193,32 @@ Two rotation costs were then moved out of the Flash Attention partial-workgroup 
 
 The standalone D128 WHT kernel now maps one float4 to each SIMD lane and processes eight rows per threadgroup. The final 16-stream attention microkernel measurements were 0.878 ms at 8K, 3.377 ms at 32K, and 6.648 ms at 64K. Compared with the preceding register-Q/shared-tile kernel, this is neutral at 8K and 2.1-2.8% faster at 32K-64K. The explicit production path was observed on all 32 quantized middle layers; the four protected BF16 boundary layers kept their original path. Direct and explicit fused chains pass 11/11 cases, including 32 query tokens and 32 independent streams.
 
+### Compact fused decode partials
+
+The final decode pass reduces traffic between the GQA4 attention kernel and its reduction kernel. Each partial workgroup now stores a normalized FP16 output vector plus FP32 softmax sum and maximum. The reducer reconstructs the global weights as `S_i * exp(M_i - M)` before combining the normalized vectors. Scratch use falls from 520 to 264 bytes per row and partial workgroup, a 49.2% reduction. Turbo4 nibble reconstruction also uses the existing FP16 centroid table and FP16 norm directly instead of expanding the same values to FP32 before writing FP16 staging memory.
+
+Scratch planning now recognizes the Turbo4 GQA4 shape even when the graph relies on the runtime explicit-chain matcher rather than the test-only fused flag. The allocator reserves the maximum of the generic FP32/NWG32 requirement and the adaptive compact Turbo requirement, so the 64K NWG128 production path cannot use a buffer sized for the generic route.
+
+The table compares the scalar fused implementation before this pass with the final compact implementation. Times are per attention operation, and lower is better.
+
+| Shape | Context | Before | Final | Improvement |
+| --- | ---: | ---: | ---: | ---: |
+| B1, one stream | 8K | 75.55 us | 72.66 us | 3.8% |
+| B1, one stream | 16K | 147.49 us | 144.49 us | 2.0% |
+| B1, one stream | 32K | 251.20 us | 244.73 us | 2.6% |
+| B1, one stream | 49K | 379.26 us | 366.27 us | 3.4% |
+| B1, one stream | 64K | 472.66 us | 464.18 us | 1.8% |
+| B16, one shared stream | 8K | 133.46 us | 128.31 us | 3.9% |
+| B16, one shared stream | 32K | 392.99 us | 372.96 us | 5.1% |
+| B16, one shared stream | 64K | 711.66 us | 669.80 us | 5.9% |
+| 16 independent streams | 8K each | 973.42 us | 927.58 us | 4.7% |
+| 16 independent streams | 32K each | 3411.24 us | 3319.86 us | 2.7% |
+| 16 independent streams | 64K each | 6669.91 us | 6386.57 us | 4.2% |
+
+An MPP TensorOps QK candidate was also implemented and measured, then removed. GQA4 supplies only four useful query rows to an eight-row cooperative tile, while the candidate added K transposition and raised threadgroup memory from about 8 KiB to 11 KiB. It regressed B1 64K from 468.98 to 782.39 us and B16 64K from 683.08 to 1020.64 us. No environment switch or dead TensorOps kernel remains.
+
+The final kernel passed 23/23 focused fused cases, 2/2 long 32K/64K CPU-reference cases, 14/14 Turbo4 read combinations, 2/2 Turbo4-K/q8-V cases, and the complete Row4 test executable. The best quality policy was also rerun against the saved BF16 logits. Its 8K metrics remained KL 0.0290108, top1 90.625%, top5 overlap 90.234%, and reference-top1-in-candidate-top5 100%. Its 64K metrics remained KL 0.0717698, top1 84.7656%, top5 overlap 84.8437%, and reference-top1-in-candidate-top5 98.8281%.
+
 With mean centering at 128 tokens and two protected layers at each boundary, full-model `tg128` reached 75.089 token/s at 8K, 49.459 at 32K, and 31.597 at 64K. A pure Turbo4 64K control reached 32.158 token/s. The protected strategy therefore retains nearly all of the pure-Turbo speed while providing the quality gains reported below.
 
 ### Tail batches below 16 streams

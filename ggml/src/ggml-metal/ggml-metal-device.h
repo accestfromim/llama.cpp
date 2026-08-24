@@ -166,7 +166,8 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
                                                                                 int32_t                    dv,
                                                                                 int32_t                    nwg,
                                                                                 bool                       round_bf16,
-                                                                                bool turbo_inverse);
+                                                                                bool                       turbo_inverse,
+                                                                                bool                       partial_f16);
 
 //
 // device

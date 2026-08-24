@@ -7785,10 +7785,10 @@ template <typename type4x4> void dequantize_turbo4_0(const device block_turbo4_0
 }
 
 template <typename type4> void dequantize_turbo4_0_t4(const device block_turbo4_0 * xb, short il, thread type4 & reg) {
-    const float norm = float(xb->norm);
-    const uchar2 q = *(const device uchar2 *) (xb->qs + 2 * il);
-    const float4 values = norm * float4(turbo_centroids_4bit[q[0] & 0xf], turbo_centroids_4bit[q[0] >> 4],
-                                        turbo_centroids_4bit[q[1] & 0xf], turbo_centroids_4bit[q[1] >> 4]);
+    const half   norm   = xb->norm;
+    const uchar2 q      = *(const device uchar2 *) (xb->qs + 2 * il);
+    const half4  values = norm * half4(turbo_centroids_4bit_f16[q[0] & 0xf], turbo_centroids_4bit_f16[q[0] >> 4],
+                                       turbo_centroids_4bit_f16[q[1] & 0xf], turbo_centroids_4bit_f16[q[1] >> 4]);
     reg = (type4) values;
 }
 
@@ -14818,10 +14818,11 @@ kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
 
     const int64_t nrows = args.ne3 * args.ne2 * args.ne1;
     const int64_t rid = iq3 * args.ne2 * args.ne1 + iq2 + iq1 * args.ne1;
-    device float4 * dst4 = (device float4 *) dst;
-    device float * dst1 = (device float *) dst + nrows * 128 * FC_flash_attn_ext_vec_nwg;
+    device half4 * dst4  = (device half4 *) dst;
+    device float * dst1  = (device float *) ((device half *) dst + nrows * 128 * FC_flash_attn_ext_vec_nwg);
 
-    dst4[rid * D4 * FC_flash_attn_ext_vec_nwg + FC_flash_attn_ext_vec_nwg * tiisg + iwg] = O;
+    dst4[rid * D4 * FC_flash_attn_ext_vec_nwg + FC_flash_attn_ext_vec_nwg * tiisg + iwg] =
+        half4(S > 0.0f ? O / S : 0.0f);
     if (tiisg == 0) {
         dst1[rid * (2 * FC_flash_attn_ext_vec_nwg) + 2 * iwg + 0] = S;
         dst1[rid * (2 * FC_flash_attn_ext_vec_nwg) + 2 * iwg + 1] = M;
@@ -14877,6 +14878,7 @@ constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_A
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 constant bool FC_flash_attn_ext_vec_reduce_round_bf16 [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 2)]];
 constant bool FC_flash_attn_ext_vec_reduce_turbo_inverse [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 3)]];
+constant bool FC_flash_attn_ext_vec_reduce_partial_f16 [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 4)]];
 
 kernel void kernel_flash_attn_ext_vec_reduce(
         constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
@@ -14893,7 +14895,10 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     const short iwg = tiisg;
 
-    device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
+    const device float * ss =
+        FC_flash_attn_ext_vec_reduce_partial_f16 ?
+            (const device float *) ((const device half *) htmp + (uint64_t) args.nrows * DV * NWG) :
+            (const device float *) htmp + (uint64_t) args.nrows * DV * NWG;
 
     const float S0 = ss[rid*(2*NWG) + 2*iwg + 0];
     const float M0 = ss[rid*(2*NWG) + 2*iwg + 1];
@@ -14909,23 +14914,43 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     const float ms1 = NWG > 32 ? exp(M1 - m) : 0.0f;
     const float ms2 = NWG > 64 ? exp(M2 - m) : 0.0f;
     const float ms3 = NWG > 96 ? exp(M3 - m) : 0.0f;
-    const float S = 1.0f/simd_sum(S0*ms0 + S1*ms1 + S2*ms2 + S3*ms3);
+    const float w0  = S0 * ms0;
+    const float w1  = S1 * ms1;
+    const float w2  = S2 * ms2;
+    const float w3  = S3 * ms3;
+    const float ws  = simd_sum(w0 + w1 + w2 + w3);
+    const float S   = ws > 0.0f ? 1.0f / ws : 0.0f;
 
     const short DV4 = DV/4;
 
-    device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
-    device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
+    const device float4 * htmp4   = (const device float4 *) htmp + rid * DV4 * NWG;
+    const device half4 *  htmp_h4 = (const device half4 *) htmp + rid * DV4 * NWG;
+    device float4 *       dst4    = (device float4 *) dst + rid * DV4;
 
     for (short i = sgitg; i < DV4; i += NWG) {
-        float4 v = htmp4[i*NWG + iwg]*ms0;
-        if (NWG > 32) {
-            v += htmp4[i*NWG + iwg + 32]*ms1;
-        }
-        if (NWG > 64) {
-            v += htmp4[i*NWG + iwg + 64]*ms2;
-        }
-        if (NWG > 96) {
-            v += htmp4[i*NWG + iwg + 96]*ms3;
+        float4 v;
+        if (FC_flash_attn_ext_vec_reduce_partial_f16) {
+            v = float4(htmp_h4[i * NWG + iwg]) * w0;
+            if (NWG > 32) {
+                v += float4(htmp_h4[i * NWG + iwg + 32]) * w1;
+            }
+            if (NWG > 64) {
+                v += float4(htmp_h4[i * NWG + iwg + 64]) * w2;
+            }
+            if (NWG > 96) {
+                v += float4(htmp_h4[i * NWG + iwg + 96]) * w3;
+            }
+        } else {
+            v = htmp4[i * NWG + iwg] * ms0;
+            if (NWG > 32) {
+                v += htmp4[i * NWG + iwg + 32] * ms1;
+            }
+            if (NWG > 64) {
+                v += htmp4[i * NWG + iwg + 64] * ms2;
+            }
+            if (NWG > 96) {
+                v += htmp4[i * NWG + iwg + 96] * ms3;
+            }
         }
         v = simd_sum(v);
 

@@ -3749,6 +3749,25 @@ static bool ggml_metal_op_flash_attn_ext_use_fairy2i_decode_vec(const ggml_tenso
            k->ne[2] == v->ne[2] && q->ne[2] > k->ne[2] && q->ne[2] % k->ne[2] == 0 && gqa_ratio <= 8;
 }
 
+static bool ggml_metal_flash_attn_ext_turbo4_gqa4_shape(const ggml_tensor * op) {
+    return op->src[1]->type == GGML_TYPE_TURBO4_0 && op->src[2]->type == GGML_TYPE_TURBO4_0 &&
+           op->src[0]->ne[0] == 128 && op->src[0]->ne[1] >= 1 && op->src[0]->ne[1] <= 16 &&
+           op->src[0]->ne[2] == 4 * op->src[1]->ne[2] && op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128;
+}
+
+static int32_t ggml_metal_flash_attn_ext_turbo4_nwg(const ggml_tensor * op) {
+    if (op->src[0]->ne[3] >= 8) {
+        return op->src[1]->ne[1] >= 32768 ? 64 : 32;
+    }
+    if (op->src[1]->ne[1] >= 65536) {
+        return 128;
+    }
+    if (op->src[1]->ne[1] >= 32768) {
+        return 64;
+    }
+    return 32;
+}
+
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3767,28 +3786,20 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
         return 0;
     }
 
-    const bool    turbo_gqa4 = ggml_flash_attn_ext_get_turbo4_fused(op) && op->src[0]->ne[0] == 128 &&
-                               op->src[0]->ne[1] >= 1 && op->src[0]->ne[1] <= 16 &&
-                               op->src[0]->ne[2] == 4 * op->src[1]->ne[2] &&
-                               op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128;
-    int64_t nwg = 32;
-    if (turbo_gqa4 && op->src[0]->ne[3] >= 8) {
-        nwg = op->src[1]->ne[1] >= 32768 ? 64 : 32;
-    } else if (turbo_gqa4 && op->src[1]->ne[1] >= 65536) {
-        nwg = 128;
-    } else if (turbo_gqa4 && op->src[1]->ne[1] >= 32768) {
-        nwg = 64;
-    }
-
     const int64_t ne01 = op->src[0]->ne[1];
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne03 = op->src[0]->ne[3];
     const int64_t ne20 = op->src[2]->ne[0];
+    const int64_t nrows = ne01 * ne02 * ne03;
 
-    // temp buffer for writing the results from each workgroup
-    // - ne20: the size of the Value head
-    // -  + 2: the S and M values for each intermediate result
-    return ggml_type_size(GGML_TYPE_F32) * (ne01 * ne02 * ne03 * nwg * (ne20 + 2));
+    const size_t generic_bytes = sizeof(float) * (size_t) nrows * 32 * (ne20 + 2);
+    if (!ggml_metal_flash_attn_ext_turbo4_gqa4_shape(op)) {
+        return generic_bytes;
+    }
+
+    const int32_t nwg         = ggml_metal_flash_attn_ext_turbo4_nwg(op);
+    const size_t  turbo_bytes = (size_t) nrows * nwg * (ne20 * sizeof(ggml_fp16_t) + 2 * sizeof(float));
+    return std::max(generic_bytes, turbo_bytes);
 }
 
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
@@ -4212,14 +4223,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nwg = 1;
             nsg = 4;
         } else {
-            nwg = 32;
-            if (turbo_gqa4_shape && ne03 >= 8) {
-                nwg = ne11 >= 32768 ? 64 : 32;
-            } else if (turbo_gqa4_shape && ne11 >= 65536) {
-                nwg = 128;
-            } else if (turbo_gqa4_shape && ne11 >= 32768) {
-                nwg = 64;
-            }
+            nwg = turbo_gqa4_shape ? ggml_metal_flash_attn_ext_turbo4_nwg(op) : 32;
             nsg = 1;
             while (2*nwg*nsg*nkpsg < ne11 && nsg < 4) {
                 nsg *= 2;
@@ -4330,7 +4334,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
                 const bool            turbo_inverse = turbo_gqa4 || turbo_chain_fused;
                 ggml_metal_pipeline_t pipeline0     = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
-                    lib, op, ne20, nwg, fairy2i_flash3 || turbo_fused, turbo_inverse);
+                    lib, op, ne20, nwg, fairy2i_flash3 || turbo_fused, turbo_inverse, turbo_gqa4);
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline0);
                 ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
