@@ -383,7 +383,7 @@ Plain int4 K is better at 1K, close at 8K, and effectively tied in KL at 64K. Th
 
 ## K mean-centering experiment
 
-`TURBO_K_MEAN_CENTER` is default-off and supports two experimental modes for fully offloaded Turbo4/Turbo4 Metal streams. Each stream owns an independent warmup sum and completed mean:
+`TURBO_K_MEAN_CENTER` is default-off and supports two experimental modes for fully offloaded Turbo4/Turbo3 or Turbo4/Turbo4 Metal streams. Each stream owns an independent warmup sum and completed mean:
 
 - Mode 1 leaves the warmup K vectors unchanged and subtracts their mean from later K vectors.
 - Mode 2 subtracts one completed warmup mean from every K vector in the initial prompt and from all later K vectors.
@@ -405,7 +405,7 @@ The proposed explanation is correct in absolute-error terms: the 128-token mean 
 
 ## Boundary BF16 layers and best quality strategy
 
-`TURBO_KV_BOUNDARY_BF16_LAYERS=2` keeps the first two and last two attention layers in BF16 and uses centered Turbo4/Turbo4 in the middle 32 layers. It is default-off and valid only for the fully offloaded Row4 Turbo4/Turbo4 experiment. At context 8192 it uses about 392 MiB of KV memory, versus 297 MiB for pure Turbo4 and 1152 MiB for BF16/BF16.
+`TURBO_KV_BOUNDARY_BF16_LAYERS=2` keeps the first two and last two attention layers in BF16 and uses centered Turbo KV in the middle 32 layers. It is default-off and valid only for fully offloaded Row4 Turbo4/Turbo3 or Turbo4/Turbo4 experiments. At context 8192, the Turbo4/Turbo4 configuration uses about 392 MiB of KV memory, versus 297 MiB for pure Turbo4 and 1152 MiB for BF16/BF16.
 
 The table below uses BF16/BF16 logits as the reference. Top5 overlap is the average set intersection divided by five; reference-top1-in-top5 asks whether the BF16 winner remains anywhere in the candidate's top five.
 
@@ -419,6 +419,19 @@ The table below uses BF16/BF16 logits as the reference. Top5 overlap is the aver
 | 65536 | 0.07177 | 84.8% | 84.8% | 98.8% |
 
 This is the best measured strategy. At 64K it reduces KL by 71.2% relative to uncentered Turbo4/Turbo4 and raises top1 agreement from 75.4% to 84.8%. Top1 exact agreement is deliberately strict: even at 64K, the BF16 top1 token remains within the candidate top five for 98.8% of evaluated rows.
+
+### Turbo4 K with Turbo3 V
+
+Turbo4/Turbo3 was tested with mean-centering mode 2, 128 warmup tokens, and two protected BF16 layers at each boundary. The logits harness used saved BF16/BF16 references, a fixed 512-token suffix beginning at WikiText-2 source token 70000, and the final 256 rows at each context depth.
+
+| Context | KL +/- SEM | Top1 agreement | Top5 overlap | Exact top5 set | BF16 top1 in candidate top5 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1024 | 0.04010 +/- 0.00271 | 84.8% | 89.7% | 55.9% | 100.0% |
+| 8192 | 0.04102 +/- 0.00356 | 90.2% | 88.2% | 48.0% | 100.0% |
+
+The equivalent centered and boundary-protected Turbo4/Turbo4 results were KL 0.02970, top1 88.3%, and top5 overlap 90.7% at 1K; and KL 0.02901, top1 90.6%, and top5 overlap 90.2% at 8K. Reducing V from Turbo4 to Turbo3 therefore causes a small measurable logits shift, but no large top-token failure in this sample.
+
+The 2048-context WikiText-2 run used 16 chunks. Turbo4/Turbo3 reached PPL 31.7521 +/- 0.81273, compared with BF16/BF16 at 31.8656 +/- 0.81957 and centered, boundary-protected Turbo4/Turbo4 at 32.3035 +/- 0.82888. The error intervals overlap, so the lower Turbo4/Turbo3 point estimate is not evidence that quantization improves the model. It does show no PPL regression in this test.
 
 Server prompt-cache reuse is not supported by this mean-centering experiment. A reused partial prompt carries a K translation computed from the old prompt, while a new suffix changes the intended warmup mean. Evaluations and applications that enable mode 2 must send `"cache_prompt": false`; changing slot-selection similarity alone is not sufficient.
 

@@ -49,8 +49,9 @@ llama_kv_cache::llama_kv_cache(
         turbo_k_mean_center = (int) mode;
     }
     if (turbo_k_mean_center) {
-        if (type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0 || !offload) {
-            throw std::invalid_argument("TURBO_K_MEAN_CENTER requires offloaded turbo4/turbo4 KV");
+        if (type_k != GGML_TYPE_TURBO4_0 || (type_v != GGML_TYPE_TURBO3_0 && type_v != GGML_TYPE_TURBO4_0) ||
+            !offload) {
+            throw std::invalid_argument("TURBO_K_MEAN_CENTER requires offloaded turbo4/turbo3 or turbo4/turbo4 KV");
         }
         const char * turbo_k_mean_warmup_env = getenv("TURBO_K_MEAN_WARMUP");
         if (turbo_k_mean_warmup_env) {
@@ -75,8 +76,10 @@ llama_kv_cache::llama_kv_cache(
         turbo_boundary_bf16_layers = (int) n_layers;
     }
     if (turbo_boundary_bf16_layers) {
-        if (!model.row4_enabled || type_k != GGML_TYPE_TURBO4_0 || type_v != GGML_TYPE_TURBO4_0 || !offload) {
-            throw std::invalid_argument("TURBO_KV_BOUNDARY_BF16_LAYERS requires offloaded Row4 turbo4/turbo4 KV");
+        if (!model.row4_enabled || type_k != GGML_TYPE_TURBO4_0 ||
+            (type_v != GGML_TYPE_TURBO3_0 && type_v != GGML_TYPE_TURBO4_0) || !offload) {
+            throw std::invalid_argument(
+                "TURBO_KV_BOUNDARY_BF16_LAYERS requires offloaded Row4 turbo4/turbo3 or turbo4/turbo4 KV");
         }
         LLAMA_LOG_INFO("%s: first and last %d Row4 KV layers use BF16\n", __func__, turbo_boundary_bf16_layers);
     }
