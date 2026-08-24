@@ -7792,6 +7792,69 @@ template <typename type4> void dequantize_turbo4_0_t4(const device block_turbo4_
     reg = (type4) values;
 }
 
+static int turbo2m4_variant_n(int variant) {
+    switch (variant) {
+        case 2:
+        case 5:
+            return 4;
+        case 3:
+        case 6:
+            return 8;
+        default:
+            return 16;
+    }
+}
+
+template <typename type4x4>
+void dequantize_turbo2m4_bytes(const device uint8_t * xb, short il, int variant, thread type4x4 & reg) {
+    const ushort norm_bits = ushort(xb[0]) | (ushort(xb[1]) << 8);
+    const float  norm      = float(as_type<half>(norm_bits));
+    float4x4     values;
+    const int    base = 16 * il;
+
+    if (variant == 0) {
+        for (int i = 0; i < 16; ++i) {
+            const int     j      = base + i;
+            const uint8_t low    = (xb[2 + j / 4] >> (2 * (j % 4))) & 0x3;
+            const uint8_t high   = (xb[34 + j / 8] >> (j % 8)) & 0x1;
+            values[i / 4][i % 4] = norm * turbo_centroids_3bit[low | (high << 2)];
+        }
+    } else if (variant == 1) {
+        for (int i = 0; i < 16; ++i) {
+            const int     j = base + i;
+            const uint8_t q = (xb[2 + j / 2] >> (4 * (j % 2))) & 0xf;
+            values[i / 4][i % 4] = norm * turbo_centroids_4bit[q];
+        }
+    } else {
+        const int  n     = turbo2m4_variant_n(variant);
+        const bool group = variant >= 5;
+        const int  n_pos = group ? n / 4 : n;
+        for (int i = 0; i < 16; ++i) {
+            const int     j  = base + i;
+            const uint8_t q2 = (xb[2 + j / 4] >> (2 * (j % 4))) & 0x3;
+            float value = turbo_centroids_2bit[q2];
+            if (group) {
+                for (int slot = 0; slot < n_pos; ++slot) {
+                    if (xb[34 + slot] == j / 4) {
+                        const int     lane = j % 4;
+                        const uint8_t q4 = (xb[34 + n_pos + 2 * slot + lane / 2] >> (4 * (lane % 2))) & 0xf;
+                        value = turbo_centroids_4bit[q4];
+                    }
+                }
+            } else {
+                for (int slot = 0; slot < n; ++slot) {
+                    if (xb[34 + slot] == j) {
+                        const uint8_t q4 = (xb[34 + n + slot / 2] >> (4 * (slot % 2))) & 0xf;
+                        value = turbo_centroids_4bit[q4];
+                    }
+                }
+            }
+            values[i / 4][i % 4] = norm * value;
+        }
+    }
+    reg = (type4x4) values;
+}
+
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
     device const uint16_t * qs = ((device const uint16_t *)xb + 1);
@@ -12612,6 +12675,18 @@ constant bool FC_flash_attn_ext_has_scap  [[function_constant(FC_FLASH_ATTN_EXT 
 constant int32_t FC_flash_attn_ext_ns10 [[function_constant(FC_FLASH_ATTN_EXT + 20)]];
 constant int32_t FC_flash_attn_ext_ns20 [[function_constant(FC_FLASH_ATTN_EXT + 21)]];
 constant int32_t FC_flash_attn_ext_nsg  [[function_constant(FC_FLASH_ATTN_EXT + 22)]];
+constant int32_t FC_flash_attn_ext_turbo_k_variant [[function_constant(FC_FLASH_ATTN_EXT + 24)]];
+constant int32_t FC_flash_attn_ext_turbo_v_variant [[function_constant(FC_FLASH_ATTN_EXT + 25)]];
+
+template <typename type4x4>
+void dequantize_turbo2m4_k(const device uint8_t * xb, short il, thread type4x4 & reg) {
+    dequantize_turbo2m4_bytes(xb, il, FC_flash_attn_ext_turbo_k_variant, reg);
+}
+
+template <typename type4x4>
+void dequantize_turbo2m4_v(const device uint8_t * xb, short il, thread type4x4 & reg) {
+    dequantize_turbo2m4_bytes(xb, il, FC_flash_attn_ext_turbo_v_variant, reg);
+}
 
 #if defined(GGML_METAL_HAS_BF16)
 template<short DK>
@@ -14156,6 +14231,16 @@ template [[host_name("kernel_flash_attn_ext_kturbo4_vturbo4_gqa4_half_dk128_dv12
                           8,
                           64,
                           4>;
+template [[host_name("kernel_flash_attn_ext_turbo2m4_dk128_dv128")]] kernel flash_attn_ext_t
+    kernel_flash_attn_ext<FA_TYPES,
+                          uint8_t,
+                          8,
+                          dequantize_turbo2m4_k,
+                          uint8_t,
+                          8,
+                          dequantize_turbo2m4_v,
+                          128,
+                          128>;
 template [[host_name("kernel_flash_attn_ext_kq8_0_vturbo2_dk128_dv128")]] kernel flash_attn_ext_t
     kernel_flash_attn_ext<FA_TYPES, block_q8_0, 2, dequantize_q8_0, block_turbo2_0, 8, dequantize_turbo2_0, 128, 128>;
 template [[host_name("kernel_flash_attn_ext_kq8_0_vturbo3_dk128_dv128")]] kernel flash_attn_ext_t
@@ -17451,6 +17536,166 @@ kernel void kernel_set_rows_turbo4_simd(constant ggml_metal_kargs_set_rows & arg
     }
 }
 
+constant int FC_turbo2m4_set_rows_variant [[function_constant(FC_TURBO2M4_SET_ROWS)]];
+
+static int turbo2m4_n() {
+    switch (FC_turbo2m4_set_rows_variant) {
+        case 0:
+        case 3:
+            return 4;
+        case 1:
+        case 4:
+            return 8;
+        default:
+            return 16;
+    }
+}
+
+static int turbo2m4_block_size() {
+    switch (FC_turbo2m4_set_rows_variant) {
+        case 0:
+        case 4:
+            return 40;
+        case 1:
+        case 5:
+            return 46;
+        case 2:
+            return 58;
+        default:
+            return 37;
+    }
+}
+
+template <typename TI>
+kernel void kernel_set_rows_turbo2m4(constant ggml_metal_kargs_set_rows & args,
+                                     const device void *                  src0,
+                                     const device void *                  src1,
+                                     device float *                       dst,
+                                     uint3                                tgpig [[threadgroup_position_in_grid]],
+                                     ushort                               tiisg [[thread_index_in_simdgroup]]) {
+    const int32_t i03   = tgpig.z;
+    const int32_t i02   = tgpig.y;
+    const int32_t block = tgpig.x % args.nk0;
+    const int32_t i01   = tgpig.x / args.nk0;
+    const int32_t i12   = i03 % args.ne12;
+    const int32_t i11   = i02 % args.ne11;
+
+    const TI row =
+        ((const device TI *) ((const device char *) src1 + i01 * args.nb10 + i11 * args.nb11 + i12 * args.nb12))[0];
+    device uint8_t * dst_block = (device uint8_t *) dst + int64_t(row) * args.nb1 + i02 * args.nb2 +
+                                 i03 * args.nb3 + block * turbo2m4_block_size();
+    const device float4 * src_row =
+        (const device float4 *) ((const device char *) src0 + i01 * args.nb01 + i02 * args.nb02 + i03 * args.nb03);
+
+    float4 x          = src_row[32 * block + tiisg];
+    const float norm  = sqrt(simd_sum(dot(x, x)));
+    x                *= norm > 1e-10f ? 1.0f / norm : 0.0f;
+    x                 = turbo_rotate_forward_simd(x, tiisg);
+
+    uchar4 q2;
+    float4 c2;
+    for (int lane = 0; lane < 4; ++lane) {
+        q2[lane] = turbo_index_2bit(x[lane]);
+        c2[lane] = turbo_centroids_2bit[q2[lane]];
+    }
+    dst_block[2 + tiisg] = q2[0] | (q2[1] << 2) | (q2[2] << 4) | (q2[3] << 6);
+
+    const int n = turbo2m4_n();
+    const bool group = FC_turbo2m4_set_rows_variant >= 3;
+    const int n_pos = group ? n / 4 : n;
+    bool4 selected4 = bool4(false);
+    bool selected_group = false;
+    threadgroup uint8_t selected_positions[16];
+
+    for (int rank = 0; rank < n_pos; ++rank) {
+        float  local_score = -1.0f;
+        ushort local_index = 255;
+        if (group) {
+            if (!selected_group) {
+                local_score = max(max(fabs(x[0]), fabs(x[1])), max(fabs(x[2]), fabs(x[3])));
+                local_index = tiisg;
+            }
+        } else {
+            for (ushort lane = 0; lane < 4; ++lane) {
+                const float score = fabs(x[lane]);
+                if (!selected4[lane] && score > local_score) {
+                    local_score = score;
+                    local_index = 4 * tiisg + lane;
+                }
+            }
+        }
+
+        const float  best_score = simd_max(local_score);
+        const ushort candidate  = local_score == best_score ? local_index : 255;
+        const ushort best_index = simd_min(candidate);
+        if (group) {
+            selected_group |= best_index == tiisg;
+        } else if (best_index / 4 == tiisg) {
+            selected4[best_index % 4] = true;
+        }
+        if (tiisg == 0) {
+            selected_positions[rank] = (uint8_t) best_index;
+        }
+    }
+
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        for (int i = 1; i < n_pos; ++i) {
+            const uint8_t value = selected_positions[i];
+            int           j     = i;
+            while (j > 0 && selected_positions[j - 1] > value) {
+                selected_positions[j] = selected_positions[j - 1];
+                --j;
+            }
+            selected_positions[j] = value;
+        }
+        for (int i = 0; i < n_pos; ++i) {
+            dst_block[34 + i] = selected_positions[i];
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    float recon_norm2 = dot(c2, c2);
+    uchar4 q4;
+    for (int lane = 0; lane < 4; ++lane) {
+        q4[lane] = turbo_index_4bit(x[lane]);
+        if ((group && selected_group) || (!group && selected4[lane])) {
+            const float c4 = turbo_centroids_4bit[q4[lane]];
+            recon_norm2 += c4 * c4 - c2[lane] * c2[lane];
+        }
+    }
+
+    device uint8_t * qh = dst_block + 34 + n_pos;
+    if (group) {
+        for (int slot = 0; slot < n_pos; ++slot) {
+            const ushort source_lane = selected_positions[slot];
+            const uchar4 code = uchar4(simd_shuffle(q4[0], source_lane), simd_shuffle(q4[1], source_lane),
+                                       simd_shuffle(q4[2], source_lane), simd_shuffle(q4[3], source_lane));
+            if (tiisg == 0) {
+                qh[2 * slot + 0] = code[0] | (code[1] << 4);
+                qh[2 * slot + 1] = code[2] | (code[3] << 4);
+            }
+        }
+    } else {
+        for (int slot = 0; slot < n; slot += 2) {
+            const ushort index0 = selected_positions[slot + 0];
+            const ushort index1 = selected_positions[slot + 1];
+            const uint8_t code0  = simd_shuffle(q4[index0 % 4], index0 / 4);
+            const uint8_t code1  = simd_shuffle(q4[index1 % 4], index1 / 4);
+            if (tiisg == 0) {
+                qh[slot / 2] = code0 | (code1 << 4);
+            }
+        }
+    }
+
+    const float recon_norm = sqrt(simd_sum(recon_norm2));
+    if (tiisg == 0) {
+        const ushort bits = as_type<ushort>(half(recon_norm > 1e-10f ? norm / recon_norm : norm));
+        dst_block[0]      = (uint8_t) (bits & 0xff);
+        dst_block[1]      = (uint8_t) (bits >> 8);
+    }
+}
+
 template<typename block_q, void (*quantize_func)(device const float *, device block_q &)>
 kernel void kernel_set_rows_q32(
         constant ggml_metal_kargs_set_rows & args,
@@ -18032,6 +18277,7 @@ template [[host_name("kernel_set_rows_iq4_nl")]] kernel set_rows_q32_t kernel_se
 typedef decltype(kernel_set_rows_turbo<int64_t, block_turbo2_0>) set_rows_turbo2_t;
 typedef decltype(kernel_set_rows_turbo<int64_t, block_turbo3_0>) set_rows_turbo3_t;
 typedef decltype(kernel_set_rows_turbo4_simd<int64_t>) set_rows_turbo4_t;
+typedef decltype(kernel_set_rows_turbo2m4<int64_t>) set_rows_turbo2m4_t;
 
 template
     [[host_name("kernel_set_rows_turbo2_i64")]] kernel set_rows_turbo2_t kernel_set_rows_turbo<int64_t, block_turbo2_0>;
@@ -18045,6 +18291,10 @@ template
     [[host_name("kernel_set_rows_turbo4_i64")]] kernel set_rows_turbo4_t kernel_set_rows_turbo4_simd<int64_t>;
 template
     [[host_name("kernel_set_rows_turbo4_i32")]] kernel set_rows_turbo4_t kernel_set_rows_turbo4_simd<int32_t>;
+template
+    [[host_name("kernel_set_rows_turbo2m4_i64")]] kernel set_rows_turbo2m4_t kernel_set_rows_turbo2m4<int64_t>;
+template
+    [[host_name("kernel_set_rows_turbo2m4_i32")]] kernel set_rows_turbo2m4_t kernel_set_rows_turbo2m4<int32_t>;
 
 //
 // matrix-matrix multiplication

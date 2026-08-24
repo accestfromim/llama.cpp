@@ -81,6 +81,7 @@
 #define FC_FAIRY2I_BUNDLE_W1_DECODE    700
 #define FC_FAIRY2I_BUNDLE_W2_DECODE    800
 #define FC_FAIRY2I_BUNDLE_W1_PREFILL   900
+#define FC_TURBO2M4_SET_ROWS           1000
 
 // kernel argument structs
 //

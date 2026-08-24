@@ -1323,7 +1323,8 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
             lib, mode == GGML_SET_ROWS_BF16_CARRIER_ELEMENTS);
     } else {
         GGML_ASSERT(mode == 0);
-        if (op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) {
+        if (op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0 ||
+            (op->type >= GGML_TYPE_TURBO2M4_S4 && op->type <= GGML_TYPE_TURBO2M4_G16)) {
             pipeline = ggml_metal_library_get_pipeline_set_rows_turbo(lib, op->type, op->src[1]->type);
         } else {
             pipeline = op->src[0]->type == GGML_TYPE_BF16 ? ggml_metal_get_pipeline_set_rows_bf16_raw(lib) :
@@ -1365,7 +1366,8 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
         return 1;
     }
 
-    if (op->type == GGML_TYPE_TURBO4_0) {
+    if (op->type == GGML_TYPE_TURBO4_0 ||
+        (op->type >= GGML_TYPE_TURBO2M4_S4 && op->type <= GGML_TYPE_TURBO2M4_G16)) {
         GGML_ASSERT(32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01 * nk0, ne02, ne03, 32, 1, 1);
         return 1;
@@ -3715,8 +3717,10 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 
     const ggml_type type_k = op->src[1]->type;
     const ggml_type type_v = op->src[2]->type;
-    const bool turbo_k = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
-    const bool turbo_v = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+    const bool turbo_k = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+                         (type_k >= GGML_TYPE_TURBO2M4_S4 && type_k <= GGML_TYPE_TURBO2M4_G16);
+    const bool turbo_v = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 ||
+                         (type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16);
     const bool turbo_vec_pair = (type_k == GGML_TYPE_TURBO4_0 && type_v == GGML_TYPE_TURBO4_0) ||
                                 (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_TURBO4_0);
     if ((turbo_k || turbo_v) && !(turbo_vec_pair && op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128)) {
@@ -3840,8 +3844,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     const ggml_type type_k = op->src[1]->type;
     const ggml_type type_v = op->src[2]->type;
-    const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
-    const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+    const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
+                         (type_k >= GGML_TYPE_TURBO2M4_S4 && type_k <= GGML_TYPE_TURBO2M4_G16);
+    const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 ||
+                         (type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16);
     GGML_ASSERT(type_k == type_v || (k_turbo && (v_turbo || type_v == GGML_TYPE_Q8_0)) ||
                 (v_turbo && (type_k == GGML_TYPE_Q8_0 || type_k == GGML_TYPE_Q4_0)));
 

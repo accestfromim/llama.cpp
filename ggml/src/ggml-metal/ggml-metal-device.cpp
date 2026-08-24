@@ -197,15 +197,29 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_set_rows_turbo(ggml_metal_
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_set_rows_%s_%s", ggml_type_name(tdst), ggml_type_name(tidx));
-    snprintf(name, 256, "%s", base);
+    const bool mixed = tdst >= GGML_TYPE_TURBO2M4_S4 && tdst <= GGML_TYPE_TURBO2M4_G16;
+    if (mixed) {
+        snprintf(base, 256, "kernel_set_rows_turbo2m4_%s", ggml_type_name(tidx));
+        snprintf(name, 256, "%s_%s", base, ggml_type_name(tdst));
+    } else {
+        snprintf(base, 256, "kernel_set_rows_%s_%s", ggml_type_name(tdst), ggml_type_name(tidx));
+        snprintf(name, 256, "%s", base);
+    }
 
     ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
     if (res) {
         return res;
     }
 
-    return ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    if (!mixed) {
+        return ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    ggml_metal_cv_t cv = ggml_metal_cv_init();
+    ggml_metal_cv_set_int32(cv, (int32_t) tdst - (int32_t) GGML_TYPE_TURBO2M4_S4, FC_TURBO2M4_SET_ROWS);
+    res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+    ggml_metal_cv_free(cv);
+    return res;
 }
 
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib) {
@@ -995,12 +1009,21 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_
 
     const ggml_type type_k = op->src[1]->type;
     const ggml_type type_v = op->src[2]->type;
-    const bool turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
-                       type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+    const bool mixed = (type_k >= GGML_TYPE_TURBO2M4_S4 && type_k <= GGML_TYPE_TURBO2M4_G16) ||
+                       (type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16);
+    const bool turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
+                       type_k == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0 ||
+                       type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || mixed;
 
     if (turbo_gqa4) {
         GGML_ASSERT(type_k == GGML_TYPE_TURBO4_0 && type_v == GGML_TYPE_TURBO4_0 && dk == 128 && dv == 128);
         snprintf(base, 256, "kernel_flash_attn_ext_kturbo4_vturbo4_gqa4_half_dk128_dv128");
+    } else if (mixed) {
+        GGML_ASSERT(
+            (type_k == GGML_TYPE_TURBO4_0 || (type_k >= GGML_TYPE_TURBO2M4_S4 && type_k <= GGML_TYPE_TURBO2M4_G16)) &&
+            (type_v == GGML_TYPE_TURBO3_0 || (type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16)) &&
+            dk == 128 && dv == 128);
+        snprintf(base, 256, "kernel_flash_attn_ext_turbo2m4_dk128_dv128");
     } else if (turbo) {
         snprintf(base, 256, "kernel_flash_attn_ext_k%s_v%s_dk%d_dv%d", ggml_type_name(type_k), ggml_type_name(type_v),
                  dk, dv);
@@ -1009,15 +1032,14 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_
         snprintf(base, 256, "kernel_flash_attn_ext_%s_dk%d_dv%d", type_name, dk, dv);
     }
 
-    snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_ns10=%d_ns20=%d_nsg=%d",
-            base,
-            has_mask,
-            has_sinks,
-            has_bias,
-            has_scap,
-            ns10,
-            ns20,
-            nsg);
+    if (mixed) {
+        snprintf(name, 256, "%s_k%s_v%s_mask=%d_sinks=%d_bias=%d_scap=%d_ns10=%d_ns20=%d_nsg=%d", base,
+                 ggml_type_name(type_k), ggml_type_name(type_v), has_mask, has_sinks, has_bias, has_scap, ns10, ns20,
+                 nsg);
+    } else {
+        snprintf(name, 256, "%s_mask=%d_sinks=%d_bias=%d_scap=%d_ns10=%d_ns20=%d_nsg=%d", base, has_mask, has_sinks,
+                 has_bias, has_scap, ns10, ns20, nsg);
+    }
 
     ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
     if (res) {
@@ -1034,6 +1056,10 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_
     ggml_metal_cv_set_int32(cv, ns10, FC_FLASH_ATTN_EXT + 20);
     ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT + 21);
     ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT + 22);
+    if (mixed) {
+        ggml_metal_cv_set_int32(cv, (int32_t) type_k - (int32_t) GGML_TYPE_TURBO3_0, FC_FLASH_ATTN_EXT + 24);
+        ggml_metal_cv_set_int32(cv, (int32_t) type_v - (int32_t) GGML_TYPE_TURBO3_0, FC_FLASH_ATTN_EXT + 25);
+    }
 
     res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

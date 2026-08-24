@@ -1050,13 +1050,24 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 
             const enum ggml_type type_k = op->src[1]->type;
             const enum ggml_type type_v = op->src[2]->type;
-            const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0;
-            const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0;
+            const bool k_mixed = type_k >= GGML_TYPE_TURBO2M4_S4 && type_k <= GGML_TYPE_TURBO2M4_G16;
+            const bool v_mixed = type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16;
+            const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
+                                 type_k == GGML_TYPE_TURBO4_0 || k_mixed;
+            const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 ||
+                                 type_v == GGML_TYPE_TURBO4_0 || v_mixed;
             if (k_turbo || v_turbo) {
-                const bool pair_supported = (k_turbo && v_turbo) ||
-                                            (k_turbo && type_v == GGML_TYPE_Q8_0) ||
-                                            (v_turbo && type_k == GGML_TYPE_Q8_0) ||
-                                            (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_TURBO4_0);
+                const bool mixed_pair = (type_k == GGML_TYPE_TURBO4_0 || k_mixed) &&
+                                        (type_v == GGML_TYPE_TURBO3_0 || v_mixed);
+                bool pair_supported;
+                if (k_mixed || v_mixed) {
+                    pair_supported = mixed_pair;
+                } else {
+                    pair_supported = (k_turbo && v_turbo) ||
+                                     (k_turbo && type_v == GGML_TYPE_Q8_0) ||
+                                     (v_turbo && type_k == GGML_TYPE_Q8_0) ||
+                                     (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_TURBO4_0);
+                }
                 return pair_supported && op->src[0]->ne[0] == 128 && op->src[1]->ne[0] == 128 &&
                        op->src[2]->ne[0] == 128 && has_simdgroup_mm;
             }
@@ -1193,6 +1204,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_TURBO2_0:
                     case GGML_TYPE_TURBO3_0:
                     case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO2M4_S4:
+                    case GGML_TYPE_TURBO2M4_S8:
+                    case GGML_TYPE_TURBO2M4_S16:
+                    case GGML_TYPE_TURBO2M4_G4:
+                    case GGML_TYPE_TURBO2M4_G8:
+                    case GGML_TYPE_TURBO2M4_G16:
                         return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32) &&
                                op->ne[0] % 128 == 0 &&
                                (ggml_get_op_params_i32(op, 1) == 0 || ggml_get_op_params_i32(op, 1) == 128);
