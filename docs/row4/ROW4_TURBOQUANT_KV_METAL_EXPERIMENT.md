@@ -580,6 +580,213 @@ The run completed 59 attempts in about 8 hours 26 minutes. It solved 18/30 probl
 
 The exact evaluated binary used the register-Q kernel with separate 16 KiB K/V staging. The later 8 KiB shared-tile, rotation-hoisting, and M16 tail-batch optimizations preserve the arithmetic order and pass the CPU-reference tests, but the 8.4-hour AIME run was not repeated and no throughput from the earlier run is attributed to the later kernels.
 
+## Mixed-precision Turbo2/Turbo4 KV experiment
+
+### Scope and formats
+
+This follow-up starts from `codex/row4-turboquant-kv-metal@697feba6`. It adds six runtime-only KV types. The types do not enter GGUF and use IDs after the Row4 Turbo2/3/4 range.
+
+| CLI name | GGML type | ID | Layout | Size |
+| --- | --- | ---: | --- | ---: |
+| `turbo2m4_s4` | `GGML_TYPE_TURBO2M4_S4` | 52 | Turbo2 plus four scalar positions and four Turbo4 codes | 40 B / 128 = 2.500 bpv |
+| `turbo2m4_s8` | `GGML_TYPE_TURBO2M4_S8` | 53 | Turbo2 plus eight scalar positions and eight Turbo4 codes | 46 B / 128 = 2.875 bpv |
+| `turbo2m4_s16` | `GGML_TYPE_TURBO2M4_S16` | 54 | Turbo2 plus 16 scalar positions and 16 Turbo4 codes | 58 B / 128 = 3.625 bpv |
+| `turbo2m4_g4` | `GGML_TYPE_TURBO2M4_G4` | 55 | Turbo2 plus one float4 group position and four Turbo4 codes | 37 B / 128 = 2.3125 bpv |
+| `turbo2m4_g8` | `GGML_TYPE_TURBO2M4_G8` | 56 | Turbo2 plus two float4 group positions and eight Turbo4 codes | 40 B / 128 = 2.500 bpv |
+| `turbo2m4_g16` | `GGML_TYPE_TURBO2M4_G16` | 57 | Turbo2 plus four float4 group positions and 16 Turbo4 codes | 46 B / 128 = 2.875 bpv |
+
+Every block first writes all 128 Turbo2 codes. Scalar variants select the largest 4, 8, or 16 rotated coefficients by absolute value. Group variants score each float4 by its largest absolute coefficient and select one, two, or four groups. Equal scores prefer the lower index, and stored positions are sorted in increasing index order. Selected values receive a second Turbo4 code. A single corrected FP16 norm is fitted against the complete mixed reconstruction.
+
+The implementation includes deterministic zero and tie inputs, byte oracles, block size assertions, whole-row versus chunked dequantization checks, and CPU dot references. Dequantization returns WHT-domain values, as with the original Turbo cache formats.
+
+### Runtime and Metal support
+
+The six formats are explicit Row4 experiments. They require D128 heads, full Metal placement, Flash Attention, and KQV offload. They are available to the CLI and `llama-bench`. Centering and boundary BF16 protection accept all six formats. CPU Row4 execution and mixed CPU/Metal placement are rejected.
+
+One Metal SET_ROWS source uses a threadgroup-uniform function constant for the six variants. One byte-addressed D128 Flash Attention source covers the 7 x 7 grid formed by K in Turbo4 plus the six mixed formats and V in Turbo3 plus the six mixed formats. The correctness grid compiled 48 mixed pipelines from that source; the unchanged Turbo4/Turbo3 path is the forty-ninth regression point. SET_ROWS compiled six I32 and six I64 pipelines from two shared host functions.
+
+The full Metal correctness results are:
+
+| Test | Actual cases | Result |
+| --- | ---: | --- |
+| Mixed CPU codec and deterministic byte tests | 1 executable | Pass |
+| Mixed SET_ROWS, I32/I64, zero, single/multiple/large rows | 126 | Pass |
+| D128 7 x 7 FA grid, decode and prefill | 98 | Pass |
+| Four specialized candidates, direct/explicit/multi-stream paths | 32 | Pass |
+| Additional 32K/64K direct and explicit paths plus 8K B32 | 20 | Pass |
+
+All selected Metal cases ran. None printed `not supported`, `0/0`, or `FAIL`. FA uses the existing `5e-4` NMSE limit and SET_ROWS uses `0.05`.
+
+### Centered 8K grid
+
+The mixed-format experiments use `qwen3-row4-v2-pair2.gguf`, whose Row4 weights use the v2 lossless LUT permutation. The quality harness uses BF16/BF16 logits as the reference, allocates 66048 KV positions for every run, fills 8192 WikiText-2 tokens, evaluates a fixed 512-token suffix, and compares its final 256 rows. The authoritative environment is:
+
+```text
+TURBO_K_MEAN_CENTER=2
+TURBO_K_MEAN_WARMUP=128
+TURBO_KV_BOUNDARY_BF16_LAYERS=0
+```
+
+Earlier scratch runs used non-existent `TURBO_K_CENTER_*` variables. They are uncentered controls and are excluded from the tables below.
+
+Before full-model screening, a 36-layer capture measured the codec directly on real Q/K/V values. The K table reports the QK dot error after applying each candidate to K. V metrics use Turbo4 K and report sampled attention-output error:
+
+| Format | K NMSE | K cosine | QK dot NMSE | V NMSE | V cosine | Attention-output NMSE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Turbo4 K / Turbo3 V | 0.00889 | 0.99556 | 0.00240 | 0.03382 | 0.98309 | 0.02535 |
+| S4 | 0.08621 | 0.95689 | 0.02816 | 0.08516 | 0.95742 | 0.05344 |
+| S8 | 0.07734 | 0.96133 | 0.02510 | 0.07514 | 0.96243 | 0.04784 |
+| S16 | 0.07386 | 0.96307 | 0.02354 | 0.07119 | 0.96441 | 0.04566 |
+| G4 | 0.10074 | 0.94963 | 0.03195 | 0.10185 | 0.94907 | 0.06351 |
+| G8 | 0.09119 | 0.95441 | 0.02886 | 0.09123 | 0.95438 | 0.05707 |
+| G16 | 0.07852 | 0.96074 | 0.02480 | 0.07747 | 0.96127 | 0.04904 |
+
+This capture predicted the full-model result: replacing Turbo4 K increased QK dot NMSE by about 10x or more, while mixed V remained a usable quality-memory tradeoff. Scalar selection is consistently more accurate at the same promoted count, while group selection stores fewer position bytes.
+
+All 49 centered combinations completed. Mixed K was not competitive: even the strongest mixed-K points had KL near 0.54 or higher at 8K. K therefore remains Turbo4 for the long-context candidates. The V frontier is:
+
+| K/V | Block bytes | 66048-token KV | KL | Top1 | Top5 overlap | Exact top5 | BF16 top1 in candidate top5 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Turbo4/Turbo3 | 116 | 2.055 GiB | 0.04588 | 88.67% | 88.44% | 48.83% | 100.00% |
+| Turbo4/S16 | 124 | 2.197 GiB | 0.05667 | 86.33% | 87.03% | 45.70% | 99.61% |
+| Turbo4/S8 | 112 | 1.984 GiB | 0.05980 | 87.11% | 85.94% | 42.97% | 100.00% |
+| Turbo4/G8 | 106 | 1.878 GiB | 0.06681 | 87.50% | 85.94% | 42.19% | 100.00% |
+| Turbo4/S4 | 106 | 1.878 GiB | 0.06809 | 87.11% | 84.84% | 40.23% | 99.61% |
+| Turbo4/G16 | 112 | 1.984 GiB | 0.06926 | 85.94% | 85.62% | 40.62% | 100.00% |
+| Turbo4/G4 | 103 | 1.825 GiB | 0.08398 | 83.20% | 82.89% | 32.03% | 99.22% |
+
+S16 is larger than the Turbo4/Turbo3 baseline and is not a memory-saving candidate. The four specialized candidates are S8 for scalar quality, S4 for scalar memory, G8 for group quality, and G4 for group memory.
+
+### 32K and 64K logits quality
+
+Long runs keep mode-2 centering, warmup 128, no boundary protection, and the same 66048-position allocation.
+
+| K/V | 32K KL | 32K Top1 | 32K Top5 | 64K KL | 64K Top1 | 64K Top5 | 64K BF16 top1 in top5 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Turbo4/Turbo3 | 0.04695 | 84.77% | 87.58% | 0.05852 | 83.98% | 86.88% | 99.61% |
+| Turbo4/S8 | 0.07643 | 83.98% | 84.06% | 0.15507 | 78.52% | 80.55% | 98.05% |
+| Turbo4/S4 | 0.08510 | 82.81% | 82.58% | 0.17003 | 79.30% | 77.42% | 97.66% |
+| Turbo4/G8 | 0.06780 | 83.98% | 84.61% | 0.10918 | 80.08% | 83.05% | 97.66% |
+| Turbo4/G4 | 0.10805 | 82.81% | 80.94% | 0.20602 | 76.17% | 77.27% | 96.09% |
+
+No mixed point meets the strict quality rule at 64K: KL must be no more than the Turbo4/Turbo3 baseline plus 0.01. G8 is the closest memory-priority point, but it misses the requested KL ceiling by 0.00918 and the BF16-top1-in-top5 floor by 0.344 percentage points. The four formats remain useful as explicit quality-memory tradeoff points rather than transparent replacements for Turbo4/Turbo3.
+
+The fallback selection rule therefore chooses S8 and G8 as the lowest-KL scalar and group points below baseline memory, plus S4 and G4 as their lower-memory counterparts. These are the four formats used for specialized-kernel work.
+
+Centered Turbo4/Turbo3 reached KL 0.05852 at 64K. Its uncentered control reached 0.17427. Centering therefore reduced its measured KL by 66.4% in this fixed suffix.
+
+### One-layer boundary protection
+
+The one-layer policy keeps the first and last layer in BF16 and quantizes the middle 34 layers. At 64K:
+
+| K/V | KV payload | KL | Top1 | Top5 overlap | BF16 top1 in candidate top5 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Turbo4/S8 | 2.378 GiB | 0.12134 | 83.20% | 81.33% | 98.83% |
+| Turbo4/S4 | 2.277 GiB | 0.14669 | 81.25% | 80.78% | 96.48% |
+| Turbo4/G8 | 2.277 GiB | 0.08074 | 83.20% | 83.59% | 99.22% |
+| Turbo4/G4 | 2.227 GiB | 0.17045 | 78.52% | 78.83% | 96.88% |
+
+Boundary protection improves G8 KL by 26.0% and makes it pass the memory-priority quality thresholds. It also increases G8 payload by 21.3% and makes it about 10.8% larger than unprotected Turbo4/Turbo3. It is therefore a quality improvement within the G8 format, but it is dominated by Turbo4/Turbo3 when both quality and total KV bytes matter.
+
+### WikiText-2 perplexity
+
+The final candidates used context 2048 and 16 chunks:
+
+| K/V policy | PPL |
+| --- | ---: |
+| BF16/BF16 | 31.8656 +/- 0.81957 |
+| Centered Turbo4/Turbo3 | 31.8328 +/- 0.81334 |
+| Centered Turbo4/S8, no boundary / one layer | 31.0871 +/- 0.78806 / 31.0516 +/- 0.78624 |
+| Centered Turbo4/S4, no boundary / one layer | 30.8847 +/- 0.78204 / 31.2406 +/- 0.79180 |
+| Centered Turbo4/G8, no boundary / one layer | 30.8813 +/- 0.78334 / 30.8899 +/- 0.78018 |
+| Centered Turbo4/G4, no boundary / one layer | 30.6010 +/- 0.77272 / 30.8914 +/- 0.77916 |
+
+All confidence intervals overlap the BF16 interval. This sample detects no significant PPL regression or improvement, so the long-context logits comparison remains the discriminating quality metric.
+
+### Pareto kernel selection
+
+The optimized Metal route reuses the existing Turbo4 D128 GQA4 architecture for four candidates: S8, S4, G8, and G4. It retains Q-WHT fusion, one K/V dequantization per shared GQA4 tile, normalized FP16 partial scratch, and output inverse-WHT fusion. Decode, multi-stream decode, and 32-token or larger prefill have specialized paths. `GGML_METAL_TURBO2M4_FORCE_GENERIC=1` selects the unified correctness kernel for direct comparisons.
+
+The optimization adds two Metal host functions and reuses one existing fused decode host function. Four candidates create at most 12 on-demand specialized pipelines: vector decode, GQA4 prefill, and fused multi-stream decode for each V format. The generic grid remains the correctness fallback.
+
+### Single-stream speed and specialized-kernel comparison
+
+All speed curves use the v2 LUT model, mode-2 centering, warmup 128, `pp512` or `tg128`, and five repetitions. Context is the number of tokens already resident before the timed operation. Values are token/s.
+
+| K/V policy, pp512 | 0 | 1K | 8K | 32K | 64K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16/BF16 | 3673.23 | 3058.35 | 1328.11 | 303.30 | 132.48 |
+| Turbo4/Turbo3 | 3181.90 | 1982.36 | 771.80 | 223.74 | 111.33 |
+| Turbo4/S8 | 2862.80 | 1824.09 | 563.69 | 208.70 | 123.86 |
+| Turbo4/S4 | 2729.53 | 1762.42 | 673.07 | 254.81 | 151.78 |
+| Turbo4/G8 | 2664.21 | 1870.45 | 827.75 | 304.02 | 180.86 |
+| Turbo4/G4 | 2363.59 | 1900.78 | 862.23 | 318.23 | 187.01 |
+| Turbo4/G8, one BF16 boundary layer | 2360.25 | 1885.94 | 832.71 | 308.52 | 178.96 |
+
+| K/V policy, tg128 | 0 | 1K | 8K | 32K | 64K |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BF16/BF16 | 124.52 | 109.08 | 95.86 | 48.95 | 29.00 |
+| Turbo4/Turbo3 | 103.97 | 65.62 | 18.12 | 5.22 | 2.68 |
+| Turbo4/S8 | 124.30 | 106.95 | 75.86 | 36.09 | 22.22 |
+| Turbo4/S4 | 125.53 | 106.41 | 82.13 | 42.07 | 27.41 |
+| Turbo4/G8 | 129.32 | 108.99 | 92.41 | 53.04 | 34.72 |
+| Turbo4/G4 | 129.40 | 106.52 | 93.60 | 54.45 | 35.62 |
+| Turbo4/G8, one BF16 boundary layer | 130.73 | 107.65 | 91.50 | 51.60 | 32.94 |
+
+G8 is the best comprehensive point. At 64K it is 36.5% faster than BF16 for pp512 and 19.7% faster for tg128 while using 1.878 GiB of KV payload. G4 gains only 3.4% pp512 and 2.6% tg128 over G8 while saving 2.8% of the KV payload and nearly doubling KL, so the extra compression is not attractive. One-layer G8 protection improves 64K KL by 26.0% for only 1.0% pp512 and 5.1% tg128 speed losses, but its KV payload rises by 21.3%.
+
+Turbo4/Turbo3 deliberately retains the pre-existing generic path as a regression baseline. Its 64K decode result exposes repeated generic dequantization and is not representative of the new specialized mixed paths.
+
+The direct FA microbenchmark confirms the kernel effect. These are FA-body times; the full-model table above includes the surrounding WHT and BF16 boundary operations.
+
+| Format | 64K B1 | 64K B32 | 64K B512 | B1 minimum payload bandwidth |
+| --- | ---: | ---: | ---: | ---: |
+| S4 | 687.55 us | 34.307 ms | 80.873 ms | 80.83 GB/s |
+| S8 | 962.47 us | 43.344 ms | 101.474 ms | 61.01 GB/s |
+| G4 | 470.45 us | 25.073 ms | 66.314 ms | 114.79 GB/s |
+| G8 | 491.51 us | 26.353 ms | 67.254 ms | 113.07 GB/s |
+
+The B1 forced-generic times are 20.134/29.427/10.300/11.386 ms for S4/S8/G4/G8. The selected kernels are therefore 21.9x to 30.6x faster for long-context decode. The specialized versus fallback comparison for independent streams is:
+
+| Format | Four streams, specialized / fallback | Speedup | 16 streams, specialized / fallback | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| S4 | 119.25 / 868.64 us | 7.29x | 1.692 / 8.322 ms | 4.92x |
+| S8 | 164.33 / 1269.02 us | 7.72x | 2.379 / 11.537 ms | 4.85x |
+| G4 | 85.43 / 480.36 us | 5.62x | 1.162 / 5.096 ms | 4.38x |
+| G8 | 88.34 / 522.34 us | 5.91x | 1.200 / 5.480 ms | 4.57x |
+
+SET_ROWS remains dispatch-bound for small row counts. The bandwidth column below is recalculated from the bytes actually read and written: 512 F32 input bytes, one I32 index, and one mixed block per row. The test harness's printed bandwidth includes the entire 20-24 MiB backing destination and is not meaningful for this scatter operation.
+
+| Format | One row | 32 rows | 512 rows | 512-row touched bandwidth |
+| --- | ---: | ---: | ---: | ---: |
+| S4 | 3.44 us | 3.65 us | 4.30 us | 66.2 GB/s |
+| S8 | 4.50 us | 4.95 us | 5.91 us | 48.7 GB/s |
+| G4 | 2.98 us | 3.07 us | 3.57 us | 79.3 GB/s |
+| G8 | 3.14 us | 3.24 us | 3.81 us | 74.7 GB/s |
+
+The final Metal source adds 3692 bytes and two `host_name` functions relative to the correctness-only commit, for 421 total host functions. The unified grid has 48 on-demand FA pipelines, SET_ROWS has 12 pipelines, and the four selected variants add at most 12 specialized pipelines. This build embeds Metal source rather than a standalone `metallib`: the embedded payload is 1018430 bytes, and `libggml-metal.dylib` is 1261408 bytes. The specialization increased the dynamic library by one 4096-byte page. A fresh process with one G8 pipeline took 0.31 seconds versus 0.08 seconds for an empty-filter process; the 0.23-second difference is an upper bound that also includes two pipeline creations, graph setup, CPU reference work, and one test, not a pure compiler timer.
+
+### Formal 64K multi-stream decode
+
+The formal benchmark allocates 21 independent 66048-token streams, prefills one 64K prefix, and copies K, V, and the per-stream centering state to disjoint stream storage on the device. It then generates 128 tokens with 1, 4, or 16 active streams. The table reports aggregate token/s; each active stream has its own complete 64K KV history.
+
+| K/V policy | 64K prefill | One stream | Four streams | 16 streams |
+| --- | ---: | ---: | ---: | ---: |
+| Turbo4/Turbo3 | 216.23 | 2.67 | 10.06 | 13.18 |
+| Turbo4/S8 | 220.46 | 22.76 | 25.00 | 25.96 |
+| Turbo4/S4 | 267.09 | 29.15 | 32.20 | 34.10 |
+| Turbo4/G8 | 322.36 | 36.10 | 39.24 | 43.37 |
+| Turbo4/G4 | 330.04 | 38.35 | 41.79 | 45.68 |
+| Turbo4/G8, one BF16 boundary layer | 314.17 | 36.18 | 38.54 | 41.44 |
+
+G8 is monotonic and reaches 43.37 aggregate token/s at 16 streams, 3.29x the old Turbo4/Turbo3 generic path. It gains only 20.1% over its own one-stream aggregate rate because every stream scans a different 64K K/V history on every layer. The v2 TensorOps projection path is shared effectively, but KV dequantization and Flash Attention become the long-context bandwidth limit. G4 is fastest but gives up substantially more logits quality for only 5.3% more 16-stream throughput than G8. The one-layer G8 policy keeps most of the quality improvement and costs 4.4% of the 16-stream throughput.
+
+### Final build checks
+
+The Release Metal targets used by this experiment build successfully: `test-backend-ops`, `test-turbo-quant`, `test-quantize-fns`, `llama-bench`, `llama-batched-bench`, and `llama-server`. A full unfiltered all-target build reaches 96% and then fails in two pre-existing Row4 utility targets: `ifairy-microbench` cannot find `ggml-ifairy-lut-impl.h`, and `ifairy-vecdot-microbench` cannot link `ggml_vec_dot_ifairy_q16_K`. Neither target or error is touched by this experiment.
+
+The available Apple clang-format 21 diff helper reports no remaining C/C++ formatting changes. `clang-tidy` is not installed in the active Command Line Tools, so that check could not run. `git diff --check` passes.
+
 ## Known limits
 
 - Metal only, full model offload only, D128 Turbo FA only.
@@ -589,7 +796,7 @@ The exact evaluated binary used the register-Q kernel with separate 16 KiB K/V s
 - No TQ3/TQ4 weight formats and no changes to GGUF serialization.
 - No CUDA, HIP, Vulkan, or SYCL kernels.
 - No source-fork TurboFlash experiment, Sparse-V, profiling, generic layer-adaptive cache precision, InnerQ, or other source-repository environment knobs. The first/last BF16 option is the only mixed-layer policy.
-- Mean centering keeps separate state for each KV stream, requires `cache_prompt=false` for server requests, and does not support cache shifting, state save/restore, or partial-prompt reuse.
+- Mean centering keeps separate state for each KV stream. Full stream copies also copy this state, which makes shared-prefix multi-stream decode valid. Cache shifting, state save/restore, and partial-prompt reuse remain unsupported.
 - Turbo cache dequantization is fused into Metal Flash Attention. The follow-up also includes a Turbo4-to-F16 copy path used by the configured-capacity prefill route.
 
-Raw commands, JSON, fixed generations, test logs, and perplexity logs are left untracked under `tmp/row4-turboquant-kv/`.
+Raw captures, commands, JSON, test logs, performance logs, and chart source data are left untracked under `tmp/row4-turboquant-mixed-kv/`.
