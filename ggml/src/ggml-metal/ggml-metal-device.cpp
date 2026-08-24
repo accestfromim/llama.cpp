@@ -1118,14 +1118,16 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
                                                                                 const ggml_tensor *  op,
                                                                                 int32_t              dv,
                                                                                 int32_t              nwg,
-                                                                                bool                 round_bf16) {
+                                                                                bool                 round_bf16,
+                                                                                bool                 turbo_inverse) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
     char name[256];
 
     snprintf(base, 256, "kernel_flash_attn_ext_vec_reduce");
-    snprintf(name, 256, "%s_dv=%d_nwg=%d_bf16=%d", base, dv, nwg, round_bf16 ? 1 : 0);
+    snprintf(name, 256, "%s_dv=%d_nwg=%d_bf16=%d_turbo_inverse=%d", base, dv, nwg, round_bf16 ? 1 : 0,
+             turbo_inverse ? 1 : 0);
 
     ggml_metal_pipeline_t res = ggml_metal_library_get_pipeline(lib, name);
     if (res) {
@@ -1137,6 +1139,7 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
     ggml_metal_cv_set_int32(cv, dv,  FC_FLASH_ATTN_EXT_VEC_REDUCE + 0);
     ggml_metal_cv_set_int32(cv, nwg, FC_FLASH_ATTN_EXT_VEC_REDUCE + 1);
     ggml_metal_cv_set_bool(cv, round_bf16, FC_FLASH_ATTN_EXT_VEC_REDUCE + 2);
+    ggml_metal_cv_set_bool(cv, turbo_inverse, FC_FLASH_ATTN_EXT_VEC_REDUCE + 3);
 
     res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

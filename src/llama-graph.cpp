@@ -1716,8 +1716,6 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
     const bool turbo_k  = llm_is_turbo_kv_type(k->type);
     const bool turbo_v  = llm_is_turbo_kv_type(v->type);
     const bool turbo_kv = turbo_k || turbo_v;
-    const bool turbo4_fused = k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0 &&
-                              q_cur->ne[2] >= 1 && q_cur->ne[2] <= 32;
 
     if (turbo_kv) {
         GGML_ASSERT(arch == LLM_ARCH_QWEN3);
@@ -1751,7 +1749,7 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
                                        q_cur->ne[2] >= 20 && turbo4_kv_capacity >= 512 && turbo4_kv_capacity < 32768;
 
     ggml_tensor * q = q_cur;
-    if (turbo_k && !turbo4_fused) {
+    if (turbo_k) {
         q = ggml_turbo_wht(ctx0, q, 0, 128, nullptr);
         cb(q, "turbo_q_wht", il);
     }
@@ -1766,15 +1764,15 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
     }
 
     ggml_tensor * cur = build_attn_mha(q, k_attn, v_attn, kq_b, kq_mask, sinks, v_mla, kq_scale, il, fairy2i_exact,
-                                       fairy2i_flash3, turbo4_fused);
+                                       fairy2i_flash3, false);
     cb(cur, "kqv_out", il);
 
-    if (turbo_v && !turbo4_fused) {
+    if (turbo_v) {
         cur = ggml_turbo_wht(ctx0, cur, 1, 128, nullptr);
         cb(cur, "turbo_v_wht_inv", il);
     }
 
-    if (turbo_kv && !turbo4_fused) {
+    if (turbo_kv) {
         cur = llm_fairy2i_bf16_roundtrip(ctx0, cur);
         cb(cur, "turbo_attn_bf16_output", il);
     }

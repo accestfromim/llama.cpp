@@ -6,7 +6,7 @@ This experiment ports only the runtime TurboQuant KV-cache path to the Row4 llam
 
 - Row4 base: `llama.cpp master@67b70bd91b2f870d83d842d6d540b26fec25acad`
 - TurboQuant source: `llama-cpp-turboquant@d14e36827586`
-- Measurement build: `e970d352` before the final autosquash
+- Initial port measurement build: `e970d352` before the final autosquash; follow-up optimization results are identified in their sections below
 - Device: Apple M5 Max
 - Model: `qwen3-row4-v1.gguf`, Qwen3 Row4 8B, 36 layers, 32 Q heads, 8 KV heads, K/V head dimension 128
 
@@ -188,6 +188,27 @@ The final multi-stream pass keeps the rotated FP16 query values in registers and
 | 65536 | 7.881 ms | 7.090 ms | 6.838 ms | 13.2% |
 
 The register path preserves the original FP16 rounding of Q before the dot products. Sequential staging does not change the QK, softmax, PV, inverse-WHT, or BF16 rounding order. All six dedicated fused cases pass against the CPU reference after the 8 KiB change, and the suite reports 14715/14715 cases rather than a skipped 0/0 result.
+
+Two rotation costs were then moved out of the Flash Attention partial-workgroup loop. Q now runs one SIMDgroup WHT per query row before Flash Attention, and the fused kernel consumes the pre-rotated values. Partial workgroups leave their V sums in the rotated domain; the reduce kernel adds them first and applies one inverse WHT per output row. This is valid because WHT is linear. The production graph contains the explicit forward WHT, Flash Attention, inverse WHT, and BF16 roundtrip, while the Metal graph matcher fuses the output chain without hiding these semantics from other backends.
+
+The standalone D128 WHT kernel now maps one float4 to each SIMD lane and processes eight rows per threadgroup. The final 16-stream attention microkernel measurements were 0.878 ms at 8K, 3.377 ms at 32K, and 6.648 ms at 64K. Compared with the preceding register-Q/shared-tile kernel, this is neutral at 8K and 2.1-2.8% faster at 32K-64K. The explicit production path was observed on all 32 quantized middle layers; the four protected BF16 boundary layers kept their original path. Direct and explicit fused chains pass 11/11 cases, including 32 query tokens and 32 independent streams.
+
+With mean centering at 128 tokens and two protected layers at each boundary, full-model `tg128` reached 75.089 token/s at 8K, 49.459 at 32K, and 31.597 at 64K. A pure Turbo4 64K control reached 32.158 token/s. The protected strategy therefore retains nearly all of the pure-Turbo speed while providing the quality gains reported below.
+
+### Tail batches below 16 streams
+
+When requests complete, a 16-slot server produces decode batches with fewer than 16 active rows. The old selector routed 2-8 rows to M8 Row4 and W8 TensorOps kernels, then switched to M16 at 9 rows. Real model-shape microbenchmarks showed that M16 was faster despite computing padded zero rows: at two rows, QKV fell from about 164 to 107 microseconds, attention/output from 145 to 103 microseconds, and FFN down from 421 to 297 microseconds. Only FFN gate/up was slightly slower, about 251 versus 240 microseconds.
+
+The final selector uses the M16 Row4 and W8 TensorOps kernels for every batch from 2 through 16 rows. Activation quantization pads missing rows with zeros and output stores remain bounded by the real row count. A 16-slot server with short identical prompts and 256 generated tokens per request measured:
+
+| Active streams | Old M8/M16 selector | M16 for 2-16 | Change |
+| ---: | ---: | ---: | ---: |
+| 2 | 36.20 token/s | 49.31 token/s | +36.22% |
+| 4 | 71.86 token/s | 96.91 token/s | +34.86% |
+| 8 | 139.62 token/s | 192.54 token/s | +37.90% |
+| 16 | 357.54 token/s | 358.10 token/s | +0.16% |
+
+The correctness sweep includes real Row4 QKV, attention/output, gate/up, and down shapes at 2, 4, and 8 rows, plus the complete 151936-output W8 lm_head at the same tail sizes. It reports 14776/14776 Metal cases with no skipped or unsupported selected case.
 
 A 32-slot server fits in memory but is not the fastest long-context configuration. Thirty active AIME requests reached about 393 generated token/s near 400 tokens and 358 token/s near 1.3K, but fell to about 119 token/s with 28 requests near 11.7K. The 16-slot run previously sustained about 176-192 token/s near the same length. The 32-slot evaluation was therefore stopped after two correct first-rollout answers and retained only as a rejected throughput experiment. The final 64K evaluation uses 16 slots.
 
@@ -397,7 +418,7 @@ The run completed 59 attempts in about 8 hours 26 minutes. It solved 18/30 probl
 | 29 | 157 | 0, 12, 3 | Wrong |
 | 30 | 393 | 687, none, none | Wrong |
 
-The exact evaluated binary used the register-Q kernel with separate 16 KiB K/V staging. The later 8 KiB shared-tile optimization preserves the arithmetic order and passes the same CPU-reference tests, but the 8.4-hour AIME run was not repeated and no throughput from the earlier run is attributed to the later kernel.
+The exact evaluated binary used the register-Q kernel with separate 16 KiB K/V staging. The later 8 KiB shared-tile, rotation-hoisting, and M16 tail-batch optimizations preserve the arithmetic order and pass the CPU-reference tests, but the 8.4-hour AIME run was not repeated and no throughput from the earlier run is attributed to the later kernels.
 
 ## Known limits
 

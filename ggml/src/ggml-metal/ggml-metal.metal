@@ -14266,7 +14266,7 @@ void kernel_flash_attn_ext_vec_impl(
     for (short i = tiisg; i < PK4; i += NW) {
         if (iq1 < args.ne01 && i < DK4) {
             float4 value = q4[i];
-            if (TURBO_FUSED) {
+            if (TURBO_FUSED && !args.q_pre_rotated) {
                 value = turbo_rotate_forward_simd(value, tiisg);
             }
             sq4[i] = (q4_t) value;
@@ -14585,7 +14585,7 @@ void kernel_flash_attn_ext_vec_impl(
         // interleave the workgroup data
         for (short i = tiisg; i < DV4; i += NW) {
             float4 result = (float4) so4[i]*S;
-            if (TURBO_FUSED) {
+            if (TURBO_FUSED && (!args.q_pre_rotated || NWG == 1)) {
                 result = turbo_rotate_inverse_simd(result, tiisg);
             }
 #if defined(GGML_METAL_HAS_BF16)
@@ -14738,7 +14738,7 @@ kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
 
     device const float4 * q4 = (device const float4 *)
         (q + iq1 * args.nb01 + iq2 * args.nb02 + iq3 * args.nb03);
-    const float4 qv = float4(half4(turbo_rotate_forward_simd(q4[tiisg], tiisg)));
+    const float4 qv = float4(half4(args.q_pre_rotated ? q4[tiisg] : turbo_rotate_forward_simd(q4[tiisg], tiisg)));
 
     const short ikv3 = iq3 / (args.ne03 / args.ne_12_3);
     k += ikv2 * args.nb12 + ikv3 * args.nb13;
@@ -14806,7 +14806,6 @@ kernel void kernel_flash_attn_ext_vec_turbo4_gqa4_fused_dk128_dv128(
     device float4 * dst4 = (device float4 *) dst;
     device float * dst1 = (device float *) dst + nrows * 128 * FC_flash_attn_ext_vec_nwg;
 
-    O = turbo_rotate_inverse_simd(O, tiisg);
     dst4[rid * D4 * FC_flash_attn_ext_vec_nwg + FC_flash_attn_ext_vec_nwg * tiisg + iwg] = O;
     if (tiisg == 0) {
         dst1[rid * (2 * FC_flash_attn_ext_vec_nwg) + 2 * iwg + 0] = S;
@@ -14862,11 +14861,13 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512")]] kernel flas
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 constant bool FC_flash_attn_ext_vec_reduce_round_bf16 [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 2)]];
+constant bool FC_flash_attn_ext_vec_reduce_turbo_inverse [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 3)]];
 
 kernel void kernel_flash_attn_ext_vec_reduce(
         constant ggml_metal_kargs_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
         device        char * dst,
+        threadgroup  float4 * inverse_tile [[threadgroup(0)]],
         uint   tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
@@ -14915,7 +14916,19 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
         if (iwg == 0) {
             const float4 result = v*S;
-            dst4[i] = FC_flash_attn_ext_vec_reduce_round_bf16 ? fairy2i_round_to_bf16_f32(result) : result;
+            if (FC_flash_attn_ext_vec_reduce_turbo_inverse) {
+                inverse_tile[i] = result;
+            } else {
+                dst4[i] = FC_flash_attn_ext_vec_reduce_round_bf16 ? fairy2i_round_to_bf16_f32(result) : result;
+            }
+        }
+    }
+
+    if (FC_flash_attn_ext_vec_reduce_turbo_inverse) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            const float4 result = turbo_rotate_inverse_simd(inverse_tile[tiisg], tiisg);
+            dst4[tiisg] = FC_flash_attn_ext_vec_reduce_round_bf16 ? fairy2i_round_to_bf16_f32(result) : result;
         }
     }
 
@@ -17101,27 +17114,25 @@ kernel void kernel_turbo_wht(constant ggml_metal_kargs_turbo_wht & args,
                              const device float *                  src [[buffer(1)]],
                              device float *                        dst [[buffer(2)]],
                              uint                                  tgpig [[threadgroup_position_in_grid]],
-                             uint                                  tiitg [[thread_index_in_threadgroup]],
-                             uint                                  ntg [[threads_per_threadgroup]]) {
-    const int64_t group = int64_t(tgpig) * ntg + tiitg;
+                             ushort                                tiisg [[thread_index_in_simdgroup]],
+                             ushort                                sgitg [[simdgroup_index_in_threadgroup]],
+                             ushort                                nsgtg [[simdgroups_per_threadgroup]]) {
+    const int64_t group = int64_t(tgpig) * nsgtg + sgitg;
     if (group >= args.n_elements / 128) {
         return;
     }
 
-    thread float x[128];
-    for (int i = 0; i < 128; ++i) {
-        x[i] = src[128 * group + i];
-    }
+    const device float4 * src4 = (const device float4 *) src + 32 * group;
+    device float4 *       dst4 = (device float4 *) dst + 32 * group;
+    float4                x    = src4[tiisg];
 
     if (args.direction == 0) {
-        turbo_rotate_forward(x);
+        x = turbo_rotate_forward_simd(x, tiisg);
     } else {
-        turbo_rotate_inverse(x);
+        x = turbo_rotate_inverse_simd(x, tiisg);
     }
 
-    for (int i = 0; i < 128; ++i) {
-        dst[128 * group + i] = x[i];
-    }
+    dst4[tiisg] = x;
 }
 
 kernel void kernel_turbo_k_mean_center(constant ggml_metal_kargs_turbo_k_mean_center & args,

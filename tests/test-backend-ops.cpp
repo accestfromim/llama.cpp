@@ -5733,10 +5733,12 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool             turbo_chain;
     const int64_t          mask_prefix;
+    const bool             explicit_chain;
 
     std::string vars() override {
         return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
-                             permute, turbo_chain) + ",mask_prefix=" + std::to_string(mask_prefix);
+                             permute, turbo_chain) +
+               ",mask_prefix=" + std::to_string(mask_prefix) + ",explicit_chain=" + std::to_string(explicit_chain);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5754,21 +5756,22 @@ struct test_flash_attn_ext : public test_case {
         return (2 * nh*nr23[0] * nb * (hsk + hsv) * kv)*nr23[1];
     }
 
-    test_flash_attn_ext(int64_t                hsk           = 128,
-                        int64_t                hsv           = 128,
-                        int64_t                nh            = 32,
-                        std::array<int64_t, 2> nr23          = { 1, 1 },
-                        int64_t                kv            = 96,
-                        int64_t                nb            = 8,
-                        bool                   mask          = true,
-                        bool                   sinks         = false,
-                        float                  max_bias      = 0.0f,
-                        float                  logit_softcap = 0.0f,
-                        ggml_prec              prec          = GGML_PREC_F32,
-                        ggml_type              type_KV       = GGML_TYPE_F16,
-                        std::array<int32_t, 4> permute       = { 0, 1, 2, 3 },
-                        bool                   turbo_chain   = false,
-                        int64_t                mask_prefix   = -1) :
+    test_flash_attn_ext(int64_t                hsk            = 128,
+                        int64_t                hsv            = 128,
+                        int64_t                nh             = 32,
+                        std::array<int64_t, 2> nr23           = { 1, 1 },
+                        int64_t                kv             = 96,
+                        int64_t                nb             = 8,
+                        bool                   mask           = true,
+                        bool                   sinks          = false,
+                        float                  max_bias       = 0.0f,
+                        float                  logit_softcap  = 0.0f,
+                        ggml_prec              prec           = GGML_PREC_F32,
+                        ggml_type              type_KV        = GGML_TYPE_F16,
+                        std::array<int32_t, 4> permute        = { 0, 1, 2, 3 },
+                        bool                   turbo_chain    = false,
+                        int64_t                mask_prefix    = -1,
+                        bool                   explicit_chain = false) :
         hsk(hsk),
         hsv(hsv),
         nh(nh),
@@ -5784,7 +5787,8 @@ struct test_flash_attn_ext : public test_case {
         type_V(type_KV),
         permute(permute),
         turbo_chain(turbo_chain),
-        mask_prefix(mask_prefix) {}
+        mask_prefix(mask_prefix),
+        explicit_chain(explicit_chain) {}
 
     test_flash_attn_ext(int64_t                hsk,
                         int64_t                hsv,
@@ -5799,8 +5803,9 @@ struct test_flash_attn_ext : public test_case {
                         ggml_prec              prec,
                         ggml_type              type_K,
                         ggml_type              type_V,
-                        bool                   turbo_chain = false,
-                        int64_t                mask_prefix = -1) :
+                        bool                   turbo_chain    = false,
+                        int64_t                mask_prefix    = -1,
+                        bool                   explicit_chain = false) :
         hsk(hsk),
         hsv(hsv),
         nh(nh),
@@ -5816,7 +5821,8 @@ struct test_flash_attn_ext : public test_case {
         type_V(type_V),
         permute({ 0, 1, 2, 3 }),
         turbo_chain(turbo_chain),
-        mask_prefix(mask_prefix) {}
+        mask_prefix(mask_prefix),
+        explicit_chain(explicit_chain) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -5864,11 +5870,18 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        ggml_tensor * q_attn = explicit_chain ? ggml_turbo_wht(ctx, q, 0, 128, nullptr) : q;
+        ggml_tensor * out    = ggml_flash_attn_ext(ctx, q_attn, k, v, m, 1.0f / sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
-        if (turbo_chain) {
+        if (turbo_chain && !explicit_chain) {
             ggml_flash_attn_ext_set_turbo4_fused(out, true);
+        }
+        if (explicit_chain) {
+            out = ggml_reshape_2d(ctx, out, out->ne[0] * out->ne[1], out->ne[2] * out->ne[3]);
+            out = ggml_turbo_wht(ctx, out, 1, 128, nullptr);
+            out = ggml_cast(ctx, out, GGML_TYPE_BF16);
+            out = ggml_cast(ctx, out, GGML_TYPE_F32);
         }
         ggml_set_name(out, "out");
 
@@ -7101,17 +7114,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             { 4096,  12288 },
         };
         for (const std::pair<int64_t, int64_t> & shape : row4_shapes) {
-            for (int64_t n : { 1, 8, 9, 15, 16, 32, 64, 96, 128 }) {
+            for (int64_t n : { 1, 2, 4, 8, 9, 15, 16, 32, 64, 96, 128 }) {
                 test_cases.emplace_back(new test_row_quant_linear(false, shape.first, n, shape.second));
             }
         }
-        for (int64_t n : { 8, 9, 15, 16, 32 }) {
+        for (int64_t n : { 2, 4, 8, 9, 15, 16, 32 }) {
             test_cases.emplace_back(new test_row_quant_linear(true, 256, n, 4096));
         }
     }
     const char * row4_full_lm_head = getenv("LLAMA_ROW4_FULL_LM_HEAD_TESTS");
     if (row4_full_lm_head && strcmp(row4_full_lm_head, "0") != 0) {
-        for (int64_t n : { 1, 8, 16 }) {
+        for (int64_t n : { 1, 2, 4, 8, 16 }) {
             test_cases.emplace_back(new test_row_quant_linear(true, 151936, n, 4096));
         }
     }
@@ -7627,14 +7640,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, nb, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0));
     }
-    for (int64_t nb : { 1, 2, 8, 16 }) {
+    for (int64_t nb : { 1, 2, 8, 16, 32 }) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, nb, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
+    }
+    for (int64_t nb : { 16, 32 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, nb, true, false, 0.0f, 0.0f,
+                                                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true, -1,
+                                                        true));
     }
     for (int64_t n_streams : { 16, 32 }) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, n_streams }, 256, 1, true, false, 0.0f,
                                                         0.0f, GGML_PREC_F32, GGML_TYPE_TURBO4_0,
                                                         GGML_TYPE_TURBO4_0, true, 128));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, n_streams }, 256, 1, true, false, 0.0f, 0.0f,
+                                                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true,
+                                                        128, true));
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, 16, true, false, 0.0f, 0.0f,
                                                     GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
@@ -7680,6 +7701,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     if (row4_decode_perf_shapes && strcmp(row4_decode_perf_shapes, "0") != 0) {
         const char *                      row4_pair2_perf_layout = getenv("LLAMA_ROW4_PAIR2_PERF_LAYOUT");
         const bool                        pair2 = row4_pair2_perf_layout && strcmp(row4_pair2_perf_layout, "0") != 0;
+        const char *                      row4_tail_perf_shapes = getenv("LLAMA_ROW4_TAIL_PERF_SHAPES");
+        const bool                        tail = row4_tail_perf_shapes && strcmp(row4_tail_perf_shapes, "0") != 0;
         const std::pair<int64_t, int64_t> row4_shapes[] = {
             { 6144,  4096  },
             { 4096,  4096  },
@@ -7687,12 +7710,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             { 4096,  12288 },
         };
         for (const std::pair<int64_t, int64_t> & shape : row4_shapes) {
-            for (int64_t n : { 1, 8, 16, 32 }) {
-                test_cases.emplace_back(new test_row_quant_linear(false, shape.first, n, shape.second, pair2));
+            if (tail) {
+                for (int64_t n = 1; n <= 16; ++n) {
+                    test_cases.emplace_back(new test_row_quant_linear(false, shape.first, n, shape.second, pair2));
+                }
+            } else {
+                for (int64_t n : { 1, 8, 16, 32 }) {
+                    test_cases.emplace_back(new test_row_quant_linear(false, shape.first, n, shape.second, pair2));
+                }
             }
         }
-        for (int64_t n : { 1, 8, 16, 32 }) {
-            test_cases.emplace_back(new test_row_quant_linear(true, 151936, n, 4096));
+        if (tail) {
+            for (int64_t n = 1; n <= 16; ++n) {
+                test_cases.emplace_back(new test_row_quant_linear(true, 151936, n, 4096));
+            }
+        } else {
+            for (int64_t n : { 1, 8, 16, 32 }) {
+                test_cases.emplace_back(new test_row_quant_linear(true, 151936, n, 4096));
+            }
         }
     }
 
