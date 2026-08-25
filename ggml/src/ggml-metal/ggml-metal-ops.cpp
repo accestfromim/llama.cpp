@@ -1870,7 +1870,8 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
 
     nth = std::min(nth, nk00);
 
-    if (op->src[0]->type == GGML_TYPE_TURBO4_0 && op->type == GGML_TYPE_F16 && ne00 == 128) {
+    if ((op->src[0]->type == GGML_TYPE_TURBO3_0 || op->src[0]->type == GGML_TYPE_TURBO4_0) &&
+        op->type == GGML_TYPE_F16 && ne00 == 128) {
         nth   = 8;
         nrptg = std::min(32, ne01);
     }

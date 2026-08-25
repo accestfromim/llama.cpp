@@ -1745,9 +1745,11 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
 
     const auto & kq_mask = inp->get_kq_mask(fairy2i_exact && (!fairy2i_flash3 || !cparams.flash_attn));
 
-    const int64_t turbo4_kv_capacity = k->view_src ? k->view_src->ne[1] : k->ne[2];
-    const bool    turbo4_predequant  = k->type == GGML_TYPE_TURBO4_0 && v->type == GGML_TYPE_TURBO4_0 &&
-                                       q_cur->ne[2] >= 20 && turbo4_kv_capacity >= 512 && turbo4_kv_capacity < 32768;
+    const int64_t turbo_kv_capacity  = k->view_src ? k->view_src->ne[1] : k->ne[2];
+    const bool    turbo_predequant_v = v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0;
+    const bool    turbo_predequant   = k->type == GGML_TYPE_TURBO4_0 && turbo_predequant_v && q_cur->ne[2] >= 20 &&
+                                  turbo_kv_capacity >= 512 &&
+                                  (v->type == GGML_TYPE_TURBO3_0 || turbo_kv_capacity < 32768);
 
     ggml_tensor * q = q_cur;
     if (turbo_k) {
@@ -1757,7 +1759,7 @@ ggml_tensor * llm_graph_context::build_attn(llm_graph_input_attn_kv * inp,
 
     ggml_tensor * k_attn = k;
     ggml_tensor * v_attn = v;
-    if (turbo4_predequant) {
+    if (turbo_predequant) {
         k_attn = ggml_cast(ctx0, k, GGML_TYPE_F16);
         v_attn = ggml_cast(ctx0, v, GGML_TYPE_F16);
         cb(k_attn, "turbo_k_f16", il);

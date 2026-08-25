@@ -15417,6 +15417,7 @@ template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_cpy_turbo3_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_turbo3_0, 8, dequantize_turbo3_0>;
 template [[host_name("kernel_cpy_turbo4_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_turbo4_0, 8, dequantize_turbo4_0>;
 
 kernel void kernel_concat(

@@ -543,19 +543,18 @@ static void ggml_compute_forward_dup_from_q(
 
 static void ggml_compute_forward_dup_from_q_f16(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
 
-    GGML_TENSOR_BINARY_OP_LOCALS
+    GGML_TENSOR_UNARY_OP_LOCALS
 
-    GGML_ASSERT(src0->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(src0->type == GGML_TYPE_TURBO3_0 || src0->type == GGML_TYPE_TURBO4_0);
     const ggml_to_float_t dequantize_row_q = ggml_get_type_traits(src0->type)->to_float;
 
     const int64_t qk = ggml_blck_size(src0->type);
-    const int64_t nr = (int64_t) ggml_nelements(src1) / qk;
+    const int64_t nr = (int64_t) ggml_nelements(dst) / qk;
 
     GGML_ASSERT(qk == 128);
-    GGML_ASSERT(nb10 == sizeof(ggml_fp16_t));
-    GGML_ASSERT((ne10 % qk) == 0 || ggml_is_contiguous(dst));
+    GGML_ASSERT(nb0 == sizeof(ggml_fp16_t));
+    GGML_ASSERT((ne0 % qk) == 0 || ggml_is_contiguous(dst));
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -575,11 +574,11 @@ static void ggml_compute_forward_dup_from_q_f16(const ggml_compute_params * para
         const int64_t i00      = i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
         const size_t  x_offset = (i00 / qk) * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03;
 
-        const int64_t i13        = i / (ne10 * ne11 * ne12);
-        const int64_t i12        = (i - i13 * ne10 * ne11 * ne12) / (ne10 * ne11);
-        const int64_t i11        = (i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11) / ne10;
-        const int64_t i10        = i - i13 * ne10 * ne11 * ne12 - i12 * ne10 * ne11 - i11 * ne10;
-        const size_t  dst_offset = i10 * nb10 + i11 * nb11 + i12 * nb12 + i13 * nb13;
+        const int64_t i3         = i / (ne0 * ne1 * ne2);
+        const int64_t i2         = (i - i3 * ne0 * ne1 * ne2) / (ne0 * ne1);
+        const int64_t i1         = (i - i3 * ne0 * ne1 * ne2 - i2 * ne0 * ne1) / ne0;
+        const int64_t i0         = i - i3 * ne0 * ne1 * ne2 - i2 * ne0 * ne1 - i1 * ne0;
+        const size_t  dst_offset = i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3;
 
         dequantize_row_q((const char *) src0->data + x_offset, values, qk);
 
@@ -635,7 +634,8 @@ void ggml_compute_forward_dup(
                     ggml_compute_forward_dup_from_q(params, dst);
                     break;
                 }
-                if (src0->type == GGML_TYPE_TURBO4_0 && dst->type == GGML_TYPE_F16) {
+                if ((src0->type == GGML_TYPE_TURBO3_0 || src0->type == GGML_TYPE_TURBO4_0) &&
+                    dst->type == GGML_TYPE_F16) {
                     ggml_compute_forward_dup_from_q_f16(params, dst);
                     break;
                 }

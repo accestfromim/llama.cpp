@@ -136,7 +136,7 @@ The follow-up Metal path adds:
 - A fused decode chain for Q WHT, Turbo4/Turbo4 vector Flash Attention, inverse WHT, and BF16 output rounding.
 - A GQA4 decode kernel with 64 partial workgroups at 32K and 128 partial workgroups at 64K.
 - SIMD32 Turbo4 SET_ROWS packing.
-- A configured-capacity route that dequantizes K/V once to F16 for prefill when the KV capacity is above 512 and below 32K. The graph cache makes the configured KV capacity the safe routing key; the current used length is not safe at graph-build time.
+- A configured-capacity route that dequantizes K/V once to F16 for prefill. Turbo4/Turbo4 uses it from 512 to below 32K; the later Turbo4/Turbo3 follow-up uses it at every capacity from 512 onward. The graph cache makes the configured KV capacity the safe routing key; the current used length is not safe at graph-build time.
 
 The specialized prefill path passed the existing `5e-4` NMSE budget at KV lengths 512 and 8192. The 8192 test uses 32 query tokens, 32 query heads, and 8 KV heads and ran as 1/1, not as a skipped case.
 
@@ -707,7 +707,7 @@ All confidence intervals overlap the BF16 interval. This sample detects no signi
 
 The optimized Metal route reuses the existing Turbo4 D128 GQA4 architecture for four mixed candidates: S8, S4, G8, and G4. It retains Q-WHT fusion, one K/V dequantization per shared GQA4 tile, normalized FP16 partial scratch, and output inverse-WHT fusion. Decode, multi-stream decode, and 32-token or larger prefill have specialized paths. `GGML_METAL_TURBO2M4_FORCE_GENERIC=1` selects the unified correctness kernel for direct comparisons.
 
-The first optimization adds two Metal host functions and reuses one existing fused decode host function. The four mixed candidates create at most 12 on-demand specialized pipelines: vector decode, GQA4 prefill, and fused multi-stream decode for each V format. The Turbo4/Turbo3 correction adds no host function. It instantiates the existing byte-addressed vector and fused hosts with Turbo3 decoder variant zero. Its prefill keeps the generic half8x8 kernel because the GQA4 half prefill kernel was slower for this format.
+The first optimization adds two Metal host functions and reuses one existing fused decode host function. The four mixed candidates create at most 12 on-demand specialized pipelines: vector decode, GQA4 prefill, and fused multi-stream decode for each V format. The Turbo4/Turbo3 decode correction adds no host function. It instantiates the existing byte-addressed vector and fused hosts with Turbo3 decoder variant zero. The later prefill correction adds one Turbo3-to-F16 copy host function.
 
 ### Single-stream speed and specialized-kernel comparison
 
@@ -716,6 +716,7 @@ All speed curves use the v2 LUT model, mode-2 centering, warmup 128, `pp512` or 
 | K/V policy, pp512 | 0 | 1K | 8K | 32K | 64K |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | BF16/BF16 | 3673.23 | 3058.35 | 1328.11 | 303.30 | 132.48 |
+| Turbo4/Turbo3, prefill optimized | 3341.42 | 2769.99 | 1254.76 | 315.81 | 142.79 |
 | Turbo4/Turbo3, fixed | 3192.55 | 2358.06 | 873.51 | 263.68 | 119.54 |
 | Turbo4/Turbo3, pre-fix generic | 3181.90 | 1982.36 | 771.80 | 223.74 | 111.33 |
 | Turbo4/S8 | 2862.80 | 1824.09 | 563.69 | 208.70 | 123.86 |
@@ -735,9 +736,15 @@ All speed curves use the v2 LUT model, mode-2 centering, warmup 128, `pp512` or 
 | Turbo4/G4 | 129.40 | 106.52 | 93.60 | 54.45 | 35.62 |
 | Turbo4/G8, one BF16 boundary layer | 130.73 | 107.65 | 91.50 | 51.60 | 32.94 |
 
-G8 remains the lower-memory throughput point. At 64K it is 36.5% faster than BF16 for pp512 and 19.7% faster for tg128 while using 1.878 GiB of KV payload. Corrected Turbo4/Turbo3 is the quality-first point: its 64K tg128 result is 16.9% faster than BF16 and within 2.4% of G8, although its pp512 result is lower. G4 gains only 3.4% pp512 and 2.6% tg128 over G8 while saving 2.8% of the KV payload and nearly doubling KL, so the extra compression is not attractive. One-layer G8 protection improves 64K KL by 26.0% for only 1.0% pp512 and 5.1% tg128 speed losses, but its KV payload rises by 21.3%.
+G8 remains the lower-memory throughput point. At 64K it is 36.5% faster than BF16 for pp512 and 19.7% faster for tg128 while using 1.878 GiB of KV payload. Corrected Turbo4/Turbo3 is the quality-first point: its optimized 64K pp512 is 7.8% faster than BF16, and its tg128 result is 16.9% faster than BF16 and within 2.4% of G8. G4 gains only 3.4% pp512 and 2.6% tg128 over G8 while saving 2.8% of the KV payload and nearly doubling KL, so the extra compression is not attractive. One-layer G8 protection improves 64K KL by 26.0% for only 1.0% pp512 and 5.1% tg128 speed losses, but its KV payload rises by 21.3%.
 
 The original Turbo4/Turbo3 result was not a format limitation. The specialized-V predicate omitted Turbo3, so graph fusion, vector dispatch, and the D128 GQA4 shape selector all rejected this pair. It fell back to generic Flash Attention and dequantized shared K/V again for each GQA query head. The fix includes Turbo3 in the decode predicates and adds Turbo3 variant zero to the float4 byte decoder. The complete 0-64K rerun uses the same model, centering settings, batch sizes, and five repetitions with cache state restored between repetitions. The old saved curve is retained above to show the magnitude of the routing regression.
+
+The prefill follow-up removes a separate reuse failure. The direct K4/V3 quantized FA path still reconstructed shared K/V inside each query-head schedule. Replacing its Turbo3 decoder did not help: the K4/V3 GQA4 half candidate took 23.788 ms at 64K B32, versus 9.608 ms for the generic quantized kernel. The production graph now dequantizes K4 and V3 once to contiguous F16 and runs the mature F16 Flash Attention kernel. Values remain in the rotated domain until the existing output inverse WHT, so this changes reuse and scheduling but not the cache format or rotation contract. Decode batches below 20 query tokens keep the fused K4/V3 vector path.
+
+The optimized pp512 row above is a five-run native-depth rerun. The 32K result was `315.81 +/- 28.86` token/s with samples `366.68, 311.19, 299.60, 298.97, 302.59`; the first run was cold and the last four averaged 303.09 token/s. The 64K result was stable at `142.79 +/- 2.43` token/s with samples `142.80, 141.39, 141.69, 141.10, 146.99`. Relative to the preceding fixed K4/V3 row, throughput improves by 4.7%, 17.5%, 43.6%, 19.8%, and 19.5% at 0, 1K, 8K, 32K, and 64K. Relative to BF16 it is 9.0%, 9.4%, and 5.5% slower at 0, 1K, and 8K, then 4.1% and 7.8% faster at 32K and 64K.
+
+Turbo3-to-F16 copy reaches 368.48 GB/s for a D128, eight-head, 64K tensor and takes 405.79 microseconds per layer. The composed Q-WHT, K4/V3 predequant, F16 FA, inverse-WHT, and BF16-roundtrip graph passes Metal against the CPU reference at 512 and 8192 KV cells with 32 query tokens. Both cases ran, reporting 2/2 rather than a skipped 0/0 result.
 
 The direct FA microbenchmark confirms the kernel effect. These are FA-body times; the full-model table above includes the surrounding WHT and BF16 boundary operations.
 
@@ -749,7 +756,7 @@ The direct FA microbenchmark confirms the kernel effect. These are FA-body times
 | G4 | 470.45 us | 25.073 ms | 66.314 ms | 114.79 GB/s |
 | G8 | 491.51 us | 26.353 ms | 67.254 ms | 113.07 GB/s |
 
-The Turbo4/Turbo3 64K B1 forced-generic time is 8.799 ms, so the fixed path is 19.1x faster. Its explicit fused core is 10.52 us versus 99.52 us on the fallback. B32 and B512 intentionally use the generic prefill route: the Turbo3 GQA4 half prefill experiment took 23.83 ms at B32 versus 9.47 ms for the generic kernel. The final shape selector gives 9.61/89.81 ms at B32/B512 without sacrificing decode. The B1 forced-generic times are 20.134/29.427/10.300/11.386 ms for S4/S8/G4/G8. The selected kernels are therefore 21.9x to 30.6x faster for long-context decode. The specialized versus fallback comparison for independent streams is:
+The Turbo4/Turbo3 64K B1 forced-generic time is 8.799 ms, so the fixed decode path is 19.1x faster. Its explicit fused core is 10.52 us versus 99.52 us on the fallback. The B32/B512 entries in the table are the standalone quantized FA fallback, not the final production prefill graph. The production path adds one-time K4/V3 copies and then uses F16 FA. The B1 forced-generic times are 20.134/29.427/10.300/11.386 ms for S4/S8/G4/G8. The selected kernels are therefore 21.9x to 30.6x faster for long-context decode. The specialized versus fallback comparison for independent streams is:
 
 | Format | Four streams, specialized / fallback | Speedup | 16 streams, specialized / fallback | Speedup |
 | --- | ---: | ---: | ---: | ---: |
@@ -767,7 +774,7 @@ SET_ROWS remains dispatch-bound for small row counts. The bandwidth column below
 | G4 | 2.98 us | 3.07 us | 3.57 us | 79.3 GB/s |
 | G8 | 3.14 us | 3.24 us | 3.81 us | 74.7 GB/s |
 
-The mixed-format Metal source adds two `host_name` functions relative to the correctness-only commit, for 421 total host functions. The Turbo4/Turbo3 correction adds no host function. The unified grid has 48 on-demand FA pipelines, SET_ROWS has 12 pipelines, the four mixed variants add at most 12 specialized pipelines, and corrected Turbo4/Turbo3 adds at most two. `libggml-metal.dylib` remains 1261408 bytes. A fresh process with one G8 pipeline took 0.31 seconds versus 0.08 seconds for an empty-filter process; the 0.23-second difference is an upper bound that also includes two pipeline creations, graph setup, CPU reference work, and one test, not a pure compiler timer.
+The mixed-format Metal source adds two `host_name` functions relative to the correctness-only commit. The K4/V3 prefill follow-up adds one copy function, for 422 total host functions. The unified grid has 48 on-demand FA pipelines, SET_ROWS has 12 pipelines, the four mixed variants add at most 12 specialized pipelines, corrected Turbo4/Turbo3 decode adds at most two, and prefill adds one copy pipeline. `libggml-metal.dylib` remains 1261408 bytes. A fresh process with one G8 pipeline took 0.31 seconds versus 0.08 seconds for an empty-filter process; the 0.23-second difference is an upper bound that also includes two pipeline creations, graph setup, CPU reference work, and one test, not a pure compiler timer.
 
 ### Formal 64K multi-stream decode
 
@@ -801,6 +808,6 @@ The available Apple clang-format 21 diff helper reports no remaining C/C++ forma
 - No CUDA, HIP, Vulkan, or SYCL kernels.
 - No source-fork TurboFlash experiment, Sparse-V, profiling, generic layer-adaptive cache precision, InnerQ, or other source-repository environment knobs. The first/last BF16 option is the only mixed-layer policy.
 - Mean centering keeps separate state for each KV stream. Full stream copies also copy this state, which makes shared-prefix multi-stream decode valid. Cache shifting, state save/restore, and partial-prompt reuse remain unsupported.
-- Turbo cache dequantization is fused into Metal Flash Attention. The follow-up also includes a Turbo4-to-F16 copy path used by the configured-capacity prefill route.
+- Turbo cache dequantization is fused into Metal Flash Attention. The prefill route can also copy Turbo4 K and Turbo3 or Turbo4 V to F16 once per layer before F16 Flash Attention.
 
 Raw captures, commands, JSON, test logs, performance logs, and chart source data are left untracked under `tmp/row4-turboquant-mixed-kv/`.

@@ -5756,11 +5756,13 @@ struct test_flash_attn_ext : public test_case {
     const bool             turbo_chain;
     const int64_t          mask_prefix;
     const bool             explicit_chain;
+    const bool             predequant;
 
     std::string vars() override {
         return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
                              permute, turbo_chain) +
-               ",mask_prefix=" + std::to_string(mask_prefix) + ",explicit_chain=" + std::to_string(explicit_chain);
+               ",mask_prefix=" + std::to_string(mask_prefix) + ",explicit_chain=" + std::to_string(explicit_chain) +
+               ",predequant=" + std::to_string(predequant);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5798,7 +5800,8 @@ struct test_flash_attn_ext : public test_case {
                         std::array<int32_t, 4> permute        = { 0, 1, 2, 3 },
                         bool                   turbo_chain    = false,
                         int64_t                mask_prefix    = -1,
-                        bool                   explicit_chain = false) :
+                        bool                   explicit_chain = false,
+                        bool                   predequant     = false) :
         hsk(hsk),
         hsv(hsv),
         nh(nh),
@@ -5815,7 +5818,8 @@ struct test_flash_attn_ext : public test_case {
         permute(permute),
         turbo_chain(turbo_chain),
         mask_prefix(mask_prefix),
-        explicit_chain(explicit_chain) {}
+        explicit_chain(explicit_chain),
+        predequant(predequant) {}
 
     test_flash_attn_ext(int64_t                hsk,
                         int64_t                hsv,
@@ -5832,7 +5836,8 @@ struct test_flash_attn_ext : public test_case {
                         ggml_type              type_V,
                         bool                   turbo_chain    = false,
                         int64_t                mask_prefix    = -1,
-                        bool                   explicit_chain = false) :
+                        bool                   explicit_chain = false,
+                        bool                   predequant     = false) :
         hsk(hsk),
         hsv(hsv),
         nh(nh),
@@ -5849,9 +5854,12 @@ struct test_flash_attn_ext : public test_case {
         permute({ 0, 1, 2, 3 }),
         turbo_chain(turbo_chain),
         mask_prefix(mask_prefix),
-        explicit_chain(explicit_chain) {}
+        explicit_chain(explicit_chain),
+        predequant(predequant) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(!predequant || (type_K == GGML_TYPE_TURBO4_0 && type_V == GGML_TYPE_TURBO3_0));
+
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
         const int64_t hsv_padded = GGML_PAD(hsv, ggml_blck_size(type_V));
 
@@ -5898,7 +5906,10 @@ struct test_flash_attn_ext : public test_case {
         }
 
         ggml_tensor * q_attn = explicit_chain ? ggml_turbo_wht(ctx, q, 0, 128, nullptr) : q;
-        ggml_tensor * out    = ggml_flash_attn_ext(ctx, q_attn, k, v, m, 1.0f / sqrtf(hsk), max_bias, logit_softcap);
+        ggml_tensor * k_attn = predequant ? ggml_cast(ctx, k, GGML_TYPE_F16) : k;
+        ggml_tensor * v_attn = predequant ? ggml_cast(ctx, v, GGML_TYPE_F16) : v;
+        ggml_tensor * out =
+            ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn, m, 1.0f / sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
         if (turbo_chain && !explicit_chain) {
@@ -7029,6 +7040,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}, {1, 0, 2, 3}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO3_0, GGML_TYPE_F16, { 128, 8, 32, 1 }, { 0, 2, 1, 3 }));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO4_0, GGML_TYPE_F16, { 128, 8, 32, 1 }, { 0, 2, 1, 3 }));
 
     test_cases.emplace_back(new test_cont());
@@ -7709,6 +7721,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                             true));
         }
     }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 512, 32, true, false, 0.0f, 0.0f,
+                                                    GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, false, -1,
+                                                    true, true));
     for (int64_t nb : { 1, 2, 8, 16, 32 }) {
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, nb, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
@@ -7729,6 +7744,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, 16, true, false, 0.0f, 0.0f,
                                                     GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
     if (getenv("LLAMA_TURBO_KV_LONG_CORRECTNESS")) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 8192, 32, true, false, 0.0f, 0.0f,
+                                                        GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0, false,
+                                                        -1, true, true));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 32768, 1, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 65536, 1, true, false, 0.0f, 0.0f,
@@ -7874,6 +7892,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F32,  {3072, 512, 2, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_Q4_0, {8192, 512, 2, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32,  {8192, 512, 2, 1}));
+    test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO3_0, GGML_TYPE_F16, { 128, 8, 512, 1 }, { 0, 2, 1, 3 }));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO4_0, GGML_TYPE_F16, { 128, 8, 512, 1 }, { 0, 2, 1, 3 }));
 
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
@@ -7954,6 +7973,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_turbo_wht(128, 32, 1));
         test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_BF16, { 128, 32, 1, 1 }));
         test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_F32, { 128, 32, 1, 1 }));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO3_0, GGML_TYPE_F16, { 128, 8, 65536, 1 }, { 0, 2, 1, 3 }));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, 16, true, false, 0, 0,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 256, 16, true, false, 0, 0,

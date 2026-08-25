@@ -1148,6 +1148,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             default:
                                 return false;
                         }
+                    case GGML_TYPE_TURBO3_0:
                     case GGML_TYPE_TURBO4_0:
                         return op->type == GGML_TYPE_F16;
                     case GGML_TYPE_I32:
