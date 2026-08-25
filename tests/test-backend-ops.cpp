@@ -7691,13 +7691,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    const ggml_type turbo2m4_pareto_v_types[] = {
-        GGML_TYPE_TURBO2M4_S4,
-        GGML_TYPE_TURBO2M4_S8,
-        GGML_TYPE_TURBO2M4_G4,
-        GGML_TYPE_TURBO2M4_G8,
+    const ggml_type turbo4_specialized_v_types[] = {
+        GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2M4_S4, GGML_TYPE_TURBO2M4_S8, GGML_TYPE_TURBO2M4_G4, GGML_TYPE_TURBO2M4_G8,
     };
-    for (ggml_type type_v : turbo2m4_pareto_v_types) {
+    for (ggml_type type_v : turbo4_specialized_v_types) {
         for (int64_t nb : { 1, 16 }) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 512, nb, true, false, 0.0f, 0.0f,
                                                             GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true));
@@ -7738,7 +7735,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, true));
         test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, 8192, 32, true, false, 0.0f, 0.0f,
                                                         GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
-        for (ggml_type type_v : turbo2m4_pareto_v_types) {
+        for (ggml_type type_v : turbo4_specialized_v_types) {
             for (int64_t kv : { 32768, 65536 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 1, true, false, 0.0f, 0.0f,
                                                                 GGML_PREC_F32, GGML_TYPE_TURBO4_0, type_v, true));
@@ -7949,11 +7946,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     const char * turbo_kv_perf_shapes = getenv("LLAMA_TURBO_KV_PERF_SHAPES");
     if (turbo_kv_perf_shapes && strcmp(turbo_kv_perf_shapes, "0") != 0) {
-        const ggml_type turbo2m4_pareto_v_types[] = {
-            GGML_TYPE_TURBO2M4_S4,
-            GGML_TYPE_TURBO2M4_S8,
-            GGML_TYPE_TURBO2M4_G4,
-            GGML_TYPE_TURBO2M4_G8,
+        const ggml_type turbo4_specialized_v_types[] = {
+            GGML_TYPE_TURBO3_0,    GGML_TYPE_TURBO2M4_S4, GGML_TYPE_TURBO2M4_S8,
+            GGML_TYPE_TURBO2M4_G4, GGML_TYPE_TURBO2M4_G8,
         };
         test_cases.emplace_back(new test_turbo_wht(128, 32, 0));
         test_cases.emplace_back(new test_turbo_wht(128, 32, 1));
@@ -7996,7 +7991,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 4, 1 }, kv, 512, true, false, 0, 0,
                                                             GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
         }
-        for (ggml_type type_v : turbo2m4_pareto_v_types) {
+        for (ggml_type type_v : turbo4_specialized_v_types) {
             for (int64_t rows : { 1, 32, 512 }) {
                 test_cases.emplace_back(new test_set_rows_turbo(type_v, GGML_TYPE_I32, 128, 65536 * 8, rows));
             }

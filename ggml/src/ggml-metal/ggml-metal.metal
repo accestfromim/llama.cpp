@@ -7877,6 +7877,16 @@ void dequantize_turbo2m4_bytes_t4(const device uint8_t * xb, short il, int varia
     const float  norm      = float(as_type<half>(norm_bits));
     const int    base      = 4 * il;
     float4       values;
+    if (variant == 0) {
+        const uint8_t low  = xb[2 + il];
+        const uint8_t high = xb[34 + il / 2] >> (4 * (il % 2));
+        values = float4(turbo_centroids_3bit[(low & 0x3) | ((high & 0x1) << 2)],
+                        turbo_centroids_3bit[((low >> 2) & 0x3) | ((high & 0x2) << 1)],
+                        turbo_centroids_3bit[((low >> 4) & 0x3) | (high & 0x4)],
+                        turbo_centroids_3bit[(low >> 6) | ((high & 0x8) >> 1)]);
+        reg = (type4) (norm * values);
+        return;
+    }
     const int    n     = turbo2m4_variant_n(variant);
     const bool   group = variant >= 5;
     const int    n_pos = group ? n / 4 : n;

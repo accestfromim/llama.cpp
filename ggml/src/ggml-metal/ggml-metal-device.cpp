@@ -1097,7 +1097,8 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(ggml_me
     const ggml_type type_k    = op->src[1]->type;
     const ggml_type type_v    = op->src[2]->type;
     const bool      mixed_v =
-        type_k == GGML_TYPE_TURBO4_0 && type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16;
+        type_k == GGML_TYPE_TURBO4_0 &&
+        (type_v == GGML_TYPE_TURBO3_0 || (type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16));
     const char *    type_name = ggml_type_name(type_k);
     char            mixed_type_name[64];
     if (turbo_gqa4) {

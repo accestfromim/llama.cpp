@@ -1412,9 +1412,9 @@ static bool ggml_metal_turbo2m4_force_generic() {
     return force;
 }
 
-static bool ggml_metal_turbo2m4_pareto_v(ggml_type type) {
-    return type == GGML_TYPE_TURBO2M4_S4 || type == GGML_TYPE_TURBO2M4_S8 || type == GGML_TYPE_TURBO2M4_G4 ||
-           type == GGML_TYPE_TURBO2M4_G8;
+static bool ggml_metal_turbo4_specialized_v(ggml_type type) {
+    return type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO2M4_S4 || type == GGML_TYPE_TURBO2M4_S8 ||
+           type == GGML_TYPE_TURBO2M4_G4 || type == GGML_TYPE_TURBO2M4_G8;
 }
 
 static bool ggml_metal_get_turbo4_fattn_fusion(ggml_metal_op_t ctx, int idx, ggml_metal_turbo4_fattn_fusion * fusion) {
@@ -1462,7 +1462,7 @@ static bool ggml_metal_get_turbo4_fattn_fusion(ggml_metal_op_t ctx, int idx, ggm
                               to_f32->type == GGML_TYPE_F32;
     const bool valid_shape =
         q_wht && q_wht->src[0] && fa->src[1]->type == GGML_TYPE_TURBO4_0 &&
-        (fa->src[2]->type == GGML_TYPE_TURBO4_0 || ggml_metal_turbo2m4_pareto_v(fa->src[2]->type)) &&
+        (fa->src[2]->type == GGML_TYPE_TURBO4_0 || ggml_metal_turbo4_specialized_v(fa->src[2]->type)) &&
         fa->src[0]->ne[0] == 128 && fa->src[0]->ne[1] >= 1 && fa->src[0]->ne[1] <= 32 && fa->src[1]->ne[0] == 128 &&
         fa->src[2]->ne[0] == 128 && ggml_is_contiguous(q_wht->src[0]) && ggml_is_contiguous(to_f32);
     if (!valid_view || !valid_ops || !valid_wht || !valid_output || !valid_shape) {
@@ -3735,11 +3735,12 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
                          (type_k >= GGML_TYPE_TURBO2M4_S4 && type_k <= GGML_TYPE_TURBO2M4_G16);
     const bool turbo_v = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 ||
                          (type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16);
-    if (type_k == GGML_TYPE_TURBO4_0 && ggml_metal_turbo2m4_pareto_v(type_v) && ggml_metal_turbo2m4_force_generic()) {
+    if (type_k == GGML_TYPE_TURBO4_0 && ggml_metal_turbo4_specialized_v(type_v) &&
+        ggml_metal_turbo2m4_force_generic()) {
         return false;
     }
     const bool turbo_vec_pair = (type_k == GGML_TYPE_TURBO4_0 && type_v == GGML_TYPE_TURBO4_0) ||
-                                (type_k == GGML_TYPE_TURBO4_0 && ggml_metal_turbo2m4_pareto_v(type_v)) ||
+                                (type_k == GGML_TYPE_TURBO4_0 && ggml_metal_turbo4_specialized_v(type_v)) ||
                                 (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_TURBO4_0);
     if ((turbo_k || turbo_v) && !(turbo_vec_pair && op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128)) {
         return false;
@@ -3773,7 +3774,7 @@ static bool ggml_metal_op_flash_attn_ext_use_fairy2i_decode_vec(const ggml_tenso
 
 static bool ggml_metal_flash_attn_ext_turbo4_gqa4_shape(const ggml_tensor * op) {
     return !ggml_metal_turbo2m4_force_generic() && op->src[1]->type == GGML_TYPE_TURBO4_0 &&
-           (op->src[2]->type == GGML_TYPE_TURBO4_0 || ggml_metal_turbo2m4_pareto_v(op->src[2]->type)) &&
+           (op->src[2]->type == GGML_TYPE_TURBO4_0 || ggml_metal_turbo4_specialized_v(op->src[2]->type)) &&
            op->src[0]->ne[0] == 128 && op->src[0]->ne[1] >= 1 && op->src[0]->ne[1] <= 16 &&
            op->src[0]->ne[2] == 4 * op->src[1]->ne[2] && op->src[1]->ne[0] == 128 && op->src[2]->ne[0] == 128;
 }
@@ -4119,9 +4120,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // simdgroups per threadgroup (a.k.a. warps)
         //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
         const bool turbo_gqa4 = !ggml_metal_turbo2m4_force_generic() && type_k == GGML_TYPE_TURBO4_0 &&
-                                (type_v == GGML_TYPE_TURBO4_0 || ggml_metal_turbo2m4_pareto_v(type_v)) && has_mask &&
-                                !has_sinks && !has_bias && !has_scap && ne00 == 128 && ne20 == 128 && ne01 >= 20 &&
-                                ne02 == 4 * ne12 && ne03 == ne13 && ne12 == ne22 && ne32 == 1;
+                                (type_v == GGML_TYPE_TURBO4_0 ||
+                                 (type_v != GGML_TYPE_TURBO3_0 && ggml_metal_turbo4_specialized_v(type_v))) &&
+                                has_mask && !has_sinks && !has_bias && !has_scap && ne00 == 128 && ne20 == 128 &&
+                                ne01 >= 20 && ne02 == 4 * ne12 && ne03 == ne13 && ne12 == ne22 && ne32 == 1;
         int32_t    nsg        = turbo_gqa4 ? 2 : 4;
 
         size_t smem = FATTN_SMEM(nsg);
