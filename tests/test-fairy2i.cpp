@@ -2839,6 +2839,92 @@ static bool compare_fairy2i_lut_quantize_block(const char *                     
     return true;
 }
 
+static bool test_fairy2i_lut_parallel_transform() {
+#if defined(GGML_USE_FAIRY2I_CPU_LUT)
+    scoped_env_var force_threads("GGML_FAIRY2I_TEST_TRANSFORM_THREADS");
+    force_threads.set("4");
+
+    constexpr int64_t K    = 4096;
+    constexpr int64_t rows = 2047;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 8 * 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        return false;
+    }
+
+    ggml_tensor * weight         = ggml_new_tensor_2d(ctx, GGML_TYPE_FAIRY2I_TILE64_V2, K, rows);
+    const int64_t blocks_per_row = K / QK_FAIRY2I_TILE64;
+    auto *        blocks         = (block_fairy2i_tile64_v2 *) weight->data;
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t blk = 0; blk < blocks_per_row; ++blk) {
+            block_fairy2i_tile64_v2 & block = blocks[(size_t) row * (size_t) blocks_per_row + (size_t) blk];
+            block.d_real                    = GGML_FP32_TO_FP16((float) ((row + 3 * blk) % 31 - 15) / 8.0f);
+            block.d_imag                    = GGML_FP32_TO_FP16((float) ((5 * row + blk) % 29 - 14) / 8.0f);
+            for (int lane = 0; lane < 16; ++lane) {
+                block.qs[lane] = (uint8_t) (row + 7 * blk + 13 * lane);
+            }
+        }
+    }
+
+    ggml_tensor * index_tensor  = weight;
+    bool          ok            = ggml_fairy2i_lut_transform_tensor(weight, &index_tensor) && index_tensor == nullptr;
+    auto *        extra         = (fairy2i_lut_extra *) weight->extra;
+    const int64_t tiles         = (rows + 15) / 16;
+    const size_t  expected_size = (size_t) tiles * (size_t) blocks_per_row * sizeof(fairy2i_tile64_lut_wtile_16);
+    ok                          = extra && extra->indexes == nullptr && extra->size == 0 && extra->packed_w &&
+                                  extra->packed_w_size == expected_size &&
+                                  ((uintptr_t) extra->packed_w % GGML_FAIRY2I_LUT_WTILE_ALIGNMENT) == 0 && ok;
+
+    if (ok) {
+        const auto * packed = (const fairy2i_tile64_lut_wtile_16 *) extra->packed_w;
+        for (int64_t row = 0; row < rows && ok; ++row) {
+            const int64_t tile = row / 16;
+            const int     lane = (int) (row % 16);
+            for (int64_t blk = 0; blk < blocks_per_row && ok; ++blk) {
+                const block_fairy2i_tile64_v2 & source = blocks[(size_t) row * (size_t) blocks_per_row + (size_t) blk];
+                const fairy2i_tile64_lut_wtile_16 & target =
+                    packed[(size_t) tile * (size_t) blocks_per_row + (size_t) blk];
+                ok = target.d_real[lane] == source.d_real && target.d_imag[lane] == source.d_imag;
+                for (int pair = 0; pair < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2 && ok; ++pair) {
+                    const int base      = 4 * pair;
+                    auto      read_code = [&](int i) {
+                        return (source.qs[i & 15] >> (2 * (i >> 4))) & 0x03u;
+                    };
+                    const uint8_t lo       = read_code(base + 0) | (uint8_t) (read_code(base + 1) << 2);
+                    const uint8_t hi       = read_code(base + 2) | (uint8_t) (read_code(base + 3) << 2);
+                    const uint8_t expected = lo | (uint8_t) (hi << 4);
+                    ok                     = target.qs[pair][lane] == expected;
+                }
+            }
+        }
+
+        const fairy2i_tile64_lut_wtile_16 & final_tile = packed[(size_t) (tiles - 1) * (size_t) blocks_per_row];
+        ok                                             = final_tile.d_real[15] == 0 && final_tile.d_imag[15] == 0 && ok;
+        for (int pair = 0; pair < QK_FAIRY2I_TILE64_GROUPS_PER_BLOCK / 2; ++pair) {
+            ok = final_tile.qs[pair][15] == 0 && ok;
+        }
+
+        void * const packed_before = extra->packed_w;
+        index_tensor               = weight;
+        ok = ggml_fairy2i_lut_transform_tensor(weight, &index_tensor) && index_tensor == nullptr &&
+             extra->packed_w == packed_before && ok;
+    }
+
+    ggml_fairy2i_lut_free();
+    ggml_free(ctx);
+    printf("  Fairy2i LUT parallel transform: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+#else
+    printf("  Fairy2i LUT parallel transform skipped: build lacks GGML_USE_FAIRY2I_CPU_LUT\n");
+    return true;
+#endif
+}
+
 static bool test_fairy2i_lut_quantize_arm_neon() {
 #if defined(GGML_USE_FAIRY2I_CPU_LUT) && defined(__aarch64__) && defined(__ARM_NEON)
     bool ok = true;
@@ -6298,6 +6384,10 @@ int main() {
     }
     if (!test_fairy2i_arm_accumulate_neon()) {
         fprintf(stderr, "Fairy2i ARM NEON accumulate helper FAILED\n");
+        ++num_failed;
+    }
+    if (!test_fairy2i_lut_parallel_transform()) {
+        fprintf(stderr, "Fairy2i LUT parallel transform FAILED\n");
         ++num_failed;
     }
     if (!test_fairy2i_lut_quantize_arm_neon()) {

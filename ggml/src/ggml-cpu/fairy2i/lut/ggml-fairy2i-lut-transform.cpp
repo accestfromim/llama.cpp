@@ -15,7 +15,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <mutex>
+#include <system_error>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -220,7 +223,92 @@ static bool ggml_fairy2i_lut_transform_tensor_impl(
         indexes = indexes_tmp.data();
     }
 
-    const bool ok = encode((const block_type *) tensor->data, k, rows, indexes, index_bytes);
+    const block_type * w_blocks = (const block_type *) tensor->data;
+
+    constexpr size_t bytes_per_transform_thread = 1024 * 1024;
+    const int        forced_threads   = ggml_fairy2i_env_get_int_nonzero("GGML_FAIRY2I_TEST_TRANSFORM_THREADS", 0);
+    const unsigned   hardware_threads = std::min(std::thread::hardware_concurrency(), 16u);
+    const size_t     useful_threads   = (total_bytes + bytes_per_transform_thread - 1) / bytes_per_transform_thread;
+    const int        n_threads = forced_threads > 0 ?
+                                     (int) std::min({ (size_t) forced_threads, (size_t) 16, (size_t) tiles }) :
+                                 total_bytes >= 2 * bytes_per_transform_thread && hardware_threads > 1 ?
+                                     (int) std::min({ (size_t) hardware_threads, (size_t) tiles, useful_threads }) :
+                                     1;
+
+    auto transform_tiles = [&](int ith) {
+        const int64_t tile_begin = tiles * ith / n_threads;
+        const int64_t tile_end   = tiles * (ith + 1) / n_threads;
+        const int64_t row_begin  = tile_begin * 16;
+        const int64_t row_end    = std::min(rows, tile_end * 16);
+        const int64_t row_count  = row_end - row_begin;
+
+        if (!encode(w_blocks + (size_t) row_begin * (size_t) blocks_per_row, k, row_count,
+                    indexes + (size_t) row_begin * (size_t) info.groups_per_row,
+                    (size_t) row_count * (size_t) info.groups_per_row)) {
+            return false;
+        }
+
+        // Each worker owns complete 16-row tiles, so packed lanes never overlap.
+        for (int64_t tile = tile_begin; tile < tile_end; ++tile) {
+            const int64_t tile_row_end = std::min(rows, (tile + 1) * 16);
+            for (int64_t row = tile * 16; row < tile_row_end; ++row) {
+                const int64_t lane = row & 15;
+
+                const uint8_t * row_indexes = indexes + (size_t) row * (size_t) info.groups_per_row;
+
+                for (int64_t blk = 0; blk < blocks_per_row; ++blk) {
+                    wtile_type * t = packed_w + (size_t) tile * (size_t) blocks_per_row + (size_t) blk;
+
+                    const block_type * wb = w_blocks + (size_t) row * (size_t) blocks_per_row + (size_t) blk;
+                    if constexpr (std::is_same_v<wtile_type, fairy2i_tile64_lut_wtile_16>) {
+                        t->d_real[lane] = wb->d_real;
+                        t->d_imag[lane] = wb->d_imag;
+                    } else {
+                        t->d_real[lane] = GGML_FP16_TO_FP32(wb->d_real);
+                        t->d_imag[lane] = GGML_FP16_TO_FP32(wb->d_imag);
+                    }
+
+                    const uint8_t * blk_idx = row_indexes + (size_t) blk * (size_t) groups_per_block;
+                    for (int64_t gi = 0; gi < groups_per_block; gi += 2) {
+                        const uint8_t lo    = blk_idx[gi + 0] & 0x0fu;
+                        const uint8_t hi    = blk_idx[gi + 1] & 0x0fu;
+                        t->qs[gi / 2][lane] = lo | (uint8_t) (hi << 4);
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    bool ok = true;
+    if (n_threads == 1) {
+        ok = transform_tiles(0);
+    } else {
+        std::vector<uint8_t>     worker_ok((size_t) n_threads, 0);
+        std::vector<std::thread> workers;
+        workers.reserve((size_t) n_threads - 1);
+        int next_ith = 1;
+        try {
+            for (; next_ith < n_threads; ++next_ith) {
+                const int ith = next_ith;
+                workers.emplace_back([&, ith]() { worker_ok[(size_t) ith] = transform_tiles(ith); });
+            }
+        } catch (const std::system_error & error) {
+            if (dbg) {
+                GGML_LOG_WARN("fairy2i_lut: transform_tensor: worker launch failed, finishing serially: %s\n",
+                              error.what());
+            }
+        }
+        for (; next_ith < n_threads; ++next_ith) {
+            worker_ok[(size_t) next_ith] = transform_tiles(next_ith);
+        }
+        worker_ok[0] = transform_tiles(0);
+        for (std::thread & worker : workers) {
+            worker.join();
+        }
+        ok = std::all_of(worker_ok.begin(), worker_ok.end(), [](uint8_t value) { return value != 0; });
+    }
+
     if (!ok) {
         if (dbg) {
             GGML_LOG_WARN("fairy2i_lut: transform_tensor: encode failed type=%s (bytes=%zu)\n",
@@ -232,36 +320,6 @@ static bool ggml_fairy2i_lut_transform_tensor_impl(
             ggml_aligned_free(buf, total_bytes);
         }
         return false;
-    }
-
-    // Build packed 16-lane weights from the per-row indexes.
-    // 2-weight encoding: 4-bit pattern is the direct LUT index.
-    const block_type * w_blocks = (const block_type *) tensor->data;
-    for (int64_t row = 0; row < rows; ++row) {
-        const int64_t tile = row >> 4;
-        const int64_t lane = row & 15;
-
-        const uint8_t * row_indexes = indexes + (size_t) row * (size_t) info.groups_per_row;
-
-        for (int64_t blk = 0; blk < blocks_per_row; ++blk) {
-            wtile_type * t = packed_w + (size_t) tile * (size_t) blocks_per_row + (size_t) blk;
-
-            const block_type * wb = w_blocks + (size_t) row * (size_t) blocks_per_row + (size_t) blk;
-            if constexpr (std::is_same_v<wtile_type, fairy2i_tile64_lut_wtile_16>) {
-                t->d_real[lane] = wb->d_real;
-                t->d_imag[lane] = wb->d_imag;
-            } else {
-                t->d_real[lane] = GGML_FP16_TO_FP32(wb->d_real);
-                t->d_imag[lane] = GGML_FP16_TO_FP32(wb->d_imag);
-            }
-
-            const uint8_t * blk_idx = row_indexes + (size_t) blk * (size_t) groups_per_block;
-            for (int64_t gi = 0; gi < groups_per_block; gi += 2) {
-                const uint8_t lo    = blk_idx[gi + 0] & 0x0fu;
-                const uint8_t hi    = blk_idx[gi + 1] & 0x0fu;
-                t->qs[gi / 2][lane] = lo | (uint8_t) (hi << 4);
-            }
-        }
     }
 
     {
