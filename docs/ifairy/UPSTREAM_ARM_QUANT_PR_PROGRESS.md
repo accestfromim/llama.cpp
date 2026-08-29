@@ -1,13 +1,13 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A2 与 B0-B1 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A2、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
-- 分支：`work`
-- 最新迭代：B1 空算子 barrier 优化（当前提交）
-- 回滚粒度：每个目标一个提交，提交顺序见下表。
-- 工作树：A0-A2 与 B0-B1 实现完成；B1 已通过 x86_64 CPU 定向回归，ARM 真机性能数据待单独采集。
+- 分支：`lwt/merge_master`
+- 最新迭代：B3 Fairy2i tile64 LUT 权重变换并行化
+- 提交粒度：每个目标保持独立。
+- 状态：A0-A2、B0-B1 与 B3 实现完成；B3 已通过 ARM64 定向回归、合成变换基准和指定 Qwen3 Row4 模型兼容性验证。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
@@ -16,6 +16,7 @@
 | A2 | 增加 Linux/aarch64 缺失 HWCAP fallback；FP16 runtime 能力要求 `HWCAP_FPHP` 与 `HWCAP_ASIMDHP` 同时存在 | `1c8e8bf8d` |
 | B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
 | B1 | 移植 #17133 的 CPU 空算子跳过路径，避免 metadata-only node 进入 worker barrier | `70465c5` |
+| B3 | 参考 #23595 的并行初始化方法，将 Fairy2i tile64 LUT encode/pack 按完整 16-row tile 分片并行化 | `1d4c22ad5` |
 
 ## A0 证据
 
@@ -136,11 +137,22 @@ bash scripts/ci-fairy2i-cpu.sh
 - CPU worker loop 直接跳过 `NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE`，这些节点只修改 tensor metadata，不执行数值计算，因此不再为它们进入线程 barrier。
 - 保留 `ggml_compute_forward()` 中的显式 no-op cases，但删除 `ops.cpp`/`ops.h` 中无实际工作的四个 compute wrapper；没有扩大到全局 `ggml_op_is_empty` API 重构。
 - `test-barrier` 的 active-thread graph 在两组 matmul 后插入 reshape nodes，同时覆盖空节点跳过与 B0 的 `1/N` active-thread 切换。
-- x86_64 Release 定向验证通过：`test-barrier 8 1` 完成 2000-node 基准 graph、10 轮含 reshape 的 active graph，以及 10 轮双 graph 切换。ARM 真机的 Fairy2i 模型 benchmark 仍应按固定 `pp512`/`tg128`、8 线程、3 次重复单独采集，不从 x86 回归推导 tok/s 收益。
+- x86_64 Release 定向验证通过：`test-barrier 8 1` 完成 2000-node 基准 graph、10 轮含 reshape 的 active graph，以及 10 轮双 graph 切换。M4 ARM 的规定模型检查使用 `-pg 128,256 -t 8 -b 64 -ub 1 -ctk bf16 -ctv bf16 -ngl 0 -dev none -r 3 --no-warmup`，空闲态结果为 `pp512=28.78 ± 0.70 t/s`、`tg128=27.25 ± 0.26 t/s`、`pp128+tg256=25.32 ± 0.08 t/s`；相关 Row4/Fairy2i 调优环境变量均未设置。数据只证明当前实现可运行，不把 tok/s 变化归因于 B1。
+
+## B3 Fairy2i LUT 权重变换并行化（已完成）
+
+- **目标与边界：** #23595 并行化的是通用 IQ quantizer LUT 初始化；B3 只借用“独立工作分片”的方法，没有移植 IQ 表、OpenMP 配置或通用 quant 路径。变更局限于 `GGML_TYPE_FAIRY2I_TILE64_V2` 的一次性 CPU LUT weight transform。
+- **分片语义：** `ggml-fairy2i-lut-transform.cpp` 以完整 16-row tile 为最小所有权单位。每个 worker 对自己的连续 row range 调用既有 encoder，再只写自己的 packed tiles；scale、code byte 和最后一个不满 tile 的零填充均无交叉写。
+- **线程策略：** packed 输出小于 2 MiB 时保持串行；更大张量的线程数为硬件线程（最多 16）、tile 数与每 1 MiB 一个有效 worker 三者的最小值，调用线程参与工作。线程创建失败时已启动 worker 会正常 join，未启动分片由调用线程串行完成。生产路径没有新增调优接口；回归使用 `GGML_FAIRY2I_TEST_TRANSFORM_THREADS=4` 确定性覆盖并行分支。
+- **缓存与内存：** 原有单 buffer 分配、临时 indexes、第二次加锁发布、cache-key 复用和 duplicate-builder 丢弃路径保持不变。五个零填充 `4096 x 4096` tile64 张量的 synthetic max-RSS 增量由串行基线 `65.75 MiB` 变为 `58.08 MiB`，未观察到峰值增加；该数包含五份保留的 cache buffer 和分配器高水位。
+- **定向正确性：** 新增 `2047 x 4096` fixture，逐行逐 block 检查所有 packed code 与 FP16 scale，检查 64-byte alignment、最后 partial tile 的零 lane，以及第二次 transform 复用同一 packed pointer。`build-rel-fairy2i/bin/test-fairy2i` 的 LUT、W1/W2 variant、dynamic tile、42-pair thread-switch 和 bundle gates 全部通过。
+- **完整回归：** `bash scripts/ci-fairy2i-cpu.sh` 通过 CPU baseline、Fairy2i direct/LUT、LUT required/disabled、W2 backend-op `14578/14578`、legacy direct/LUT 全矩阵；`GGML_FAIRY2I_LUT=1`、legacy direct 与 `GGML_IFAIRY_LUT=1` 三组显式门禁也全部通过。
+- **首次变换延迟：** 同一 M4、空闲 CPU、五个 `4096 x 4096` 张量的中位数从串行 `10.00 ms` 降至 `3.52 ms`，为 `2.84x`；这是 weight transform 一次性延迟，不是 token throughput。
+- **指定模型兼容性：** `qwen3-row4-int8-v1-final-bos.gguf` 加载 436 tensors，并以 8 threads、BF16 KV、CPU-only exact path 完成固定 seed 的 32-token CLI smoke，eval 为 `30.69 t/s`；同一最终构建的三次性能检查为 `pp512=28.78 ± 0.70 t/s`、`tg128=27.25 ± 0.26 t/s`、`pp128+tg256=25.32 ± 0.08 t/s`。该模型使用 `ROW4_CODES`，不经过 Fairy2i tile64 LUT transform，因此这里只证明 B3 没有造成共享 CPU/loader 回归，不能作为 B3 加速证据。
 
 ## 暂不移植
 
 - 标准 Q4/Q5/Q6/Q8 ARM repack：布局不兼容 Fairy2i tile64。
 - KleidiAI / SME / SME2：单独的可选 ARM 后端路线，不能从通用 benchmark 推导 Fairy2i 收益。
-- 通用 RMS_NORM、FlashAttention、IQ LUT 并行化：仅作实现参考，不替换 Fairy2i 自定义算子。
+- 通用 RMS_NORM、FlashAttention 和 IQ LUT 实现：不直接移植；B3 仅在 Fairy2i 私有 transform 中采用独立分片方法。
 - 通用 GGUF/model-quant PR：需要 Fairy2i-specific fixture 证明 tensor type、stride、scale 和 bundle metadata 后再处理。
