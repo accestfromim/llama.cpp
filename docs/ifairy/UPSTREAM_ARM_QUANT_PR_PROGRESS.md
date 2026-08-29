@@ -1,13 +1,13 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A7、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A7、A9、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
 - 分支：`lwt/merge_master`
-- 最新迭代：A7 quantization tool safety
+- 最新迭代：A9 row-contiguous quantized concat
 - 提交粒度：每个目标保持独立。
-- 状态：A0-A7、B0-B1 与 B3 实现完成；A7 已通过真实 GGUF 碰撞拒绝、checksum、量化工具构建、代码审查和完整 CPU 矩阵。
+- 状态：A0-A7、A9、B0-B1 与 B3 实现完成；A9 已通过 assertion 复现、五格式/四维/view-mask 回归、代码审查和完整 CPU 矩阵。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
@@ -19,6 +19,7 @@
 | A5 | 适配 #26838，使 Android 进入已有 Linux `sched_setaffinity()` 分支 | `c719d8b4a` |
 | A6 | 适配 #16520，隔离 Linux-only SVE header 并使 non-Linux SVE 明确失败 | `c71df67f9` |
 | A7 | 适配 #17788、#18451，移除无效架构断言并阻止 unsplit/split 输出覆盖输入 | `90e2586b6` |
+| A9 | 适配 #25678，使量化 `CONCAT` 接受 row-contiguous 高维 views | `98327d467` |
 | B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
 | B1 | 移植 #17133 的 CPU 空算子跳过路径，避免 metadata-only node 进入 worker barrier | `70465c5` |
 | B3 | 参考 #23595 的并行初始化方法，将 Fairy2i tile64 LUT encode/pack 按完整 16-row tile 分片并行化 | `1d4c22ad5` |
@@ -96,6 +97,14 @@
 - **验证：** `llama-quantize` build 通过；真实 `qwen3-row4-int8-v1-final-bos.gguf` 同路径 Q8_0 请求在模型加载前返回错误，前后 SHA-256 均为 `306b3086b28251cf662c462e0bc2d4e153b2a517593a651cf95f3887a62b5deb`。`bash scripts/ci-fairy2i-cpu.sh` 全矩阵通过。
 - **边界：** 当前没有 hybrid/expert/recurrent source GGUF fixture，故未伪造量化输出；assert 删除依据其结构性错误和上游最终状态，构建与现有模型矩阵证明无回归。
 
+## A9 row-contiguous quantized concat（已完成）
+
+- **上游目标：** #25678 将量化 concat 的输入要求从 globally contiguous 放宽为 contiguous rows。A4 已完成 #25247 的 block-unit 索引修复，因此本批次只扩展合法 stride 组合。
+- **复现：** 先加入 row-contiguous 但 dim3 有 gap 的 Q4_0 view；旧 `ggml_is_contiguous()` guard 在首个 `v=4` case 明确 assertion。
+- **实现与回归：** `ggml_compute_forward_concat_any` 已按输入各自的 `nb[0..3]` 寻址，故只将 guard 改为 `ggml_is_contiguous_rows()`，保留 dim0 整 block 断言。Q4_0、Q4_1、Q5_0、Q5_1、Q8_0 × dimensions 0-3 × view masks 0/4/8/12 全部通过；v=4/8/12 分别覆盖 only-a、only-b、both 高维 stride gaps。
+- **验证：** `CONCAT` 定向运行 `14662/14662`；独立审查确认 dim0 block offset 和 dim1-3 logical offsets 保持一致；`bash scripts/ci-fairy2i-cpu.sh` 全矩阵通过。
+- **模型边界：** 指定 Row4 模型不构造量化 concat graph；A4 的模型 smoke 已覆盖共享 loader/runtime，无需把 tok/s 归因于本次 stride capability。
+
 ## Fairy2i / iFairy 模型兼容性
 
 当前模型格式对应不同 CPU gate，不能把两条路径混成一个标准 quant kernel：
@@ -106,7 +115,7 @@
 | `models/Fairy2i-W2/fairy2i-w2.gguf`（旧 `IFairy` 权重、`fairy2i` architecture） | 同时启用 `GGML_FAIRY2I_CPU=ON` 与 `GGML_LEGACY_IFAIRY_CPU=ON` 的 compatibility build，`--device none` | CLI 生成 smoke PASS；加载 966 tensors，输出可读文本 |
 | Fairy2i tile64/bundle fixtures | `build-rel-fairy2i-direct` / `build-rel-fairy2i` | loader、CPU direct、LUT、Metal fixture gates PASS |
 
-`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A7 隐式改变。
+`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A7、A9 隐式改变。
 
 ## CPU CI 证据
 
@@ -123,7 +132,7 @@ bash scripts/ci-fairy2i-cpu.sh
 - CPU-only baseline `ggml-base` / `ggml-cpu` build；
 - Fairy2i direct loader/test；
 - Fairy2i LUT loader/test、LUT required/disabled runtime gates；
-- Fairy2i W2 backend-op 14602/14602 cases；
+- Fairy2i W2 backend-op 14662/14662 cases；
 - legacy iFairy direct 与 LUT loader/test。
 
 另行通过的 targeted checks：
