@@ -95,9 +95,11 @@ static void test_active(int n_threads, int n_rounds) {
     for (int i = 0; i < 2; i++) {
         struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 64, 128);
         out = ggml_mul_mat(ctx, a, out);
+        out                    = ggml_reshape_1d(ctx, out, ggml_nelements(out));
 
         struct ggml_tensor * d = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 128, 64);
         out = ggml_mul_mat(ctx, d, out);
+        out                    = ggml_reshape_1d(ctx, out, ggml_nelements(out));
     }
     ggml_build_forward_expand(gf, out);
     const int n_nodes = ggml_graph_n_nodes(gf);

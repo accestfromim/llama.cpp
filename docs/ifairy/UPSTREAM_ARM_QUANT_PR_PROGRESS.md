@@ -1,13 +1,13 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前 `lwt/merge_master` 分支完成并验证的 A0-A2 与 B0 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A2 与 B0-B1 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
-- 分支：`lwt/merge_master`
-- 最新实现提交：`89e5045d2`（B0 源码），`66b095e15`（B0 回归）
+- 分支：`work`
+- 最新迭代：B1 空算子 barrier 优化（当前提交）
 - 回滚粒度：每个目标一个提交，提交顺序见下表。
-- 工作树：A0-A2 与 B0 实现完成；源代码提交后由 CPU 矩阵和真实模型 smoke 验证。
+- 工作树：A0-A2 与 B0-B1 实现完成；B1 已通过 x86_64 CPU 定向回归，ARM 真机性能数据待单独采集。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
@@ -15,6 +15,7 @@
 | A1 | 适配 ARM `-mcpu`/`-march` 探测、宏验证和所需 feature flag 传递；保留 Fairy2i source split 与 DOTPROD gate | `6028b4b64` |
 | A2 | 增加 Linux/aarch64 缺失 HWCAP fallback；FP16 runtime 能力要求 `HWCAP_FPHP` 与 `HWCAP_ASIMDHP` 同时存在 | `1c8e8bf8d` |
 | B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
+| B1 | 移植 #17133 的 CPU 空算子跳过路径，避免 metadata-only node 进入 worker barrier | `70465c5` |
 
 ## A0 证据
 
@@ -90,7 +91,7 @@ bash scripts/ci-fairy2i-cpu.sh
 
 ## B0 调度器移植决策（已完成）
 
-- **目标：#17748**（threadpool 中把 `n_graph` 与 active-thread count 合并为一个原子状态）；**#17133**（跳过 NOP/barrier）仍保持独立后续提交。
+- **目标：#17748**（threadpool 中把 `n_graph` 与 active-thread count 合并为一个原子状态）；#17133 已在后续的独立 B1 提交中完成。
 - 选择依据：修复前，同一个 `ggml_threadpool` 交替执行 `1` 与 `N` 线程图会出现 `SIGSEGV`、挂死或极端延迟；这是共享 CPU runtime 状态一致性缺陷，不是 Fairy2i tile claim 算法缺陷。
 - B0 提交：`d8fe14ad4`（barrier active/multi-graph 回归）、`89e5045d2`（threadpool packed state）、`66b095e15`（同 backend/threadpool 的 Fairy2i W1/W2 LUT stress）。
 
@@ -128,7 +129,14 @@ bash scripts/ci-fairy2i-cpu.sh
 
 ### 后续
 
-- B0 已稳定；不把 #17133 的 NOP/barrier 优化与本提交混合。下一步若继续移植，应单独实现并验证 `NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE` 的 worker-loop 跳过逻辑，保留独立输出与性能回归。
+- B0 已稳定；#17133 的 NOP/barrier 优化已作为独立 B1 迭代实现。
+
+## B1 空算子 barrier 优化（已完成）
+
+- CPU worker loop 直接跳过 `NONE/RESHAPE/VIEW/PERMUTE/TRANSPOSE`，这些节点只修改 tensor metadata，不执行数值计算，因此不再为它们进入线程 barrier。
+- 保留 `ggml_compute_forward()` 中的显式 no-op cases，但删除 `ops.cpp`/`ops.h` 中无实际工作的四个 compute wrapper；没有扩大到全局 `ggml_op_is_empty` API 重构。
+- `test-barrier` 的 active-thread graph 在两组 matmul 后插入 reshape nodes，同时覆盖空节点跳过与 B0 的 `1/N` active-thread 切换。
+- x86_64 Release 定向验证通过：`test-barrier 8 1` 完成 2000-node 基准 graph、10 轮含 reshape 的 active graph，以及 10 轮双 graph 切换。ARM 真机的 Fairy2i 模型 benchmark 仍应按固定 `pp512`/`tg128`、8 线程、3 次重复单独采集，不从 x86 回归推导 tok/s 收益。
 
 ## 暂不移植
 

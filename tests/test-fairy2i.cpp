@@ -2149,8 +2149,8 @@ static bool test_fairy2i_exact_mlp_residual_logits() {
         const float gate_bf16 = bf16_round(gate_values[i]);
         const float up_bf16   = bf16_round(up_values[i]);
         const float exp_value = expf(gate_bf16);
-        const float silu_f32 =
-            signbit(gate_bf16) ? gate_bf16 * exp_value / (1.0f + exp_value) : gate_bf16 / (1.0f + expf(-gate_bf16));
+        const float silu_f32  = std::signbit(gate_bf16) ? gate_bf16 * exp_value / (1.0f + exp_value) :
+                                                          gate_bf16 / (1.0f + expf(-gate_bf16));
         const float silu_bf16 = bf16_round(silu_f32);
         gate.push_back(gate_bf16);
         up.push_back(up_bf16);
