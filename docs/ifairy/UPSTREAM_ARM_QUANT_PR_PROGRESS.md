@@ -1,13 +1,13 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A4、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A5、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
 - 分支：`lwt/merge_master`
-- 最新迭代：A4 共享 CPU 算子正确性
+- 最新迭代：A5 Android CPU affinity portability
 - 提交粒度：每个目标保持独立。
-- 状态：A0-A4、B0-B1 与 B3 实现完成；A4 已通过定向操作回归、完整 CPU 矩阵和指定 Qwen3 Row4 模型兼容性验证。
+- 状态：A0-A5、B0-B1 与 B3 实现完成；A5 已通过 Android target 宏选择探针、代码审查和完整 host CPU 矩阵。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
@@ -16,6 +16,7 @@
 | A2 | 增加 Linux/aarch64 缺失 HWCAP fallback；FP16 runtime 能力要求 `HWCAP_FPHP` 与 `HWCAP_ASIMDHP` 同时存在 | `1c8e8bf8d` |
 | A3 | 适配 #15928、#19861、#20460，初始化 IQ scratch/fallback 状态并保护退化缩放 | `7ea3c22ed` |
 | A4 | 适配 #24305、#25247，修正 `RMS_NORM_BACK` 原地别名和量化 `CONCAT` block 索引 | `03f3ed5a2` |
+| A5 | 适配 #26838，使 Android 进入已有 Linux `sched_setaffinity()` 分支 | `c719d8b4a` |
 | B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
 | B1 | 移植 #17133 的 CPU 空算子跳过路径，避免 metadata-only node 进入 worker barrier | `70465c5` |
 | B3 | 参考 #23595 的并行初始化方法，将 Fairy2i tile64 LUT encode/pack 按完整 16-row tile 分片并行化 | `1d4c22ad5` |
@@ -70,6 +71,14 @@
 - **验证：** `bash scripts/ci-fairy2i-cpu.sh` 的 baseline、Fairy2i direct/LUT、LUT required/disabled、W2 `14602/14602`、legacy direct/LUT 全矩阵通过。
 - **指定模型：** `qwen3-row4-int8-v1-final-bos.gguf` 加载 436 tensors，8 threads、BF16 KV、CPU-only、固定 seed 的 16-token smoke 输出可读文本，eval 为 `30.86 t/s`。该模型不执行 concat 或 backward graph，因此该结果只证明共享 CPU/loader 无回归。
 
+## A5 Android CPU affinity portability（已完成）
+
+- **上游目标：** #26838 将线程亲和力实现的条件从 glibc 专用 `__gnu_linux__` 改为内核平台宏 `__linux__`。Android bionic 定义后者而不定义前者，因此旧代码落入不执行任何操作的 unsupported stub。
+- **实现边界：** 只修改 affinity/priority 平台分支。分支内现有 `__ANDROID__` 路径继续调用 `sched_setaffinity()`；NUMA 与 `syscall.h` 的 `__gnu_linux__` 条件保持不变，避免把 bionic 不支持的 NUMA/glibc 接口带入 Android。
+- **平台探针：** `clang --target=aarch64-linux-android24 -dM -E` 证明 `__ANDROID__`、`__linux__` 存在且 `__gnu_linux__` 不存在；同一 target 的条件编译断言通过。Apple 分支优先于 Linux，BSD 不定义 `__linux__`。
+- **验证：** 独立审查未发现平台覆盖或头文件问题；`bash scripts/ci-fairy2i-cpu.sh` 的 baseline、Fairy2i direct/LUT、LUT required/disabled、W2 `14602/14602`、legacy direct/LUT 全矩阵通过。
+- **验证边界：** 当前机器没有 Android NDK、Android device、QEMU 或远程 ARM host，因此未执行 Android link/runtime affinity probe；这项缺口已保留为目标环境验证，而不是推断运行成功。
+
 ## Fairy2i / iFairy 模型兼容性
 
 当前模型格式对应不同 CPU gate，不能把两条路径混成一个标准 quant kernel：
@@ -80,7 +89,7 @@
 | `models/Fairy2i-W2/fairy2i-w2.gguf`（旧 `IFairy` 权重、`fairy2i` architecture） | 同时启用 `GGML_FAIRY2I_CPU=ON` 与 `GGML_LEGACY_IFAIRY_CPU=ON` 的 compatibility build，`--device none` | CLI 生成 smoke PASS；加载 966 tensors，输出可读文本 |
 | Fairy2i tile64/bundle fixtures | `build-rel-fairy2i-direct` / `build-rel-fairy2i` | loader、CPU direct、LUT、Metal fixture gates PASS |
 
-`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A4 隐式改变。
+`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A5 隐式改变。
 
 ## CPU CI 证据
 
