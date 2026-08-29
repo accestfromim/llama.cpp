@@ -761,8 +761,12 @@ bool ggml_is_numa(void) {
 #endif
 
 static void ggml_init_arm_arch_features(void) {
-#if defined(__linux__) && defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+#if defined(__linux__)
     ggml_arm_arch_features.sve_cnt = PR_SVE_VL_LEN_MASK & prctl(PR_SVE_GET_VL);
+#else
+#error "SVE is not supported on this platform because its vector length cannot be initialized"
+#endif
 #endif
 }
 
