@@ -1,17 +1,18 @@
 #include "common.h"
-#include "llama.h"
 #include "gguf.h"
+#include "llama.h"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <vector>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <string>
 #include <unordered_map>
-#include <map>
-#include <fstream>
-#include <cmath>
-#include <cctype>
-#include <algorithm>
+#include <vector>
 
 struct quant_option {
     std::string name;
@@ -723,6 +724,13 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "Please do not use IQ1_S, IQ1_M, IQ2_S, IQ2_XXS, IQ2_XS or Q2_K_S quantization without an importance matrix\n");
         fprintf(stderr, "==========================================================================================================\n\n\n");
         return 1;
+    }
+
+    if (!params.keep_split) {
+        if (std::error_code ec; std::filesystem::equivalent(fname_inp, fname_out, ec)) {
+            fprintf(stderr, "%s: error: input and output files are the same: '%s'\n", __func__, fname_inp.c_str());
+            return 1;
+        }
     }
 
     print_build_info();

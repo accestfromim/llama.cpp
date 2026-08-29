@@ -1,12 +1,14 @@
 #include "llama-quant.h"
+
 #include "llama-impl.h"
-#include "llama-model.h"
 #include "llama-model-loader.h"
+#include "llama-model.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
-#include <cinttypes>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <regex>
@@ -702,8 +704,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
 
     std::map<int, std::string> mapped;
-    int blk_id = 0;
-    int pruned_attention_w = 0;
+    int                        blk_id = 0;
 
     // make a list of weights
     std::vector<const llama_model_loader::llama_tensor_weight *> tensors;
@@ -711,11 +712,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     for (const auto & it : ml.weights_map) {
         const std::string remapped_name(remap_layer(it.first, prune_list, mapped, blk_id));
         if (remapped_name.empty()) {
-            if (it.first.find("attn_v.weight") != std::string::npos ||
-                it.first.find("attn_qkv.weight") != std::string::npos ||
-                it.first.find("attn_kv_b.weight") != std::string::npos) {
-                    pruned_attention_w++;
-            }
             LLAMA_LOG_DEBUG("%s: pruning tensor %s\n", __func__, it.first.c_str());
             continue;
         } else if (remapped_name != it.first) {
@@ -755,20 +751,6 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)model.hparams.n_layer;
 
-    // sanity checks for models that have attention layers
-    if (qs.n_attention_wv != 0)
-    {
-        const auto & n_head_kv_iter = model.hparams.n_head_kv_arr.begin();
-        // attention layers have a non-zero number of kv heads
-        int32_t n_attn_layer = model.hparams.n_layer - std::count(n_head_kv_iter, n_head_kv_iter + model.hparams.n_layer, 0);
-        if (llama_model_has_encoder(&model)) {
-            // now n_attn_layer is the number of attention layers in the encoder
-            // for each decoder block, there are 2 attention layers
-            n_attn_layer += 2 * model.hparams.dec_n_layer;
-        }
-        GGML_ASSERT((qs.n_attention_wv == n_attn_layer - pruned_attention_w) && "n_attention_wv is unexpected");
-    }
-
     size_t total_size_org = 0;
     size_t total_size_new = 0;
 
@@ -791,6 +773,28 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
+
+    std::vector<std::string> output_paths(n_split, fname_out);
+    if (params->keep_split) {
+        std::vector<char> split_path(llama_path_max(), 0);
+        for (uint16_t i = 0; i < n_split; ++i) {
+            llama_split_path(split_path.data(), split_path.size(), fname_out.c_str(), i, n_split);
+            output_paths[i] = split_path.data();
+        }
+    }
+    for (const std::string & output_path : output_paths) {
+        if (splits.empty()) {
+            if (std::error_code ec; std::filesystem::equivalent(fname_inp, output_path, ec)) {
+                throw std::runtime_error(format("input and output files are the same: '%s'", output_path.c_str()));
+            }
+        } else {
+            for (const std::string & input_path : splits) {
+                if (std::error_code ec; std::filesystem::equivalent(input_path, output_path, ec)) {
+                    throw std::runtime_error(format("input and output files are the same: '%s'", output_path.c_str()));
+                }
+            }
+        }
+    }
 
     // populate the original tensors so we get an initial meta data
     for (const auto * it : tensors) {
@@ -826,12 +830,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     auto new_ofstream = [&](int index) {
         cur_split = index;
         GGML_ASSERT(ctx_outs[cur_split] && "Find uninitialized gguf_context");
-        std::string fname = fname_out;
-        if (params->keep_split) {
-            std::vector<char> split_path(llama_path_max(), 0);
-            llama_split_path(split_path.data(), split_path.size(), fname_out.c_str(), cur_split, n_split);
-            fname = std::string(split_path.data());
-        }
+        const std::string & fname = output_paths[cur_split];
 
         fout = std::ofstream(fname, std::ios::binary);
         fout.exceptions(std::ofstream::failbit); // fail fast on write errors
