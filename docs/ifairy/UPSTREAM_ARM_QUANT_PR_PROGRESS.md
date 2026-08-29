@@ -1,13 +1,13 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A5、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A6、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
 - 分支：`lwt/merge_master`
-- 最新迭代：A5 Android CPU affinity portability
+- 最新迭代：A6 non-Linux SVE portability boundary
 - 提交粒度：每个目标保持独立。
-- 状态：A0-A5、B0-B1 与 B3 实现完成；A5 已通过 Android target 宏选择探针、代码审查和完整 host CPU 矩阵。
+- 状态：A0-A6、B0-B1 与 B3 实现完成；A6 已通过失败复现、macOS ARMv9 compile probes、代码审查和完整 CPU 矩阵。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
@@ -17,6 +17,7 @@
 | A3 | 适配 #15928、#19861、#20460，初始化 IQ scratch/fallback 状态并保护退化缩放 | `7ea3c22ed` |
 | A4 | 适配 #24305、#25247，修正 `RMS_NORM_BACK` 原地别名和量化 `CONCAT` block 索引 | `03f3ed5a2` |
 | A5 | 适配 #26838，使 Android 进入已有 Linux `sched_setaffinity()` 分支 | `c719d8b4a` |
+| A6 | 适配 #16520，隔离 Linux-only SVE header 并使 non-Linux SVE 明确失败 | `c71df67f9` |
 | B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
 | B1 | 移植 #17133 的 CPU 空算子跳过路径，避免 metadata-only node 进入 worker barrier | `70465c5` |
 | B3 | 参考 #23595 的并行初始化方法，将 Fairy2i tile64 LUT encode/pack 按完整 16-row tile 分片并行化 | `1d4c22ad5` |
@@ -79,6 +80,13 @@
 - **验证：** 独立审查未发现平台覆盖或头文件问题；`bash scripts/ci-fairy2i-cpu.sh` 的 baseline、Fairy2i direct/LUT、LUT required/disabled、W2 `14602/14602`、legacy direct/LUT 全矩阵通过。
 - **验证边界：** 当前机器没有 Android NDK、Android device、QEMU 或远程 ARM host，因此未执行 Android link/runtime affinity probe；这项缺口已保留为目标环境验证，而不是推断运行成功。
 
+## A6 non-Linux SVE portability boundary（已完成）
+
+- **上游目标：** #16520 隔离 `sys/prctl.h` 与 `PR_SVE_GET_VL` 的 Linux 依赖。旧代码只要编译器定义 `__ARM_FEATURE_SVE` 就包含 Linux header；AppleClang 的 macOS `-march=armv9-a` 正会定义 SVE/SVE2。
+- **复现与实现：** 修复前，standalone `ggml-cpu-impl.h` probe 在 macOS `-march=armv9-a` 下因缺失 `sys/prctl.h` 失败。修复后该 header probe 通过；Linux aarch64/SVE 继续由 `prctl()` 初始化 vector length，non-Linux aarch64/SVE 在 backend source 中得到明确 compile-time diagnostic，避免 `ggml_cpu_get_sve_cnt()` 返回未初始化的零值。
+- **验证：** 显式 `GGML_NATIVE=OFF`、`GGML_CPU_ARM_ARCH=armv9-a` 配置到达预期 non-Linux SVE diagnostic；正常 M4 native feature probe 加入 `+nosve` 与 `-U__ARM_FEATURE_SVE`，backend build 通过。独立审查和 `bash scripts/ci-fairy2i-cpu.sh` 全矩阵通过。
+- **边界：** 该批次只修复平台 header/runtime 初始化不变量，不声称实现 macOS SVE。SVE vector arithmetic 正确性链仍需要可运行的 Linux SVE target。
+
 ## Fairy2i / iFairy 模型兼容性
 
 当前模型格式对应不同 CPU gate，不能把两条路径混成一个标准 quant kernel：
@@ -89,7 +97,7 @@
 | `models/Fairy2i-W2/fairy2i-w2.gguf`（旧 `IFairy` 权重、`fairy2i` architecture） | 同时启用 `GGML_FAIRY2I_CPU=ON` 与 `GGML_LEGACY_IFAIRY_CPU=ON` 的 compatibility build，`--device none` | CLI 生成 smoke PASS；加载 966 tensors，输出可读文本 |
 | Fairy2i tile64/bundle fixtures | `build-rel-fairy2i-direct` / `build-rel-fairy2i` | loader、CPU direct、LUT、Metal fixture gates PASS |
 
-`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A5 隐式改变。
+`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A6 隐式改变。
 
 ## CPU CI 证据
 
