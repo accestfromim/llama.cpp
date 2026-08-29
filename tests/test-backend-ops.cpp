@@ -3597,6 +3597,55 @@ struct test_rms_norm_back : public test_case {
     }
 };
 
+struct test_rms_norm_back_inplace_alias : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float                  eps;
+
+    test_rms_norm_back_inplace_alias(std::array<int64_t, 4> ne = { 64, 5, 4, 3 }, float eps = 1e-6f) :
+        ne(ne),
+        eps(eps) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_BACK_ALIAS";
+    }
+
+    std::string vars() override { return VARS_TO_STR2(ne, eps); }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * dz = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(dz, "dz");
+
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+
+        ggml_tensor * expected = ggml_rms_norm_back(ctx, dz, x, eps);
+        ggml_set_name(expected, "expected");
+
+        ggml_tensor * aliased = ggml_view_tensor(ctx, dz);
+        memcpy(aliased->op_params, &eps, sizeof(eps));
+        aliased->op     = GGML_OP_RMS_NORM_BACK;
+        aliased->src[0] = dz;
+        aliased->src[1] = x;
+        aliased->src[2] = expected;
+        // Force the out-of-place reference to run before aliased overwrites dz.
+        ggml_set_name(aliased, "aliased");
+
+        // Equal outputs produce sqrt(-0); any aliasing error produces NaN and fails the harness.
+        ggml_tensor * difference = ggml_abs(ctx, ggml_sub(ctx, expected, aliased));
+        return ggml_sqrt(ctx, ggml_neg(ctx, difference));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -10.f, 10.f);
+        }
+        ggml_tensor * dz      = ggml_get_tensor(ctx, "dz");
+        ggml_tensor * aliased = ggml_get_tensor(ctx, "aliased");
+        GGML_ASSERT(dz && aliased && dz->data == aliased->data);
+    }
+};
+
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
@@ -6846,6 +6895,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, v, eps));
         }
         test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, {64, 5, 4, 3}, eps));
+        test_cases.emplace_back(new test_rms_norm_back_inplace_alias({ 64, 5, 4, 3 }, eps));
         test_cases.emplace_back(new test_l2_norm      (GGML_TYPE_F32, {64, 5, 4, 3}, eps));
     }
     for (float eps : {0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f}) {
@@ -7215,6 +7265,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int dim : { 0, 1, 2, 3, }) {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
+        }
+    }
+
+    for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
+        for (int dim : { 0, 1, 2, 3 }) {
+            test_cases.emplace_back(new test_concat(type_a, { 128, 12, 13, 14 }, dim == 0 ? 256 : 7, dim, 0));
         }
     }
 
