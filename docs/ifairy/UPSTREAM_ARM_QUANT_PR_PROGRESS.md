@@ -111,7 +111,7 @@
 - **上游目标：** #17523 把 MXFP4 数据标记为 endian-neutral；#26618 增加 Q1_0/TQ2_0 block byteswap。当前树没有 Q1_0，因此只适配已经存在且可验证的 MXFP4 与 TQ2_0。
 - **布局：** `block_mxfp4` 是 1-byte E8M0 exponent + 16-byte packed quants，不含多字节字段；`block_tq2_0` 是 64-byte quants + trailing f16 delta。Python `GGML_QUANT_SIZES` 分别给出 17 与 66 bytes，与 C static assertions 一致。
 - **实现：** converter 的 block size 统一从 `GGML_QUANT_SIZES` 获取，删除四种旧格式的重复硬编码；MXFP4 注册 no-op，TQ2_0 只交换每块 offsets 64-65 的 f16 delta。
-- **验证：** 新增 block-level unittest 覆盖两个连续 TQ2 blocks、非 delta bytes 保持、double-swap 恢复原字节、MXFP4 全块不变和 mapping 注册。`pytest` 2 passed，Ruff 与 venv Pyright 零问题；独立审查通过。
+- **验证：** 新增 block-level unittest 覆盖两个连续 TQ2 blocks、非 delta bytes 保持、double-swap 恢复原字节、MXFP4 全块不变和 mapping 注册。定向 `pytest` 通过 `2/2`，仓库 `scripts/test-gguf-py.sh` 通过 `299 passed, 1 skipped`，Ruff 与 venv Pyright 零问题；独立审查通过。
 
 ## Fairy2i / iFairy 模型兼容性
 
