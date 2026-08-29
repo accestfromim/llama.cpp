@@ -195,6 +195,13 @@ bash scripts/ci-fairy2i-cpu.sh
 - **首次变换延迟：** 同一 M4、空闲 CPU、五个 `4096 x 4096` 张量的中位数从串行 `10.00 ms` 降至 `3.52 ms`，为 `2.84x`；这是 weight transform 一次性延迟，不是 token throughput。
 - **指定模型兼容性：** `qwen3-row4-int8-v1-final-bos.gguf` 加载 436 tensors，并以 8 threads、BF16 KV、CPU-only exact path 完成固定 seed 的 32-token CLI smoke，eval 为 `30.69 t/s`；同一最终构建的三次性能检查为 `pp512=28.78 ± 0.70 t/s`、`tg128=27.25 ± 0.26 t/s`、`pp128+tg256=25.32 ± 0.08 t/s`。该模型使用 `ROW4_CODES`，不经过 Fairy2i tile64 LUT transform，因此这里只证明 B3 没有造成共享 CPU/loader 回归，不能作为 B3 加速证据。
 
+## KleidiAI optional-backend screening（blocked）
+
+- `GGML_CPU_KLEIDIAI=ON` 的当前 v1.13 integration 可在 M4 构建，但 CPU `MUL_MAT` 定向矩阵仅 `14583/14602` 通过；reachable Q4_0 GEMM（GEMV 除外）产生 NaN。
+- 试验性升级到 v1.14，并完整替换 #16460 的 kernel interface refactor 后，结果仍只有 `14585/14602`，Q4_0 GEMM 继续产生 NaN。该试验未满足 correctness gate，源码和 CMake 改动已全部撤回。
+- 因为 #20620 只放宽 3D input 支持，在基础 Q4_0 GEMM 已错误时单独移植会扩大错误可达面。后续 Q8、SME/SME2 hybrid scheduling、v1.24 dependency 和 runtime feature detection 形成一个版本化 backend migration，不能拆成安全的一行 backport。
+- 当前默认 Fairy2i/Row4 build 未启用 KleidiAI；完整 CPU 矩阵不经过该可选 backend。解除 blocker 需要整链迁移，并让 KleidiAI-enabled `test-backend-ops` 零失败后再讨论性能。
+
 ## 暂不移植
 
 - 标准 Q4/Q5/Q6/Q8 ARM repack：布局不兼容 Fairy2i tile64。
