@@ -1,13 +1,13 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A7、A9、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A7、A9-A10、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
 - 分支：`lwt/merge_master`
-- 最新迭代：A9 row-contiguous quantized concat
+- 最新迭代：A10 MXFP4/TQ2 endian conversion
 - 提交粒度：每个目标保持独立。
-- 状态：A0-A7、A9、B0-B1 与 B3 实现完成；A9 已通过 assertion 复现、五格式/四维/view-mask 回归、代码审查和完整 CPU 矩阵。
+- 状态：A0-A7、A9-A10、B0-B1 与 B3 实现完成；A10 已通过 block-layout oracle、双次转换可逆性、Pytest、Ruff、Pyright 和代码审查。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
@@ -20,6 +20,7 @@
 | A6 | 适配 #16520，隔离 Linux-only SVE header 并使 non-Linux SVE 明确失败 | `c71df67f9` |
 | A7 | 适配 #17788、#18451，移除无效架构断言并阻止 unsplit/split 输出覆盖输入 | `90e2586b6` |
 | A9 | 适配 #25678，使量化 `CONCAT` 接受 row-contiguous 高维 views | `98327d467` |
+| A10 | 适配 #17523、#26618，为现有 MXFP4/TQ2_0 增加 endian conversion | `9ed7fe05b` |
 | B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
 | B1 | 移植 #17133 的 CPU 空算子跳过路径，避免 metadata-only node 进入 worker barrier | `70465c5` |
 | B3 | 参考 #23595 的并行初始化方法，将 Fairy2i tile64 LUT encode/pack 按完整 16-row tile 分片并行化 | `1d4c22ad5` |
@@ -105,6 +106,13 @@
 - **验证：** `CONCAT` 定向运行 `14662/14662`；独立审查确认 dim0 block offset 和 dim1-3 logical offsets 保持一致；`bash scripts/ci-fairy2i-cpu.sh` 全矩阵通过。
 - **模型边界：** 指定 Row4 模型不构造量化 concat graph；A4 的模型 smoke 已覆盖共享 loader/runtime，无需把 tok/s 归因于本次 stride capability。
 
+## A10 MXFP4/TQ2 endian conversion（已完成）
+
+- **上游目标：** #17523 把 MXFP4 数据标记为 endian-neutral；#26618 增加 Q1_0/TQ2_0 block byteswap。当前树没有 Q1_0，因此只适配已经存在且可验证的 MXFP4 与 TQ2_0。
+- **布局：** `block_mxfp4` 是 1-byte E8M0 exponent + 16-byte packed quants，不含多字节字段；`block_tq2_0` 是 64-byte quants + trailing f16 delta。Python `GGML_QUANT_SIZES` 分别给出 17 与 66 bytes，与 C static assertions 一致。
+- **实现：** converter 的 block size 统一从 `GGML_QUANT_SIZES` 获取，删除四种旧格式的重复硬编码；MXFP4 注册 no-op，TQ2_0 只交换每块 offsets 64-65 的 f16 delta。
+- **验证：** 新增 block-level unittest 覆盖两个连续 TQ2 blocks、非 delta bytes 保持、double-swap 恢复原字节、MXFP4 全块不变和 mapping 注册。`pytest` 2 passed，Ruff 与 venv Pyright 零问题；独立审查通过。
+
 ## Fairy2i / iFairy 模型兼容性
 
 当前模型格式对应不同 CPU gate，不能把两条路径混成一个标准 quant kernel：
@@ -115,7 +123,7 @@
 | `models/Fairy2i-W2/fairy2i-w2.gguf`（旧 `IFairy` 权重、`fairy2i` architecture） | 同时启用 `GGML_FAIRY2I_CPU=ON` 与 `GGML_LEGACY_IFAIRY_CPU=ON` 的 compatibility build，`--device none` | CLI 生成 smoke PASS；加载 966 tensors，输出可读文本 |
 | Fairy2i tile64/bundle fixtures | `build-rel-fairy2i-direct` / `build-rel-fairy2i` | loader、CPU direct、LUT、Metal fixture gates PASS |
 
-`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A7、A9 隐式改变。
+`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A7、A9-A10 隐式改变。
 
 ## CPU CI 证据
 
