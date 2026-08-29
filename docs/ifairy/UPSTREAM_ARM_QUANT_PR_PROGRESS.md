@@ -1,19 +1,20 @@
 # ARM / Fairy2i upstream port progress
 
-> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A2、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
+> 开发进度记录。本文只记录已在当前分支完成并验证的 A0-A3、B0-B1 与 B3 适配；不把通用上游 ARM quant 代码直接套到 Fairy2i/iFairy 自定义布局。
 
 ## 当前状态
 
 - 分支：`lwt/merge_master`
-- 最新迭代：B3 Fairy2i tile64 LUT 权重变换并行化
+- 最新迭代：A3 IQ 量化退化输入正确性
 - 提交粒度：每个目标保持独立。
-- 状态：A0-A2、B0-B1 与 B3 实现完成；B3 已通过 ARM64 定向回归、合成变换基准和指定 Qwen3 Row4 模型兼容性验证。
+- 状态：A0-A3、B0-B1 与 B3 实现完成；A3 已通过格式级 oracle、完整 CPU 矩阵和指定 Qwen3 Row4 模型兼容性验证。
 
 | 批次 | 内容 | 提交 |
 |---|---|---|
 | A0 | 修正 `ggml_vec_mad1_f32()` 的 SIMD FMA 参数顺序；加入长向量 `SCALE` 回归用例 | `64cd4f3bc`, `8c351ee68` |
 | A1 | 适配 ARM `-mcpu`/`-march` 探测、宏验证和所需 feature flag 传递；保留 Fairy2i source split 与 DOTPROD gate | `6028b4b64` |
 | A2 | 增加 Linux/aarch64 缺失 HWCAP fallback；FP16 runtime 能力要求 `HWCAP_FPHP` 与 `HWCAP_ASIMDHP` 同时存在 | `1c8e8bf8d` |
+| A3 | 适配 #15928、#19861、#20460，初始化 IQ scratch/fallback 状态并保护退化缩放 | `7ea3c22ed` |
 | B0 | 移植 #17748 的 packed threadpool graph/active-thread 状态发布；加入 barrier 与 Fairy2i 同 backend/threadpool 线程切换回归 | `d8fe14ad4`, `89e5045d2`, `66b095e15` |
 | B1 | 移植 #17133 的 CPU 空算子跳过路径，避免 metadata-only node 进入 worker barrier | `70465c5` |
 | B3 | 参考 #23595 的并行初始化方法，将 Fairy2i tile64 LUT encode/pack 按完整 16-row tile 分片并行化 | `1d4c22ad5` |
@@ -51,6 +52,14 @@
 - 保留本地 backend score ABI 和 Fairy2i runtime gate；没有引入后续 `ggml-feats.h` 重构。
 - 通过伪造 Linux `sys/auxv.h` 的语法/score harness 验证缺少系统 HWCAP 宏时仍可编译，并验证 FP16 / DOTPROD score 条件。
 
+## A3 IQ 量化退化输入正确性（已完成）
+
+- **上游链：** #15928 初始化 IQ3_XXS `is_on_grid`；#19861 补齐 IQ2/IQ3 scratch、IQ1 shift 和失败搜索 fallback；#20460 在 IQ4_NL/XS 的 `sumq2 == 0` 时生成零缩放，避免 NaN。
+- **复现：** 非零输入配合零 importance weights 会让旧 IQ2_XXS 路径把未初始化的 `L` 编码为 off-grid point，并在 `ggml-quants.c` 的 grid lookup 处 abort。该输入是合法 imatrix 边界：量化接口要求权重指针存在，但没有要求每个权重严格大于零。
+- **回归：** `test-quantize-fns` 对 IQ2_XXS、IQ2_XS、IQ3_XXS、IQ1_S、IQ4_NL、IQ3_S、IQ2_S、IQ4_XS、IQ1_M 使用同一 block 内 mixed zero/nonzero imatrix，检查两次不同目标预填充得到完全相同的字节并可有限值反量化。IQ2/IQ3/IQ1 七种格式另以独立 subgroup grid/index/shift oracle 检查 fallback 打包位。
+- **验证：** `test-quantize-fns -v` 与 CTest 通过；`bash scripts/ci-fairy2i-cpu.sh` 的 baseline、Fairy2i direct/LUT、LUT required/disabled、W2 `14578/14578`、legacy direct/LUT 全矩阵通过。
+- **指定模型：** `qwen3-row4-int8-v1-final-bos.gguf` 继续加载 436 tensors，8 threads、BF16 KV、CPU-only、固定 seed 的 16-token smoke 输出可读文本，eval 为 `31.03 t/s`。模型使用 `ROW4_CODES` 而非 IQ 类型，因此该结果是共享量化核心的无回归证据，不代表 IQ 性能。
+
 ## Fairy2i / iFairy 模型兼容性
 
 当前模型格式对应不同 CPU gate，不能把两条路径混成一个标准 quant kernel：
@@ -61,7 +70,7 @@
 | `models/Fairy2i-W2/fairy2i-w2.gguf`（旧 `IFairy` 权重、`fairy2i` architecture） | 同时启用 `GGML_FAIRY2I_CPU=ON` 与 `GGML_LEGACY_IFAIRY_CPU=ON` 的 compatibility build，`--device none` | CLI 生成 smoke PASS；加载 966 tensors，输出可读文本 |
 | Fairy2i tile64/bundle fixtures | `build-rel-fairy2i-direct` / `build-rel-fairy2i` | loader、CPU direct、LUT、Metal fixture gates PASS |
 
-`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A2 隐式改变。
+`fairy2i-w2.gguf` 不能在只启用新 Fairy2i CPU kernel、未启用 legacy iFairy CPU kernel 的配置中加载；其 tensor type 仍是 `GGML_TYPE_IFAIRY`。这属于现有格式/compile gate 约束，不由 A0-A3 隐式改变。
 
 ## CPU CI 证据
 

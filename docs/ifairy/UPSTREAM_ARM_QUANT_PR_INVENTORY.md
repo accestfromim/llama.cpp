@@ -8,8 +8,8 @@
 - upstream snapshot: `34af94cd9` (`upstream/master` fetched before this report)
 - range: first-parent commits in `4b8560ab56fdd9819358b47c338bbc8ec357c57e..upstream/master`
 - upstream range size: 3951 commits; PR-tagged unique numbers observed: 3852
-- current branch: `lwt/merge_master`, latest B3 commit `1d4c22ad5` (tile-disjoint Fairy2i LUT weight transform)
-- source code status: A0 SIMD scale fix, A1 ARM feature/CMake chain, A2 HWCAP/FP16 fallback, B0 packed threadpool state publication, B1 metadata-only op skipping, and B3 tile-disjoint LUT weight transform are implemented; detailed evidence is in `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`
+- current branch: `lwt/merge_master`, latest A3 commit `7ea3c22ed` (degenerate IQ quantization correctness)
+- source code status: A0 SIMD scale fix, A1 ARM feature/CMake chain, A2 HWCAP/FP16 fallback, A3 IQ degenerate-input correctness, B0 packed threadpool state publication, B1 metadata-only op skipping, and B3 tile-disjoint LUT weight transform are implemented; detailed evidence is in `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`
 
 ## Filter definition
 
@@ -245,6 +245,7 @@ Fairy2i implementation, not upstream names alone.
 | A0 correctness | [#16307](https://github.com/ggml-org/llama.cpp/pull/16307), `b887d2f34` | **Adapted and verified** | Fixed local `ggml_vec_mad1_f32()` to use `GGML_F32_VEC_FMA(vb, ay[j], vs)`; Fairy2i LoRA and exact-attention scale call sites remain on the shared generic scale path. | Long-vector `SCALE` regression (`n=100`) passes SIMD/CPU comparison; direct/LUT Fairy2i CPU matrix passes. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
 | A1 ARM CMake chain | [#16229](https://github.com/ggml-org/llama.cpp/pull/16229), [#16239](https://github.com/ggml-org/llama.cpp/pull/16239), [#17170](https://github.com/ggml-org/llama.cpp/pull/17170), [#17519](https://github.com/ggml-org/llama.cpp/pull/17519) | **Adapted locally and verified** | Adapted native `-march`/`-mcpu` selection, scoped macro verification, explicit undefines, and list-to-string flag handling without changing Fairy2i source split or DOTPROD gates. | Native, explicit ARM baseline, all CPU variants, dotprod on/off, and full `scripts/ci-fairy2i-cpu.sh` checks pass. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
 | A2 ARM feature portability | [#25554](https://github.com/ggml-org/llama.cpp/pull/25554), `cb26014d9` | **Adapted narrowly and verified** | Added only missing HWCAP fallbacks and changed FP16 runtime detection to require both `HWCAP_FPHP` and `HWCAP_ASIMDHP`; retained local backend-score ABI and runtime gates. | Linux header-compatibility harness and ARM CPU matrix pass; no later `ggml-feats.h` refactor imported. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
+| A3 IQ quant core | [#15928](https://github.com/ggml-org/llama.cpp/pull/15928), [#19861](https://github.com/ggml-org/llama.cpp/pull/19861), [#20460](https://github.com/ggml-org/llama.cpp/pull/20460) | **Adapted and verified** | Initializes IQ scratch indices/grid flags and fallback shifts, handles failed IQ1 searches, and prevents IQ2/IQ4 degenerate scale division. The change is shared quant core and does not alter Fairy2i/Row4 private layouts. | Mixed zero/nonzero imatrix tests cover nine IQ types; seven formats also compare subgroup grid/index/shift encodings against independent fallback oracles. The old IQ2_XXS path aborts on an off-grid uninitialized point; the adapted path, `test-quantize-fns`, full CPU matrix, and Row4 smoke pass. |
 | B0 shared CPU scheduling | [#17748](https://github.com/ggml-org/llama.cpp/pull/17748) | **Adapted and verified** | Ported only the packed `n_graph`/active-thread publication chain. Same-threadpool `1`/`N` barrier regression and same-backend Fairy2i W1/W2 LUT `N=1` stress pass without changing dynamic tile batching or custom layouts. | `test-barrier 10 1000`, 42-pair Fairy2i thread-switch stress, full Fairy2i CPU matrix, legacy direct/LUT tests, and fixed-seed model smoke pass. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
 | B1 empty-op scheduling | [#17133](https://github.com/ggml-org/llama.cpp/pull/17133) | **Adapted and verified** | CPU workers skip metadata-only nodes before compute and intermediate barriers. The active-thread regression includes reshape nodes; ARM throughput is recorded as validation rather than attributed to this scheduler change. | `test-barrier 8 1` passes on x86_64; the prescribed idle M4 ARM run with Qwen3 Row4, 8 threads, and three repetitions completes at `pp512=28.78 ± 0.70 t/s` and `tg128=27.25 ± 0.26 t/s`. Evidence: `docs/ifairy/UPSTREAM_ARM_QUANT_PR_PROGRESS.md`. |
 | B2 shared operation optimization | [#22423](https://github.com/ggml-org/llama.cpp/pull/22423), [#19422](https://github.com/ggml-org/llama.cpp/pull/19422), [#19012](https://github.com/ggml-org/llama.cpp/pull/19012) | **Reference only** | Upstream fuses generic RMS_NORM/MUL or changes generic flash-attention tiling. Fairy2i has custom `ifairy_build_norm` and `GGML_OP_FAIRY2I_ATTN_EXACT_CPU`; cherry-picking would bypass BF16/complex semantics. | If pursued, implement a local op and compare exact graph outputs before/after; do not transplant generic graph builders. |
@@ -253,13 +254,27 @@ Fairy2i implementation, not upstream names alone.
 | D KleidiAI/SME | [#18458](https://github.com/ggml-org/llama.cpp/pull/18458), [#20043](https://github.com/ggml-org/llama.cpp/pull/20043), [#20070](https://github.com/ggml-org/llama.cpp/pull/20070), [#23819](https://github.com/ggml-org/llama.cpp/pull/23819), [#25478](https://github.com/ggml-org/llama.cpp/pull/25478), [#26076](https://github.com/ggml-org/llama.cpp/pull/26076) | **Separate optional track** | These improve KleidiAI kernels, SME/SME2 dispatch, runtime feature discovery, or hybrid scheduling. Current Fairy2i W2 dispatch is its own NEON/DOTPROD path; M4 validation does not exercise SME. | Require a KleidiAI-enabled ARM target and a standard GGML quantized workload benchmark; no Fairy2i claim from a generic KleidiAI speedup. |
 | E format/conversion | [#26672](https://github.com/ggml-org/llama.cpp/pull/26672) and generic MODEL QUANT rows | **Defer / usually drop** | Current Fairy2i conversion lives under `gguf-py/fairy2i/`, and the local loader's tensor creation path does not match the upstream reshape implementation. Standard quantizer metadata or loader changes need a separate schema diff. | Add only with a Fairy2i fixture that fails before the change and passes after it; validate tile/bundle byte layout and loader type/stride invariants. |
 
+### A-priority dependency ledger
+
+| Chain | Upstream PRs | Decision | Dependency / proof gate |
+|---|---|---|---|
+| IQ quant core | #15928 → #19861 → #20460 | **Implemented as A3** | Degenerate imatrix format oracles, finite dequantization, full CPU matrix. |
+| Shared FP16 ELU | #16519 | **Not applicable to the live path** | The buggy inline `ggml_vec_elu_f16` has no caller; a direct CPU graph probe already preserves positive FP16 inputs. Revisit only if a caller is introduced. |
+| SVE vector correctness | #16443 → #16518 → #22841 → #24699 | **Queued** | Preserve non-SVE fallbacks; require SVE-target compilation plus a runnable SVE oracle before performance claims. |
+| Repack correctness | #16956 → #17526 → #19575 | **Inspect as one dependency chain** | Compare the older local repack planner/layout before adapting individual fixes. |
+| Shared CPU ops | #24305, #25247, #25490, #26838 | **Queued next** | Require alias, quantized-concat, depthwise-conv, and Android affinity fixtures respectively. |
+| SIMD GEMM tail | #19642, #25390 | **Not applicable in the current tree** | `ggml/src/ggml-cpu/simd-gemm.h` is absent; importing the later GEMM module would exceed a correctness transplant. |
+| Q1/NVFP4 ARM fixes | #21716, #21559 | **Blocked on format introduction** | Current enum has neither `GGML_TYPE_Q1_0` nor `GGML_TYPE_NVFP4`; first review foundational #21273/#19769 as separate public-format changes. |
+| KleidiAI correctness/runtime | #16246 → #17240 → #19581 → #20457 → #20767 → #20620 → #26277 → #26076 → #26991 | **Separate optional chain** | Depends on KleidiAI version/build integration and standard quantized workloads; no Fairy2i speed claim. |
+
 ### Migration order and gates
 
 1. **A0:** adapted and verified in `64cd4f3bc` and `8c351ee68`; no Fairy2i layout changes.
 2. **A1–A2:** adapted and verified in `6028b4b64` and `1c8e8bf8d`; DOTPROD compile-time availability remains separate from `ggml_cpu_has_dotprod()` runtime availability.
-3. **B0–B1:** adapted and verified in `d8fe14ad4`, `89e5045d2`, `66b095e15`, and `70465c5`; the prescribed B1 ARM model run is complete, without claiming causal scheduler speedup.
-4. **B2–B3:** B2 remains reference-only. B3 is a local Fairy2i adaptation of the parallel-initialization idea, with tile64-specific correctness, latency, memory, and model-compatibility evidence.
-5. **C–E:** remain reference/deferred until a Fairy2i-specific fixture or benchmark identifies a concrete contract.
+3. **A3:** adapted and verified in `7ea3c22ed`; nine IQ types retain deterministic finite encodings under mixed zero/nonzero importance weights.
+4. **B0–B1:** adapted and verified in `d8fe14ad4`, `89e5045d2`, `66b095e15`, and `70465c5`; the prescribed B1 ARM model run is complete, without claiming causal scheduler speedup.
+5. **B2–B3:** B2 remains reference-only. B3 is a local Fairy2i adaptation of the parallel-initialization idea, with tile64-specific correctness, latency, memory, and model-compatibility evidence.
+6. **Remaining chains:** follow the dependency ledger above; blocked or absent modules are not imported implicitly.
 
 Every source batch must pass the existing CPU matrix:
 
@@ -275,4 +290,4 @@ ctest --test-dir build-ifairy-direct --output-on-failure -R legacy-ifairy-direct
 GGML_IFAIRY_LUT=1 ctest --test-dir build-ifairy-legacy --output-on-failure -R legacy-ifairy
 ```
 
-No source transplant is approved by this inventory alone. A0-A2, B0-B1, and B3 are narrow local adaptations; future B2 and C-E work remains gated by Fairy2i-specific evidence.
+No source transplant is approved by this inventory alone. A0-A3, B0-B1, and B3 are narrow local adaptations; remaining chains follow the dependency ledger and require their own local contract evidence.
