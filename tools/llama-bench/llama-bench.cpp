@@ -348,6 +348,7 @@ static void print_usage(int /* argc */, char ** argv) {
            join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                  (default: %s)\n",
            join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
+    printf("  --turboquant                              use K=turbo4, V=turbo3, and Flash Attention by default\n");
     printf("  -t, --threads <n>                         (default: %s)\n",
            join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                  (default: %s)\n",
@@ -480,6 +481,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    bool turboquant             = false;
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -564,6 +566,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.type_k.insert(params.type_k.end(), types.begin(), types.end());
+            } else if (arg == "--turboquant") {
+                turboquant = true;
             } else if (arg == "-ctv" || arg == "--cache-type-v") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -899,6 +903,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.n_ubatch.empty()) {
         params.n_ubatch = cmd_params_defaults.n_ubatch;
+    }
+    if (turboquant) {
+        if (params.type_k.empty()) {
+            params.type_k = { GGML_TYPE_TURBO4_0 };
+        }
+        if (params.type_v.empty()) {
+            params.type_v = { GGML_TYPE_TURBO3_0 };
+        }
+        if (params.flash_attn.empty()) {
+            params.flash_attn = { true };
+        }
     }
     if (params.type_k.empty()) {
         params.type_k = cmd_params_defaults.type_k;

@@ -425,11 +425,14 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    bool turboquant        = false; // use the default TurboQuant KV cache types
 
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_COUNT;  // KV cache data type for K; COUNT selects the model default
     ggml_type cache_type_v = GGML_TYPE_COUNT;  // KV cache data type for V; COUNT selects the model default
+    bool cache_type_k_explicit = false;
+    bool cache_type_v_explicit = false;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

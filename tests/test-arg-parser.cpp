@@ -103,6 +103,42 @@ int main(void) {
     assert(params.speculative.cache_type_k == GGML_TYPE_F16);
     assert(params.speculative.cache_type_v == GGML_TYPE_F16);
 
+    {
+        common_params turbo_params;
+        argv      = { "binary_name", "--turboquant" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), turbo_params, LLAMA_EXAMPLE_COMMON));
+        assert(turbo_params.cache_type_k == GGML_TYPE_TURBO4_0);
+        assert(turbo_params.cache_type_v == GGML_TYPE_TURBO3_0);
+    }
+
+    {
+        common_params turbo_params;
+        argv      = { "binary_name", "--cache-type-k", "turbo2", "--turboquant", "--cache-type-v", "turbo4" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), turbo_params, LLAMA_EXAMPLE_COMMON));
+        assert(turbo_params.cache_type_k == GGML_TYPE_TURBO2_0);
+        assert(turbo_params.cache_type_v == GGML_TYPE_TURBO4_0);
+    }
+
+    {
+        common_params default_params;
+        argv      = { "binary_name" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), default_params, LLAMA_EXAMPLE_COMMON));
+        assert(default_params.cache_type_k == GGML_TYPE_COUNT);
+        assert(default_params.cache_type_v == GGML_TYPE_COUNT);
+    }
+
+    {
+        common_params turbo_params;
+        argv      = { "binary_name", "--turboquant", "--cache-type-k", "auto" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), turbo_params, LLAMA_EXAMPLE_COMMON));
+        assert(turbo_params.cache_type_k == GGML_TYPE_COUNT);
+        assert(turbo_params.cache_type_v == GGML_TYPE_TURBO3_0);
+    }
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");

@@ -43,7 +43,7 @@ BF16/BF16 continues to use the existing carrier SET_ROWS operation and Fairy2i/R
 
 ## Supported configurations
 
-TurboQuant is an explicit Row4 Metal experiment. The default remains BF16/BF16.
+TurboQuant is an explicit Row4 Metal experiment. The default remains BF16/BF16. Passing `--turboquant` selects Turbo4 K and Turbo3 V. Explicit `-ctk` or `-ctv` values override the corresponding preset type.
 
 | Configuration | Status |
 | --- | --- |
@@ -63,9 +63,10 @@ Example:
 
 ```bash
 build-rel-metal/bin/llama-cli \
-    -m qwen3-row4-v1.gguf -ngl 99 -fa on \
-    -ctk q8_0 -ctv turbo3
+    -m qwen3-row4-v2-pair2.gguf -ngl 99 --turboquant
 ```
+
+`llama-bench --turboquant` uses the same K4/V3 preset and enables Flash Attention unless `-fa` is set explicitly. Centering and boundary protection remain independent experimental settings.
 
 ## Correctness tests
 

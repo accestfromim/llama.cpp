@@ -1427,6 +1427,14 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        if (ctx_arg.params.turboquant) {
+            if (!ctx_arg.params.cache_type_k_explicit && ctx_arg.params.cache_type_k == GGML_TYPE_COUNT) {
+                ctx_arg.params.cache_type_k = GGML_TYPE_TURBO4_0;
+            }
+            if (!ctx_arg.params.cache_type_v_explicit && ctx_arg.params.cache_type_v == GGML_TYPE_COUNT) {
+                ctx_arg.params.cache_type_v = GGML_TYPE_TURBO3_0;
+            }
+        }
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -2365,13 +2373,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_extra_bufts = true;
         }
     ).set_env("LLAMA_ARG_NO_REPACK"));
+    add_opt(common_arg({ "--turboquant" },
+                       "enable TurboQuant KV cache (default: K=turbo4, V=turbo3; explicit cache types override)",
+                       [](common_params & params) { params.turboquant = true; })
+                .set_env("LLAMA_ARG_TURBOQUANT"));
     add_opt(common_arg({ "-ctk", "--cache-type-k" }, "TYPE",
                        string_format("KV cache data type for K\n"
                                      "allowed values: %s\n"
                                      "(default: %s)",
                                      get_all_kv_cache_types().c_str(), kv_cache_type_name(params.cache_type_k)),
                        [](common_params & params, const std::string & value) {
-                           params.cache_type_k = kv_cache_type_from_str(value);
+                           params.cache_type_k          = kv_cache_type_from_str(value);
+                           params.cache_type_k_explicit = true;
                        })
                 .set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg({ "-ctv", "--cache-type-v" }, "TYPE",
@@ -2380,7 +2393,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                      "(default: %s)",
                                      get_all_kv_cache_types().c_str(), kv_cache_type_name(params.cache_type_v)),
                        [](common_params & params, const std::string & value) {
-                           params.cache_type_v = kv_cache_type_from_str(value);
+                           params.cache_type_v          = kv_cache_type_from_str(value);
+                           params.cache_type_v_explicit = true;
                        })
                 .set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
