@@ -1549,6 +1549,15 @@ int ggml_metal_op_turbo_k_mean_center(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(n_features <= std::numeric_limits<int>::max());
     const int64_t n_jobs = n_features * args.n_active_streams;
     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) ((n_jobs + nth - 1) / nth), 1, 1, nth, 1, 1);
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    pipeline = ggml_metal_library_get_pipeline_turbo_k_mean_center_count(ctx->lib);
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[2]), 2);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, 1, 1, 1, args.n_active_streams, 1, 1);
     return 1;
 }
 

@@ -11285,28 +11285,20 @@ void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params
         const int64_t stream        = get_index(token_begin) / kv_size;
         float *       stream_sum    = (float *) ((char *) sum->data + stream * sum->nb[1]);
 
-        bool    reset     = false;
-        int64_t max_index = -1;
-        for (int64_t it = token_begin; it < token_end; ++it) {
-            const int64_t index = get_index(it) % kv_size;
-            reset |= index == 0;
-            max_index = MAX(max_index, index);
-        }
-        const int32_t effective_warmup =
-            center_warmup ? (reset ? MIN(warmup, (int32_t) max_index + 1) : MAX(1, (int32_t) stream_sum[n_features])) :
-                            warmup;
-        const bool complete = max_index >= effective_warmup - 1;
-        if (feature == 0 && center_warmup && reset) {
-            stream_sum[n_features] = (float) effective_warmup;
-        }
+        const int32_t old_count        = std::max(0, std::min(warmup, (int32_t) stream_sum[n_features]));
+        const int32_t effective_warmup = center_warmup && old_count > 0 ? old_count :
+                                         center_warmup                  ? std::min(warmup, n_seq_tokens) :
+                                                                          warmup;
+        const int32_t take             = std::min(effective_warmup - old_count, n_seq_tokens);
+        const int32_t new_count        = old_count + take;
+        const bool    complete         = new_count == effective_warmup;
 
         const int64_t i0  = feature % src->ne[0];
         const int64_t i1  = feature / src->ne[0];
-        float         acc = reset ? 0.0f : stream_sum[feature];
+        float         acc = old_count == 0 ? 0.0f : stream_sum[feature];
 
-        for (int64_t it = token_begin; it < token_end; ++it) {
-            const int64_t index = get_index(it) % kv_size;
-            if (index < effective_warmup) {
+        for (int64_t it = token_begin; it < token_begin + take; ++it) {
+            if (it < token_end) {
                 acc +=
                     *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
             }
@@ -11314,12 +11306,25 @@ void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params
         stream_sum[feature] = acc;
 
         for (int64_t it = token_begin; it < token_end; ++it) {
-            const int64_t index = get_index(it) % kv_size;
             const float   value =
                 *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
             *(float *) ((char *) dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + it * dst->nb[2]) =
-                complete && (center_warmup || index >= effective_warmup) ? value - acc / (float) effective_warmup :
-                                                                           value;
+                complete && (center_warmup || it >= token_begin + take) ? value - acc / (float) effective_warmup :
+                                                                          value;
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+    if (params->ith == 0) {
+        for (int64_t active_stream = 0; active_stream < n_active_streams; ++active_stream) {
+            const int64_t token_begin      = active_stream * n_seq_tokens;
+            const int64_t stream           = get_index(token_begin) / kv_size;
+            float *       stream_sum       = (float *) ((char *) sum->data + stream * sum->nb[1]);
+            const int32_t old_count        = std::max(0, std::min(warmup, (int32_t) stream_sum[n_features]));
+            const int32_t effective_warmup = center_warmup && old_count > 0 ? old_count :
+                                             center_warmup                  ? std::min(warmup, n_seq_tokens) :
+                                                                              warmup;
+            stream_sum[n_features]         = (float) (old_count + std::min(effective_warmup - old_count, n_seq_tokens));
         }
     }
 }

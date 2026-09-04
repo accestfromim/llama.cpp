@@ -102,6 +102,16 @@ struct llama_memory_i {
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
+    virtual bool seq_set_prefix(llama_seq_id seq_id, llama_pos prefix_end) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(prefix_end);
+        return false;
+    }
+
+    virtual llama_pos seq_get_prefix(llama_seq_id seq_id) const {
+        GGML_UNUSED(seq_id);
+        return -1;
+    }
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 

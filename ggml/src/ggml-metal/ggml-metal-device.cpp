@@ -242,6 +242,16 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_k_mean_center(ggml_m
     return ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
 }
 
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_k_mean_center_count(ggml_metal_library_t lib) {
+    constexpr const char * name = "kernel_turbo_k_mean_center_count";
+    ggml_metal_pipeline_t  res  = ggml_metal_library_get_pipeline(lib, name);
+    if (res) {
+        return res;
+    }
+
+    return ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+}
+
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_repeat(ggml_metal_library_t lib, ggml_type tsrc) {
     char base[256];
     char name[256];

@@ -17380,41 +17380,47 @@ kernel void kernel_turbo_k_mean_center(constant ggml_metal_kargs_turbo_k_mean_ce
     const int64_t stream = global_index / args.kv_size;
     device float * stream_sum = (device float *) ((device char *) sum + stream * args.nb11);
 
-    bool reset = false;
-    int64_t max_index = -1;
-    for (int64_t token = token_begin; token < token_end; ++token) {
-        const int64_t index = (args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
-                                                *(const device int32_t *) (indices + token * args.nb10)) % args.kv_size;
-        reset |= index == 0;
-        max_index = max(max_index, index);
-    }
-    const int effective_warmup = args.center_warmup ?
-                                     (reset ? min(args.warmup, int(max_index) + 1) : max(1, int(stream_sum[args.n_features]))) :
-                                     args.warmup;
-    const bool complete = max_index >= effective_warmup - 1;
-    if (feature == 0 && args.center_warmup && reset) {
-        stream_sum[args.n_features] = float(effective_warmup);
-    }
+    const int old_count = max(0, min(args.warmup, int(stream_sum[args.n_features])));
+    const int effective_warmup = args.center_warmup && old_count > 0 ? old_count :
+                                 args.center_warmup ? min(args.warmup, args.n_seq_tokens) : args.warmup;
+    const int take = min(effective_warmup - old_count, args.n_seq_tokens);
+    const int new_count = old_count + take;
+    const bool complete = new_count == effective_warmup;
 
     const int64_t i0 = feature % args.ne00;
     const int64_t i1 = feature / args.ne00;
-    float acc = reset ? 0.0f : stream_sum[feature];
-    for (int64_t token = token_begin; token < token_end; ++token) {
-        const int64_t index = (args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
-                                                *(const device int32_t *) (indices + token * args.nb10)) % args.kv_size;
-        if (index < effective_warmup) {
+    float acc = old_count == 0 ? 0.0f : stream_sum[feature];
+    for (int64_t token = token_begin; token < token_begin + take; ++token) {
+        if (token < token_end) {
             acc += *(const device float *) (src + i0 * args.nb00 + i1 * args.nb01 + token * args.nb02);
         }
     }
     stream_sum[feature] = acc;
 
     for (int64_t token = token_begin; token < token_end; ++token) {
-        const int64_t index = (args.index_i64 ? *(const device int64_t *) (indices + token * args.nb10) :
-                                                *(const device int32_t *) (indices + token * args.nb10)) % args.kv_size;
         const float value = *(const device float *) (src + i0 * args.nb00 + i1 * args.nb01 + token * args.nb02);
         *(device float *) (dst + i0 * args.nb0 + i1 * args.nb1 + token * args.nb2) =
-            complete && (args.center_warmup || index >= effective_warmup) ? value - acc / effective_warmup : value;
+            complete && (args.center_warmup || token >= token_begin + take) ? value - acc / effective_warmup : value;
     }
+}
+
+kernel void kernel_turbo_k_mean_center_count(constant ggml_metal_kargs_turbo_k_mean_center & args,
+                                             const device char *                            indices,
+                                             device float *                                 sum,
+                                             uint                                            tid [[thread_position_in_grid]]) {
+    if (tid >= args.n_active_streams) {
+        return;
+    }
+
+    const int64_t token_begin = int64_t(tid) * args.n_seq_tokens;
+    const int64_t global_index = args.index_i64 ? *(const device int64_t *) (indices + token_begin * args.nb10) :
+                                                  *(const device int32_t *) (indices + token_begin * args.nb10);
+    const int64_t stream = global_index / args.kv_size;
+    device float * stream_sum = (device float *) ((device char *) sum + stream * args.nb11);
+    const int old_count = max(0, min(args.warmup, int(stream_sum[args.n_features])));
+    const int effective_warmup = args.center_warmup && old_count > 0 ? old_count :
+                                 args.center_warmup ? min(args.warmup, args.n_seq_tokens) : args.warmup;
+    stream_sum[args.n_features] = float(old_count + min(effective_warmup - old_count, args.n_seq_tokens));
 }
 
 static uint8_t turbo_index_2bit(float x) {

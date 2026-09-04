@@ -27,6 +27,9 @@ static bool llama_is_turbo_kv_type(ggml_type type) {
            llama_is_turbo2m4_type(type);
 }
 
+static constexpr uint32_t LLAMA_KV_STATE_MAGIC   = 0x50534b56;
+static constexpr uint32_t LLAMA_KV_STATE_VERSION = 1;
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
                 ggml_type   type_k,
@@ -39,11 +42,15 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                 uint32_t   prefix_sliding_window,
+                 uint32_t   prefix_sliding_prefix_cap,
+                 uint32_t   prefix_sliding_n_ubatch,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
-    model(model), hparams(model.hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
-
+    model(model), hparams(model.hparams), type_k(type_k), type_v(type_v), v_trans(v_trans),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
+    prefix_sliding_window(prefix_sliding_window), prefix_sliding_prefix_cap(prefix_sliding_prefix_cap),
+    prefix_sliding_n_ubatch(prefix_sliding_n_ubatch), swa_type(swa_type) {
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
@@ -134,6 +141,8 @@ llama_kv_cache::llama_kv_cache(
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
     }
+
+    v_prefix_end.resize(LLAMA_MAX_SEQ, -1);
 
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
@@ -288,7 +297,12 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+        if (!data) {
+            reset_k_mean(s);
+        }
     }
+
+    std::fill(v_prefix_end.begin(), v_prefix_end.end(), -1);
 
     if (data) {
         for (auto & buf : bufs) {
@@ -300,12 +314,32 @@ void llama_kv_cache::clear(bool data) {
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
+    const bool remove_all = p0 <= 0 && p1 < 0;
+
     if (p0 < 0) {
         p0 = 0;
     }
 
     if (p1 < 0) {
         p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    if (prefix_sliding_enabled()) {
+        if (seq_id >= 0) {
+            if (remove_all) {
+                v_prefix_end[seq_id] = -1;
+            } else if (p0 < p1 && v_prefix_end[seq_id] >= 0 && p0 < v_prefix_end[seq_id]) {
+                v_prefix_end[seq_id] = p0;
+            }
+        } else if (remove_all) {
+            std::fill(v_prefix_end.begin(), v_prefix_end.end(), -1);
+        } else {
+            for (auto & prefix_end : v_prefix_end) {
+                if (p0 < p1 && prefix_end >= 0 && p0 < prefix_end) {
+                    prefix_end = p0;
+                }
+            }
+        }
     }
 
     if (seq_id >= 0) {
@@ -329,6 +363,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
+        }
+        if (remove_all && cells.get_used() == 0) {
+            reset_k_mean(seq_to_stream[seq_id]);
         }
     } else {
         // match any sequence
@@ -354,6 +391,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
             }
+            if (remove_all) {
+                reset_k_mean(s);
+            }
         }
     }
 
@@ -366,6 +406,15 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
+
+    if (prefix_sliding_enabled()) {
+        const bool full = p0 <= 0 && p1 < 0;
+        if (!full) {
+            LLAMA_LOG_ERROR("%s: prefix sliding supports only full sequence copies\n", __func__);
+            return;
+        }
+        v_prefix_end[seq_id_dst] = v_prefix_end[seq_id_src];
+    }
 
     if (s0 == s1) {
         // since both sequences are in the same stream, no data copy is necessary
@@ -446,6 +495,32 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
+    if (prefix_sliding_enabled()) {
+        const uint32_t keep_stream = seq_to_stream[seq_id];
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            auto & cells = v_cells[s];
+            auto & head  = v_heads[s];
+            uint32_t new_head = cells.size();
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.seq_keep(i, seq_id) && new_head == cells.size()) {
+                    new_head = i;
+                }
+            }
+            if (new_head != cells.size() && new_head < head) {
+                head = new_head;
+            }
+            if (s != keep_stream) {
+                reset_k_mean(s);
+            }
+        }
+        for (llama_seq_id cur = 0; cur < (llama_seq_id) v_prefix_end.size(); ++cur) {
+            if (cur != seq_id) {
+                v_prefix_end[cur] = -1;
+            }
+        }
+        return;
+    }
+
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
 
@@ -465,8 +540,31 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     }
 }
 
+bool llama_kv_cache::seq_set_prefix(llama_seq_id seq_id, llama_pos prefix_end) {
+    if (!prefix_sliding_enabled() || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || prefix_end < 0 ||
+        prefix_end > (llama_pos) prefix_sliding_prefix_cap) {
+        return false;
+    }
+
+    v_prefix_end[seq_id] = prefix_end;
+    return true;
+}
+
+llama_pos llama_kv_cache::seq_get_prefix(llama_seq_id seq_id) const {
+    if (!prefix_sliding_enabled() || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
+
+    return v_prefix_end[seq_id];
+}
+
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (prefix_sliding_enabled()) {
+        LLAMA_LOG_ERROR("%s: position shifts are not supported with prefix sliding\n", __func__);
+        return;
+    }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -511,6 +609,11 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    if (prefix_sliding_enabled()) {
+        LLAMA_LOG_ERROR("%s: position division is not supported with prefix sliding\n", __func__);
+        return;
+    }
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -662,7 +765,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             auto & head  = v_heads[sinfo.strm[s]];
 
             cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
+            head = it->v_heads_old[sinfo.strm[s]];
         }
     }
 
@@ -852,7 +955,23 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        const llama_pos prefix_end = prefix_sliding_enabled() ? v_prefix_end[seq_id] : -1;
+        if (prefix_sliding_enabled() && prefix_end < 0) {
+            LLAMA_LOG_ERROR("%s: prefix boundary is not set for sequence %d\n", __func__, seq_id);
+            return {};
+        }
+
+        llama_pos min_incoming_pos = std::numeric_limits<llama_pos>::max();
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            min_incoming_pos = std::min(min_incoming_pos, ubatch.pos[s * n_tokens + i]);
+        }
+
+        const uint32_t usable_size = prefix_sliding_enabled() ? prefix_sliding_size(seq_id) : cells.size();
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+        if (head_cur >= usable_size) {
+            head_cur = 0;
+        }
 
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
@@ -860,8 +979,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        if (n_tokens > usable_size) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > usable size = %u\n", __func__, n_tokens, usable_size);
             return { };
         }
 
@@ -872,8 +991,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+            if (head_cur + n_test > usable_size) {
+                n_tested += usable_size - head_cur;
                 head_cur = 0;
                 continue;
             }
@@ -907,8 +1026,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                     if (!can_use) {
                         const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
+                        if (prefix_sliding_enabled() && seq_id_cell == seq_id && pos_cell >= prefix_end &&
+                            pos_cell < min_incoming_pos - (llama_pos) prefix_sliding_window + 1) {
+                            can_use = true;
+                        }
+
                         // SWA mask
-                        if (is_masked_swa(pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        if (!can_use && is_masked_swa(pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
                             can_use = true;
                         }
                     }
@@ -931,7 +1055,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= usable_size) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -972,7 +1096,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 const llama_seq_id seq_id = cells.seq_get(idx);
                 const llama_pos    pos    = cells.pos_get(idx);
 
-                seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+                if (!prefix_sliding_enabled()) {
+                    seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
+                }
 
                 cells.rm(idx);
             }
@@ -988,7 +1114,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+    for (uint32_t s = 0; !prefix_sliding_enabled() && s < LLAMA_MAX_SEQ; ++s) {
         if (seq_pos_max_rm[s] == -1) {
             continue;
         }
@@ -1014,7 +1140,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    return true;
+    return !prefix_sliding_enabled();
 }
 
 uint32_t llama_kv_cache::get_size() const {
@@ -1438,6 +1564,14 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                         continue;
                     }
 
+                    if (prefix_sliding_enabled()) {
+                        const llama_pos prefix_end   = v_prefix_end[seq_id];
+                        const llama_pos window_begin = std::max(prefix_end, p1 - (llama_pos) prefix_sliding_window + 1);
+                        if (p0 >= prefix_end && p0 < window_begin) {
+                            continue;
+                        }
+                    }
+
                     data[idst + j] = hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f;
                 }
             }
@@ -1616,8 +1750,53 @@ bool llama_kv_cache::is_masked_swa(llama_pos p0, llama_pos p1) const {
     return llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1);
 }
 
+bool llama_kv_cache::prefix_sliding_enabled() const {
+    return prefix_sliding_window > 0 && prefix_sliding_prefix_cap > 0;
+}
+
+uint32_t llama_kv_cache::prefix_sliding_size(llama_seq_id seq_id) const {
+    GGML_ASSERT(prefix_sliding_enabled());
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < v_prefix_end.size());
+
+    const uint64_t active =
+        (uint64_t) std::max<llama_pos>(0, v_prefix_end[seq_id]) + prefix_sliding_window - 1 + prefix_sliding_n_ubatch;
+    return (uint32_t) std::min<uint64_t>(get_size(), GGML_PAD(active, n_pad));
+}
+
+void llama_kv_cache::reset_k_mean(uint32_t stream) {
+    const float zero = 0.0f;
+    for (auto & layer : layers) {
+        if (!layer.k_mean) {
+            continue;
+        }
+        auto * mean = layer.k_mean_stream[stream];
+        ggml_backend_tensor_set(mean, &zero, (mean->ne[0] - 1) * sizeof(float), sizeof(zero));
+    }
+}
+
 void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     GGML_UNUSED(flags);
+
+    io.write(&LLAMA_KV_STATE_MAGIC, sizeof(LLAMA_KV_STATE_MAGIC));
+    io.write(&LLAMA_KV_STATE_VERSION, sizeof(LLAMA_KV_STATE_VERSION));
+
+    const uint32_t prefix_enabled = prefix_sliding_enabled() ? 1 : 0;
+    const int32_t  type_k_i       = type_k;
+    const int32_t  type_v_i       = type_v;
+    io.write(&prefix_enabled, sizeof(prefix_enabled));
+    io.write(&prefix_sliding_window, sizeof(prefix_sliding_window));
+    io.write(&prefix_sliding_prefix_cap, sizeof(prefix_sliding_prefix_cap));
+    io.write(&type_k_i, sizeof(type_k_i));
+    io.write(&type_v_i, sizeof(type_v_i));
+
+    const uint32_t prefix_count = seq_id == -1 ? n_seq_max : 1;
+    io.write(&prefix_count, sizeof(prefix_count));
+    for (uint32_t i = 0; i < prefix_count; ++i) {
+        const llama_seq_id saved_seq_id = seq_id == -1 ? (llama_seq_id) i : seq_id;
+        const llama_pos    prefix_end   = v_prefix_end[saved_seq_id];
+        io.write(&saved_seq_id, sizeof(saved_seq_id));
+        io.write(&prefix_end, sizeof(prefix_end));
+    }
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -1667,6 +1846,30 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }
+
+    uint32_t mean_count = 0;
+    for (const auto & layer : layers) {
+        if (layer.k_mean) {
+            mean_count += seq_id == -1 ? n_stream : 1;
+        }
+    }
+    io.write(&mean_count, sizeof(mean_count));
+
+    for (const auto & layer : layers) {
+        if (!layer.k_mean) {
+            continue;
+        }
+        const uint32_t s_begin = seq_id == -1 ? 0 : seq_to_stream[seq_id];
+        const uint32_t s_end   = seq_id == -1 ? n_stream : s_begin + 1;
+        for (uint32_t s = s_begin; s < s_end; ++s) {
+            const uint32_t il     = layer.il;
+            const uint64_t nbytes = ggml_nbytes(layer.k_mean_stream[s]);
+            io.write(&il, sizeof(il));
+            io.write(&s, sizeof(s));
+            io.write(&nbytes, sizeof(nbytes));
+            io.write_tensor(layer.k_mean_stream[s], 0, nbytes);
+        }
+    }
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -1674,10 +1877,68 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
-    uint32_t n_stream_cur;
-    io.read_to(&n_stream_cur, sizeof(n_stream_cur));
+    uint32_t first;
+    io.read_to(&first, sizeof(first));
+
+    const bool new_state    = first == LLAMA_KV_STATE_MAGIC;
+    uint32_t   n_stream_cur = first;
+    if (new_state) {
+        uint32_t version;
+        uint32_t prefix_enabled;
+        uint32_t window;
+        uint32_t prefix_cap;
+        int32_t  type_k_i;
+        int32_t  type_v_i;
+        io.read_to(&version, sizeof(version));
+        io.read_to(&prefix_enabled, sizeof(prefix_enabled));
+        io.read_to(&window, sizeof(window));
+        io.read_to(&prefix_cap, sizeof(prefix_cap));
+        io.read_to(&type_k_i, sizeof(type_k_i));
+        io.read_to(&type_v_i, sizeof(type_v_i));
+
+        if (version != LLAMA_KV_STATE_VERSION) {
+            throw std::runtime_error("unsupported KV state version");
+        }
+        if ((prefix_enabled != 0) != prefix_sliding_enabled() || window != prefix_sliding_window ||
+            prefix_cap != prefix_sliding_prefix_cap || type_k_i != type_k || type_v_i != type_v) {
+            throw std::runtime_error("KV state configuration mismatch");
+        }
+
+        if (seq_id == -1) {
+            clear(true);
+        }
+
+        uint32_t prefix_count;
+        io.read_to(&prefix_count, sizeof(prefix_count));
+        if (prefix_count != (seq_id == -1 ? n_seq_max : 1)) {
+            throw std::runtime_error("invalid prefix metadata count in KV state");
+        }
+        if (seq_id == -1) {
+            std::fill(v_prefix_end.begin(), v_prefix_end.end(), -1);
+        }
+        for (uint32_t i = 0; i < prefix_count; ++i) {
+            llama_seq_id saved_seq_id;
+            llama_pos    prefix_end;
+            io.read_to(&saved_seq_id, sizeof(saved_seq_id));
+            io.read_to(&prefix_end, sizeof(prefix_end));
+            const llama_seq_id target_seq_id = seq_id == -1 ? saved_seq_id : seq_id;
+            if (target_seq_id < 0 || (size_t) target_seq_id >= v_prefix_end.size() ||
+                (prefix_sliding_enabled() && (prefix_end < -1 || prefix_end > (llama_pos) prefix_sliding_prefix_cap))) {
+                throw std::runtime_error("invalid prefix metadata in KV state");
+            }
+            v_prefix_end[target_seq_id] = prefix_end;
+        }
+
+        io.read_to(&n_stream_cur, sizeof(n_stream_cur));
+    } else if (prefix_sliding_enabled()) {
+        throw std::runtime_error("legacy KV state cannot be restored with prefix sliding enabled");
+    }
+
     if (n_stream_cur != n_stream) {
         throw std::runtime_error("n_stream mismatch");
+    }
+    if (!new_state && seq_id == -1) {
+        clear(true);
     }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1701,6 +1962,40 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
                 seq_rm(seq_id, -1, -1);
             }
             throw std::runtime_error("failed to restore kv cache");
+        }
+    }
+
+    if (new_state) {
+        uint32_t mean_count;
+        io.read_to(&mean_count, sizeof(mean_count));
+        uint32_t expected_mean_count = 0;
+        for (const auto & layer : layers) {
+            if (layer.k_mean) {
+                expected_mean_count += seq_id == -1 ? n_stream : 1;
+            }
+        }
+        if (mean_count != expected_mean_count) {
+            throw std::runtime_error("invalid K mean count in KV state");
+        }
+        for (uint32_t i = 0; i < mean_count; ++i) {
+            uint32_t il;
+            uint32_t saved_stream;
+            uint64_t nbytes;
+            io.read_to(&il, sizeof(il));
+            io.read_to(&saved_stream, sizeof(saved_stream));
+            io.read_to(&nbytes, sizeof(nbytes));
+
+            const auto it = map_layer_ids.find(il);
+            if (it == map_layer_ids.end()) {
+                throw std::runtime_error("invalid mean layer in KV state");
+            }
+            auto &         layer         = layers[it->second];
+            const uint32_t target_stream = seq_id == -1 ? saved_stream : seq_to_stream[seq_id];
+            if (!layer.k_mean || target_stream >= layer.k_mean_stream.size() ||
+                nbytes != ggml_nbytes(layer.k_mean_stream[target_stream])) {
+                throw std::runtime_error("K mean state mismatch");
+            }
+            ggml_backend_tensor_set(layer.k_mean_stream[target_stream], io.read(nbytes), 0, nbytes);
         }
     }
 }
@@ -1834,7 +2129,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
     if (dest_seq_id != -1) {
         // single sequence
+        const llama_pos prefix_end = v_prefix_end[dest_seq_id];
         seq_rm(dest_seq_id, -1, -1);
+        v_prefix_end[dest_seq_id] = prefix_end;
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -1894,8 +2191,6 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
             return false;
         }
-
-        clear(true);
 
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;

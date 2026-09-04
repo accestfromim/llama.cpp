@@ -111,6 +111,7 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_set_rows_turbo(ggml_metal_
                                                                      enum ggml_type       tidx);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_k_mean_center(ggml_metal_library_t lib);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_k_mean_center_count(ggml_metal_library_t lib);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_glu               (ggml_metal_library_t lib, const struct ggml_tensor * op);

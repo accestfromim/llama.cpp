@@ -90,6 +90,9 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
+                     uint32_t   prefix_sliding_window,
+                     uint32_t   prefix_sliding_prefix_cap,
+                     uint32_t   prefix_sliding_n_ubatch,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -120,6 +123,8 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+    bool seq_set_prefix(llama_seq_id seq_id, llama_pos prefix_end) override;
+    llama_pos seq_get_prefix(llama_seq_id seq_id) const override;
 
     // state write/load
 
@@ -189,6 +194,8 @@ public:
 private:
     const llama_model & model;
     const llama_hparams & hparams;
+    const ggml_type type_k;
+    const ggml_type type_v;
 
     struct kv_layer {
         // layer index in the model
@@ -215,6 +222,10 @@ private:
     // SWA
     const uint32_t n_swa = 0;
 
+    const uint32_t prefix_sliding_window     = 0;
+    const uint32_t prefix_sliding_prefix_cap = 0;
+    const uint32_t prefix_sliding_n_ubatch   = 0;
+
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
@@ -233,6 +244,7 @@ private:
     std::vector<uint32_t> v_heads;
 
     std::vector<llama_kv_cells> v_cells;
+    std::vector<llama_pos> v_prefix_end;
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
@@ -251,6 +263,9 @@ private:
     size_t size_v_bytes() const;
 
     bool is_masked_swa(llama_pos p0, llama_pos p1) const;
+    bool prefix_sliding_enabled() const;
+    uint32_t prefix_sliding_size(llama_seq_id seq_id) const;
+    void reset_k_mean(uint32_t stream);
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
