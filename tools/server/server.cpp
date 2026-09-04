@@ -2147,6 +2147,14 @@ struct server_context {
 
         params_base = params;
 
+        if (params_base.prefix_sliding_window > 0 && (params_base.ctx_shift || params_base.n_cache_reuse > 0 ||
+                                                      params_base.kv_unified || !params_base.mmproj.path.empty())) {
+            SRV_ERR(
+                "%s",
+                "prefix sliding is incompatible with context shift, cache reuse, unified KV, and multimodal mode\n");
+            return false;
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model = llama_init.model.get();
@@ -3411,6 +3419,14 @@ struct server_context {
                             continue;
                         }
 
+                        if (params_base.prefix_sliding_window > 0 &&
+                            prompt_tokens.size() > (size_t) params_base.prefix_sliding_prefix_cap) {
+                            slot.release();
+                            send_error(slot, "prompt exceeds the configured prefix-sliding prefix cap",
+                                       ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                            continue;
+                        }
+
                         // TODO: support memory-less logits computation
                         if (slot.need_logits() && !llama_get_memory(ctx)) {
                             slot.release();
@@ -3481,6 +3497,12 @@ struct server_context {
                             if (slot.params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 slot.n_past = slot.cache_tokens.get_common_prefix(prompt_tokens);
+
+                                if (params_base.prefix_sliding_window > 0) {
+                                    const llama_pos old_prefix =
+                                        llama_memory_seq_get_prefix(llama_get_memory(ctx), slot.id);
+                                    slot.n_past = std::min(slot.n_past, std::max(0, old_prefix));
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start >= 0) {
@@ -3634,6 +3656,13 @@ struct server_context {
                     }
 
                     SLT_INF(slot, "kv cache rm [%d, end)\n", slot.n_past);
+
+                    if (params_base.prefix_sliding_window > 0 &&
+                        !llama_memory_seq_set_prefix(llama_get_memory(ctx), slot.id, slot.n_prompt_tokens)) {
+                        slot.release();
+                        send_error(slot, "failed to set prefix-sliding prompt boundary", ERROR_TYPE_SERVER);
+                        continue;
+                    }
 
                     // remove the non-common part from the cache
                     slot.cache_tokens.keep_first(slot.n_past);
