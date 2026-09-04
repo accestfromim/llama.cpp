@@ -131,6 +131,31 @@ int main(void) {
     }
 
     {
+        common_params prefix_params;
+        argv      = { "binary_name", "--no-context-shift",          "--prefix-sliding-window",
+                      "8192",        "--prefix-sliding-prefix-cap", "4096" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), prefix_params, LLAMA_EXAMPLE_MAIN));
+        assert(prefix_params.prefix_sliding_window == 8192);
+        assert(prefix_params.prefix_sliding_prefix_cap == 4096);
+    }
+
+    {
+        common_params prefix_params;
+        argv      = { "binary_name", "--no-context-shift", "--prefix-sliding-window", "8192" };
+        auto args = list_str_to_char(argv);
+        assert(false == common_params_parse(argv.size(), args.data(), prefix_params, LLAMA_EXAMPLE_MAIN));
+    }
+
+    {
+        common_params prefix_params;
+        argv      = { "binary_name", "--no-context-shift",          "--prefix-sliding-window",
+                      "-1",          "--prefix-sliding-prefix-cap", "-1" };
+        auto args = list_str_to_char(argv);
+        assert(false == common_params_parse(argv.size(), args.data(), prefix_params, LLAMA_EXAMPLE_MAIN));
+    }
+
+    {
         common_params turbo_params;
         argv      = { "binary_name", "--turboquant", "--cache-type-k", "auto" };
         auto args = list_str_to_char(argv);
