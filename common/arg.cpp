@@ -1435,6 +1435,33 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
                 ctx_arg.params.cache_type_v = GGML_TYPE_TURBO3_0;
             }
         }
+        if ((ctx_arg.params.prefix_sliding_window > 0) != (ctx_arg.params.prefix_sliding_prefix_cap > 0)) {
+            throw std::invalid_argument(
+                "--prefix-sliding-window and --prefix-sliding-prefix-cap must both be positive");
+        }
+        if (ctx_arg.params.prefix_sliding_window < 0 || ctx_arg.params.prefix_sliding_prefix_cap < 0) {
+            throw std::invalid_argument("prefix sliding values must not be negative");
+        }
+        if (ctx_arg.params.prefix_sliding_window > 0) {
+            if (ctx_arg.params.ctx_shift || ctx_arg.params.grp_attn_n != 1 || ctx_arg.params.kv_unified) {
+                throw std::invalid_argument(
+                    "prefix sliding is incompatible with context shift, self-extend, and unified KV");
+            }
+            if (ctx_arg.params.n_cache_reuse > 0) {
+                throw std::invalid_argument("prefix sliding is incompatible with chunk relocation cache reuse");
+            }
+            if (!ctx_arg.params.mmproj.path.empty() || !ctx_arg.params.image.empty()) {
+                throw std::invalid_argument("prefix sliding does not support multimodal requests");
+            }
+            const bool has_speculative_model =
+                !ctx_arg.params.speculative.model.path.empty() || !ctx_arg.params.speculative.model.hf_repo.empty();
+            const bool has_speculative_type =
+                std::any_of(ctx_arg.params.speculative.types.begin(), ctx_arg.params.speculative.types.end(),
+                            [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+            if (has_speculative_model || has_speculative_type) {
+                throw std::invalid_argument("prefix sliding does not support speculative decoding");
+            }
+        }
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -1716,6 +1743,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.swa_full = true;
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
+    add_opt(common_arg({ "--prefix-sliding-window" }, "N",
+                       "recent-token window for Row4 prefix-sliding attention (default: 0, disabled)",
+                       [](common_params & params, int value) { params.prefix_sliding_window = value; })
+                .set_env("LLAMA_ARG_PREFIX_SLIDING_WINDOW")
+                .set_examples({ LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY }));
+    add_opt(common_arg({ "--prefix-sliding-prefix-cap" }, "N",
+                       "maximum preserved prompt length for Row4 prefix-sliding attention (default: 0, disabled)",
+                       [](common_params & params, int value) { params.prefix_sliding_prefix_cap = value; })
+                .set_env("LLAMA_ARG_PREFIX_SLIDING_PREFIX_CAP")
+                .set_examples({ LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY }));
     add_opt(common_arg(
         {"--swa-checkpoints"}, "N",
         string_format("max number of SWA checkpoints per slot to create (default: %d)\n"

@@ -341,6 +341,10 @@ int main(int argc, char ** argv) {
             }
             n_matching_session_tokens++;
         }
+        if (params.prefix_sliding_window > 0) {
+            const llama_pos old_prefix = llama_memory_seq_get_prefix(mem, 0);
+            n_matching_session_tokens  = std::min(n_matching_session_tokens, (size_t) std::max(0, old_prefix));
+        }
         if (params.prompt.empty() && n_matching_session_tokens == embd_inp.size()) {
             LOG_INF("%s: using full prompt from session file\n", __func__);
         } else if (n_matching_session_tokens >= embd_inp.size()) {
@@ -355,6 +359,18 @@ int main(int argc, char ** argv) {
 
         // remove any "future" tokens that we might have inherited from the previous session
         llama_memory_seq_rm(mem, -1, n_matching_session_tokens, -1);
+    }
+
+    if (params.prefix_sliding_window > 0) {
+        if (embd_inp.size() > (size_t) params.prefix_sliding_prefix_cap) {
+            LOG_ERR("%s: prompt has %zu tokens, above prefix cap %d\n", __func__, embd_inp.size(),
+                    params.prefix_sliding_prefix_cap);
+            return 1;
+        }
+        if (!llama_memory_seq_set_prefix(mem, 0, embd_inp.size())) {
+            LOG_ERR("%s: failed to set prefix boundary\n", __func__);
+            return 1;
+        }
     }
 
     LOG_DBG("recalculate the cached logits (check): embd_inp.size() %zu, n_matching_session_tokens %zu, embd_inp.size() %zu, session_tokens.size() %zu\n",

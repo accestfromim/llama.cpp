@@ -35,6 +35,21 @@ struct results_log_softmax {
     float  prob;
 };
 
+static bool set_prefix_sliding(llama_context * ctx, const common_params & params, int n_seq, int n_ctx) {
+    if (params.prefix_sliding_window == 0) {
+        return true;
+    }
+
+    const llama_pos prefix_end = std::min(n_ctx, params.prefix_sliding_prefix_cap);
+    for (int seq = 0; seq < n_seq; ++seq) {
+        if (!llama_memory_seq_set_prefix(llama_get_memory(ctx), seq, prefix_end)) {
+            LOG_ERR("%s: failed to set prefix boundary for sequence %d\n", __func__, seq);
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
     float max_logit = logits[0];
@@ -362,6 +377,9 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+        if (!set_prefix_sliding(ctx, params, 1, n_ctx)) {
+            return { tokens, -1, logit_history, prob_history };
+        }
 
         llama_batch batch = llama_batch_init(n_batch, 0, 1);
 
@@ -548,6 +566,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
         // clear the KV cache
         llama_memory_clear(llama_get_memory(ctx), true);
+        if (!set_prefix_sliding(ctx, params, n_seq_batch, n_ctx)) {
+            return { tokens, -1, logit_history, prob_history };
+        }
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
