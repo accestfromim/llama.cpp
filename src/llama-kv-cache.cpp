@@ -55,13 +55,12 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
-    const bool row4_prefix_production = model.row4_enabled && type_k == GGML_TYPE_TURBO4_0 &&
-                                        type_v == GGML_TYPE_TURBO3_0 &&
-                                        prefix_sliding_window == LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW &&
-                                        prefix_sliding_prefix_cap == LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP;
-    if (row4_prefix_production) {
-        turbo_k_mean_center = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_K_MEAN_CENTER;
-        turbo_k_mean_warmup = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_K_MEAN_WARMUP;
+    const bool row4_default_turboquant =
+        model.row4_enabled && type_k == GGML_TYPE_TURBO4_0 && type_v == GGML_TYPE_TURBO3_0;
+    if (row4_default_turboquant) {
+        turbo_k_mean_center        = LLAMA_ROW4_TURBOQUANT_DEFAULT_K_MEAN_CENTER;
+        turbo_k_mean_warmup        = LLAMA_ROW4_TURBOQUANT_DEFAULT_K_MEAN_WARMUP;
+        turbo_boundary_bf16_layers = LLAMA_ROW4_TURBOQUANT_DEFAULT_BOUNDARY_BF16_LAYERS;
     }
 
     const char * turbo_k_mean_center_env = getenv("TURBO_K_MEAN_CENTER");

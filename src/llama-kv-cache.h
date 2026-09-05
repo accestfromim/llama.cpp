@@ -231,7 +231,7 @@ private:
 
     int turbo_k_mean_center        = 0;
     int turbo_k_mean_warmup        = 32;
-    int turbo_boundary_bf16_layers = 0;
+    int turbo_boundary_bf16_layers = LLAMA_ROW4_TURBOQUANT_DEFAULT_BOUNDARY_BF16_LAYERS;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
