@@ -428,6 +428,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool turboquant        = false; // use the default TurboQuant KV cache types
+    bool row4_prefix_sliding = false;  // use the validated Row4 long-context profile
 
     bool single_turn       = false; // single turn chat conversation
 

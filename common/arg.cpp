@@ -1427,6 +1427,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        if (ctx_arg.params.row4_prefix_sliding) {
+            ctx_arg.params.turboquant = true;
+            if (ctx_arg.params.prefix_sliding_window == 0 && ctx_arg.params.prefix_sliding_prefix_cap == 0) {
+                ctx_arg.params.prefix_sliding_window     = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW;
+                ctx_arg.params.prefix_sliding_prefix_cap = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP;
+            }
+        }
         if (ctx_arg.params.turboquant) {
             if (!ctx_arg.params.cache_type_k_explicit && ctx_arg.params.cache_type_k == GGML_TYPE_COUNT) {
                 ctx_arg.params.cache_type_k = GGML_TYPE_TURBO4_0;
@@ -1752,6 +1759,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                        "maximum preserved prompt length for Row4 prefix-sliding attention (default: 0, disabled)",
                        [](common_params & params, int value) { params.prefix_sliding_prefix_cap = value; })
                 .set_env("LLAMA_ARG_PREFIX_SLIDING_PREFIX_CAP")
+                .set_examples({ LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY }));
+    add_opt(common_arg({ "--row4-prefix-sliding" },
+                       string_format("use the validated Row4 profile: K=turbo4, V=turbo3, window=%d, prefix cap=%d",
+                                     LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW,
+                                     LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP),
+                       [](common_params & params) { params.row4_prefix_sliding = true; })
+                .set_env("LLAMA_ARG_ROW4_PREFIX_SLIDING")
                 .set_examples({ LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY }));
     add_opt(common_arg(
         {"--swa-checkpoints"}, "N",
