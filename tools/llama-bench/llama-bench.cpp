@@ -357,7 +357,9 @@ static void print_usage(int /* argc */, char ** argv) {
            join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                  (default: %s)\n",
            join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
-    printf("  --turboquant                              use K=turbo4, V=turbo3, and Flash Attention by default\n");
+    printf(
+        "  --turboquant                              use K4/V3, centering 2/128, boundary 0, and Flash "
+        "Attention\n");
     printf("  -t, --threads <n>                         (default: %s)\n",
            join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                  (default: %s)\n",

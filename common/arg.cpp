@@ -2425,7 +2425,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_REPACK"));
     add_opt(common_arg({ "--turboquant" },
-                       "enable TurboQuant KV cache (default: K=turbo4, V=turbo3; explicit cache types override)",
+                       "enable TurboQuant KV cache (default: K=turbo4, V=turbo3, centering=2/128, boundary=0; "
+                       "explicit cache types override)",
                        [](common_params & params) { params.turboquant = true; })
                 .set_env("LLAMA_ARG_TURBOQUANT"));
     add_opt(common_arg({ "-ctk", "--cache-type-k" }, "TYPE",
