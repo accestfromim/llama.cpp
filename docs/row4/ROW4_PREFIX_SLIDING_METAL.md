@@ -1,8 +1,47 @@
-# Row4 Prefix Sliding Metal experiment
+# Row4 Prefix Sliding Metal
+
+## Production profile
+
+The validated production profile is available through one option:
+
+```text
+--row4-prefix-sliding
+```
+
+It selects Turbo4 K, Turbo3 V, an 8192-token recent window, a 4096-token prefix cap, K centering mode 2 with 128 warmup tokens, no BF16 boundary layers, and Flash Attention. Prefix Sliding remains opt-in; `--turboquant` by itself continues to select dense K4/V3.
+
+For a 16-slot server where each request can reach 64K absolute context, use:
+
+```bash
+TURBO_K_MEAN_CENTER=2 TURBO_K_MEAN_WARMUP=128 \
+TURBO_KV_BOUNDARY_BF16_LAYERS=0 \
+build-prefix-metal/bin/llama-server \
+    -m qwen3-row4-v2-pair2.gguf -ngl 99 -fa on \
+    -c 1048576 -np 16 -b 2048 -ub 512 --no-context-shift \
+    --row4-prefix-sliding
+```
+
+`n_ctx` is the total logical context across server slots. Use `65536 * n_parallel` when every slot needs an independent 64K position range. This does not allocate dense 64K KV: the production profile allocates 12,800 physical cells per slot with ubatch 512.
+
+| Setting | Production value |
+| --- | --- |
+| K/V cache | Turbo4/Turbo3 |
+| Recent window | 8,192 tokens, including the current token |
+| Prefix cap | 4,096 tokens |
+| K centering | Mode 2, warmup 128 |
+| BF16 boundary layers | 0 |
+| Attention | Causal Metal Flash Attention |
+| KV layout | Per-stream, non-unified, fully offloaded |
+| Context shift | Disabled; RoPE positions remain absolute |
+| Physical KV per stream | 12,800 cells, 407.95 MiB reported by the v2 Pair2 model |
+
+The production startup check loaded the v2 Pair2 model on Apple M5 Max and reported `type_k=turbo4`, `type_v=turbo3`, `window=8192`, `prefix_cap=4096`, centering mode 2, warmup 128, and a 407.95 MiB Metal KV buffer for one stream. These values are runtime checks, not only parser defaults.
+
+The preset is also accepted by `llama-cli`, `llama-perplexity`, and `llama-bench`. Low-level `--prefix-sliding-window`, `--prefix-sliding-prefix-cap`, `-ctk`, and `-ctv` options remain available for controlled experiments. Overriding any preset value leaves the validated production profile and must be qualified separately.
 
 ## Scope and provenance
 
-This experiment adds Prefix Sliding attention to the Row4 Metal runtime. It starts from `codex/row4-turboquant-mixed-kv@6b62d5f737b3` and uses these implementations as semantic references:
+This implementation adds Prefix Sliding attention to the Row4 Metal runtime. It starts from `codex/row4-turboquant-mixed-kv@6b62d5f737b3` and uses these implementations as semantic references:
 
 - `prefix-sliding@4350eb6a`
 - `vllm/st29@22abbc6c`
@@ -20,7 +59,7 @@ Let `P` be the tokenized request prompt length, `W` the recent window including 
 
 The prefix and recent regions participate in one online softmax. RoPE positions stay absolute. The cache does not shift or renumber positions.
 
-The experiment default is:
+The validated production profile is:
 
 ```text
 W = 8192
@@ -31,9 +70,10 @@ The prefix boundary is request metadata, not an inferred cache position. Server 
 
 ## Configuration
 
-The common CLI accepts:
+The common CLI accepts the production preset and its low-level controls:
 
 ```text
+--row4-prefix-sliding
 --prefix-sliding-window N
 --prefix-sliding-prefix-cap N
 ```
@@ -43,6 +83,7 @@ The matching environment variables are:
 ```text
 LLAMA_ARG_PREFIX_SLIDING_WINDOW
 LLAMA_ARG_PREFIX_SLIDING_PREFIX_CAP
+LLAMA_ARG_ROW4_PREFIX_SLIDING
 ```
 
 The C API adds:

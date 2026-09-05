@@ -41,8 +41,12 @@ test parameters:
   -d, --n-depth <n>                         (default: 0)
   -b, --batch-size <n>                      (default: 2048)
   -ub, --ubatch-size <n>                    (default: 512)
+  --prefix-sliding-window <n>               (default: 0, disabled)
+  --prefix-sliding-prefix-cap <n>           (default: 0, disabled)
+  --row4-prefix-sliding                     use the validated K4/V3, W8192, cap4096 profile
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
+  --turboquant                              use K=turbo4, V=turbo3, and Flash Attention by default
   -t, --threads <n>                         (default: system dependent)
   -C, --cpu-mask <hex,hex>                  (default: 0x0)
   --cpu-strict <0|1>                        (default: 0)
