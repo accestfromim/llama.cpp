@@ -13,8 +13,6 @@ It selects Turbo4 K, Turbo3 V, an 8192-token recent window, a 4096-token prefix 
 For a 16-slot server where each request can reach 64K absolute context, use:
 
 ```bash
-TURBO_K_MEAN_CENTER=2 TURBO_K_MEAN_WARMUP=128 \
-TURBO_KV_BOUNDARY_BF16_LAYERS=0 \
 build-prefix-metal/bin/llama-server \
     -m qwen3-row4-v2-pair2.gguf -ngl 99 -fa on \
     -c 1048576 -np 16 -b 2048 -ub 512 --no-context-shift \
@@ -93,7 +91,7 @@ bool llama_memory_seq_set_prefix(llama_memory_t mem, llama_seq_id seq_id, llama_
 llama_pos llama_memory_seq_get_prefix(llama_memory_t mem, llama_seq_id seq_id);
 ```
 
-Supported KV configurations are BF16/BF16 and Turbo4 K with Turbo3 V. K4/V3 remains compatible with `TURBO_K_MEAN_CENTER`, `TURBO_K_MEAN_WARMUP`, and `TURBO_KV_BOUNDARY_BF16_LAYERS`.
+Supported KV configurations are BF16/BF16 and Turbo4 K with Turbo3 V. Row4 K4/V3 defaults to K centering mode 2, warmup 128, and zero BF16 boundary layers in both dense and Prefix Sliding modes. `TURBO_K_MEAN_CENTER`, `TURBO_K_MEAN_WARMUP`, and `TURBO_KV_BOUNDARY_BF16_LAYERS` remain optional experimental overrides.
 
 Example BF16 server:
 
@@ -108,13 +106,10 @@ build-prefix-metal/bin/llama-server \
 Example K4/V3 server:
 
 ```bash
-TURBO_K_MEAN_CENTER=2 TURBO_K_MEAN_WARMUP=128 \
-TURBO_KV_BOUNDARY_BF16_LAYERS=0 \
 build-prefix-metal/bin/llama-server \
     -m qwen3-row4-v2-pair2.gguf -ngl 99 -fa on \
-    -ctk turbo4 -ctv turbo3 -c 1056768 -np 16 -b 2048 -ub 512 \
-    --no-context-shift --prefix-sliding-window 8192 \
-    --prefix-sliding-prefix-cap 4096
+    -c 1056768 -np 16 -b 2048 -ub 512 --no-context-shift \
+    --row4-prefix-sliding
 ```
 
 The runtime rejects non-Row4 models, non-causal attention, CPU or mixed placement, other KV pairs, disabled Flash Attention, disabled KQV offload, unified KV, model-defined SWA, context shift, chunk relocation reuse, speculative decoding, and multimodal mode.

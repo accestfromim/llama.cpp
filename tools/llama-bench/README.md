@@ -46,7 +46,7 @@ test parameters:
   --row4-prefix-sliding                     use the validated K4/V3, W8192, cap4096 profile
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
-  --turboquant                              use K=turbo4, V=turbo3, and Flash Attention by default
+  --turboquant                              use K4/V3, centering 2/128, boundary 0, and Flash Attention
   -t, --threads <n>                         (default: system dependent)
   -C, --cpu-mask <hex,hex>                  (default: 0x0)
   --cpu-strict <0|1>                        (default: 0)

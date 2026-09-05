@@ -69,7 +69,7 @@ The project is under active development, and we are [looking for feedback and co
 | `--yarn-beta-fast N` | YaRN: low correction dim or beta (default: 32.0)<br/>(env: LLAMA_ARG_YARN_BETA_FAST) |
 | `-nkvo, --no-kv-offload` | disable KV offload<br/>(env: LLAMA_ARG_NO_KV_OFFLOAD) |
 | `-nr, --no-repack` | disable weight repacking<br/>(env: LLAMA_ARG_NO_REPACK) |
-| `--turboquant` | enable TurboQuant KV cache (default: K=turbo4, V=turbo3; explicit cache types override)<br/>(env: LLAMA_ARG_TURBOQUANT) |
+| `--turboquant` | enable TurboQuant KV cache (default: K=turbo4, V=turbo3, centering=2/128, boundary=0; explicit cache types override)<br/>(env: LLAMA_ARG_TURBOQUANT) |
 | `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: auto, f32, f16, bf16, q8_0, turbo2, turbo3, turbo4, turbo2m4_s4, turbo2m4_s8, turbo2m4_s16, turbo2m4_g4, turbo2m4_g8, turbo2m4_g16, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: auto)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: auto, f32, f16, bf16, q8_0, turbo2, turbo3, turbo4, turbo2m4_s4, turbo2m4_s8, turbo2m4_s16, turbo2m4_g4, turbo2m4_g8, turbo2m4_g16, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: auto)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
 | `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |

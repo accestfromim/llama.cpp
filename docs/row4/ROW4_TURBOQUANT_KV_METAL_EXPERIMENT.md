@@ -43,7 +43,7 @@ BF16/BF16 continues to use the existing carrier SET_ROWS operation and Fairy2i/R
 
 ## Supported configurations
 
-TurboQuant is an explicit Row4 Metal experiment. The default remains BF16/BF16. Passing `--turboquant` selects Turbo4 K and Turbo3 V. Explicit `-ctk` or `-ctv` values override the corresponding preset type.
+TurboQuant is opt-in and the model default remains BF16/BF16. Passing `--turboquant` selects Turbo4 K, Turbo3 V, K centering mode 2 with 128 warmup tokens, and zero BF16 boundary layers. Explicit `-ctk` or `-ctv` values override the corresponding preset type.
 
 | Configuration | Status |
 | --- | --- |
@@ -66,7 +66,7 @@ build-rel-metal/bin/llama-cli \
     -m qwen3-row4-v2-pair2.gguf -ngl 99 --turboquant
 ```
 
-`llama-bench --turboquant` uses the same K4/V3 preset and enables Flash Attention unless `-fa` is set explicitly. Centering and boundary protection remain independent experimental settings.
+`llama-bench --turboquant` uses the same K4/V3 defaults and enables Flash Attention unless `-fa` is set explicitly. The three legacy environment variables remain available when an experiment needs to override centering, warmup, or boundary protection.
 
 ## Correctness tests
 
@@ -384,14 +384,14 @@ Plain int4 K is better at 1K, close at 8K, and effectively tied in KL at 64K. Th
 
 ## K mean-centering experiment
 
-`TURBO_K_MEAN_CENTER` is default-off and supports two experimental modes for fully offloaded Turbo4/Turbo3 or Turbo4/Turbo4 Metal streams. Each stream owns an independent warmup sum and completed mean:
+`TURBO_K_MEAN_CENTER` supports two modes for fully offloaded Turbo4/Turbo3 or Turbo4/Turbo4 Metal streams. The final Row4 K4/V3 profile now defaults to mode 2; other explicit TurboQuant pairs remain default-off. Each stream owns an independent warmup sum and completed mean:
 
 - Mode 1 leaves the warmup K vectors unchanged and subtracts their mean from later K vectors.
 - Mode 2 subtracts one completed warmup mean from every K vector in the initial prompt and from all later K vectors.
 
 Mode 1 is not softmax invariant. It shifts only the logits for later keys relative to the warmup keys and caused KL above 2.1. Mode 2 applies one common translation to every key. For query `q` and common mean `mu`, every exact attention logit changes by the same scalar `-q dot mu`; softmax therefore stays unchanged before quantization.
 
-The warmup length is selected with `TURBO_K_MEAN_WARMUP`, default 32. Lengths 1, 8, 16, 32, 64, and 128 were tested at 1K, 8K, and 64K. No single length won every top1 point, but 128 gave the best aggregate KL and top5 behavior after the boundary-layer experiment. If the first prompt batch is shorter than the configured warmup, mode 2 now uses that actual batch length. The Metal and CPU tests include the explicit configured-128/actual-64 case.
+The warmup length is selected with `TURBO_K_MEAN_WARMUP`. The final Row4 K4/V3 profile defaults to 128; explicitly centered non-default pairs retain the historical fallback of 32. Lengths 1, 8, 16, 32, 64, and 128 were tested at 1K, 8K, and 64K. No single length won every top1 point, but 128 gave the best aggregate KL and top5 behavior after the boundary-layer experiment. If the first prompt batch is shorter than the configured warmup, mode 2 now uses that actual batch length. The Metal and CPU tests include the explicit configured-128/actual-64 case.
 
 The mechanism was checked on the real post-RoPE K tensors from all 36 layers and the first 512 WikiText tokens. This distinguishes lower absolute quantization error from lower relative error:
 
