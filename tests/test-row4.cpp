@@ -1737,16 +1737,17 @@ static bool test_metal_row4_swiglu_down_fusion() {
             ggml_backend_t     metal_fused = ggml_backend_dev_init(dev, nullptr);
             std::vector<float> fused;
             bool               gate_up_fusion_hit = false;
+            bool               m5_tensorops_bypass_hit = false;
             ok = metal_fused &&
                  run_row4_swiglu_down_backend(fused, metal_fused, input, gate_up_pair2, gate_up_pair2_scales,
                                               down_pair2, down_pair2_scales, tokens, true, false, false,
-                                              &gate_up_fusion_hit, false, true) &&
+                                              &gate_up_fusion_hit, false, true, &m5_tensorops_bypass_hit) &&
                  compare_exact(("Row4 pair2 QAT SwiGLU-down fused/oracle B=" + std::to_string(tokens)).c_str(), fused,
                                oracle) &&
                  compare_exact(("Row4 pair2 QAT SwiGLU-down fused/unfused B=" + std::to_string(tokens)).c_str(), fused,
                                unfused) &&
                  ok;
-            const bool expect_gate_up_fusion = tokens > 8 && tokens % 32 == 0;
+            const bool expect_gate_up_fusion = tokens > 8 && tokens % 32 == 0 && !m5_tensorops_bypass_hit;
             if (gate_up_fusion_hit != expect_gate_up_fusion) {
                 fprintf(stderr, "Row4 pair2 gate-up producer fusion hit mismatch B=%lld: actual=%d expected=%d\n",
                         (long long) tokens, (int) gate_up_fusion_hit, (int) expect_gate_up_fusion);
@@ -2384,7 +2385,7 @@ static bool test_metal_operator_matrix() {
     }
 
     bool ok = true;
-    for (int64_t tokens : { 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
+    for (int64_t tokens : { 1, 2, 3, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 64, 96, 128, 256, 512 }) {
         const std::vector<float> input = make_input(K, tokens);
         std::vector<float>       actual;
         const std::vector<float> expected_row4 = oracle_row4_linear(input, row4_codes, row4_scales, O, K, tokens);

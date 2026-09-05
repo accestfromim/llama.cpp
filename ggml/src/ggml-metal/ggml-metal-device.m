@@ -596,6 +596,7 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                     "kernel_row4_m5_preexpand_int4",
                     "kernel_row4_m5_preexpand_int4_pair2",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
                     "kernel_row4_w1a8_m5_tensorops_decode_m16n64_sg4",
                     "kernel_row4_w1a8_m5_tensorops_decode_m8n128",

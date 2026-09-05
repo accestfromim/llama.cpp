@@ -2228,18 +2228,19 @@ static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(b
     // smaller B, online BK128 decode into 16 KiB of threadgroup memory wins.
     if (act_rows >= 512 && act_rows % 32 == 0 && m % 128 == 0) {
         return {
-            "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
-            "M5 MPP TensorOps exact A8/I4/I32 M32N128 BK128 device-preexpand",
+            k % 512 == 0 ? "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512" :
+                           "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
+            k % 512 == 0 ? "M5 MPP TensorOps exact A8/I4/I32 M32N128 BK512 device-preexpand" :
+                           "M5 MPP TensorOps exact A8/I4/I32 M32N128 BK128 device-preexpand",
             32,
             128,
             4,
             true,
         };
     }
-    // The online TensorOps kernels decode the v1 physical stream directly
-    // into threadgroup INT4. Pair2 uses the portable layout-aware prefill
-    // kernels below B512, where a complete device expansion is not amortized.
-    if (layout == 2) {
+    // Both physical layouts decode directly into a bounded threadgroup INT4
+    // tile. Keep Pair2 multi-decode on its independent-row LUT path.
+    if (layout == 2 && act_rows < 32) {
         return {};
     }
     if (act_rows >= 256 && act_rows % 256 == 0 && m % 32 == 0) {
@@ -2561,6 +2562,8 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const char * row4_path_detail =
         row4_m5_tensorops_prefill ?
             row4_m5_tensorops.path_detail :
+        pair2_decode && props_dev->has_mpp_tensorops ?
+            "M5 exact F16 packet8/F32 LUT16 O32 split-K2 eight-SIMDgroup staged-act" :
         pair2_decode ?
             "A8/F32 exact-integer LUT16 O32 two-O4-per-SIMDgroup staged-act" :
         row4_decode_o16_o4_staged_act ?
@@ -2728,11 +2731,11 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_threadgroup_memory_size(enc, 16 * rows_per_tg * sizeof(float), 2);
         ggml_metal_encoder_dispatch_threadgroups(enc, m / 16, (act_rows + rows_per_tg - 1) / rows_per_tg, 1, nth, 1, 1);
     } else if (pair2_decode || row4_decode_o16_o4_staged_act) {
-        // Pair2's LUT16 kernel covers O32 with four SIMDgroups. The v1
-        // four-bank kernel covers O16 with four SIMDgroups. Both stage the
-        // activation once per threadgroup.
+        // M5 Pair2 uses two K partitions over eight SIMDgroups and reuses
+        // the activation storage for their final reduction. Portable Pair2
+        // and v1 keep four SIMDgroups.
         const int     rows_per_tg = pair2_decode ? 32 : 16;
-        constexpr int nth         = 4 * 32;
+        const int     nth         = pair2_decode && props_dev->has_mpp_tensorops ? 8 * 32 : 4 * 32;
         GGML_ASSERT(pair2_decode || k == 4096 || k == 12288);
         GGML_ASSERT(!pair2_decode || k <= row4_pair2_f32_exact_k_max);
         GGML_ASSERT(act_q.offs % 16 == 0);

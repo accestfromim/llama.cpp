@@ -1313,6 +1313,11 @@ constexpr constant static char4 k_row4_m5_int4_codebook[16] = {
     char4( 0,  0, -2,  0),
 };
 
+constexpr constant static ushort k_row4_m5_packed_int4_codebook[16] = {
+    0x0002, 0xe000, 0xf1f1, 0xff11, 0x2000, 0x000e, 0x11ff, 0x1f1f,
+    0x1111, 0xf11f, 0x0200, 0x0020, 0x1ff1, 0xffff, 0x00e0, 0x0e00,
+};
+
 static inline uchar row4_m5_pack_int4(char low, char high) {
     return (uchar) (((uint) ((uchar) low) & 0x0fU) | (((uint) ((uchar) high) & 0x0fU) << 4U));
 }
@@ -1389,31 +1394,29 @@ kernel void kernel_row4_m5_preexpand_int4_pair2(
     const uint k_low  = kp * 256U + k_half * 128U + split * 16U + j;
     const uint k_high = k_low + 8U;
     const uchar code_pair = codes[gid];
-    const char4 low        = k_row4_m5_int4_codebook[(uint) (code_pair & 0x0fU)];
-    const char4 high       = k_row4_m5_int4_codebook[(uint) (code_pair >> 4)];
+    const ushort low      = k_row4_m5_packed_int4_codebook[(uint) (code_pair & 0x0fU)];
+    const ushort high     = k_row4_m5_packed_int4_codebook[(uint) (code_pair >> 4)];
 
     const ulong low_offset  = ((ulong) k_low * (ulong) args.m + (ulong) output) >> 1;
     const ulong high_offset = ((ulong) k_high * (ulong) args.m + (ulong) output) >> 1;
-    weight_i4[low_offset + 0UL]  = row4_m5_pack_int4(low.x, low.y);
-    weight_i4[low_offset + 1UL]  = row4_m5_pack_int4(low.z, low.w);
-    weight_i4[high_offset + 0UL] = row4_m5_pack_int4(high.x, high.y);
-    weight_i4[high_offset + 1UL] = row4_m5_pack_int4(high.z, high.w);
+    *((device ushort *) (weight_i4 + low_offset)) = low;
+    *((device ushort *) (weight_i4 + high_offset)) = high;
 }
 
 // Large prefills amortize one complete Row4 expansion across many token tiles.
 // Keep the cooperative INT32 accumulator live across K and write through the
 // same exact scale/BF16 epilogue as every other Row4 path.
-kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128(
-        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
-        device int8_t * act_q                             [[buffer(1)]],
-        device uchar * weight_i4                          [[buffer(2)]],
-        device const float * act_scales                   [[buffer(3)]],
-        device const ushort * scales                      [[buffer(4)]],
-        device float * dst                                [[buffer(5)]],
-        uint3 tgpig                                       [[threadgroup_position_in_grid]]) {
+template<int k_tile>
+static inline void row4_m5_prefill_preexpanded_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device int8_t * act_q,
+        device uchar * weight_i4,
+        device const float * act_scales,
+        device const ushort * scales,
+        device float * dst,
+        uint3 tgpig) {
     constexpr int row_tile    = 32;
     constexpr int output_tile = 128;
-    constexpr int k_tile      = 128;
     constexpr auto desc = matmul2d_descriptor(
         row_tile,
         output_tile,
@@ -1462,6 +1465,22 @@ kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128(
     }
 }
 
+#define ROW4_M5_PREFILL_PREEXPANDED(name, bk) \
+kernel void name( \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]], \
+        device int8_t * act_q [[buffer(1)]], \
+        device uchar * weight_i4 [[buffer(2)]], \
+        device const float * act_scales [[buffer(3)]], \
+        device const ushort * scales [[buffer(4)]], \
+        device float * dst [[buffer(5)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]]) { \
+    row4_m5_prefill_preexpanded_impl<bk>(args, act_q, weight_i4, act_scales, scales, dst, tgpig); \
+}
+
+ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128, 128)
+ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512, 512)
+#undef ROW4_M5_PREFILL_PREEXPANDED
+
 template<int row_tile, int output_tile, int n_simdgroups>
 static inline void row4_w1a8_m5_tensorops_prefill_impl(
         constant ggml_metal_kargs_row_quant_linear & args,
@@ -1499,9 +1518,7 @@ static inline void row4_w1a8_m5_tensorops_prefill_impl(
 
     const uint output_base = tgpig.x * output_tile;
     const uint row_base    = tgpig.y * row_tile;
-    const uint k_tiles     = (uint) args.k >> 7;
     for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
-        const uint kt = k_base >> 7;
         for (uint work = tid; work < (uint) (output_tile / 4) * 64U; work += threadgroup_threads) {
             const uint g4     = work >> 6;
             const uint b      = work & 63U;
@@ -1512,10 +1529,7 @@ static inline void row4_w1a8_m5_tensorops_prefill_impl(
             const uint output = output_base + 4U * g4;
             const uint ot     = output >> 4;
             const uint group  = (output & 15U) >> 2;
-            const ulong source_offset =
-                ((((ulong) ot * (ulong) k_tiles + (ulong) kt) * 4UL + (ulong) group) * 64UL) +
-                (ulong) split * 8UL + (ulong) j;
-            const uchar code_pair = codes[source_offset];
+            const uchar code_pair = row4_load_prefill_byte(args, codes, ot, (int) k_base, group, split, j);
             const char4 low        = k_row4_m5_int4_codebook[(uint) (code_pair & 0x0fU)];
             const char4 high       = k_row4_m5_int4_codebook[(uint) (code_pair >> 4)];
             const uint dst_low     = k_low * 128U + g4 * 2U;
@@ -2413,9 +2427,10 @@ kernel void kernel_row4_w1a8_decode_o16_o4_staged_act_qat_residual(
 }
 
 
-// Pair2 B1 decode keeps the validated O32/128-thread/four-SIMDgroup geometry,
-// dual-O4 issue order, K256 u2 lookahead, activation staging, and epilogue
-// boundary. The 4-bit code directly indexes the existing 16-entry row LUT.
+// Pair2 retains dual-O4 issue order, K256 u2 lookahead, activation staging,
+// and the exact epilogue. M5 doubles SIMD parallelism with an in-threadgroup
+// two-way K reduction; other devices keep the four-SIMDgroup geometry. The
+// 4-bit code directly indexes the existing 16-entry row LUT.
 // Each A8 * ROW4 term and every partial sum are exact in F32 through K=65536:
 // the worst-case magnitude is 2 * 128 * 65536 = 2^24.
 static inline void row4_decode_pair2_lut16_apply(
@@ -2425,6 +2440,21 @@ static inline void row4_decode_pair2_lut16_apply(
         char2 activation1_low,
         char2 activation1_high,
         thread float4 & acc) {
+#if defined(GGML_METAL_HAS_MPP_TENSOROPS)
+    // Eight A8 x Row4 terms have magnitude <= 8 * 128 * 2 = 2048.
+    // Every integer partial sum is therefore exact in FP16; widen once per
+    // packet before the full-K F32 accumulation.
+    half4 partial = {};
+    partial += row4_decode4((uint) (packed.x & 0x0fU)) * half4((half) activation0_low.x);
+    partial += row4_decode4((uint) (packed.y & 0x0fU)) * half4((half) activation0_low.y);
+    partial += row4_decode4((uint) (packed.x >> 4)) * half4((half) activation0_high.x);
+    partial += row4_decode4((uint) (packed.y >> 4)) * half4((half) activation0_high.y);
+    partial += row4_decode4((uint) (packed.z & 0x0fU)) * half4((half) activation1_low.x);
+    partial += row4_decode4((uint) (packed.w & 0x0fU)) * half4((half) activation1_low.y);
+    partial += row4_decode4((uint) (packed.z >> 4)) * half4((half) activation1_high.x);
+    partial += row4_decode4((uint) (packed.w >> 4)) * half4((half) activation1_high.y);
+    acc += float4(partial);
+#else
     acc += float4(row4_decode4((uint) (packed.x & 0x0fU))) * float4((float) activation0_low.x);
     acc += float4(row4_decode4((uint) (packed.y & 0x0fU))) * float4((float) activation0_low.y);
     acc += float4(row4_decode4((uint) (packed.x >> 4))) * float4((float) activation0_high.x);
@@ -2433,6 +2463,7 @@ static inline void row4_decode_pair2_lut16_apply(
     acc += float4(row4_decode4((uint) (packed.w & 0x0fU))) * float4((float) activation1_low.y);
     acc += float4(row4_decode4((uint) (packed.z >> 4))) * float4((float) activation1_high.x);
     acc += float4(row4_decode4((uint) (packed.w >> 4))) * float4((float) activation1_high.y);
+#endif
 }
 
 static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
@@ -2442,6 +2473,8 @@ static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
         uint3 tgpig,
         uint simd_lane,
         uint output_pair,
+        uint k_partition,
+        uint k_partitions,
         thread float4 & acc0,
         thread float4 & acc1) {
     constexpr int groups_per_block   = 8;
@@ -2461,8 +2494,13 @@ static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
     device const uchar * code1_ptr = code0_ptr + group_record_bytes;
     threadgroup const char * act_ptr = act_tg + (ulong) split * 16UL + (ulong) j;
 
-    int kp = 0;
-    for (; kp + 1 < k_pairs; kp += 2) {
+    const int kp_begin = k_pairs * (int) k_partition / (int) k_partitions;
+    const int kp_end = k_pairs * ((int) k_partition + 1) / (int) k_partitions;
+    code0_ptr += kp_begin * bytes_per_k_pair;
+    code1_ptr += kp_begin * bytes_per_k_pair;
+    act_ptr += kp_begin * k_pair;
+    int kp = kp_begin;
+    for (; kp + 1 < kp_end; kp += 2) {
         const uchar4 current_packed0 = *((device const uchar4 *) code0_ptr);
         const uchar4 current_packed1 = *((device const uchar4 *) code1_ptr);
         const char2 current_activation0_low  = *((threadgroup const char2 *) act_ptr);
@@ -2514,7 +2552,7 @@ static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
         act_ptr += 2 * k_pair;
     }
 
-    if (kp < k_pairs) {
+    if (kp < kp_end) {
         const uchar4 packed0 = *((device const uchar4 *) code0_ptr);
         const uchar4 packed1 = *((device const uchar4 *) code1_ptr);
         const char2 activation0_low  = *((threadgroup const char2 *) act_ptr);
@@ -2525,6 +2563,34 @@ static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
             packed0, activation0_low, activation0_high, activation1_low, activation1_high, acc0);
         row4_decode_pair2_lut16_apply(
             packed1, activation0_low, activation0_high, activation1_low, activation1_high, acc1);
+    }
+}
+
+static inline void row4_decode_pair2_reduce(
+        threadgroup char * act_tg,
+        uint k_partitions,
+        uint simd_group,
+        uint simd_lane,
+        thread float4 & acc0,
+        thread float4 & acc1) {
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    if (k_partitions == 1) {
+        return;
+    }
+
+    // All activation reads finish before their storage is reused. K >= 256
+    // leaves room for 8 SIMDgroups x 2 int4 partials without extra scratch.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup int4 * partials = (threadgroup int4 *) act_tg;
+    if (simd_lane == 0U) {
+        partials[simd_group * 2U] = int4(acc0);
+        partials[simd_group * 2U + 1U] = int4(acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group < 4U) {
+        acc0 = float4(partials[simd_group * 2U] + partials[(simd_group + 4U) * 2U]);
+        acc1 = float4(partials[simd_group * 2U + 1U] + partials[(simd_group + 4U) * 2U + 1U]);
     }
 }
 
@@ -2539,11 +2605,14 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
         uint3 tgpig                                       [[threadgroup_position_in_grid]],
         uint tid                                          [[thread_index_in_threadgroup]],
         uint simd_lane                                    [[thread_index_in_simdgroup]],
-        uint output_pair                                  [[simdgroup_index_in_threadgroup]]) {
+        uint simd_group                                   [[simdgroup_index_in_threadgroup]],
+        uint3 ntg                                         [[threads_per_threadgroup]]) {
+    const uint output_pair = simd_group & 3U;
     constexpr int rows_per_group = 4;
     constexpr int rows_per_pair  = 8;
     constexpr int copy_bytes     = 16;
-    constexpr int threads_per_tg = 128;
+    const int threads_per_tg = (int) ntg.x;
+    const uint k_partitions = ntg.x / 128U;
     const ulong token            = (ulong) tgpig.y;
     device const char * act_row  = act_q + token * (ulong) args.k;
     device float * dst_row       = dst + token * (ulong) args.m;
@@ -2557,9 +2626,14 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
     float4 acc0 = {};
     float4 acc1 = {};
     row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
-        args, codes, act_tg, tgpig, simd_lane, output_pair, acc0, acc1);
+        args, codes, act_tg, tgpig, simd_lane, output_pair, simd_group >> 2, k_partitions, acc0, acc1);
 
-    const int4 sum0 = int4(simd_sum(acc0));
+    row4_decode_pair2_reduce(act_tg, k_partitions, simd_group, simd_lane, acc0, acc1);
+    if (simd_group >= 4U) {
+        return;
+    }
+
+    const int4 sum0 = int4(acc0);
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
         const float sx = act_scales[token];
@@ -2569,7 +2643,7 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
         dst_row[output + 3] = row4_finish_i32(sum0.w, sx, scales[output + 3]);
     }
 
-    const int4 sum1 = int4(simd_sum(acc1));
+    const int4 sum1 = int4(acc1);
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
         const float sx = act_scales[token];
@@ -2593,11 +2667,14 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
         uint3 tgpig                                       [[threadgroup_position_in_grid]],
         uint tid                                          [[thread_index_in_threadgroup]],
         uint simd_lane                                    [[thread_index_in_simdgroup]],
-        uint output_pair                                  [[simdgroup_index_in_threadgroup]]) {
+        uint simd_group                                   [[simdgroup_index_in_threadgroup]],
+        uint3 ntg                                         [[threads_per_threadgroup]]) {
+    const uint output_pair = simd_group & 3U;
     constexpr int rows_per_group = 4;
     constexpr int rows_per_pair  = 8;
     constexpr int copy_bytes     = 16;
-    constexpr int threads_per_tg = 128;
+    const int threads_per_tg = (int) ntg.x;
+    const uint k_partitions = ntg.x / 128U;
     const ulong token            = (ulong) tgpig.y;
     device const char * act_row  = act_q + token * (ulong) args.k;
     device float * dst_row       = dst + token * (ulong) args.m;
@@ -2613,9 +2690,14 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
     float4 acc0 = {};
     float4 acc1 = {};
     row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
-        args, codes, act_tg, tgpig, simd_lane, output_pair, acc0, acc1);
+        args, codes, act_tg, tgpig, simd_lane, output_pair, simd_group >> 2, k_partitions, acc0, acc1);
 
-    const int4 sum0 = int4(simd_sum(acc0));
+    row4_decode_pair2_reduce(act_tg, k_partitions, simd_group, simd_lane, acc0, acc1);
+    if (simd_group >= 4U) {
+        return;
+    }
+
+    const int4 sum0 = int4(acc0);
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair;
         const float sx = act_scales[token];
@@ -2638,7 +2720,7 @@ kernel void kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lu
         }
     }
 
-    const int4 sum1 = int4(simd_sum(acc1));
+    const int4 sum1 = int4(acc1);
     if (simd_lane == 0U) {
         const int output = (int) tgpig.x * 32 + (int) output_pair * rows_per_pair + rows_per_group;
         const float sx = act_scales[token];
