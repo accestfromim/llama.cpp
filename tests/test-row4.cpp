@@ -1264,6 +1264,16 @@ static void m5_tensorops_path_log_callback(enum ggml_log_level level, const char
         bit = 1u << 2;
     } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M256N32")) {
         bit = 1u << 3;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I8/I32 M8N16 direct-device")) {
+        bit = 1u << 7;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I8/I32 M16N16 direct-device")) {
+        bit = 1u << 8;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I8/I32 M32N16 direct-device")) {
+        bit = 1u << 9;
+    } else if (strstr(text, "B2 shared-weight")) {
+        bit = 1u << 10;
+    } else if (strstr(text, "B4 shared-weight")) {
+        bit = 1u << 11;
     }
     if (bit != 0) {
         m5_tensorops_path_log_marker * marker = static_cast<m5_tensorops_path_log_marker *>(user_data);
@@ -1737,16 +1747,17 @@ static bool test_metal_row4_swiglu_down_fusion() {
             ggml_backend_t     metal_fused = ggml_backend_dev_init(dev, nullptr);
             std::vector<float> fused;
             bool               gate_up_fusion_hit = false;
+            bool               m5_tensorops_bypass_hit = false;
             ok = metal_fused &&
                  run_row4_swiglu_down_backend(fused, metal_fused, input, gate_up_pair2, gate_up_pair2_scales,
                                               down_pair2, down_pair2_scales, tokens, true, false, false,
-                                              &gate_up_fusion_hit, false, true) &&
+                                              &gate_up_fusion_hit, false, true, &m5_tensorops_bypass_hit) &&
                  compare_exact(("Row4 pair2 QAT SwiGLU-down fused/oracle B=" + std::to_string(tokens)).c_str(), fused,
                                oracle) &&
                  compare_exact(("Row4 pair2 QAT SwiGLU-down fused/unfused B=" + std::to_string(tokens)).c_str(), fused,
                                unfused) &&
                  ok;
-            const bool expect_gate_up_fusion = tokens > 8 && tokens % 32 == 0;
+            const bool expect_gate_up_fusion = tokens > 8 && tokens % 32 == 0 && !m5_tensorops_bypass_hit;
             if (gate_up_fusion_hit != expect_gate_up_fusion) {
                 fprintf(stderr, "Row4 pair2 gate-up producer fusion hit mismatch B=%lld: actual=%d expected=%d\n",
                         (long long) tokens, (int) gate_up_fusion_hit, (int) expect_gate_up_fusion);
@@ -2384,7 +2395,7 @@ static bool test_metal_operator_matrix() {
     }
 
     bool ok = true;
-    for (int64_t tokens : { 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
+    for (int64_t tokens : { 1, 2, 3, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 64, 96, 128, 256, 512 }) {
         const std::vector<float> input = make_input(K, tokens);
         std::vector<float>       actual;
         const std::vector<float> expected_row4 = oracle_row4_linear(input, row4_codes, row4_scales, O, K, tokens);
@@ -2490,7 +2501,7 @@ static bool test_metal_operator_matrix() {
 
     if (require_m5_tensorops) {
         ggml_log_set(nullptr, nullptr);
-        constexpr uint32_t all_m5_tiles = (1u << 7) - 1u;
+        constexpr uint32_t all_m5_tiles = (1u << 12) - 1u;
         const uint32_t     hit_mask     = m5_marker.tile_mask.load(std::memory_order_relaxed);
         if (hit_mask != all_m5_tiles) {
             fprintf(stderr, "M5 TensorOps tile marker mismatch: actual=0x%x expected=0x%x\n", hit_mask, all_m5_tiles);
@@ -2566,14 +2577,13 @@ static bool test_metal_real_shape_matrix() {
         const char * label;
         int64_t      o;
         int64_t      k;
-        bool         packed_n32_boundaries;
     };
 
     const row4_shape shapes[] = {
-        { "qkv",     6144,  4096,  true  },
-        { "o",       4096,  4096,  false },
-        { "gate_up", 24576, 4096,  false },
-        { "down",    4096,  12288, true  },
+        { "qkv",     6144,  4096  },
+        { "o",       4096,  4096  },
+        { "gate_up", 24576, 4096  },
+        { "down",    4096,  12288 },
     };
 
     bool ok = true;
@@ -2588,11 +2598,7 @@ static bool test_metal_real_shape_matrix() {
 
         const std::vector<float> input_two    = make_input(shape.k, 2);
         const std::vector<float> expected_two = oracle_row4_linear(input_two, codes, scales, shape.o, shape.k, 2);
-        for (int64_t tokens : { 1, 2, 4, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
-            if (!shape.packed_n32_boundaries && tokens != 1 && tokens != 8 && tokens != 9 && tokens != 16 &&
-                tokens != 32 && tokens != 256 && tokens != 512) {
-                continue;
-            }
+        for (int64_t tokens : { 1, 2, 3, 4, 7, 8, 9, 11, 12, 15, 16, 17, 24, 31, 32, 33, 64, 96, 128, 256, 512 }) {
             const std::vector<float> input    = repeat_two_token_pattern(input_two, shape.k, tokens);
             const std::vector<float> expected = repeat_two_token_output(expected_two, shape.o, tokens);
             std::vector<float>       actual;
@@ -2625,7 +2631,7 @@ static bool test_metal_real_shape_matrix() {
         }
         const std::vector<float> input_two    = make_input(K, 2);
         const std::vector<float> expected_two = oracle_w8a8_linear(input_two, codes, scales, O, K, 2);
-        for (int64_t tokens : { 8, 9, 15, 16, 32 }) {
+        for (int64_t tokens : { 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33 }) {
             const std::vector<float> input    = repeat_two_token_pattern(input_two, K, tokens);
             const std::vector<float> expected = repeat_two_token_output(expected_two, O, tokens);
             std::vector<float>       actual;
@@ -2652,7 +2658,7 @@ static bool test_metal_real_shape_matrix() {
                 }
             }
 
-            for (int64_t tokens : { 1, 8, 16, 32 }) {
+            for (int64_t tokens : { 1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33 }) {
                 const std::vector<float> input = repeat_two_token_pattern(input_two, K, tokens);
                 std::vector<float>       expected((size_t) FULL_O * tokens);
                 for (int64_t token = 0; token < tokens; ++token) {
