@@ -37,6 +37,11 @@
 
 #define LLAMA_TOKEN_NULL -1
 
+#define LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW        8192
+#define LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP    4096
+#define LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_K_MEAN_CENTER 2
+#define LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_K_MEAN_WARMUP 128
+
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
 #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
@@ -309,8 +314,8 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
-        uint32_t prefix_sliding_window;      // recent-token window, 0 = disabled [EXPERIMENTAL]
-        uint32_t prefix_sliding_prefix_cap;  // maximum preserved prompt length, 0 = disabled [EXPERIMENTAL]
+        uint32_t prefix_sliding_window;      // recent-token window, 0 = disabled
+        uint32_t prefix_sliding_prefix_cap;  // maximum preserved prompt length, 0 = disabled
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
