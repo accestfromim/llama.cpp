@@ -2,6 +2,7 @@
 #include "llama.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -81,6 +82,46 @@ int main(int argc, char ** argv) {
     cparams.kv_unified                = false;
     cparams.prefix_sliding_window     = 64;
     cparams.prefix_sliding_prefix_cap = 128;
+
+#ifndef _WIN32
+    if (mode == "turbo") {
+        unsetenv("TURBO_K_MEAN_WARMUP");
+        unsetenv("TURBO_KV_BOUNDARY_BF16_LAYERS");
+        const auto production_state_size = [&](bool disable_centering) {
+            if (disable_centering) {
+                setenv("TURBO_K_MEAN_CENTER", "0", 1);
+            } else {
+                unsetenv("TURBO_K_MEAN_CENTER");
+            }
+
+            llama_context_params production      = cparams;
+            production.n_ctx                     = 256;
+            production.n_seq_max                 = 1;
+            production.prefix_sliding_window     = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW;
+            production.prefix_sliding_prefix_cap = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP;
+
+            llama_context * production_ctx = llama_init_from_model(model, production);
+            require(production_ctx != nullptr, "production profile context creation failed");
+            require(llama_memory_seq_set_prefix(llama_get_memory(production_ctx), 0, 1),
+                    "production profile prefix set failed");
+
+            const llama_vocab * production_vocab = llama_model_get_vocab(model);
+            llama_token         production_token = llama_vocab_bos(production_vocab);
+            if (production_token == LLAMA_TOKEN_NULL) {
+                production_token = 0;
+            }
+            decode_prompt(production_ctx, 1, 0, production_token);
+            const size_t state_size = llama_state_seq_get_size(production_ctx, 0);
+            llama_free(production_ctx);
+            return state_size;
+        };
+
+        const size_t centered_state_size   = production_state_size(false);
+        const size_t uncentered_state_size = production_state_size(true);
+        unsetenv("TURBO_K_MEAN_CENTER");
+        require(centered_state_size > uncentered_state_size, "production profile did not enable K mean centering");
+    }
+#endif
 
     const auto expect_context_failure = [&](llama_context_params invalid, const char * message) {
         llama_context * invalid_ctx = llama_init_from_model(model, invalid);

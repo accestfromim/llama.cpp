@@ -141,6 +141,46 @@ int main(void) {
     }
 
     {
+        common_params production_params;
+        argv      = { "binary_name", "--row4-prefix-sliding" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), production_params, LLAMA_EXAMPLE_MAIN));
+        assert(production_params.row4_prefix_sliding);
+        assert(production_params.turboquant);
+        assert(production_params.cache_type_k == GGML_TYPE_TURBO4_0);
+        assert(production_params.cache_type_v == GGML_TYPE_TURBO3_0);
+        assert(production_params.prefix_sliding_window == LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW);
+        assert(production_params.prefix_sliding_prefix_cap == LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP);
+    }
+
+    {
+        common_params production_params;
+        argv      = { "binary_name",
+                      "--row4-prefix-sliding",
+                      "--cache-type-k",
+                      "bf16",
+                      "--cache-type-v",
+                      "bf16",
+                      "--prefix-sliding-window",
+                      "4096",
+                      "--prefix-sliding-prefix-cap",
+                      "2048" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), production_params, LLAMA_EXAMPLE_MAIN));
+        assert(production_params.cache_type_k == GGML_TYPE_BF16);
+        assert(production_params.cache_type_v == GGML_TYPE_BF16);
+        assert(production_params.prefix_sliding_window == 4096);
+        assert(production_params.prefix_sliding_prefix_cap == 2048);
+    }
+
+    {
+        common_params production_params;
+        argv      = { "binary_name", "--row4-prefix-sliding", "--prefix-sliding-window", "4096" };
+        auto args = list_str_to_char(argv);
+        assert(false == common_params_parse(argv.size(), args.data(), production_params, LLAMA_EXAMPLE_MAIN));
+    }
+
+    {
         common_params prefix_params;
         argv      = { "binary_name", "--no-context-shift", "--prefix-sliding-window", "8192" };
         auto args = list_str_to_char(argv);
