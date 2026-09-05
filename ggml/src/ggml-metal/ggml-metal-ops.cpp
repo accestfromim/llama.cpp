@@ -2238,9 +2238,25 @@ static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(b
             true,
         };
     }
-    // Both physical layouts decode directly into a bounded threadgroup INT4
-    // tile. Keep Pair2 multi-decode on its independent-row LUT path.
+    // Small Pair2 batches favor LUTs except for wide projections, where a
+    // full MPP token tile amortizes the online codebook expansion.
     if (layout == 2 && act_rows < 32) {
+        if (act_rows >= 12 && act_rows <= 16 && m >= 16384 && m % 64 == 0 && k <= 4096) {
+            return { "kernel_row4_w1a8_m5_tensorops_decode_m16n64_sg4",
+                     "M5 MPP TensorOps exact A8/I4/I32 M16N64 SG4 multi-decode",
+                     16,
+                     64,
+                     4,
+                     false };
+        }
+        if (act_rows > 16 && m >= 6144 && m % 128 == 0 && k <= 4096) {
+            return { "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
+                     "M5 MPP TensorOps exact A8/I4/I32 M32N128 padded multi-decode",
+                     32,
+                     128,
+                     4,
+                     false };
+        }
         return {};
     }
     if (act_rows >= 256 && act_rows % 256 == 0 && m % 32 == 0) {
@@ -2306,6 +2322,19 @@ static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(b
     return {};
 }
 
+static int ggml_metal_w8_m5_row_tile(ggml_metal_device_t dev, const ggml_tensor * op) {
+    const int64_t rows = ggml_nrows(op->src[0]);
+    const int32_t k    = ggml_get_op_params_i32(op, 2);
+    // B2/B3 showed no reliable full-model gain; retain their independent-row path.
+    return op->op == GGML_OP_W8A8_LINEAR && ggml_metal_device_get_props(dev)->has_mpp_tensorops && rows >= 4 &&
+                   rows <= 32 && ggml_get_op_params_i32(op, 1) % 128 == 0 && k > 0 && k % 128 == 0 &&
+                   k <= std::numeric_limits<int32_t>::max() / (128 * 127) ?
+               (rows <= 8  ? 8 :
+                rows <= 16 ? 16 :
+                             32) :
+               0;
+}
+
 size_t ggml_metal_op_row_quant_linear_extra_act_q(ggml_metal_device_t dev, const ggml_tensor * op) {
     assert(op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR);
     assert(op->src[0]);
@@ -2321,14 +2350,12 @@ size_t ggml_metal_op_row_quant_linear_extra_act_q(ggml_metal_device_t dev, const
             ggml_metal_row4_m5_tensorops_select(ggml_metal_device_get_props(dev)->has_mpp_tensorops, false, layout,
                                                 (int32_t) act_rows, ggml_get_op_params_i32(op, 1), (int32_t) k) :
             ggml_metal_row4_m5_tensorops_config{};
-    const bool w8_m5_tensorops = op->op == GGML_OP_W8A8_LINEAR &&
-                                 ggml_metal_device_get_props(dev)->has_mpp_tensorops && act_rows >= 2 && act_rows <= 16 &&
-                                 ggml_get_op_params_i32(op, 1) % 128 == 0 && k % 128 == 0;
+    const int    w8_row_tile = ggml_metal_w8_m5_row_tile(dev, op);
     const size_t staged_rows = m5_tensorops.pipeline_name ?
                                    (act_rows + (size_t) m5_tensorops.row_tile - 1) / (size_t) m5_tensorops.row_tile *
                                        (size_t) m5_tensorops.row_tile :
-                               w8_m5_tensorops ? 16 :
-                                                 act_rows;
+                               w8_row_tile ? GGML_PAD(act_rows, (size_t) w8_row_tile) :
+                                             act_rows;
     const size_t quant_bytes = staged_rows * k * sizeof(int8_t) + staged_rows * sizeof(float);
     const bool direct_act = op->op == GGML_OP_ROW4_LINEAR && !m5_tensorops.pipeline_name &&
                             ggml_get_op_params_i32(op, 1) % 64 == 0 && act_rows > 8 && act_rows % 32 == 0;
@@ -2415,24 +2442,22 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const bool row4_independent_rows = op->op == GGML_OP_ROW4_LINEAR && layout == 1 && act_rows >= 2 && act_rows <= 4 &&
                                        m % 16 == 0 && (k == 4096 || k == 12288) &&
                                        (act_rows < 4 || row4_problem_size <= 64U * 1024U * 1024U);
-    const bool row4_pair2_independent_rows = op->op == GGML_OP_ROW4_LINEAR && layout == 2 && act_rows >= 2 &&
-                                             act_rows <= 16 && m % 32 == 0 && k % 256 == 0 &&
-                                             k <= row4_pair2_f32_exact_k_max;
     const bool w8_independent_rows =
         op->op == GGML_OP_W8A8_LINEAR && act_rows >= 2 && act_rows <= 4 && m % 128 == 0 && k % 128 == 0;
-    const ggml_metal_row4_m5_tensorops_config row4_m5_tensorops = ggml_metal_row4_m5_tensorops_select(
-        op->op == GGML_OP_ROW4_LINEAR && !row4_independent_rows && !row4_pair2_independent_rows &&
-            ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops,
-        qat_residual_add != nullptr, layout, act_rows, m, k);
+    const ggml_metal_row4_m5_tensorops_config row4_m5_tensorops =
+        ggml_metal_row4_m5_tensorops_select(op->op == GGML_OP_ROW4_LINEAR && !row4_independent_rows &&
+                                                ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops,
+                                            qat_residual_add != nullptr, layout, act_rows, m, k);
     const bool row4_m5_tensorops_prefill = row4_m5_tensorops.pipeline_name != nullptr;
-    const bool w8_m5_tensorops_m16       = op->op == GGML_OP_W8A8_LINEAR && !w8_independent_rows &&
-                                     ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops && act_rows >= 2 &&
-                                     act_rows <= 16 && m % 128 == 0 && k % 128 == 0;
+    const bool    row4_pair2_independent_rows = op->op == GGML_OP_ROW4_LINEAR && layout == 2 && act_rows >= 2 &&
+                                                act_rows <= 16 && m % 32 == 0 && k % 256 == 0 &&
+                                                k <= row4_pair2_f32_exact_k_max && !row4_m5_tensorops_prefill;
+    const int     w8_row_tile                 = ggml_metal_w8_m5_row_tile(ctx->dev, op);
     const int32_t staged_rows =
         row4_m5_tensorops_prefill ?
             (act_rows + row4_m5_tensorops.row_tile - 1) / row4_m5_tensorops.row_tile * row4_m5_tensorops.row_tile :
-        w8_m5_tensorops_m16 ? 16 :
-                              act_rows;
+        w8_row_tile ? GGML_PAD(act_rows, w8_row_tile) :
+                      act_rows;
     const bool row4_direct_act           = op->op == GGML_OP_ROW4_LINEAR && !row4_m5_tensorops_prefill && m % 64 == 0 &&
                                  act_rows > 8 && act_rows % 32 == 0;
 
@@ -2522,6 +2547,14 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const bool      row4_v2      = row4 && layout == 2;
     const bool                      pair2_decode = row4_v2 && (path == PATH_DECODE || row4_pair2_independent_rows);
     const ggml_metal_device_props * props_dev             = ggml_metal_device_get_props(ctx->dev);
+    const bool pair2_shared_eligible = row4_v2 && !row4_m5_tensorops_prefill && props_dev->has_mpp_tensorops &&
+                                       act_rows >= 4 && act_rows < 32 && m % 32 == 0 && k % 256 == 0 &&
+                                       k <= row4_pair2_f32_exact_k_max &&
+                                       (act_rows >= 8 || m >= 16384 || (k > 4096 && act_rows >= 4));
+    const int  pair2_shared_rows     = !pair2_shared_eligible                                                   ? 0 :
+                                       act_rows >= 4 && (size_t) k * 4 <= props_dev->max_theadgroup_memory_size ? 4 :
+                                       (size_t) k * 2 <= props_dev->max_theadgroup_memory_size                  ? 2 :
+                                                                                                                  0;
     const size_t                    pair2_decode_bytes    = (size_t) k * sizeof(int8_t);
     const bool                      pair2_decode_tgmem_ok = !pair2_decode || (k <= row4_pair2_f32_exact_k_max &&
                                                          pair2_decode_bytes <= props_dev->max_theadgroup_memory_size);
@@ -2538,13 +2571,16 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const bool w8_decode_o128_rows16       = !row4 && (path == PATH_DECODE || w8_independent_rows) && m % 128 == 0;
     const bool w8_decode_o64_rows8         = !row4 && path == PATH_DECODE && !w8_decode_o128_rows16;
     const bool row4_prefill_m64n32_native_layout_dualw_direct_act = row4_direct_act && !pair2_decode;
-    const bool row4_prefill_m64n32_native_layout_dualw =
-        row4 && path == PATH_PREFILL && m % 64 == 0 && !pair2_decode && !row4_direct_act && !row4_m5_tensorops_prefill;
+    const bool row4_prefill_m64n32_native_layout_dualw = row4 && path == PATH_PREFILL && m % 64 == 0 && !pair2_decode &&
+                                                         !row4_direct_act && !row4_m5_tensorops_prefill &&
+                                                         !pair2_shared_rows;
     const char * pipeline_name =
-        pair2_decode              ? (qat_residual_add ?
-                                         "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32_"
-                                         "qat_residual" :
-                                         "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32") :
+        pair2_shared_rows == 4 ? "kernel_row4_pair2_decode_o32_b4_shared" :
+        pair2_shared_rows == 2 ? "kernel_row4_pair2_decode_o32_b2_shared" :
+        pair2_decode ? (qat_residual_add ?
+                            "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32_"
+                            "qat_residual" :
+                            "kernel_row4_w1a8_decode_o32_o4_staged_act_pair2_dual_o4_lookahead_lut16_const_rows_f32") :
         qat_residual_add          ? "kernel_row4_w1a8_decode_o16_o4_staged_act_qat_residual" :
         row4_m5_tensorops_prefill ? row4_m5_tensorops.pipeline_name :
         row4_prefill_m64n32_native_layout_dualw_direct_act ?
@@ -2552,7 +2588,9 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         row4_prefill_m64n32_native_layout_dualw ? "kernel_row4_w1a8_prefill_m64n32_ilp4_native_layout_dualw" :
         row4_decode_o16_o4_staged_act           ? "kernel_row4_w1a8_decode_o16_o4_staged_act" :
         row4_decode_o32_segmented16             ? "kernel_row4_w1a8_decode_o32_segmented16" :
-        w8_m5_tensorops_m16                     ? "kernel_row8_w8a8_m5_tensorops_m16n128" :
+        w8_row_tile == 8                        ? "kernel_row8_w8a8_m5_direct_m8n16" :
+        w8_row_tile == 16                       ? "kernel_row8_w8a8_m5_direct_m16n16" :
+        w8_row_tile == 32                       ? "kernel_row8_w8a8_m5_direct_m32n16" :
         w8_decode_o128_rows16                   ? "kernel_row8_w8a8_decode_o128_rows16" :
         w8_decode_o64_rows8                     ? "kernel_row8_w8a8_decode_o64_rows8" :
         row4 && path == PATH_SMALL_BATCH        ? "kernel_row4_w1a8_small_batch" :
@@ -2560,6 +2598,10 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         row4                                    ? "kernel_row4_w1a8_prefill" :
                                                   "kernel_row8_w8a8_prefill";
     const char * row4_path_detail =
+        pair2_shared_rows == 4 ?
+            "M5 exact F16 packet8/F32 LUT16 O32 B4 shared-weight" :
+        pair2_shared_rows == 2 ?
+            "M5 exact F16 packet8/F32 LUT16 O32 B2 shared-weight" :
         row4_m5_tensorops_prefill ?
             row4_m5_tensorops.path_detail :
         pair2_decode && props_dev->has_mpp_tensorops ?
@@ -2583,6 +2625,9 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         pipeline = ggml_metal_library_compile_pipeline(lib, pipeline_name, pipeline_name, nullptr);
     }
 
+    const int pair2_shared_nth =
+        pair2_shared_rows && k > 4096 && ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) >= 256 ? 256 : 128;
+
     using log_key = std::tuple<int, int, bool, int32_t, int32_t, int32_t, int32_t>;
 
     static std::mutex                 log_mutex;
@@ -2605,7 +2650,12 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         logged_local.emplace_back(key);
     }
     if (log_shape) {
-        if (row4_v2 && pair2_decode) {
+        if (pair2_shared_rows) {
+            GGML_LOG_INFO(
+                "ROW4 Metal W1A8 path: %s layout=m32k256_pair2_split8_v2 act_rows=%d O=%d K=%d "
+                "pipeline=lut16-shared-rows split_K=%d threads=%d (%s, BF16 boundary)\n",
+                suffix, act_rows, m, k, pair2_shared_nth / 128, pair2_shared_nth, row4_path_detail);
+        } else if (row4_v2 && pair2_decode) {
             GGML_LOG_INFO(
                 "ROW4 Metal W1A8 path: %s layout=m32k256_pair2_split8_v2 act_rows=%d O=%d K=%d pipeline=%s (%s, "
                 "BF16 boundary)\n",
@@ -2614,8 +2664,10 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
             GGML_LOG_INFO("ROW4 Metal W1A8 path: %s layout=%s act_rows=%d O=%d K=%d (%s, BF16 boundary)\n", suffix,
                           row4_v2 ? "m32k256_pair2_split8_v2" : "m16k128_split8_v1", act_rows, m, k, row4_path_detail);
         } else {
-            const char * w8_path_detail = w8_m5_tensorops_m16 ? "M5 MPP TensorOps exact A8/I8/I32 M16N128" :
-                                          path == PATH_PREFILL ? "half MMA/F32 K1024 segments/I32 merge" :
+            const char * w8_path_detail = w8_row_tile == 8  ? "M5 MPP TensorOps exact A8/I8/I32 M8N16 direct-device" :
+                                          w8_row_tile == 16 ? "M5 MPP TensorOps exact A8/I8/I32 M16N16 direct-device" :
+                                          w8_row_tile == 32 ? "M5 MPP TensorOps exact A8/I8/I32 M32N16 direct-device" :
+                                          path == PATH_PREFILL  ? "half MMA/F32 K1024 segments/I32 merge" :
                                           w8_decode_o128_rows16 ? "A8/I32 O128 sixteen-rows-per-SIMDgroup" :
                                           w8_decode_o64_rows8   ? "A8/I32 O64 eight-rows-per-SIMDgroup" :
                                                                   "A8/I32";
@@ -2675,14 +2727,11 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(qat_residual_add->src[1]), 6);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(qat_residual_add), 7);
     }
-    if (w8_m5_tensorops_m16) {
-        constexpr int output_tile = 128;
-        constexpr int k_tile      = 128;
+    if (w8_row_tile) {
+        constexpr int output_tile = 16;
         constexpr int nth         = 4 * 32;
-        constexpr int row_tile    = 16;
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, output_tile * k_tile * sizeof(int8_t), 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, m / output_tile, staged_rows / row_tile, 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, m / output_tile, staged_rows / w8_row_tile, 1, nth, 1, 1);
     } else if (row4_m5_tensorops_prefill) {
         constexpr int k_tile            = 128;
         constexpr int int4_stride       = 256;
@@ -2696,10 +2745,18 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_buffer(enc, act_h, 6);
     }
 
-    if (w8_m5_tensorops_m16) {
+    if (w8_row_tile) {
         // Dispatched above with its dedicated TensorOps geometry.
     } else if (row4_m5_tensorops_prefill) {
         // Dispatched above with its dedicated TensorOps geometry.
+    } else if (pair2_shared_rows) {
+        const size_t stage_bytes = (size_t) pair2_shared_rows * (size_t) k;
+        GGML_ASSERT(act_q.offs % 16 == 0);
+        GGML_ASSERT(pair2_shared_nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        GGML_ASSERT(stage_bytes + ggml_metal_pipeline_get_smem(pipeline) <= props_dev->max_theadgroup_memory_size);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, stage_bytes, 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, m / 32, (act_rows + pair2_shared_rows - 1) / pair2_shared_rows, 1,
+                                                 pair2_shared_nth, 1, 1);
     } else if (row4_prefill_m64n32_native_layout_dualw_direct_act) {
         constexpr int row_tile  = 64;
         constexpr int col_tile  = 32;

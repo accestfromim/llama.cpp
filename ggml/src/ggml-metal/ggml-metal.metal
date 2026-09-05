@@ -1687,6 +1687,73 @@ template_row8_m5_tensorops(kernel_row8_w8a8_m5_tensorops_m16n128, 16)
 template_row8_m5_tensorops(kernel_row8_w8a8_m5_tensorops_m8n128,   8)
 #undef template_row8_m5_tensorops
 
+// The on-disk W8 tile is already a contiguous {K128, O16} tensor.
+// Consume it as the transposed right operand instead of gathering and
+// transposing O128 into threadgroup memory before every matrix operation.
+template<int row_tile>
+static inline void row8_w8a8_m5_direct_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const char * codes,
+        device const float * scales,
+        device int8_t * act_q,
+        device const float * act_scales,
+        device float * dst,
+        uint3 tgpig) {
+    constexpr int output_tile = 16;
+    constexpr int k_tile = 128;
+    constexpr auto desc = matmul2d_descriptor(
+        row_tile, output_tile, k_tile, false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    using input_tensor = tensor<device int8_t, dextents<int, 2>, tensor_inline>;
+    auto acc = op.template get_destination_cooperative_tensor<input_tensor, input_tensor, int32_t>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+    const uint output_base = tgpig.x * output_tile;
+    const uint row_base = tgpig.y * row_tile;
+    for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
+        input_tensor activation(
+            act_q + (ulong) row_base * (ulong) args.k + k_base,
+            dextents<int, 2>(k_tile, row_tile), array<int, 2>{ 1, args.k });
+        input_tensor weight(
+            (device int8_t *) codes + (ulong) output_base * (ulong) args.k + (ulong) k_base * output_tile,
+            dextents<int, 2>(k_tile, output_tile), array<int, 2>{ 1, k_tile });
+        op.run(activation, weight, acc);
+    }
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto coordinate = acc.get_multidimensional_index(i);
+            const uint output = output_base + (uint) coordinate[0];
+            const uint row = row_base + (uint) coordinate[1];
+            if (row < (uint) args.act_rows) {
+                dst[(ulong) row * (ulong) args.m + output] =
+                    w8a8_finish_i32(acc[i], act_scales[row], scales[output]);
+            }
+        }
+    }
+}
+
+#define ROW8_M5_DIRECT(name, rows) \
+kernel void name( \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]], \
+        device const char * codes [[buffer(1)]], \
+        device const float * scales [[buffer(2)]], \
+        device int8_t * act_q [[buffer(3)]], \
+        device const float * act_scales [[buffer(4)]], \
+        device float * dst [[buffer(5)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]]) { \
+    row8_w8a8_m5_direct_impl<rows>(args, codes, scales, act_q, act_scales, dst, tgpig); \
+}
+ROW8_M5_DIRECT(kernel_row8_w8a8_m5_direct_m8n16, 8)
+ROW8_M5_DIRECT(kernel_row8_w8a8_m5_direct_m16n16, 16)
+ROW8_M5_DIRECT(kernel_row8_w8a8_m5_direct_m32n16, 32)
+#undef ROW8_M5_DIRECT
+
 #endif
 
 static inline void row4_accumulate_basis_branchless(
@@ -2465,6 +2532,158 @@ static inline void row4_decode_pair2_lut16_apply(
     acc += float4(row4_decode4((uint) (packed.w >> 4))) * float4((float) activation1_high.y);
 #endif
 }
+
+#if defined(GGML_METAL_HAS_MPP_TENSOROPS)
+template<int rows>
+static inline void row4_pair2_apply_shared_rows(
+        uchar4 packed,
+        threadgroup const char * act,
+        int k,
+        thread float4 * acc) {
+    const half4 w0 = row4_decode4((uint) (packed.x & 0x0fU));
+    const half4 w1 = row4_decode4((uint) (packed.y & 0x0fU));
+    const half4 w2 = row4_decode4((uint) (packed.x >> 4));
+    const half4 w3 = row4_decode4((uint) (packed.y >> 4));
+    const half4 w4 = row4_decode4((uint) (packed.z & 0x0fU));
+    const half4 w5 = row4_decode4((uint) (packed.w & 0x0fU));
+    const half4 w6 = row4_decode4((uint) (packed.z >> 4));
+    const half4 w7 = row4_decode4((uint) (packed.w >> 4));
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        threadgroup const char * x = act + (ulong) r * (ulong) k;
+        const char2 a0 = *((threadgroup const char2 *) x);
+        const char2 a1 = *((threadgroup const char2 *) (x + 8));
+        const char2 a2 = *((threadgroup const char2 *) (x + 128));
+        const char2 a3 = *((threadgroup const char2 *) (x + 136));
+        // The same eight-term exact-FP16 bound applies independently to
+        // each token. Decode the coefficients once for the whole row tile.
+        half4 partial = {};
+        partial += w0 * half4((half) a0.x);
+        partial += w1 * half4((half) a0.y);
+        partial += w2 * half4((half) a1.x);
+        partial += w3 * half4((half) a1.y);
+        partial += w4 * half4((half) a2.x);
+        partial += w5 * half4((half) a2.y);
+        partial += w6 * half4((half) a3.x);
+        partial += w7 * half4((half) a3.y);
+        acc[r] += float4(partial);
+    }
+}
+
+template<int rows>
+static inline void row4_pair2_decode_shared_rows(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device const uchar * codes,
+        device const ushort * scales,
+        device const char * act_q,
+        device const float * act_scales,
+        device float * dst,
+        threadgroup char * act_tg,
+        uint3 tgpig,
+        uint tid,
+        uint simd_lane,
+        uint simd_group,
+        uint threads_per_tg) {
+    const uint row_base = tgpig.y * rows;
+    const uint output_pair = simd_group & 3U;
+    const uint k_partitions = threads_per_tg / 128U;
+    const uint k_partition = simd_group >> 2;
+    const uint vectors_per_row = (uint) args.k / 16U;
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const uint row = row_base + r;
+        for (uint v = tid; v < vectors_per_row; v += threads_per_tg) {
+            *((threadgroup int4 *) (act_tg + (ulong) r * (ulong) args.k + v * 16U)) =
+                row < (uint) args.act_rows ?
+                    *((device const int4 *) (act_q + (ulong) row * (ulong) args.k + v * 16U)) : int4(0);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 acc0[rows] = {};
+    float4 acc1[rows] = {};
+    const uint k_pairs = (uint) args.k / 256U;
+    const uint kp_begin = k_pairs * k_partition / k_partitions;
+    const uint kp_end = k_pairs * (k_partition + 1U) / k_partitions;
+    const uint split = simd_lane >> 2;
+    const uint j = (simd_lane & 3U) * 2U;
+    device const uchar * code = codes + (ulong) tgpig.x * k_pairs * 1024UL +
+                                kp_begin * 1024U + output_pair * 256U + simd_lane * 4U;
+    threadgroup const char * act = act_tg + kp_begin * 256U + split * 16U + j;
+    for (uint kp = kp_begin; kp < kp_end; ++kp) {
+        const uchar4 packed0 = *((device const uchar4 *) code);
+        const uchar4 packed1 = *((device const uchar4 *) (code + 128));
+        row4_pair2_apply_shared_rows<rows>(packed0, act, args.k, acc0);
+        row4_pair2_apply_shared_rows<rows>(packed1, act, args.k, acc1);
+        code += 1024;
+        act += 256;
+    }
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        acc0[r] = simd_sum(acc0[r]);
+        acc1[r] = simd_sum(acc1[r]);
+    }
+    if (k_partitions == 2U) {
+        // Activation storage is dead now. Reuse it for the exact integer
+        // merge, with enough space even for rows * K256 test tensors.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup int4 * partials = (threadgroup int4 *) act_tg;
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            if (simd_lane == 0U) {
+                partials[r * 16U + simd_group * 2U] = int4(acc0[r]);
+                partials[r * 16U + simd_group * 2U + 1U] = int4(acc1[r]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            if (k_partition == 0U) {
+                const uint off = r * 16U + simd_group * 2U;
+                acc0[r] = float4(partials[off] + partials[off + 8U]);
+                acc1[r] = float4(partials[off + 1U] + partials[off + 9U]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const int4 sum0 = int4(acc0[r]);
+        const int4 sum1 = int4(acc1[r]);
+        const uint row = row_base + r;
+        if (k_partition == 0U && simd_lane == 0U && row < (uint) args.act_rows) {
+            const uint output = tgpig.x * 32U + simd_group * 8U;
+            const float sx = act_scales[row];
+            device float * out = dst + (ulong) row * (ulong) args.m + output;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                out[i] = row4_finish_i32(sum0[i], sx, scales[output + i]);
+                out[i + 4] = row4_finish_i32(sum1[i], sx, scales[output + i + 4]);
+            }
+        }
+    }
+}
+
+#define ROW4_PAIR2_SHARED_ROWS(name, rows) \
+kernel void name( \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]], \
+        device const uchar * codes [[buffer(1)]], \
+        device const ushort * scales [[buffer(2)]], \
+        device const char * act_q [[buffer(3)]], \
+        device const float * act_scales [[buffer(4)]], \
+        device float * dst [[buffer(5)]], \
+        threadgroup char * act_tg [[threadgroup(0)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]], \
+        uint tid [[thread_index_in_threadgroup]], \
+        uint simd_lane [[thread_index_in_simdgroup]], \
+        uint simd_group [[simdgroup_index_in_threadgroup]], \
+        uint3 ntg [[threads_per_threadgroup]]) { \
+    row4_pair2_decode_shared_rows<rows>(args, codes, scales, act_q, act_scales, dst, act_tg, \
+                                      tgpig, tid, simd_lane, simd_group, ntg.x); \
+}
+ROW4_PAIR2_SHARED_ROWS(kernel_row4_pair2_decode_o32_b2_shared, 2)
+ROW4_PAIR2_SHARED_ROWS(kernel_row4_pair2_decode_o32_b4_shared, 4)
+#undef ROW4_PAIR2_SHARED_ROWS
+#endif
 
 static inline void row4_decode_pair2_lut16_accumulate_dual_o4_lookahead(
         constant ggml_metal_kargs_row_quant_linear & args,
