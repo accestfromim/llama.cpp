@@ -352,6 +352,7 @@ static void print_usage(int /* argc */, char ** argv) {
            cmd_params_defaults.prefix_sliding_window);
     printf("  --prefix-sliding-prefix-cap <n>           (default: %d, disabled)\n",
            cmd_params_defaults.prefix_sliding_prefix_cap);
+    printf("  --row4-prefix-sliding                     use the validated K4/V3, W8192, cap4096 profile\n");
     printf("  -ctk, --cache-type-k <t>                  (default: %s)\n",
            join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                  (default: %s)\n",
@@ -492,6 +493,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.prefix_sliding_window     = cmd_params_defaults.prefix_sliding_window;
     params.prefix_sliding_prefix_cap = cmd_params_defaults.prefix_sliding_prefix_cap;
     bool turboquant             = false;
+    bool row4_prefix_sliding         = false;
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
@@ -568,6 +570,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.prefix_sliding_prefix_cap = std::stoi(argv[i]);
+            } else if (arg == "--row4-prefix-sliding") {
+                row4_prefix_sliding = true;
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -902,6 +906,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
         print_usage(argc, argv);
         exit(1);
+    }
+
+    if (row4_prefix_sliding) {
+        turboquant = true;
+        if (params.prefix_sliding_window == 0 && params.prefix_sliding_prefix_cap == 0) {
+            params.prefix_sliding_window     = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW;
+            params.prefix_sliding_prefix_cap = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP;
+        }
     }
 
     if (params.prefix_sliding_window < 0 || params.prefix_sliding_prefix_cap < 0) {
