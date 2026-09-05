@@ -103,6 +103,107 @@ int main(void) {
     assert(params.speculative.cache_type_k == GGML_TYPE_F16);
     assert(params.speculative.cache_type_v == GGML_TYPE_F16);
 
+    {
+        common_params turbo_params;
+        argv      = { "binary_name", "--turboquant" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), turbo_params, LLAMA_EXAMPLE_COMMON));
+        assert(turbo_params.cache_type_k == GGML_TYPE_TURBO4_0);
+        assert(turbo_params.cache_type_v == GGML_TYPE_TURBO3_0);
+    }
+
+    {
+        common_params turbo_params;
+        argv      = { "binary_name", "--cache-type-k", "turbo2", "--turboquant", "--cache-type-v", "turbo4" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), turbo_params, LLAMA_EXAMPLE_COMMON));
+        assert(turbo_params.cache_type_k == GGML_TYPE_TURBO2_0);
+        assert(turbo_params.cache_type_v == GGML_TYPE_TURBO4_0);
+    }
+
+    {
+        common_params default_params;
+        argv      = { "binary_name" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), default_params, LLAMA_EXAMPLE_COMMON));
+        assert(default_params.cache_type_k == GGML_TYPE_COUNT);
+        assert(default_params.cache_type_v == GGML_TYPE_COUNT);
+    }
+
+    {
+        common_params prefix_params;
+        argv      = { "binary_name", "--no-context-shift",          "--prefix-sliding-window",
+                      "8192",        "--prefix-sliding-prefix-cap", "4096" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), prefix_params, LLAMA_EXAMPLE_MAIN));
+        assert(prefix_params.prefix_sliding_window == 8192);
+        assert(prefix_params.prefix_sliding_prefix_cap == 4096);
+    }
+
+    {
+        common_params production_params;
+        argv      = { "binary_name", "--row4-prefix-sliding" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), production_params, LLAMA_EXAMPLE_MAIN));
+        assert(production_params.row4_prefix_sliding);
+        assert(production_params.turboquant);
+        assert(production_params.cache_type_k == GGML_TYPE_TURBO4_0);
+        assert(production_params.cache_type_v == GGML_TYPE_TURBO3_0);
+        assert(production_params.prefix_sliding_window == LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW);
+        assert(production_params.prefix_sliding_prefix_cap == LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP);
+    }
+
+    {
+        common_params production_params;
+        argv      = { "binary_name",
+                      "--row4-prefix-sliding",
+                      "--cache-type-k",
+                      "bf16",
+                      "--cache-type-v",
+                      "bf16",
+                      "--prefix-sliding-window",
+                      "4096",
+                      "--prefix-sliding-prefix-cap",
+                      "2048" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), production_params, LLAMA_EXAMPLE_MAIN));
+        assert(production_params.cache_type_k == GGML_TYPE_BF16);
+        assert(production_params.cache_type_v == GGML_TYPE_BF16);
+        assert(production_params.prefix_sliding_window == 4096);
+        assert(production_params.prefix_sliding_prefix_cap == 2048);
+    }
+
+    {
+        common_params production_params;
+        argv      = { "binary_name", "--row4-prefix-sliding", "--prefix-sliding-window", "4096" };
+        auto args = list_str_to_char(argv);
+        assert(false == common_params_parse(argv.size(), args.data(), production_params, LLAMA_EXAMPLE_MAIN));
+    }
+
+    {
+        common_params prefix_params;
+        argv      = { "binary_name", "--no-context-shift", "--prefix-sliding-window", "8192" };
+        auto args = list_str_to_char(argv);
+        assert(false == common_params_parse(argv.size(), args.data(), prefix_params, LLAMA_EXAMPLE_MAIN));
+    }
+
+    {
+        common_params prefix_params;
+        argv      = { "binary_name", "--no-context-shift",          "--prefix-sliding-window",
+                      "-1",          "--prefix-sliding-prefix-cap", "-1" };
+        auto args = list_str_to_char(argv);
+        assert(false == common_params_parse(argv.size(), args.data(), prefix_params, LLAMA_EXAMPLE_MAIN));
+    }
+
+    {
+        common_params turbo_params;
+        argv      = { "binary_name", "--turboquant", "--cache-type-k", "auto" };
+        auto args = list_str_to_char(argv);
+        assert(true == common_params_parse(argv.size(), args.data(), turbo_params, LLAMA_EXAMPLE_COMMON));
+        assert(turbo_params.cache_type_k == GGML_TYPE_COUNT);
+        assert(turbo_params.cache_type_v == GGML_TYPE_TURBO3_0);
+    }
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");

@@ -268,6 +268,81 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// TurboQuant KV blocks are runtime-only and store values in the rotated domain.
+#        define QK_TURBO2       128
+#        define QK_TURBO2_GROUP 128
+#        define NL_TURBO2       (QK_TURBO2 / 16)
+#        define NL_TURBO2_VEC   (QK_TURBO2 / 4)
+
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO2 / 4];
+} block_turbo2_0;
+
+static_assert(sizeof(block_turbo2_0) == 34, "wrong turbo2_0 block size");
+
+#        define QK_TURBO3       128
+#        define QK_TURBO3_GROUP 128
+#        define NL_TURBO3       (QK_TURBO3 / 16)
+#        define NL_TURBO3_VEC   (QK_TURBO3 / 4)
+
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO3 / 4];
+    uint8_t   signs[QK_TURBO3 / 8];
+} block_turbo3_0;
+
+static_assert(sizeof(block_turbo3_0) == 50, "wrong turbo3_0 block size");
+
+#        define QK_TURBO4       128
+#        define TURBO4_USE_4BIT 1
+
+typedef struct {
+    ggml_half norm;
+    uint8_t   qs[QK_TURBO4 / 2];
+} block_turbo4_0;
+
+static_assert(sizeof(block_turbo4_0) == 66, "wrong turbo4_0 block size");
+
+#        define QK_TURBO2M4 128
+
+#        pragma pack(push, 1)
+
+#        define DECLARE_BLOCK_TURBO2M4_SCALAR(name, n) \
+            typedef struct {                           \
+                ggml_half norm;                        \
+                uint8_t   qs[QK_TURBO2M4 / 4];         \
+                uint8_t   positions[n];                \
+                uint8_t   qh[n / 2];                   \
+            } name
+
+#        define DECLARE_BLOCK_TURBO2M4_GROUP(name, n_groups) \
+            typedef struct {                                 \
+                ggml_half norm;                              \
+                uint8_t   qs[QK_TURBO2M4 / 4];               \
+                uint8_t   positions[n_groups];               \
+                uint8_t   qh[2 * n_groups];                  \
+            } name
+
+DECLARE_BLOCK_TURBO2M4_SCALAR(block_turbo2m4_s4, 4);
+DECLARE_BLOCK_TURBO2M4_SCALAR(block_turbo2m4_s8, 8);
+DECLARE_BLOCK_TURBO2M4_SCALAR(block_turbo2m4_s16, 16);
+DECLARE_BLOCK_TURBO2M4_GROUP(block_turbo2m4_g4, 1);
+DECLARE_BLOCK_TURBO2M4_GROUP(block_turbo2m4_g8, 2);
+DECLARE_BLOCK_TURBO2M4_GROUP(block_turbo2m4_g16, 4);
+
+#        pragma pack(pop)
+
+static_assert(sizeof(block_turbo2m4_s4) == 40, "wrong turbo2m4_s4 block size");
+static_assert(sizeof(block_turbo2m4_s8) == 46, "wrong turbo2m4_s8 block size");
+static_assert(sizeof(block_turbo2m4_s16) == 58, "wrong turbo2m4_s16 block size");
+static_assert(sizeof(block_turbo2m4_g4) == 37, "wrong turbo2m4_g4 block size");
+static_assert(sizeof(block_turbo2m4_g8) == 40, "wrong turbo2m4_g8 block size");
+static_assert(sizeof(block_turbo2m4_g16) == 46, "wrong turbo2m4_g16 block size");
+
+#        undef DECLARE_BLOCK_TURBO2M4_SCALAR
+#        undef DECLARE_BLOCK_TURBO2M4_GROUP
+
 // ifairy_model
 // 每个块处理 QK_IFAIRY 个 2-bit 值
 // 每个复数用一个 2-bit 值表示（离散化到 4 个复数值）

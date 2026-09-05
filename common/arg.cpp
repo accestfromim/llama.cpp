@@ -1037,15 +1037,10 @@ static handle_model_result common_params_handle_model(
 }
 
 const std::vector<ggml_type> kv_cache_types = {
-    GGML_TYPE_F32,
-    GGML_TYPE_F16,
-    GGML_TYPE_BF16,
-    GGML_TYPE_Q8_0,
-    GGML_TYPE_Q4_0,
-    GGML_TYPE_Q4_1,
-    GGML_TYPE_IQ4_NL,
-    GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_1,
+    GGML_TYPE_F32,         GGML_TYPE_F16,         GGML_TYPE_BF16,         GGML_TYPE_Q8_0,        GGML_TYPE_TURBO2_0,
+    GGML_TYPE_TURBO3_0,    GGML_TYPE_TURBO4_0,    GGML_TYPE_TURBO2M4_S4,  GGML_TYPE_TURBO2M4_S8, GGML_TYPE_TURBO2M4_S16,
+    GGML_TYPE_TURBO2M4_G4, GGML_TYPE_TURBO2M4_G8, GGML_TYPE_TURBO2M4_G16, GGML_TYPE_Q4_0,        GGML_TYPE_Q4_1,
+    GGML_TYPE_IQ4_NL,      GGML_TYPE_Q5_0,        GGML_TYPE_Q5_1,
 };
 
 static const char * kv_cache_type_name(ggml_type type) {
@@ -1432,6 +1427,48 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        if (ctx_arg.params.row4_prefix_sliding) {
+            ctx_arg.params.turboquant = true;
+            if (ctx_arg.params.prefix_sliding_window == 0 && ctx_arg.params.prefix_sliding_prefix_cap == 0) {
+                ctx_arg.params.prefix_sliding_window     = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW;
+                ctx_arg.params.prefix_sliding_prefix_cap = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP;
+            }
+        }
+        if (ctx_arg.params.turboquant) {
+            if (!ctx_arg.params.cache_type_k_explicit && ctx_arg.params.cache_type_k == GGML_TYPE_COUNT) {
+                ctx_arg.params.cache_type_k = GGML_TYPE_TURBO4_0;
+            }
+            if (!ctx_arg.params.cache_type_v_explicit && ctx_arg.params.cache_type_v == GGML_TYPE_COUNT) {
+                ctx_arg.params.cache_type_v = GGML_TYPE_TURBO3_0;
+            }
+        }
+        if ((ctx_arg.params.prefix_sliding_window > 0) != (ctx_arg.params.prefix_sliding_prefix_cap > 0)) {
+            throw std::invalid_argument(
+                "--prefix-sliding-window and --prefix-sliding-prefix-cap must both be positive");
+        }
+        if (ctx_arg.params.prefix_sliding_window < 0 || ctx_arg.params.prefix_sliding_prefix_cap < 0) {
+            throw std::invalid_argument("prefix sliding values must not be negative");
+        }
+        if (ctx_arg.params.prefix_sliding_window > 0) {
+            if (ctx_arg.params.ctx_shift || ctx_arg.params.grp_attn_n != 1 || ctx_arg.params.kv_unified) {
+                throw std::invalid_argument(
+                    "prefix sliding is incompatible with context shift, self-extend, and unified KV");
+            }
+            if (ctx_arg.params.n_cache_reuse > 0) {
+                throw std::invalid_argument("prefix sliding is incompatible with chunk relocation cache reuse");
+            }
+            if (!ctx_arg.params.mmproj.path.empty() || !ctx_arg.params.image.empty()) {
+                throw std::invalid_argument("prefix sliding does not support multimodal requests");
+            }
+            const bool has_speculative_model =
+                !ctx_arg.params.speculative.model.path.empty() || !ctx_arg.params.speculative.model.hf_repo.empty();
+            const bool has_speculative_type =
+                std::any_of(ctx_arg.params.speculative.types.begin(), ctx_arg.params.speculative.types.end(),
+                            [](common_speculative_type type) { return type != COMMON_SPECULATIVE_TYPE_NONE; });
+            if (has_speculative_model || has_speculative_type) {
+                throw std::invalid_argument("prefix sliding does not support speculative decoding");
+            }
+        }
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -1713,6 +1750,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.swa_full = true;
         }
     ).set_env("LLAMA_ARG_SWA_FULL"));
+    add_opt(common_arg({ "--prefix-sliding-window" }, "N",
+                       "recent-token window for Row4 prefix-sliding attention (default: 0, disabled)",
+                       [](common_params & params, int value) { params.prefix_sliding_window = value; })
+                .set_env("LLAMA_ARG_PREFIX_SLIDING_WINDOW")
+                .set_examples({ LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY }));
+    add_opt(common_arg({ "--prefix-sliding-prefix-cap" }, "N",
+                       "maximum preserved prompt length for Row4 prefix-sliding attention (default: 0, disabled)",
+                       [](common_params & params, int value) { params.prefix_sliding_prefix_cap = value; })
+                .set_env("LLAMA_ARG_PREFIX_SLIDING_PREFIX_CAP")
+                .set_examples({ LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY }));
+    add_opt(common_arg({ "--row4-prefix-sliding" },
+                       string_format("use the validated Row4 profile: K=turbo4, V=turbo3, window=%d, prefix cap=%d",
+                                     LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW,
+                                     LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP),
+                       [](common_params & params) { params.row4_prefix_sliding = true; })
+                .set_env("LLAMA_ARG_ROW4_PREFIX_SLIDING")
+                .set_examples({ LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY }));
     add_opt(common_arg(
         {"--swa-checkpoints"}, "N",
         string_format("max number of SWA checkpoints per slot to create (default: %d)\n"
@@ -2370,13 +2424,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_extra_bufts = true;
         }
     ).set_env("LLAMA_ARG_NO_REPACK"));
+    add_opt(common_arg({ "--turboquant" },
+                       "enable TurboQuant KV cache (default: K=turbo4, V=turbo3, centering=2/128, boundary=0; "
+                       "explicit cache types override)",
+                       [](common_params & params) { params.turboquant = true; })
+                .set_env("LLAMA_ARG_TURBOQUANT"));
     add_opt(common_arg({ "-ctk", "--cache-type-k" }, "TYPE",
                        string_format("KV cache data type for K\n"
                                      "allowed values: %s\n"
                                      "(default: %s)",
                                      get_all_kv_cache_types().c_str(), kv_cache_type_name(params.cache_type_k)),
                        [](common_params & params, const std::string & value) {
-                           params.cache_type_k = kv_cache_type_from_str(value);
+                           params.cache_type_k          = kv_cache_type_from_str(value);
+                           params.cache_type_k_explicit = true;
                        })
                 .set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg({ "-ctv", "--cache-type-v" }, "TYPE",
@@ -2385,7 +2445,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                      "(default: %s)",
                                      get_all_kv_cache_types().c_str(), kv_cache_type_name(params.cache_type_v)),
                        [](common_params & params, const std::string & value) {
-                           params.cache_type_v = kv_cache_type_from_str(value);
+                           params.cache_type_v          = kv_cache_type_from_str(value);
+                           params.cache_type_v_explicit = true;
                        })
                 .set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(

@@ -58,6 +58,8 @@ llama_context::llama_context(
 
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
+    cparams.prefix_sliding_window     = params.prefix_sliding_window;
+    cparams.prefix_sliding_prefix_cap = params.prefix_sliding_prefix_cap;
     cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -351,7 +353,7 @@ llama_context::llama_context(
             }
             if (row4_requires_metal_fa && (fa_device_mismatch || n_fa_nodes == 0)) {
                 throw std::runtime_error(
-                    "Qwen3 Row4 full Metal placement requires every BF16 Flash Attention node to remain on Metal");
+                    "Qwen3 Row4 full Metal placement requires every Flash Attention node to remain on Metal");
             }
             if (fa_device_mismatch) {
                 cparams.flash_attn = false;
@@ -1745,7 +1747,9 @@ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
 
-        if (magic != LLAMA_SESSION_MAGIC || version != LLAMA_SESSION_VERSION) {
+        const bool legacy         = version == LLAMA_SESSION_VERSION - 1;
+        const bool prefix_sliding = cparams.prefix_sliding_window > 0 && cparams.prefix_sliding_prefix_cap > 0;
+        if (magic != LLAMA_SESSION_MAGIC || (version != LLAMA_SESSION_VERSION && (!legacy || prefix_sliding))) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for session file: %08x, %08x\n", __func__, magic, version);
             return false;
         }
@@ -1805,7 +1809,9 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
 
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        const bool legacy         = version == LLAMA_STATE_SEQ_VERSION - 1;
+        const bool prefix_sliding = cparams.prefix_sliding_window > 0 && cparams.prefix_sliding_prefix_cap > 0;
+        if (magic != LLAMA_STATE_SEQ_MAGIC || (version != LLAMA_STATE_SEQ_VERSION && (!legacy || prefix_sliding))) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
             return 0;
         }
@@ -2293,6 +2299,8 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/2048,
         /*.n_ubatch                    =*/512,
         /*.n_seq_max                   =*/1,
+        /*.prefix_sliding_window       =*/0,
+        /*.prefix_sliding_prefix_cap   =*/0,
         /*.n_threads                   =*/GGML_DEFAULT_N_THREADS,  // TODO: better default
         /*.n_threads_batch             =*/GGML_DEFAULT_N_THREADS,
         /*.rope_scaling_type           =*/LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -2343,11 +2351,11 @@ llama_context * llama_init_from_model(
     }
 
     const bool   fairy2i_bf16_runtime = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_bf16_runtime_profile();
-    const bool   row4_bf16_runtime    = model->arch == LLM_ARCH_QWEN3 && model->row4_enabled;
+    const bool   row4_runtime         = model->arch == LLM_ARCH_QWEN3 && model->row4_enabled;
     const bool   fairy2i_qwen3_qat = model->arch == LLM_ARCH_FAIRY2I && model->fairy2i_uses_qwen3_qat_numeric_profile();
     const char * fairy2i_numeric_profile =
         model->arch == LLM_ARCH_FAIRY2I ? model->fairy2i_numeric_profile_name() : "n/a";
-    const ggml_type default_kv_type = fairy2i_bf16_runtime || row4_bf16_runtime ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    const ggml_type default_kv_type = fairy2i_bf16_runtime || row4_runtime ? GGML_TYPE_BF16 : GGML_TYPE_F16;
     if (params.type_k == GGML_TYPE_COUNT) {
         params.type_k = default_kv_type;
     }
@@ -2363,12 +2371,89 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
-    if (row4_bf16_runtime && (params.type_k != GGML_TYPE_BF16 || params.type_v != GGML_TYPE_BF16)) {
+    const auto is_turbo_kv = [](ggml_type type) {
+        return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+               (type >= GGML_TYPE_TURBO2M4_S4 && type <= GGML_TYPE_TURBO2M4_G16);
+    };
+    const auto is_turbo2m4 = [](ggml_type type) {
+        return type >= GGML_TYPE_TURBO2M4_S4 && type <= GGML_TYPE_TURBO2M4_G16;
+    };
+    const bool row4_turbo_runtime = row4_runtime && (is_turbo_kv(params.type_k) || is_turbo_kv(params.type_v));
+    const bool row4_mixed_pair    = (params.type_k == GGML_TYPE_TURBO4_0 || is_turbo2m4(params.type_k)) &&
+                                 (params.type_v == GGML_TYPE_TURBO3_0 || is_turbo2m4(params.type_v));
+    const bool row4_legacy_turbo_pair =
+        (is_turbo_kv(params.type_k) && (is_turbo_kv(params.type_v) || params.type_v == GGML_TYPE_Q8_0)) ||
+        (params.type_k == GGML_TYPE_Q8_0 && is_turbo_kv(params.type_v)) ||
+        (params.type_k == GGML_TYPE_Q4_0 && params.type_v == GGML_TYPE_TURBO4_0);
+    const bool row4_turbo_pair =
+        is_turbo2m4(params.type_k) || is_turbo2m4(params.type_v) ? row4_mixed_pair : row4_legacy_turbo_pair;
+    const bool row4_bf16_pair = params.type_k == GGML_TYPE_BF16 && params.type_v == GGML_TYPE_BF16;
+    const bool prefix_sliding = params.prefix_sliding_window > 0 || params.prefix_sliding_prefix_cap > 0;
+
+    if ((params.prefix_sliding_window == 0) != (params.prefix_sliding_prefix_cap == 0)) {
+        LLAMA_LOG_ERROR("%s: prefix sliding window and prefix cap must both be positive or both be zero\n", __func__);
+        return nullptr;
+    }
+
+    if (prefix_sliding) {
+        if (!row4_runtime) {
+            LLAMA_LOG_ERROR("%s: prefix sliding is supported only for Qwen3 Row4\n", __func__);
+            return nullptr;
+        }
+        if (!model->hparams.causal_attn || params.attention_type == LLAMA_ATTENTION_TYPE_NON_CAUSAL) {
+            LLAMA_LOG_ERROR("%s: prefix sliding requires causal attention\n", __func__);
+            return nullptr;
+        }
+        if (!row4_bf16_pair && !(params.type_k == GGML_TYPE_TURBO4_0 && params.type_v == GGML_TYPE_TURBO3_0)) {
+            LLAMA_LOG_ERROR("%s: prefix sliding supports only bf16/bf16 or turbo4/turbo3 KV\n", __func__);
+            return nullptr;
+        }
+        if (params.prefix_sliding_prefix_cap > (uint32_t) std::numeric_limits<llama_pos>::max() ||
+            params.prefix_sliding_window > (uint32_t) std::numeric_limits<llama_pos>::max()) {
+            LLAMA_LOG_ERROR("%s: prefix sliding window and prefix cap exceed the position range\n", __func__);
+            return nullptr;
+        }
+        if (!params.offload_kqv || params.kv_unified) {
+            LLAMA_LOG_ERROR("%s: prefix sliding requires offload_kqv=true and kv_unified=false\n", __func__);
+            return nullptr;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: prefix sliding requires Flash Attention\n", __func__);
+            return nullptr;
+        }
+        if (model->hparams.swa_type != LLAMA_SWA_TYPE_NONE || model->hparams.is_swa_any()) {
+            LLAMA_LOG_ERROR("%s: prefix sliding is incompatible with model-defined SWA\n", __func__);
+            return nullptr;
+        }
+    }
+
+    if (row4_runtime && !row4_bf16_pair && !row4_turbo_pair) {
         LLAMA_LOG_ERROR(
-            "%s: Qwen3 Row4 bf16_a8_away_i32_bf16_v1 requires BF16 K/V cache, got type_k=%s type_v=%s; "
-            "set both cache types to bf16\n",
+            "%s: Qwen3 Row4 supports bf16/bf16 or explicit TurboQuant pairs turboN/turboM, "
+            "q8_0/turboN, turboN/q8_0, q4_0/turbo4, and turbo4-or-mixed/mixed-or-turbo3; "
+            "got type_k=%s type_v=%s\n",
             __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
+    }
+
+    if (row4_turbo_runtime) {
+        const bool mixed = is_turbo2m4(params.type_k) || is_turbo2m4(params.type_v);
+        if ((mixed && (model->hparams.n_embd_head_k != 128 || model->hparams.n_embd_head_v != 128)) ||
+            (!mixed && (model->hparams.n_embd_head_k % 128 != 0 || model->hparams.n_embd_head_v % 128 != 0))) {
+            LLAMA_LOG_ERROR(
+                "%s: Qwen3 Row4 mixed TurboQuant requires K/V D128; other TurboQuant types require "
+                "dimensions divisible by 128, got K=%u V=%u\n",
+                __func__, model->hparams.n_embd_head_k, model->hparams.n_embd_head_v);
+            return nullptr;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: Qwen3 Row4 TurboQuant requires Flash Attention\n", __func__);
+            return nullptr;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: Qwen3 Row4 TurboQuant requires Flash Attention; enabling it\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
     }
 
     if (fairy2i_bf16_runtime) {
@@ -2449,7 +2534,7 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (row4_bf16_runtime) {
+    if (row4_runtime) {
         if (model->has_tensor_overrides()) {
             LLAMA_LOG_ERROR(
                 "%s: Qwen3 Row4 forbids tensor buffer overrides because they can create an unvalidated "
@@ -2482,13 +2567,20 @@ llama_context * llama_init_from_model(
                 return nullptr;
             }
             if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+                LLAMA_LOG_ERROR("%s: Qwen3 Row4 full Metal placement requires Flash Attention\n", __func__);
+                return nullptr;
+            }
+            if (prefix_sliding) {
+                LLAMA_LOG_INFO("%s: Row4 prefix sliding enabled: window=%u prefix_cap=%u\n", __func__,
+                               params.prefix_sliding_window, params.prefix_sliding_prefix_cap);
+            }
+        } else if (all_row4_devices_cpu) {
+            if (row4_turbo_runtime || prefix_sliding) {
                 LLAMA_LOG_ERROR(
-                    "%s: Qwen3 Row4 full Metal placement requires BF16 exact Flash Attention; enable Flash "
-                    "Attention\n",
+                    "%s: Qwen3 Row4 TurboQuant and prefix sliding require full Metal placement; CPU execution is unsupported\n",
                     __func__);
                 return nullptr;
             }
-        } else if (all_row4_devices_cpu) {
             if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED) {
                 LLAMA_LOG_ERROR(
                     "%s: Qwen3 Row4 exact Flash Attention requires Metal; use --flash-attn off for the CPU "
@@ -2504,10 +2596,16 @@ llama_context * llama_init_from_model(
                 params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
             }
         } else {
-            LLAMA_LOG_ERROR(
-                "%s: Qwen3 Row4 forbids mixed CPU/Metal placement; choose full Metal offload with Flash "
-                "Attention or --gpu-layers 0 with --flash-attn off\n",
-                __func__);
+            if (row4_turbo_runtime || prefix_sliding) {
+                LLAMA_LOG_ERROR(
+                    "%s: Qwen3 Row4 TurboQuant and prefix sliding forbid mixed CPU/Metal placement and require full Metal offload with Flash Attention\n",
+                    __func__);
+            } else {
+                LLAMA_LOG_ERROR(
+                    "%s: Qwen3 Row4 forbids mixed CPU/Metal placement; choose full Metal offload with Flash "
+                    "Attention or --gpu-layers 0 with --flash-attn off\n",
+                    __func__);
+            }
             return nullptr;
         }
     }
@@ -2742,6 +2840,14 @@ void llama_memory_seq_keep(
     }
 
     mem->seq_keep(seq_id);
+}
+
+bool llama_memory_seq_set_prefix(llama_memory_t mem, llama_seq_id seq_id, llama_pos prefix_end) {
+    return mem && mem->seq_set_prefix(seq_id, prefix_end);
+}
+
+llama_pos llama_memory_seq_get_prefix(llama_memory_t mem, llama_seq_id seq_id) {
+    return mem ? mem->seq_get_prefix(seq_id) : -1;
 }
 
 void llama_memory_seq_add(

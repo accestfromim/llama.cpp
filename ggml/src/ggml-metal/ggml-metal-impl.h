@@ -81,6 +81,7 @@
 #define FC_FAIRY2I_BUNDLE_W1_DECODE    700
 #define FC_FAIRY2I_BUNDLE_W2_DECODE    800
 #define FC_FAIRY2I_BUNDLE_W1_PREFILL   900
+#define FC_TURBO2M4_SET_ROWS           1000
 
 // kernel argument structs
 //
@@ -354,6 +355,7 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  q_pre_rotated;
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {
@@ -695,6 +697,31 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
 } ggml_metal_kargs_set_rows;
+
+typedef struct {
+    int64_t n_elements;
+    int32_t direction;
+} ggml_metal_kargs_turbo_wht;
+
+typedef struct {
+    int64_t  n_features;
+    int64_t  n_tokens;
+    int64_t  ne00;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb10;
+    uint64_t nb11;
+    int32_t  warmup;
+    int32_t  index_i64;
+    int32_t  center_warmup;
+    int32_t  kv_size;
+    int32_t  n_seq_tokens;
+    int32_t  n_active_streams;
+} ggml_metal_kargs_turbo_k_mean_center;
 
 typedef struct {
     int64_t  ne00;

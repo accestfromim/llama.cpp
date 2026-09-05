@@ -1252,6 +1252,10 @@ static void m5_tensorops_path_log_callback(enum ggml_log_level level, const char
     uint32_t bit = 0;
     if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M32N128 BK128 device-preexpand")) {
         bit = 1u << 4;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M8N128 multi-decode")) {
+        bit = 1u << 5;
+    } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M16N64 SG4 multi-decode")) {
+        bit = 1u << 6;
     } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M32N128")) {
         bit = 1u << 0;
     } else if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M64N64")) {
@@ -2380,7 +2384,7 @@ static bool test_metal_operator_matrix() {
     }
 
     bool ok = true;
-    for (int64_t tokens : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
+    for (int64_t tokens : { 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
         const std::vector<float> input = make_input(K, tokens);
         std::vector<float>       actual;
         const std::vector<float> expected_row4 = oracle_row4_linear(input, row4_codes, row4_scales, O, K, tokens);
@@ -2425,7 +2429,7 @@ static bool test_metal_operator_matrix() {
         constexpr int64_t          KPAIR       = 256;
         const std::vector<uint8_t> v1_codes    = make_row4_codes(O, KPAIR);
         const std::vector<uint8_t> pair2_codes = make_row4_pair2_codes(O, KPAIR);
-        for (int64_t tokens : { 1, 2, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
+        for (int64_t tokens : { 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
             const std::vector<float> input    = make_input(KPAIR, tokens);
             const std::vector<float> expected = oracle_row4_linear(input, v1_codes, row4_scales, O, KPAIR, tokens);
             std::vector<float>       actual;
@@ -2486,7 +2490,7 @@ static bool test_metal_operator_matrix() {
 
     if (require_m5_tensorops) {
         ggml_log_set(nullptr, nullptr);
-        constexpr uint32_t all_m5_tiles = (1u << 5) - 1u;
+        constexpr uint32_t all_m5_tiles = (1u << 7) - 1u;
         const uint32_t     hit_mask     = m5_marker.tile_mask.load(std::memory_order_relaxed);
         if (hit_mask != all_m5_tiles) {
             fprintf(stderr, "M5 TensorOps tile marker mismatch: actual=0x%x expected=0x%x\n", hit_mask, all_m5_tiles);
@@ -2584,9 +2588,9 @@ static bool test_metal_real_shape_matrix() {
 
         const std::vector<float> input_two    = make_input(shape.k, 2);
         const std::vector<float> expected_two = oracle_row4_linear(input_two, codes, scales, shape.o, shape.k, 2);
-        for (int64_t tokens : { 1, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
-            if (!shape.packed_n32_boundaries && tokens != 1 && tokens != 9 && tokens != 32 && tokens != 256 &&
-                tokens != 512) {
+        for (int64_t tokens : { 1, 2, 4, 8, 9, 16, 17, 31, 32, 33, 64, 96, 128, 256, 512 }) {
+            if (!shape.packed_n32_boundaries && tokens != 1 && tokens != 8 && tokens != 9 && tokens != 16 &&
+                tokens != 32 && tokens != 256 && tokens != 512) {
                 continue;
             }
             const std::vector<float> input    = repeat_two_token_pattern(input_two, shape.k, tokens);
@@ -2621,7 +2625,7 @@ static bool test_metal_real_shape_matrix() {
         }
         const std::vector<float> input_two    = make_input(K, 2);
         const std::vector<float> expected_two = oracle_w8a8_linear(input_two, codes, scales, O, K, 2);
-        for (int64_t tokens : { 9, 32 }) {
+        for (int64_t tokens : { 8, 9, 15, 16, 32 }) {
             const std::vector<float> input    = repeat_two_token_pattern(input_two, K, tokens);
             const std::vector<float> expected = repeat_two_token_output(expected_two, O, tokens);
             std::vector<float>       actual;
@@ -2648,7 +2652,7 @@ static bool test_metal_real_shape_matrix() {
                 }
             }
 
-            for (int64_t tokens : { 1, 32 }) {
+            for (int64_t tokens : { 1, 8, 16, 32 }) {
                 const std::vector<float> input = repeat_two_token_pattern(input_two, K, tokens);
                 std::vector<float>       expected((size_t) FULL_O * tokens);
                 for (int64_t token = 0; token < tokens; ++token) {

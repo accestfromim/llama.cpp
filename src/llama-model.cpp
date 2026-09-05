@@ -20875,6 +20875,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         cparams.n_ctx = n_ctx_per_stream;
                     }
 
+                    uint32_t kv_size = n_ctx_per_stream;
+                    if (cparams.prefix_sliding_window > 0 && cparams.prefix_sliding_prefix_cap > 0) {
+                        const uint64_t bounded = (uint64_t) cparams.prefix_sliding_prefix_cap +
+                                                 cparams.prefix_sliding_window - 1 + cparams.n_ubatch;
+                        kv_size = GGML_PAD((uint32_t) std::min<uint64_t>(n_ctx_per_stream, bounded), padding);
+                    }
+
                     LLAMA_LOG_DEBUG("%s: n_ctx = %u (padded)\n", __func__, cparams.n_ctx);
 
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -20900,7 +20907,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.offload_kqv,
                                 params.swa_full,
                                 cparams.kv_unified,
-                                n_ctx_per_stream,
+                                kv_size,
                                 cparams.n_seq_max,
                                 cparams.n_ubatch,
                                 padding,
@@ -20916,11 +20923,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                n_ctx_per_stream,
+                                kv_size,
                                 cparams.n_seq_max,
                                 padding,
                                 hparams.n_swa,
                                 hparams.swa_type,
+                                cparams.prefix_sliding_window,
+                                cparams.prefix_sliding_prefix_cap,
+                                cparams.n_ubatch,
                                 nullptr,
                                 nullptr);
                     }

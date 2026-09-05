@@ -37,15 +37,21 @@
 
 #define LLAMA_TOKEN_NULL -1
 
+#define LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW        8192
+#define LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP    4096
+#define LLAMA_ROW4_TURBOQUANT_DEFAULT_K_MEAN_CENTER        2
+#define LLAMA_ROW4_TURBOQUANT_DEFAULT_K_MEAN_WARMUP        128
+#define LLAMA_ROW4_TURBOQUANT_DEFAULT_BOUNDARY_BF16_LAYERS 0
+
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
 #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -309,6 +315,8 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
+        uint32_t prefix_sliding_window;      // recent-token window, 0 = disabled
+        uint32_t prefix_sliding_prefix_cap;  // maximum preserved prompt length, 0 = disabled
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -659,6 +667,17 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Set and get the immutable prefix boundary for prefix-sliding attention.
+    // Returns false/-1 when the memory does not support prefix sliding.
+    LLAMA_API bool llama_memory_seq_set_prefix(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos prefix_end);
+
+    LLAMA_API llama_pos llama_memory_seq_get_prefix(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Adds relative position "delta" to all tokens that belong to the specified sequence and have positions in [p0, p1)
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
@@ -682,6 +701,7 @@ extern "C" {
     // Returns the smallest position present in the memory for the specified sequence
     // This is typically non-zero only for SWA caches
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory
+    // except when prefix-sliding attention is enabled.
     // Return -1 if the sequence is empty
     LLAMA_API llama_pos llama_memory_seq_pos_min(
             llama_memory_t mem,
@@ -689,6 +709,7 @@ extern "C" {
 
     // Returns the largest position present in the memory for the specified sequence
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory
+    // except when prefix-sliding attention is enabled.
     // Return -1 if the sequence is empty
     LLAMA_API llama_pos llama_memory_seq_pos_max(
             llama_memory_t mem,

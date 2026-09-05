@@ -135,6 +135,13 @@ int main(int argc, char * argv[]) {
             continue;
         }
 
+        // Turbo KV dequantization stays in the rotated domain.
+        if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
+            type == GGML_TYPE_TURBO2M4_S4 || type == GGML_TYPE_TURBO2M4_S8 || type == GGML_TYPE_TURBO2M4_S16 ||
+            type == GGML_TYPE_TURBO2M4_G4 || type == GGML_TYPE_TURBO2M4_G8 || type == GGML_TYPE_TURBO2M4_G16) {
+            continue;
+        }
+
         const ggml_type ei = (ggml_type)i;
 
         printf("Testing %s\n", ggml_type_name((ggml_type) i));

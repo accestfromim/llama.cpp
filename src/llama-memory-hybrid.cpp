@@ -42,6 +42,9 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_pad,
         n_swa,
         swa_type,
+        0,
+        0,
+        0,
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recurrent(il); }
             : filter_attn,

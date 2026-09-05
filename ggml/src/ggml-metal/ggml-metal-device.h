@@ -106,6 +106,12 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_cpy               (ggml_me
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_pool_2d           (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_op_pool op_pool);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_get_rows          (ggml_metal_library_t lib, enum ggml_type tsrc);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_set_rows          (ggml_metal_library_t lib, enum ggml_type tdst);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_set_rows_turbo(ggml_metal_library_t lib,
+                                                                     enum ggml_type       tdst,
+                                                                     enum ggml_type       tidx);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_wht(ggml_metal_library_t lib);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_k_mean_center(ggml_metal_library_t lib);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_turbo_k_mean_center_count(ggml_metal_library_t lib);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_repeat            (ggml_metal_library_t lib, enum ggml_type tsrc);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_unary             (ggml_metal_library_t lib, const struct ggml_tensor * op);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_glu               (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -136,30 +142,33 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_pad_reflect_1d    (ggml_me
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_arange            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_timestep_embedding(ggml_metal_library_t lib, const struct ggml_tensor * op);
 
-ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(
-        ggml_metal_library_t lib,
-        const struct ggml_tensor * op,
-        bool    has_mask,
-        bool    has_sinks,
-        bool    has_bias,
-        bool    has_scap,
-        int32_t nsg);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_library_t       lib,
+                                                                     const struct ggml_tensor * op,
+                                                                     bool                       has_mask,
+                                                                     bool                       has_sinks,
+                                                                     bool                       has_bias,
+                                                                     bool                       has_scap,
+                                                                     int32_t                    nsg,
+                                                                     bool                       turbo_gqa4);
 
-ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(
-        ggml_metal_library_t lib,
-        const struct ggml_tensor * op,
-        bool    has_mask,
-        bool    has_sinks,
-        bool    has_bias,
-        bool    has_scap,
-        int32_t nsg,
-        int32_t nwg);
+ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(ggml_metal_library_t       lib,
+                                                                         const struct ggml_tensor * op,
+                                                                         bool                       has_mask,
+                                                                         bool                       has_sinks,
+                                                                         bool                       has_bias,
+                                                                         bool                       has_scap,
+                                                                         int32_t                    nsg,
+                                                                         int32_t                    nwg,
+                                                                         bool                       turbo_fused,
+                                                                         bool                       turbo_gqa4);
 
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(ggml_metal_library_t       lib,
                                                                                 const struct ggml_tensor * op,
                                                                                 int32_t                    dv,
                                                                                 int32_t                    nwg,
-                                                                                bool                       round_bf16);
+                                                                                bool                       round_bf16,
+                                                                                bool                       turbo_inverse,
+                                                                                bool                       partial_f16);
 
 //
 // device

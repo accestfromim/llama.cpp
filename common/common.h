@@ -315,6 +315,8 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
+    int32_t prefix_sliding_window     = 0;     // recent-token window for prefix sliding
+    int32_t prefix_sliding_prefix_cap = 0;     // maximum preserved prompt length
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -425,11 +427,15 @@ struct common_params {
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
+    bool turboquant        = false; // use the default TurboQuant KV cache types
+    bool row4_prefix_sliding = false;  // use the validated Row4 long-context profile
 
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_COUNT;  // KV cache data type for K; COUNT selects the model default
     ggml_type cache_type_v = GGML_TYPE_COUNT;  // KV cache data type for V; COUNT selects the model default
+    bool cache_type_k_explicit = false;
+    bool cache_type_v_explicit = false;
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

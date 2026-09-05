@@ -1007,6 +1007,46 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 1,
         .is_quantized             = true,
     },
+    [GGML_TYPE_TURBO2_0] = {
+        .type_name                = "turbo2",
+        .blck_size                = QK_TURBO2,
+        .type_size                = sizeof(block_turbo2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo2_0_ref,
+    },
+    [GGML_TYPE_TURBO3_0] = {
+        .type_name                = "turbo3",
+        .blck_size                = QK_TURBO3,
+        .type_size                = sizeof(block_turbo3_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo3_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo3_0_ref,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .type_name                = "turbo4",
+        .blck_size                = QK_TURBO4,
+        .type_size                = sizeof(block_turbo4_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo4_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo4_0_ref,
+    },
+#define TURBO2M4_TYPE_TRAITS(type, name, block_type, suffix)                        \
+    [type] = {                                                                      \
+        .type_name      = name,                                                     \
+        .blck_size      = QK_TURBO2M4,                                              \
+        .type_size      = sizeof(block_type),                                       \
+        .is_quantized   = true,                                                     \
+        .to_float       = (ggml_to_float_t) dequantize_row_turbo2m4_##suffix,       \
+        .from_float_ref = (ggml_from_float_t) quantize_row_turbo2m4_##suffix##_ref, \
+    }
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S4, "turbo2m4_s4", block_turbo2m4_s4, s4),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S8, "turbo2m4_s8", block_turbo2m4_s8, s8),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_S16, "turbo2m4_s16", block_turbo2m4_s16, s16),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G4, "turbo2m4_g4", block_turbo2m4_g4, g4),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G8, "turbo2m4_g8", block_turbo2m4_g8, g8),
+    TURBO2M4_TYPE_TRAITS(GGML_TYPE_TURBO2M4_G16, "turbo2m4_g16", block_turbo2m4_g16, g16),
+#undef TURBO2M4_TYPE_TRAITS
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1175,6 +1215,8 @@ static const char * GGML_OP_NAME[] = {
     "FAIRY2I_ATTN_EXACT_CPU",
     "ROW4_LINEAR",
     "W8A8_LINEAR",
+    "TURBO_WHT",
+    "TURBO_K_MEAN_CENTER",
 };
 
 static_assert(sizeof(GGML_OP_NAME) / sizeof(GGML_OP_NAME[0]) == GGML_OP_COUNT, "GGML_OP_NAME must match GGML_OP_COUNT");
@@ -1303,6 +1345,8 @@ static const char * GGML_OP_SYMBOL[] = {
     "fairy2i_attn_exact_cpu(q,k,v,mask)",
     "row4_linear(x,codes,scales)",
     "w8a8_linear(x,codes,scales)",
+    "turbo_wht(x)",
+    "turbo_k_mean_center(k,indices,sum)",
 };
 
 static_assert(sizeof(GGML_OP_SYMBOL) / sizeof(GGML_OP_SYMBOL[0]) == GGML_OP_COUNT,
@@ -3853,7 +3897,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
     GGML_ASSERT(b->type == GGML_TYPE_F32 || (a->type == GGML_TYPE_BF16 && b->type == GGML_TYPE_BF16));
-    GGML_ASSERT(c->type == GGML_TYPE_I64);
+    GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));
     GGML_ASSERT(ggml_is_contiguous_rows(b));
@@ -5848,6 +5892,72 @@ void ggml_flash_attn_ext_set_fairy2i_flash3(struct ggml_tensor * a, bool flash3)
 bool ggml_flash_attn_ext_get_fairy2i_flash3(const struct ggml_tensor * a) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     return ggml_get_op_params_i32(a, 4) == 2;
+}
+
+void ggml_flash_attn_ext_set_turbo4_fused(struct ggml_tensor * a, bool fused) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 5, fused ? 1 : 0);
+}
+
+bool ggml_flash_attn_ext_get_turbo4_fused(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
+
+struct ggml_tensor * ggml_turbo_wht(struct ggml_context * ctx,
+                                    struct ggml_tensor *  a,
+                                    int                   direction,
+                                    int                   group_size,
+                                    struct ggml_tensor *  scale) {
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(direction == 0 || direction == 1);
+
+    if (group_size == 0) {
+        group_size = 128;
+    }
+    GGML_ASSERT(group_size == 128);
+    GGML_ASSERT(a->ne[0] % group_size == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+    result->op                  = GGML_OP_TURBO_WHT;
+    result->src[0]              = a;
+    result->src[1]              = scale;
+
+    ggml_set_op_params_i32(result, 0, direction);
+    ggml_set_op_params_i32(result, 1, group_size);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_turbo_k_mean_center(struct ggml_context * ctx,
+                                              struct ggml_tensor *  k,
+                                              struct ggml_tensor *  indices,
+                                              struct ggml_tensor *  sum,
+                                              int                   warmup,
+                                              bool                  center_warmup,
+                                              int64_t               kv_size,
+                                              int64_t               n_seq_tokens) {
+    GGML_ASSERT(k->type == GGML_TYPE_F32 && ggml_is_contiguous(k));
+    GGML_ASSERT(indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64);
+    GGML_ASSERT(sum->type == GGML_TYPE_F32 && ggml_is_contiguous(sum));
+    GGML_ASSERT(k->ne[2] == ggml_nelements(indices) && k->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] * k->ne[1] + 1 == sum->ne[0]);
+    GGML_ASSERT(warmup > 0);
+    GGML_ASSERT(kv_size > 0 && n_seq_tokens > 0 && k->ne[2] % n_seq_tokens == 0);
+    GGML_ASSERT(k->ne[2] / n_seq_tokens <= sum->ne[1]);
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, k);
+    result->op                  = GGML_OP_TURBO_K_MEAN_CENTER;
+    result->src[0]              = k;
+    result->src[1]              = indices;
+    result->src[2]              = sum;
+    ggml_set_op_params_i32(result, 0, warmup);
+    ggml_set_op_params_i32(result, 1, center_warmup ? 1 : 0);
+    ggml_set_op_params_i32(result, 2, (int32_t) kv_size);
+    ggml_set_op_params_i32(result, 3, (int32_t) n_seq_tokens);
+
+    return result;
 }
 
 void ggml_flash_attn_ext_add_sinks(
@@ -7968,6 +8078,33 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IFAIRY:
             result = quantize_ifairy(src + start, src + start, (char *) dst + start_row * row_size, nrows, n_per_row,
                                      imatrix);
+            break;
+        case GGML_TYPE_TURBO2_0:
+            result = quantize_turbo2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO3_0:
+            result = quantize_turbo3_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO4_0:
+            result = quantize_turbo4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_S4:
+            result = quantize_turbo2m4_s4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_S8:
+            result = quantize_turbo2m4_s8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_S16:
+            result = quantize_turbo2m4_s16(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_G4:
+            result = quantize_turbo2m4_g4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_G8:
+            result = quantize_turbo2m4_g8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
+            break;
+        case GGML_TYPE_TURBO2M4_G16:
+            result = quantize_turbo2m4_g16(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix);
             break;
         case GGML_TYPE_F16:
             {

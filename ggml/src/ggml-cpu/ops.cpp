@@ -13,6 +13,12 @@
 
 #include <algorithm>
 
+extern "C" {
+GGML_API int  turbo3_cpu_wht_group_size;
+GGML_API void turbo_cpu_fwht_forward(float * x, int group_size);
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
+}
+
 static inline uint32_t fairy2i_load_packed_bf16_pair(const void * src) {
     uint32_t bits;
     memcpy(&bits, src, sizeof(bits));
@@ -535,6 +541,54 @@ static void ggml_compute_forward_dup_from_q(
     }
 }
 
+static void ggml_compute_forward_dup_from_q_f16(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == GGML_TYPE_TURBO3_0 || src0->type == GGML_TYPE_TURBO4_0);
+    const ggml_to_float_t dequantize_row_q = ggml_get_type_traits(src0->type)->to_float;
+
+    const int64_t qk = ggml_blck_size(src0->type);
+    const int64_t nr = (int64_t) ggml_nelements(dst) / qk;
+
+    GGML_ASSERT(qk == 128);
+    GGML_ASSERT(nb0 == sizeof(ggml_fp16_t));
+    GGML_ASSERT((ne0 % qk) == 0 || ggml_is_contiguous(dst));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    float values[128];
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i = ir * qk;
+
+        const int64_t i03      = i / (ne00 * ne01 * ne02);
+        const int64_t i02      = (i - i03 * ne00 * ne01 * ne02) / (ne00 * ne01);
+        const int64_t i01      = (i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00) / ne00;
+        const int64_t i00      = i - i03 * ne00 * ne01 * ne02 - i02 * ne01 * ne00 - i01 * ne00;
+        const size_t  x_offset = (i00 / qk) * nb00 + i01 * nb01 + i02 * nb02 + i03 * nb03;
+
+        const int64_t i3         = i / (ne0 * ne1 * ne2);
+        const int64_t i2         = (i - i3 * ne0 * ne1 * ne2) / (ne0 * ne1);
+        const int64_t i1         = (i - i3 * ne0 * ne1 * ne2 - i2 * ne0 * ne1) / ne0;
+        const int64_t i0         = i - i3 * ne0 * ne1 * ne2 - i2 * ne0 * ne1 - i1 * ne0;
+        const size_t  dst_offset = i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3;
+
+        dequantize_row_q((const char *) src0->data + x_offset, values, qk);
+
+        ggml_fp16_t * dst_ptr = (ggml_fp16_t *) ((char *) dst->data + dst_offset);
+        for (int64_t j = 0; j < qk; ++j) {
+            dst_ptr[j] = ggml_fp32_to_fp16(values[j]);
+        }
+    }
+}
+
 void ggml_compute_forward_dup(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -578,6 +632,11 @@ void ggml_compute_forward_dup(
             {
                 if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
                     ggml_compute_forward_dup_from_q(params, dst);
+                    break;
+                }
+                if ((src0->type == GGML_TYPE_TURBO3_0 || src0->type == GGML_TYPE_TURBO4_0) &&
+                    dst->type == GGML_TYPE_F16) {
+                    ggml_compute_forward_dup_from_q_f16(params, dst);
                     break;
                 }
                 GGML_ABORT("fatal error");
@@ -5138,6 +5197,11 @@ static void ggml_compute_forward_set_rows_f32(
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
+    if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0) {
+        const int group_size      = ggml_get_op_params_i32(dst, 1);
+        turbo3_cpu_wht_group_size = group_size == 128 ? group_size : 0;
+    }
+
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
             for (int64_t i = ir0; i < ir1; ++i) {
@@ -5145,7 +5209,8 @@ static void ggml_compute_forward_set_rows_f32(
                 const int64_t i11 = i02%ne11;
                 const int64_t i10 = i;
 
-                const int64_t i1 = *(int64_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                const char *  index = (const char *) src1->data + i10 * nb10 + i11 * nb11 + i12 * nb12;
+                const int64_t i1    = src1->type == GGML_TYPE_I64 ? *(const int64_t *) index : *(const int32_t *) index;
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
@@ -5185,7 +5250,8 @@ static void ggml_compute_forward_set_rows_bf16(const ggml_compute_params * param
             for (int64_t i = ir0; i < ir1; ++i) {
                 const int64_t i12 = i03 % ne12;
                 const int64_t i11 = i02 % ne11;
-                const int64_t i1  = *(int64_t *) ((char *) src1->data + i * nb10 + i11 * nb11 + i12 * nb12);
+                const char *  index = (const char *) src1->data + i * nb10 + i11 * nb11 + i12 * nb12;
+                const int64_t i1    = src1->type == GGML_TYPE_I64 ? *(const int64_t *) index : *(const int32_t *) index;
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
@@ -5917,6 +5983,15 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_FAIRY2I_BUNDLE_CODES:
         case GGML_TYPE_ROW4_CODES:
         case GGML_TYPE_ROW4_CODES_PAIR2:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TURBO2M4_S4:
+        case GGML_TYPE_TURBO2M4_S8:
+        case GGML_TYPE_TURBO2M4_S16:
+        case GGML_TYPE_TURBO2M4_G4:
+        case GGML_TYPE_TURBO2M4_G8:
+        case GGML_TYPE_TURBO2M4_G16:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");
@@ -8828,6 +8903,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DK = nek0;
     const int64_t DV = nev0;
     const int64_t N  = neq1;
+    const bool    turbo4_fused = ggml_flash_attn_ext_get_turbo4_fused(dst);
+
+    const bool turbo4_fused_v = v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 ||
+                                v->type == GGML_TYPE_TURBO2M4_S4 || v->type == GGML_TYPE_TURBO2M4_S8 ||
+                                v->type == GGML_TYPE_TURBO2M4_G4 || v->type == GGML_TYPE_TURBO2M4_G8;
+    GGML_ASSERT(!turbo4_fused ||
+                (DK == 128 && DV == 128 && N >= 1 && N <= 16 && k->type == GGML_TYPE_TURBO4_0 && turbo4_fused_v));
 
     GGML_ASSERT(ne0 == DV);
     GGML_ASSERT(ne2 == N);
@@ -8929,6 +9011,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+        float         turbo_q[128];
+        if (turbo4_fused) {
+            memcpy(turbo_q, pq, sizeof(turbo_q));
+            turbo_cpu_fwht_forward(turbo_q, 128);
+            pq = turbo_q;
+        }
         q_to_vec_dot(pq, Q_q, DK);
 
         // online softmax / attention
@@ -9033,6 +9121,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             GGML_ABORT("inf discovered in flash attention");
         }
         ggml_vec_scale_f32(DV, VKQ32, S_inv);
+
+        if (turbo4_fused) {
+            turbo_cpu_fwht_inverse(VKQ32, 128);
+            for (int64_t d = 0; d < DV; ++d) {
+                VKQ32[d] = GGML_BF16_TO_FP32(GGML_FP32_TO_BF16(VKQ32[d]));
+            }
+        }
 
         // dst indices
         const int i1 = iq1;
@@ -11114,5 +11209,122 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+void ggml_compute_forward_turbo_wht(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src        = dst->src[0];
+    const ggml_tensor * scale      = dst->src[1];
+    const int           direction  = ggml_get_op_params_i32(dst, 0);
+    const int           group_size = ggml_get_op_params_i32(dst, 1);
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(group_size == 128 && src->ne[0] % group_size == 0);
+
+    const int64_t groups     = ggml_nelements(src) / group_size;
+    const int64_t begin      = groups * params->ith / params->nth;
+    const int64_t end        = groups * (params->ith + 1) / params->nth;
+    const float * scale_data = scale ? (const float *) scale->data : nullptr;
+
+    for (int64_t group = begin; group < end; ++group) {
+        const float * in  = (const float *) src->data + group * group_size;
+        float *       out = (float *) dst->data + group * group_size;
+        memcpy(out, in, group_size * sizeof(float));
+
+        if (direction == 0 && scale_data) {
+            for (int i = 0; i < group_size; ++i) {
+                out[i] *= scale_data[i];
+            }
+        }
+
+        if (direction == 0) {
+            turbo_cpu_fwht_forward(out, group_size);
+        } else {
+            turbo_cpu_fwht_inverse(out, group_size);
+        }
+
+        if (direction == 1 && scale_data) {
+            for (int i = 0; i < group_size; ++i) {
+                out[i] *= scale_data[i];
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_turbo_k_mean_center(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src           = dst->src[0];
+    const ggml_tensor * indices       = dst->src[1];
+    ggml_tensor *       sum           = dst->src[2];
+    const int32_t       warmup        = ggml_get_op_params_i32(dst, 0);
+    const bool          center_warmup = ggml_get_op_params_i32(dst, 1) != 0;
+    const int32_t       kv_size       = ggml_get_op_params_i32(dst, 2);
+    const int32_t       n_seq_tokens  = ggml_get_op_params_i32(dst, 3);
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT((indices->type == GGML_TYPE_I32 || indices->type == GGML_TYPE_I64) && sum->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->ne[2] == ggml_nelements(indices) && src->ne[3] == 1);
+    GGML_ASSERT(src->ne[0] * src->ne[1] + 1 == sum->ne[0]);
+    GGML_ASSERT(warmup > 0 && kv_size > 0 && n_seq_tokens > 0 && src->ne[2] % n_seq_tokens == 0);
+
+    const int64_t n_features       = src->ne[0] * src->ne[1];
+    const int64_t n_active_streams = src->ne[2] / n_seq_tokens;
+    const int64_t n_jobs           = n_features * n_active_streams;
+    const int64_t begin            = n_jobs * params->ith / params->nth;
+    const int64_t end              = n_jobs * (params->ith + 1) / params->nth;
+
+    const auto get_index = [&](int64_t token) {
+        const char * ptr = (const char *) indices->data + token * indices->nb[0];
+        return indices->type == GGML_TYPE_I64 ? *(const int64_t *) ptr : (int64_t) *(const int32_t *) ptr;
+    };
+
+    for (int64_t job = begin; job < end; ++job) {
+        const int64_t active_stream = job / n_features;
+        const int64_t feature       = job % n_features;
+        const int64_t token_begin   = active_stream * n_seq_tokens;
+        const int64_t token_end     = token_begin + n_seq_tokens;
+        const int64_t stream        = get_index(token_begin) / kv_size;
+        float *       stream_sum    = (float *) ((char *) sum->data + stream * sum->nb[1]);
+
+        const int32_t old_count        = std::max(0, std::min(warmup, (int32_t) stream_sum[n_features]));
+        const int32_t effective_warmup = center_warmup && old_count > 0 ? old_count :
+                                         center_warmup                  ? std::min(warmup, n_seq_tokens) :
+                                                                          warmup;
+        const int32_t take             = std::min(effective_warmup - old_count, n_seq_tokens);
+        const int32_t new_count        = old_count + take;
+        const bool    complete         = new_count == effective_warmup;
+
+        const int64_t i0  = feature % src->ne[0];
+        const int64_t i1  = feature / src->ne[0];
+        float         acc = old_count == 0 ? 0.0f : stream_sum[feature];
+
+        for (int64_t it = token_begin; it < token_begin + take; ++it) {
+            if (it < token_end) {
+                acc +=
+                    *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
+            }
+        }
+        stream_sum[feature] = acc;
+
+        for (int64_t it = token_begin; it < token_end; ++it) {
+            const float   value =
+                *(const float *) ((const char *) src->data + i0 * src->nb[0] + i1 * src->nb[1] + it * src->nb[2]);
+            *(float *) ((char *) dst->data + i0 * dst->nb[0] + i1 * dst->nb[1] + it * dst->nb[2]) =
+                complete && (center_warmup || it >= token_begin + take) ? value - acc / (float) effective_warmup :
+                                                                          value;
+        }
+    }
+
+    ggml_barrier(params->threadpool);
+    if (params->ith == 0) {
+        for (int64_t active_stream = 0; active_stream < n_active_streams; ++active_stream) {
+            const int64_t token_begin      = active_stream * n_seq_tokens;
+            const int64_t stream           = get_index(token_begin) / kv_size;
+            float *       stream_sum       = (float *) ((char *) sum->data + stream * sum->nb[1]);
+            const int32_t old_count        = std::max(0, std::min(warmup, (int32_t) stream_sum[n_features]));
+            const int32_t effective_warmup = center_warmup && old_count > 0 ? old_count :
+                                             center_warmup                  ? std::min(warmup, n_seq_tokens) :
+                                                                              warmup;
+            stream_sum[n_features]         = (float) (old_count + std::min(effective_warmup - old_count, n_seq_tokens));
+        }
     }
 }

@@ -1037,6 +1037,12 @@ struct common_init_result common_init_from_params(common_params & params) {
         LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
+        if (params.prefix_sliding_window > 0 && !llama_memory_seq_set_prefix(llama_get_memory(lctx), 0, 0)) {
+            LOG_ERR("%s: failed to initialize prefix sliding for warmup\n", __func__);
+            llama_free(lctx);
+            llama_model_free(model);
+            return iparams;
+        }
 
         std::vector<llama_token> tmp;
         llama_token bos = llama_vocab_bos(vocab);
@@ -1145,6 +1151,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+    cparams.prefix_sliding_window     = params.prefix_sliding_window;
+    cparams.prefix_sliding_prefix_cap = params.prefix_sliding_prefix_cap;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

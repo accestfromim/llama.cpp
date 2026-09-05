@@ -50,6 +50,9 @@ The project is under active development, and we are [looking for feedback and co
 | `-ub, --ubatch-size N` | physical maximum batch size (default: 512)<br/>(env: LLAMA_ARG_UBATCH) |
 | `--keep N` | number of tokens to keep from the initial prompt (default: 0, -1 = all) |
 | `--swa-full` | use full-size SWA cache (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)<br/>(env: LLAMA_ARG_SWA_FULL) |
+| `--prefix-sliding-window N` | recent-token window for Row4 prefix-sliding attention (default: 0, disabled)<br/>(env: LLAMA_ARG_PREFIX_SLIDING_WINDOW) |
+| `--prefix-sliding-prefix-cap N` | maximum preserved prompt length for Row4 prefix-sliding attention (default: 0, disabled)<br/>(env: LLAMA_ARG_PREFIX_SLIDING_PREFIX_CAP) |
+| `--row4-prefix-sliding` | use the validated Row4 production profile: K=turbo4, V=turbo3, window=8192, prefix cap=4096<br/>(env: LLAMA_ARG_ROW4_PREFIX_SLIDING) |
 | `--kv-unified, -kvu` | use single unified KV buffer for the KV cache of all sequences (default: false)<br/>[(more info)](https://github.com/ggml-org/llama.cpp/pull/14363)<br/>(env: LLAMA_ARG_KV_SPLIT) |
 | `-fa, --flash-attn` | enable Flash Attention (default: disabled)<br/>(env: LLAMA_ARG_FLASH_ATTN) |
 | `--no-perf` | disable internal libllama performance timings (default: false)<br/>(env: LLAMA_ARG_NO_PERF) |
@@ -66,8 +69,9 @@ The project is under active development, and we are [looking for feedback and co
 | `--yarn-beta-fast N` | YaRN: low correction dim or beta (default: 32.0)<br/>(env: LLAMA_ARG_YARN_BETA_FAST) |
 | `-nkvo, --no-kv-offload` | disable KV offload<br/>(env: LLAMA_ARG_NO_KV_OFFLOAD) |
 | `-nr, --no-repack` | disable weight repacking<br/>(env: LLAMA_ARG_NO_REPACK) |
-| `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
-| `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
+| `--turboquant` | enable TurboQuant KV cache (default: K=turbo4, V=turbo3, centering=2/128, boundary=0; explicit cache types override)<br/>(env: LLAMA_ARG_TURBOQUANT) |
+| `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: auto, f32, f16, bf16, q8_0, turbo2, turbo3, turbo4, turbo2m4_s4, turbo2m4_s8, turbo2m4_s16, turbo2m4_g4, turbo2m4_g8, turbo2m4_g16, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: auto)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
+| `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: auto, f32, f16, bf16, q8_0, turbo2, turbo3, turbo4, turbo2m4_s4, turbo2m4_s8, turbo2m4_s16, turbo2m4_g4, turbo2m4_g8, turbo2m4_g16, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: auto)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
 | `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |
 | `-np, --parallel N` | number of parallel sequences to decode (default: 1)<br/>(env: LLAMA_ARG_N_PARALLEL) |
 | `--mlock` | force system to keep model in RAM rather than swapping or compressing<br/>(env: LLAMA_ARG_MLOCK) |

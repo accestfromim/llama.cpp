@@ -597,9 +597,13 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                     "kernel_row4_m5_preexpand_int4_pair2",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
+                    "kernel_row4_w1a8_m5_tensorops_decode_m16n64_sg4",
+                    "kernel_row4_w1a8_m5_tensorops_decode_m8n128",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m64n64",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m128n32",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m256n32",
+                    "kernel_row8_w8a8_m5_tensorops_m16n128",
+                    "kernel_row8_w8a8_m5_tensorops_m8n128",
                 };
                 for (size_t i = 0; i < sizeof(mpp_pipeline_names) / sizeof(mpp_pipeline_names[0]); ++i) {
                     const char * name = mpp_pipeline_names[i];
@@ -732,9 +736,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         }
 
         if (op->op == GGML_OP_ROW4_LINEAR) {
-            // Pair2 B1 stages the full-K activation in threadgroup memory and
-            // accumulates LUT-decoded integer values in F32. Every integer is
-            // exactly representable through K=65536 (worst case 2^24).
+            // Pair2 decode stages one activation row and uses an exact F32 integer sum through K=65536.
             const bool pair2_decode_ok = ggml_nrows(x) != 1 ||
                                          (k <= 65536 &&
                                           (size_t) k * sizeof(int8_t) <= dev->props.max_theadgroup_memory_size);
@@ -1045,10 +1047,48 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 // TODO: disabled for now, until optmized
                 return false;
             }
+
+            const enum ggml_type type_k = op->src[1]->type;
+            const enum ggml_type type_v = op->src[2]->type;
+            const bool k_mixed = type_k >= GGML_TYPE_TURBO2M4_S4 && type_k <= GGML_TYPE_TURBO2M4_G16;
+            const bool v_mixed = type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16;
+            const bool k_turbo = type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 ||
+                                 type_k == GGML_TYPE_TURBO4_0 || k_mixed;
+            const bool v_turbo = type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 ||
+                                 type_v == GGML_TYPE_TURBO4_0 || v_mixed;
+            if (k_turbo || v_turbo) {
+                const bool mixed_pair = (type_k == GGML_TYPE_TURBO4_0 || k_mixed) &&
+                                        (type_v == GGML_TYPE_TURBO3_0 || v_mixed);
+                bool pair_supported;
+                if (k_mixed || v_mixed) {
+                    pair_supported = mixed_pair;
+                } else {
+                    pair_supported = (k_turbo && v_turbo) ||
+                                     (k_turbo && type_v == GGML_TYPE_Q8_0) ||
+                                     (v_turbo && type_k == GGML_TYPE_Q8_0) ||
+                                     (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_TURBO4_0);
+                }
+                return pair_supported && op->src[0]->ne[0] == 128 && op->src[1]->ne[0] == 128 &&
+                       op->src[2]->ne[0] == 128 && has_simdgroup_mm;
+            }
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_TURBO_WHT:
+            return op->src[0] && !op->src[1] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] % 128 == 0 && ggml_get_op_params_i32(op, 1) == 128 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op);
+        case GGML_OP_TURBO_K_MEAN_CENTER:
+            return op->src[0] && op->src[1] && op->src[2] && op->src[0]->type == GGML_TYPE_F32 &&
+                   (op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64) &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 && op->src[0]->ne[2] == ggml_nelements(op->src[1]) &&
+                   op->src[0]->ne[3] == 1 && op->src[0]->ne[0] * op->src[0]->ne[1] + 1 == op->src[2]->ne[0] &&
+                   ggml_get_op_params_i32(op, 2) > 0 && ggml_get_op_params_i32(op, 3) > 0 &&
+                   op->src[0]->ne[2] % ggml_get_op_params_i32(op, 3) == 0 &&
+                   op->src[0]->ne[2] / ggml_get_op_params_i32(op, 3) <= op->src[2]->ne[1] &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
@@ -1108,6 +1148,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             default:
                                 return false;
                         }
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                        return op->type == GGML_TYPE_F16;
                     case GGML_TYPE_I32:
                         return op->type == GGML_TYPE_F32;
                     default:
@@ -1159,6 +1202,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_IQ4_NL:
                         return true;
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
+                    case GGML_TYPE_TURBO2M4_S4:
+                    case GGML_TYPE_TURBO2M4_S8:
+                    case GGML_TYPE_TURBO2M4_S16:
+                    case GGML_TYPE_TURBO2M4_G4:
+                    case GGML_TYPE_TURBO2M4_G8:
+                    case GGML_TYPE_TURBO2M4_G16:
+                        return (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32) &&
+                               op->ne[0] % 128 == 0 &&
+                               (ggml_get_op_params_i32(op, 1) == 0 || ggml_get_op_params_i32(op, 1) == 128);
                     default:
                         return false;
                 };
