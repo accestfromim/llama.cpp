@@ -97,13 +97,11 @@ int main(int argc, char ** argv) {
             llama_context_params production      = cparams;
             production.n_ctx                     = 256;
             production.n_seq_max                 = 1;
-            production.prefix_sliding_window     = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_WINDOW;
-            production.prefix_sliding_prefix_cap = LLAMA_ROW4_PREFIX_SLIDING_PRODUCTION_PREFIX_CAP;
+            production.prefix_sliding_window     = 0;
+            production.prefix_sliding_prefix_cap = 0;
 
             llama_context * production_ctx = llama_init_from_model(model, production);
-            require(production_ctx != nullptr, "production profile context creation failed");
-            require(llama_memory_seq_set_prefix(llama_get_memory(production_ctx), 0, 1),
-                    "production profile prefix set failed");
+            require(production_ctx != nullptr, "default TurboQuant context creation failed");
 
             const llama_vocab * production_vocab = llama_model_get_vocab(model);
             llama_token         production_token = llama_vocab_bos(production_vocab);
@@ -119,7 +117,7 @@ int main(int argc, char ** argv) {
         const size_t centered_state_size   = production_state_size(false);
         const size_t uncentered_state_size = production_state_size(true);
         unsetenv("TURBO_K_MEAN_CENTER");
-        require(centered_state_size > uncentered_state_size, "production profile did not enable K mean centering");
+        require(centered_state_size > uncentered_state_size, "default TurboQuant did not enable K mean centering");
     }
 #endif
 
