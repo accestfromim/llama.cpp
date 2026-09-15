@@ -2295,6 +2295,183 @@ static bool test_metal_row4_swiglu_down_fusion() {
     return ok;
 }
 
+void swiglu_a8_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    if (strstr(text, "fuse Row4 QAT SwiGLU + A8 quantization K12288")) {
+        static_cast<std::atomic<bool> *>(user_data)->store(true, std::memory_order_relaxed);
+    }
+}
+
+bool test_metal_row4_swiglu_a8_fusion() {
+    const char * strict = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
+    if (!strict || strcmp(strict, "0") == 0) {
+        printf("  Metal Row4 SwiGLU/A8 fusion: SKIP (strict M5 suite only)\n");
+        return true;
+    }
+    ggml_backend_dev_t dev = find_metal_device();
+    if (!dev) {
+        return false;
+    }
+    scoped_env_var disable("GGML_METAL_FUSION_DISABLE");
+    scoped_env_var debug("GGML_METAL_FUSION_DEBUG");
+    disable.set("1");
+    ggml_backend_t reference = ggml_backend_dev_init(dev, nullptr);
+    disable.unset();
+    debug.set("2");
+    ggml_backend_t fused = ggml_backend_dev_init(dev, nullptr);
+    if (!reference || !fused) {
+        if (reference) {
+            ggml_backend_free(reference);
+        }
+        if (fused) {
+            ggml_backend_free(fused);
+        }
+        return false;
+    }
+    bool ok = true;
+    enum class mode : uint8_t { normal, output, extra_use, split, alias };
+    const std::pair<int64_t, mode> cases[] = {
+        { 128, mode::normal    },
+        { 512, mode::normal    },
+        { 544, mode::normal    },
+        { 512, mode::output    },
+        { 512, mode::extra_use },
+        { 512, mode::split     },
+        { 512, mode::alias     },
+    };
+    for (const auto & test_case : cases) {
+        constexpr int64_t      N_FF      = 12288;
+        constexpr int64_t      O         = 128;
+        const int64_t          tokens    = test_case.first;
+        const mode             test_mode = test_case.second;
+        const int64_t          k         = test_mode == mode::alias ? 4096 : 256;
+        const ggml_init_params params    = { 2 * 1024 * 1024, nullptr, true };
+        ggml_context *         ctx       = ggml_init(params);
+        ggml_tensor *          x         = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_tensor * codes1  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, 2 * N_FF / 32);
+        ggml_tensor * scales1 = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 2 * N_FF);
+        ggml_tensor * gate_up = ggml_row4_linear(ctx, x, codes1, scales1, 2 * N_FF, k);
+        ggml_tensor * gate    = ggml_view_2d(ctx, gate_up, N_FF, tokens, gate_up->nb[1], 0);
+        ggml_tensor * up      = ggml_view_2d(ctx, gate_up, N_FF, tokens, gate_up->nb[1], N_FF * sizeof(float));
+        ggml_tensor * silu    = ggml_fairy2i_silu_exact(ctx, gate);
+        ggml_fairy2i_exact_set_qat(silu, true);
+        ggml_tensor * mul = ggml_fairy2i_mul_exact(ctx, silu, up);
+        ggml_fairy2i_exact_set_qat(mul, true);
+        if (test_mode == mode::output) {
+            ggml_set_output(mul);
+        }
+        ggml_tensor * codes2  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, N_FF / 256, O / 32);
+        ggml_tensor * scales2 = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, O);
+        ggml_tensor * down    = ggml_row4_linear(ctx, mul, codes2, scales2, O, N_FF);
+        ggml_tensor * extra   = test_mode == mode::extra_use ? ggml_dup(ctx, mul) : nullptr;
+        ggml_cgraph * graph   = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, down);
+        if (extra) {
+            ggml_build_forward_expand(graph, extra);
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, fused);
+        if (!buffer) {
+            ggml_free(ctx);
+            ok = false;
+            break;
+        }
+        if (test_mode == mode::alias) {
+            // The ordinary packed handoff can reuse dead gate/up INT4, but
+            // the new fusion deliberately rejects overlap with its backing
+            // allocation. Its standalone fallback must still be exact.
+            const size_t end     = ((ggml_nbytes(gate_up) + 63) & ~size_t(63)) + tokens * (k + sizeof(float));
+            const size_t offset  = end + (64 - ((uintptr_t) gate_up->data + end) % 64) % 64;
+            void *       address = (char *) gate_up->data + offset;
+            mul->buffer          = nullptr;
+            mul->data            = nullptr;
+            ok                   = ggml_backend_tensor_alloc(buffer, mul, address) == GGML_STATUS_SUCCESS && ok;
+        }
+        auto input = make_input(k, tokens);
+        for (int64_t row = 0; row < tokens; ++row) {
+            for (int64_t col = 0; col < k; ++col) {
+                if (row % 17 == 0) {
+                    input[row * k + col] = col % 2 ? -0.0f : 0.0f;
+                }
+                if (row % 17 == 1) {
+                    input[row * k + col] *= 0x1p-30f;
+                }
+            }
+        }
+        const auto packed1 = make_row4_pair2_codes(2 * N_FF, k);
+        const auto scale1  = make_row4_scales(2 * N_FF);
+        const auto packed2 = make_row4_pair2_codes(O, N_FF);
+        const auto scale2  = make_row4_scales(O);
+        ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(codes1, packed1.data(), 0, packed1.size());
+        ggml_backend_tensor_set(scales1, scale1.data(), 0, ggml_nbytes(scales1));
+        ggml_backend_tensor_set(codes2, packed2.data(), 0, packed2.size());
+        ggml_backend_tensor_set(scales2, scale2.data(), 0, ggml_nbytes(scales2));
+        std::vector<float> expected_mul(N_FF * tokens);
+        std::vector<float> expected_output(O * tokens);
+        for (bool expected : { true, false }) {
+            std::atomic<bool> hit{ false };
+            ggml_log_set(swiglu_a8_log_callback, &hit);
+            ggml_status status;
+            if (!expected && test_mode == mode::split) {
+                ggml_cgraph * a = ggml_new_graph(ctx);
+                ggml_cgraph * b = ggml_new_graph(ctx);
+                ggml_build_forward_expand(a, mul);
+                ggml_graph_add_node(b, down);
+                status = ggml_backend_graph_compute(fused, a);
+                if (status == GGML_STATUS_SUCCESS) {
+                    status = ggml_backend_graph_compute(fused, b);
+                }
+            } else {
+                status = ggml_backend_graph_compute(expected ? reference : fused, graph);
+            }
+            ggml_log_set(nullptr, nullptr);
+            const bool expected_hit = !expected && test_mode == mode::normal && tokens >= 512;
+            if (status != GGML_STATUS_SUCCESS || hit.load() != expected_hit) {
+                fprintf(stderr, "SwiGLU/A8 B=%lld mode=%d reference=%d status=%d hit=%d expected=%d\n",
+                        (long long) tokens, (int) test_mode, expected, (int) status, hit.load(), expected_hit);
+                ok = false;
+            }
+            std::vector<float> output(O * tokens);
+            ggml_backend_tensor_get(down, output.data(), 0, ggml_nbytes(down));
+            if (expected) {
+                ggml_backend_tensor_get(mul, expected_mul.data(), 0, ggml_nbytes(mul));
+                expected_output = std::move(output);
+            } else {
+                ok = compare_exact("SwiGLU/A8 down output", output, expected_output) && ok;
+                if (expected_hit) {
+                    std::vector<int8_t> actual_q(N_FF * tokens);
+                    std::vector<float>  actual_scales(tokens);
+                    std::vector<float>  expected_scales(tokens);
+                    ggml_backend_tensor_get(mul, actual_q.data(), 0, actual_q.size());
+                    ggml_backend_tensor_get(mul, actual_scales.data(), actual_q.size(), tokens * sizeof(float));
+                    for (int64_t row = 0; row < tokens; ++row) {
+                        const auto q         = oracle_quantize_token(expected_mul.data() + row * N_FF, N_FF);
+                        expected_scales[row] = q.scale;
+                        if (memcmp(q.values.data(), actual_q.data() + row * N_FF, N_FF) != 0) {
+                            fprintf(stderr, "SwiGLU/A8 integer mismatch B=%lld row=%lld\n", (long long) tokens,
+                                    (long long) row);
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok = compare_exact("SwiGLU/A8 scales", actual_scales, expected_scales) && ok;
+                } else if (test_mode == mode::output || test_mode == mode::extra_use || test_mode == mode::split) {
+                    std::vector<float> actual_mul(N_FF * tokens);
+                    ggml_backend_tensor_get(extra ? extra : mul, actual_mul.data(), 0, ggml_nbytes(mul));
+                    ok = compare_exact("SwiGLU/A8 observable MUL", actual_mul, expected_mul) && ok;
+                }
+            }
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(fused);
+    ggml_backend_free(reference);
+    printf("  Metal Row4 SwiGLU/A8 fusion: integer oracle, scales, output/extra/split/alias gates - %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 struct row4_residual_outputs {
     std::vector<float> row4;
     std::vector<float> add;
@@ -2535,6 +2712,195 @@ static std::vector<uint16_t> make_row4_residual_scales(int64_t o) {
         scales[(size_t) row] = profiles[row % 4];
     }
     return scales;
+}
+
+void row4_prefill_residual_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) level;
+    if (strstr(text, "fuse Row4 prefill MPP + QAT COMPLEX_ADD residual")) {
+        static_cast<std::atomic<bool> *>(user_data)->store(true, std::memory_order_relaxed);
+    }
+}
+
+bool test_metal_row4_prefill_residual() {
+    const char * strict = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
+    if (!strict || strcmp(strict, "0") == 0) {
+        printf("  Metal Row4 prefill residual: SKIP (strict M5 suite only)\n");
+        return true;
+    }
+    ggml_backend_dev_t dev = find_metal_device();
+    if (!dev) {
+        return false;
+    }
+    scoped_env_var disable("GGML_METAL_FUSION_DISABLE");
+    scoped_env_var debug("GGML_METAL_FUSION_DEBUG");
+    disable.set("1");
+    ggml_backend_t reference = ggml_backend_dev_init(dev, nullptr);
+    disable.unset();
+    debug.set("2");
+    ggml_backend_t fused = ggml_backend_dev_init(dev, nullptr);
+    if (!reference || !fused) {
+        if (reference) {
+            ggml_backend_free(reference);
+        }
+        if (fused) {
+            ggml_backend_free(fused);
+        }
+        return false;
+    }
+    bool ok = true;
+    enum class mode : uint8_t { normal, output, extra, reverse, non_qat, split, scratch, inplace, ffn, packed_alias };
+
+    struct test_case {
+        int64_t k;
+        int64_t rows;
+        mode    kind;
+    };
+
+    std::vector<test_case> cases;
+    for (int64_t k : { 4096, 12288 }) {
+        for (int64_t rows : { 128, 512, 544 }) {
+            cases.push_back({ k, rows, mode::normal });
+        }
+        for (mode kind :
+             { mode::output, mode::extra, mode::reverse, mode::non_qat, mode::split, mode::scratch, mode::inplace }) {
+            cases.push_back({ k, 512, kind });
+        }
+    }
+    cases.push_back({ 12288, 512, mode::ffn });
+    cases.push_back({ 12288, 512, mode::packed_alias });
+    for (const auto & tc : cases) {
+        constexpr int64_t      O          = 4096;
+        const bool             ffn        = tc.kind == mode::ffn || tc.kind == mode::packed_alias;
+        const int64_t          input_k    = ffn ? 4096 : tc.k;
+        const ggml_init_params params     = { 2 * 1024 * 1024, nullptr, true };
+        ggml_context *         ctx        = ggml_init(params);
+        ggml_tensor *          x          = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, input_k, tc.rows);
+        ggml_tensor *          activation = x;
+        ggml_tensor *          gc         = nullptr;
+        ggml_tensor *          gs         = nullptr;
+        if (ffn) {
+            gc = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, input_k / 256, 2 * tc.k / 32);
+            gs = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, 2 * tc.k);
+            ggml_tensor * gate_up = ggml_row4_linear(ctx, x, gc, gs, 2 * tc.k, input_k);
+            ggml_tensor * gate    = ggml_view_2d(ctx, gate_up, tc.k, tc.rows, gate_up->nb[1], 0);
+            ggml_tensor * up      = ggml_view_2d(ctx, gate_up, tc.k, tc.rows, gate_up->nb[1], tc.k * sizeof(float));
+            ggml_tensor * silu    = ggml_fairy2i_silu_exact(ctx, gate);
+            ggml_fairy2i_exact_set_qat(silu, true);
+            activation = ggml_fairy2i_mul_exact(ctx, silu, up);
+            ggml_fairy2i_exact_set_qat(activation, true);
+        }
+        ggml_tensor * codes    = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, tc.k / 256, O / 32);
+        ggml_tensor * scales   = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, O);
+        ggml_tensor * linear   = ggml_row4_linear(ctx, activation, codes, scales, O, tc.k);
+        ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, O, tc.rows);
+        ggml_tensor * add      = tc.kind == mode::reverse ? ggml_complex_add(ctx, residual, linear) :
+                                                            ggml_complex_add(ctx, linear, residual);
+        ggml_complex_add_set_qat(add, tc.kind != mode::non_qat);
+        if (tc.kind == mode::output) {
+            ggml_set_output(linear);
+        }
+        ggml_tensor * extra = tc.kind == mode::extra ? ggml_dup(ctx, linear) : nullptr;
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, add);
+        if (extra) {
+            ggml_build_forward_expand(graph, extra);
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, fused);
+        if (!buffer) {
+            ggml_free(ctx);
+            ok = false;
+            break;
+        }
+        if (tc.kind == mode::scratch || tc.kind == mode::inplace || tc.kind == mode::packed_alias) {
+            void * address = (char *) linear->data + ((ggml_nbytes(linear) + 63) & ~size_t(63));
+            if (tc.kind == mode::inplace) {
+                address = residual->data;
+            } else if (tc.kind == mode::packed_alias) {
+                address = activation->data;
+            }
+            add->buffer = nullptr;
+            add->data   = nullptr;
+            ok          = ggml_backend_tensor_alloc(buffer, add, address) == GGML_STATUS_SUCCESS && ok;
+        }
+        auto input = make_input(input_k, tc.rows);
+        for (int64_t row = 0; row < tc.rows; row += 17) {
+            for (int64_t col = 0; col < input_k; ++col) {
+                input[row * input_k + col] = col % 2 ? -0.0f : 0.0f;
+            }
+        }
+        const auto packed = make_row4_pair2_codes(O, tc.k);
+        const auto scale  = make_row4_scales(O);
+        ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(codes, packed.data(), 0, packed.size());
+        ggml_backend_tensor_set(scales, scale.data(), 0, ggml_nbytes(scales));
+        if (ffn) {
+            const auto pc = make_row4_pair2_codes(2 * tc.k, input_k);
+            const auto ps = make_row4_scales(2 * tc.k);
+            ggml_backend_tensor_set(gc, pc.data(), 0, pc.size());
+            ggml_backend_tensor_set(gs, ps.data(), 0, ggml_nbytes(gs));
+        }
+        constexpr uint16_t profiles[] = { 0,      0x8000, 1,      0x8001, 0x7f,   0x807f, 0x80,   0x8080,
+                                          0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x7f80, 0xff80, 0x7fc1, 0xffc1 };
+        std::vector<float> residual_data(O * tc.rows);
+        for (size_t i = 0; i < residual_data.size(); ++i) {
+            residual_data[i] = f32_from_bits((uint32_t) profiles[i % 16] | ((uint32_t) profiles[(i / 16) % 16] << 16));
+        }
+        std::vector<float> expected(O * tc.rows);
+        std::vector<float> expected_linear(O * tc.rows);
+        for (bool ref : { true, false }) {
+            ggml_backend_tensor_set(residual, residual_data.data(), 0, ggml_nbytes(residual));
+            std::atomic<bool> hit{ false };
+            ggml_log_set(row4_prefill_residual_log_callback, &hit);
+            ggml_backend_t backend = ref ? reference : fused;
+            ggml_status    status;
+            if (!ref && tc.kind == mode::split) {
+                ggml_cgraph * a = ggml_new_graph(ctx);
+                ggml_cgraph * b = ggml_new_graph(ctx);
+                ggml_build_forward_expand(a, linear);
+                ggml_graph_add_node(b, add);
+                status = ggml_backend_graph_compute(backend, a);
+                if (status == GGML_STATUS_SUCCESS) {
+                    status = ggml_backend_graph_compute(backend, b);
+                }
+            } else {
+                status = ggml_backend_graph_compute(backend, graph);
+            }
+            ggml_log_set(nullptr, nullptr);
+            const bool expected_hit = !ref && tc.rows >= 512 && tc.rows % 64 == 0 &&
+                                      (tc.kind == mode::normal || tc.kind == mode::inplace || tc.kind == mode::ffn);
+            if (status != GGML_STATUS_SUCCESS || hit.load() != expected_hit) {
+                fprintf(stderr, "prefill residual K=%lld B=%lld mode=%d ref=%d status=%d hit=%d expected=%d\n",
+                        (long long) tc.k, (long long) tc.rows, (int) tc.kind, ref, (int) status, hit.load(),
+                        expected_hit);
+                ok = false;
+            }
+            std::vector<float> actual(O * tc.rows);
+            ggml_backend_tensor_get(add, actual.data(), 0, ggml_nbytes(add));
+            if (ref) {
+                expected = std::move(actual);
+            } else {
+                ok = compare_exact("prefill residual", actual, expected) && ok;
+            }
+            if (tc.kind == mode::output || extra) {
+                std::vector<float> visible(O * tc.rows);
+                ggml_backend_tensor_get(extra ? extra : linear, visible.data(), 0, ggml_nbytes(linear));
+                if (ref) {
+                    expected_linear = std::move(visible);
+                } else {
+                    ok = compare_exact("prefill observable projection", visible, expected_linear) && ok;
+                }
+            }
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    ggml_backend_free(fused);
+    ggml_backend_free(reference);
+    printf(
+        "  Metal Row4 prefill residual: BF16 edges, output/extra/reverse/non-QAT/split/scratch/inplace/FFN gates - "
+        "%s\n",
+        ok ? "PASS" : "FAIL");
+    return ok;
 }
 
 static bool test_metal_row4_decode_residual_fusion() {
@@ -3192,7 +3558,9 @@ int main() {
     failed += !test_metal_row4_preexpand_lookahead();
     failed += !test_metal_row4_swiglu_fusion();
     failed += !test_metal_row4_swiglu_down_fusion();
+    failed += !test_metal_row4_swiglu_a8_fusion();
     failed += !test_metal_row4_decode_residual_fusion();
+    failed += !test_metal_row4_prefill_residual();
     failed += !test_metal_real_shape_matrix();
 
     printf("========================================\n");

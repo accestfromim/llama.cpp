@@ -2475,6 +2475,43 @@ static bool ggml_metal_row4_range_overlaps_tensor(uintptr_t address, size_t size
     return address <= other ? other - address < size : address - other < other_size;
 }
 
+static ggml_tensor * ggml_metal_row4_prefill_qat_residual_add(ggml_metal_op_t ctx,
+                                                              int             idx,
+                                                              ggml_tensor *   op,
+                                                              bool            packed_a8 = false) {
+    if (!ctx->use_fusion || idx + 1 >= ctx->idx_end || op->op != GGML_OP_ROW4_LINEAR ||
+        ggml_get_op_params_i32(op, 0) != 2 || ggml_get_op_params_i32(op, 1) != 4096 ||
+        (ggml_get_op_params_i32(op, 2) != 4096 && ggml_get_op_params_i32(op, 2) != 12288) ||
+        ggml_nrows(op->src[0]) < 512 || ggml_nrows(op->src[0]) % 64 != 0 ||
+        !ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops || !ggml_node_has_n_uses(ctx->gf, idx, 1) ||
+        !op->data || !op->buffer) {
+        return nullptr;
+    }
+    ggml_tensor * add = ggml_graph_node(ctx->gf, idx + 1);
+    if (add->op != GGML_OP_COMPLEX_ADD || !ggml_complex_add_get_qat(add) || add->src[0] != op || !add->src[1] ||
+        op->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(op, add->src[1]) || !ggml_are_same_shape(op, add) || !ggml_is_contiguous(op) ||
+        !ggml_is_contiguous(add->src[1]) || !ggml_is_contiguous(add) || !add->data ||
+        !ggml_metal_device_supports_op(ctx->dev, add)) {
+        return nullptr;
+    }
+    const uintptr_t address       = (uintptr_t) add->data;
+    const size_t    bytes         = ggml_nbytes(add);
+    const size_t    offset        = GGML_PAD(ggml_nbytes(op), 64);
+    const uintptr_t scratch       = (uintptr_t) op->data + offset;
+    const size_t    scratch_bytes = ggml_nbytes(op) + ggml_metal_op_row_quant_linear_extra_act_q(ctx->dev, op) - offset;
+    // The final add allocation may reuse an earlier activation. MPP still
+    // needs its A8/scale/INT4 tail, or the packed A8 in MUL, across all tiles.
+    const bool scratch_overlap    = address <= scratch ? scratch - address < bytes : address - scratch < scratch_bytes;
+    if (scratch_overlap || ggml_metal_row4_range_overlaps_tensor(address, bytes, op->src[1]) ||
+        ggml_metal_row4_range_overlaps_tensor(address, bytes, op->src[2]) ||
+        (packed_a8 && ggml_metal_row4_range_overlaps_tensor(address, bytes, op->src[0])) ||
+        (add->data != add->src[1]->data && ggml_metal_row4_range_overlaps_tensor(address, bytes, add->src[1]))) {
+        return nullptr;
+    }
+    return add;
+}
+
 static void ggml_metal_row4_preexpand_lookahead(ggml_metal_op_t ctx, const ggml_tensor * current) {
     if (!ctx->use_concurrency || ctx->row4_preexpanded) {
         return;
@@ -2553,7 +2590,8 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                                                ggml_metal_buffer_id x_buffer,
                                                bool                 x_packed_bf16,
                                                ggml_tensor *        qat_residual_add,
-                                               bool                 act_q_ready = false) {
+                                               bool                 act_q_ready = false,
+                                               bool                 x_packed_a8 = false) {
     GGML_ASSERT(op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR);
     GGML_ASSERT(op->src[0] && op->src[1] && op->src[2]);
     GGML_ASSERT(!x_packed_bf16 || op->op == GGML_OP_ROW4_LINEAR);
@@ -2578,7 +2616,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     const ggml_metal_row4_m5_tensorops_config row4_m5_tensorops =
         ggml_metal_row4_m5_tensorops_select(op->op == GGML_OP_ROW4_LINEAR && !row4_independent_rows &&
                                                 ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops,
-                                            qat_residual_add != nullptr, layout, act_rows, m, k);
+                                            qat_residual_add != nullptr && act_rows == 1, layout, act_rows, m, k);
     const bool row4_m5_tensorops_prefill = row4_m5_tensorops.pipeline_name != nullptr;
     const bool    row4_pair2_independent_rows = op->op == GGML_OP_ROW4_LINEAR && layout == 2 && act_rows >= 2 &&
                                                 act_rows <= 16 && m % 32 == 0 && k % 256 == 0 &&
@@ -2617,6 +2655,15 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     ggml_metal_buffer_id preexpanded_i4 = act_scales;
     preexpanded_i4.offs += (size_t) staged_rows * sizeof(float);
     preexpanded_i4.offs = GGML_PAD(preexpanded_i4.offs, 64);
+
+    if (x_packed_a8) {
+        // SwiGLU prepares A8 and scales in its dead MUL allocation because
+        // this linear's scratch can still alias the gate/up inputs.
+        GGML_ASSERT(act_q_ready && !x_packed_bf16 && row4_m5_tensorops.preexpanded_weights);
+        act_q      = x_buffer;
+        act_scales = x_buffer;
+        act_scales.offs += (size_t) staged_rows * (size_t) k;
+    }
 
     if (!act_q_ready) {
         const char * pipeline_name =
@@ -2709,6 +2756,8 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                                                          !row4_direct_act && !row4_m5_tensorops_prefill &&
                                                          !pair2_shared_rows;
     const char * pipeline_name =
+        qat_residual_add && row4_m5_tensorops.preexpanded_weights ?
+            "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512_qat_residual" :
         pair2_shared_rows == 4 ? "kernel_row4_pair2_decode_o32_b4_shared" :
         pair2_shared_rows == 2 ? "kernel_row4_pair2_decode_o32_b2_shared" :
         pair2_decode ? (qat_residual_add ?
@@ -2831,7 +2880,15 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_buffer(enc, preexpanded_i4, 2);
         ggml_metal_encoder_set_buffer(enc, act_scales, 3);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(scales), 4);
-        ggml_metal_encoder_set_buffer(enc, op_buffer, 5);
+        ggml_metal_encoder_set_buffer(enc, qat_residual_add ? ggml_metal_get_buffer_id(qat_residual_add) : op_buffer,
+                                      5);
+        if (qat_residual_add) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(qat_residual_add->src[1]), 6);
+            if (ctx->debug_fusion > 1) {
+                GGML_LOG_DEBUG("%s: fuse Row4 prefill MPP + QAT COMPLEX_ADD residual (B=%d K=%d)\n", __func__, act_rows,
+                               k);
+            }
+        }
         ggml_metal_encoder_dispatch_threadgroups(enc, m / row4_m5_tensorops.output_tile,
                                                  act_rows / row4_m5_tensorops.row_tile, 1, direct_nth, 1, 1);
         ggml_metal_row4_preexpand_lookahead(ctx, op);
@@ -3156,12 +3213,15 @@ int ggml_metal_op_row_quant_linear(ggml_metal_op_t ctx, int idx) {
     }
 
     ggml_tensor * qat_residual_add = ggml_metal_row4_decode_qat_residual_add(ctx, idx, op);
+    if (!qat_residual_add) {
+        qat_residual_add = ggml_metal_row4_prefill_qat_residual_add(ctx, idx, op);
+    }
     if (qat_residual_add && !ggml_metal_op_concurrency_check(ctx, qat_residual_add)) {
         ggml_metal_op_concurrency_reset(ctx);
     }
     ggml_metal_op_row_quant_linear_impl(ctx, op, ggml_metal_get_buffer_id(op->src[0]), false, qat_residual_add);
 
-    if (qat_residual_add && ctx->debug_fusion > 1) {
+    if (qat_residual_add && ggml_nrows(op->src[0]) == 1 && ctx->debug_fusion > 1) {
         if (ggml_get_op_params_i32(op, 0) == 2) {
             GGML_LOG_DEBUG(
                 "%s: fuse Row4 decode staged epilogue + QAT COMPLEX_ADD residual "
@@ -5090,6 +5150,57 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
                 /*.src1_nb1 =*/up->nb[1],
             };
 
+            if (fused_down && ne0 == 12288 && !mul->view_src && ggml_get_op_params_i32(down, 0) == 2 &&
+                ggml_metal_row4_m5_tensorops_select(ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops, false, 2,
+                                                    rows, ggml_get_op_params_i32(down, 1), ne0)
+                    .preexpanded_weights) {
+                const size_t    quant_bytes = rows * (ne0 + sizeof(float));
+                const uintptr_t address     = (uintptr_t) mul->data;
+                // The fused producer and MPP keep A8 live in MUL storage.
+                // Neither the gate/up reads nor the down output/INT4 writes
+                // may overlap this range. No graph allocation is enlarged.
+                if (quant_bytes <= ggml_nbytes(mul) &&
+                    !ggml_metal_row4_range_overlaps_tensor(address, quant_bytes, gate) &&
+                    !ggml_metal_row4_range_overlaps_tensor(address, quant_bytes, down)) {
+                    constexpr const char * name     = "kernel_fairy2i_swiglu_qat_row4_quantize_activation_i8_k12288";
+                    ggml_metal_pipeline_t  pipeline = ggml_metal_library_get_pipeline(ctx->lib, name);
+                    if (!pipeline) {
+                        pipeline = ggml_metal_library_compile_pipeline(ctx->lib, name, name, nullptr);
+                    }
+                    constexpr int nth = 1024;
+                    if (nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+                        if (!ggml_metal_op_concurrency_check(ctx, mul)) {
+                            ggml_metal_op_concurrency_reset(ctx);
+                        }
+                        ggml_tensor * qat_residual_add =
+                            ggml_metal_row4_prefill_qat_residual_add(ctx, idx + 3, down, true);
+                        if (qat_residual_add && !ggml_metal_op_concurrency_check(ctx, qat_residual_add)) {
+                            ggml_metal_op_concurrency_reset(ctx);
+                        }
+                        const auto quant  = ggml_metal_get_buffer_id(mul);
+                        auto       scales = quant;
+                        scales.offs += rows * ne0;
+                        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+                        ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+                        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(gate), 1);
+                        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(up), 2);
+                        ggml_metal_encoder_set_buffer(ctx->enc, quant, 3);
+                        ggml_metal_encoder_set_buffer(ctx->enc, scales, 4);
+                        ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 32 * sizeof(float), 0);
+                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, rows, 1, 1, nth, 1, 1);
+                        // Down INT4 scratch can reuse the gate/up allocation:
+                        // finish these reads before allowing weight expansion.
+                        ggml_metal_encoder_memory_barrier(ctx->enc);
+                        ggml_metal_op_row_quant_linear_impl(ctx, down, quant, false, qat_residual_add, true, true);
+                        if (ctx->debug_fusion > 1) {
+                            GGML_LOG_DEBUG("%s: fuse Row4 QAT SwiGLU + A8 quantization K12288 (B=%llu, MUL scratch)\n",
+                                           __func__, (unsigned long long) rows);
+                        }
+                        return qat_residual_add ? 5 : 4;
+                    }
+                }
+            }
+
             ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_swiglu_qat(ctx->lib, fused_down);
             const int             nth      = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -5106,6 +5217,9 @@ int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {
                 // projection widens and quantizes those exact payloads.
                 ggml_metal_encoder_memory_barrier(ctx->enc);
                 ggml_tensor * qat_residual_add = ggml_metal_row4_decode_qat_residual_add(ctx, idx + 3, down);
+                if (!qat_residual_add) {
+                    qat_residual_add = ggml_metal_row4_prefill_qat_residual_add(ctx, idx + 3, down);
+                }
                 if (qat_residual_add && !ggml_metal_op_concurrency_check(ctx, qat_residual_add)) {
                     ggml_metal_op_concurrency_reset(ctx);
                 }

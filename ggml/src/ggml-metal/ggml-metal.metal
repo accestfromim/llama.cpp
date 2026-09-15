@@ -1584,7 +1584,7 @@ ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m3
 // Full M64 tiles can write the exact BF16 epilogue through the cooperative
 // INT32 tensor. Keep its fragment layout and store the F32 result bit patterns
 // so the cooperative store does not introduce a numeric conversion.
-template<int output_tile, int n_simdgroups, int grouped_rows>
+template<int output_tile, int n_simdgroups, int grouped_rows, bool has_residual = false>
 static inline void row4_m5_prefill_cooperative_impl(
         constant ggml_metal_kargs_row_quant_linear & args,
         device int8_t * act_q,
@@ -1592,7 +1592,8 @@ static inline void row4_m5_prefill_cooperative_impl(
         device const float * act_scales,
         device const ushort * scales,
         device float * dst,
-        uint3 tgpig) {
+        uint3 tgpig,
+        device const uint * residual = nullptr) {
     constexpr int row_tile = 64;
     constexpr int k_tile   = 512;
     constexpr auto desc = matmul2d_descriptor(
@@ -1638,6 +1639,18 @@ static inline void row4_m5_prefill_cooperative_impl(
             const auto coordinate = acc.get_multidimensional_index(i);
             acc[i] = as_type<int32_t>(row4_finish_i32(
                 acc[i], act_scales[row_base + (uint) coordinate[1]], scales[output_base + (uint) coordinate[0]]));
+            if (has_residual) {
+                // Preserve the materialized BF16 boundary. Folding the low
+                // component's +0 changes signed zero, subnormal flushing and
+                // NaN canonicalization versus COMPLEX_ADD_QAT.
+                thread volatile uint rounded = as_type<uint>(acc[i]);
+                const uint a = rounded;
+                const uint b = residual[(ulong) (row_base + (uint) coordinate[1]) * args.m +
+                                        output_base + (uint) coordinate[0]];
+                const float real = fairy2i_bf16_to_f32(ushort(a)) + fairy2i_bf16_to_f32(ushort(b));
+                const float imag = fairy2i_bf16_to_f32(ushort(a >> 16)) + fairy2i_bf16_to_f32(ushort(b >> 16));
+                acc[i] = as_type<int32_t>(fairy2i_pack_bf16_pair(real, imag));
+            }
         }
     }
     auto target = tensor((device int32_t *) dst + (ulong) row_base * (uint) args.m + output_base,
@@ -1661,6 +1674,16 @@ kernel void name( \
 ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512, 64, 4, 2)
 ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512, 128, 8, 4)
 #undef ROW4_M5_PREFILL_COOPERATIVE
+
+kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512_qat_residual(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device int8_t * act_q [[buffer(1)]], device uchar * weight_i4 [[buffer(2)]],
+        device const float * act_scales [[buffer(3)]], device const ushort * scales [[buffer(4)]],
+        device float * dst [[buffer(5)]], device const uint * residual [[buffer(6)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    row4_m5_prefill_cooperative_impl<64, 4, 2, true>(args, act_q, weight_i4, act_scales, scales, dst, tgpig, residual);
+}
+
 
 template<int row_tile, int output_tile, int n_simdgroups>
 static inline void row4_w1a8_m5_tensorops_prefill_impl(
@@ -11108,6 +11131,66 @@ kernel void kernel_fairy2i_swiglu_qat_packed_bf16(
     // final BF16 payload needed by the following activation quantizer.
     const ushort silu_bits            = fairy2i_silu_qat_bf16(gate_bits);
     dst[(ulong) row * args.ne0 + col] = fairy2i_mul_qat_bf16(silu_bits, up_bits);
+}
+
+// Keep the two QAT BF16 boundaries and each row's complete absmax.
+// Three ushort4 values per thread retain the SwiGLU output without device
+// round trips; only the sole Row4 consumer may use this compact A8 handoff.
+kernel void kernel_fairy2i_swiglu_qat_row4_quantize_activation_i8_k12288(
+    constant ggml_metal_kargs_fairy2i_elementwise_exact & args [[buffer(0)]],
+    const device uint *                                   gate [[buffer(1)]],
+    const device uint *                                   up [[buffer(2)]],
+    device char *                                         act_q [[buffer(3)]],
+    device float *                                        act_scales [[buffer(4)]],
+    threadgroup float *                                   maxima [[threadgroup(0)]],
+    uint                                                  row [[threadgroup_position_in_grid]],
+    uint                                                  tid [[thread_index_in_threadgroup]]) {
+    constexpr uint      n_threads = 1024;
+    constexpr uint      k         = 12288;
+    constexpr uint      n_values  = k / (4 * n_threads);
+    ushort4             values[n_values];
+    const device uint * gate_row   = (const device uint *) ((const device char *) gate + (ulong) row * args.src0_nb1);
+    const device uint * up_row     = (const device uint *) ((const device char *) up + (ulong) row * args.src1_nb1);
+    float               thread_max = 0.0f;
+    FOR_UNROLL(uint j = 0; j < n_values; ++j) {
+        const uint    i         = 4 * (tid + j * n_threads);
+        const uint4   gate_bits = *(const device uint4 *) (gate_row + i);
+        const uint4   up_bits   = *(const device uint4 *) (up_row + i);
+        const ushort4 out_bits =
+            ushort4(fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.x >> 16)), ushort(up_bits.x >> 16)),
+                    fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.y >> 16)), ushort(up_bits.y >> 16)),
+                    fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.z >> 16)), ushort(up_bits.z >> 16)),
+                    fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.w >> 16)), ushort(up_bits.w >> 16)));
+        const float4 xb     = as_type<float4>(uint4(out_bits) << 16);
+        values[j]           = out_bits;
+        const float4 abs_xb = fabs(xb);
+        thread_max          = max(thread_max, max(max(abs_xb.x, abs_xb.y), max(abs_xb.z, abs_xb.w)));
+    }
+    const uint lane = tid & 31, group = tid >> 5;
+    float      group_max = simd_max(thread_max);
+    if (lane == 0) {
+        maxima[group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (group == 0) {
+        float m = lane < n_threads / 32 ? maxima[lane] : 0.0f;
+        m       = simd_max(m);
+        if (lane == 0) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(m), 127U);
+            maxima[0]             = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[row]       = maxima[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sx = maxima[0];
+    FOR_UNROLL(uint j = 0; j < n_values; ++j) {
+        const float4 xb        = as_type<float4>(uint4(values[j]) << 16);
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + 0.5f);
+        int4         q         = int4(magnitude);
+        q                      = select(q, -q, xb < float4(0));
+        *(device char4 *) (act_q + (ulong) row * k + 4 * (tid + j * n_threads)) =
+            char4(clamp(q, int4(-127), int4(127)));
+    }
 }
 
 kernel void kernel_fairy2i_pack_bf16_exact(constant ulong &    ne,
