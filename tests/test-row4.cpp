@@ -754,7 +754,8 @@ static bool run_operator_backend(std::vector<float> &          output,
                                  int64_t                       tokens,
                                  const char *                  force_path,
                                  bool                          debug_marker     = false,
-                                 ggml_backend_t                backend_override = nullptr) {
+                                 ggml_backend_t                backend_override = nullptr,
+                                 bool                          rewrite_codes    = false) {
     scoped_env_var force("GGML_ROW4_TEST_FORCE_PATH");
     scoped_env_var debug("GGML_ROW4_CPU_DEBUG");
     if (force_path) {
@@ -836,6 +837,16 @@ static bool run_operator_backend(std::vector<float> &          output,
     } else {
         ggml_backend_tensor_set(codes, w8_codes.data(), 0, w8_codes.size());
         ggml_backend_tensor_set(scales, w8_scales.data(), 0, w8_scales.size() * sizeof(float));
+    }
+
+    if (rewrite_codes) {
+        // Reuse the same graph and scratch after updating the compressed
+        // weights. Every numeric INT4 destination must be overwritten.
+        GGML_ASSERT(is_row4);
+        const std::vector<uint8_t> poison(row4_codes.size(), 0xa5U);
+        ggml_backend_tensor_set(codes, poison.data(), 0, poison.size());
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS && ok;
+        ggml_backend_tensor_set(codes, row4_codes.data(), 0, row4_codes.size());
     }
 
     ok                       = codes->extra == nullptr && scales->extra == nullptr && ok;
@@ -1232,6 +1243,8 @@ struct gate_up_fusion_log_marker {
 struct m5_tensorops_path_log_marker {
     std::atomic<uint32_t> tile_mask              = 0;
     std::atomic<bool>     pair2_device_preexpand = false;
+    std::atomic<bool>     pair2_cooperative_n64  = false;
+    std::atomic<bool>     pair2_cooperative_n128 = false;
 };
 
 static void gate_up_fusion_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
@@ -1249,6 +1262,15 @@ static void gate_up_fusion_log_callback(enum ggml_log_level level, const char * 
 
 static void m5_tensorops_path_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
+    auto * marker = static_cast<m5_tensorops_path_log_marker *>(user_data);
+    if (strstr(text, "layout=m32k256_pair2_split8_v2") && strstr(text, "cooperative-store")) {
+        if (strstr(text, "M64N64 BK512 device-preexpand")) {
+            marker->pair2_cooperative_n64.store(true, std::memory_order_relaxed);
+        }
+        if (strstr(text, "M64N128 BK512 device-preexpand")) {
+            marker->pair2_cooperative_n128.store(true, std::memory_order_relaxed);
+        }
+    }
     uint32_t bit = 0;
     if (strstr(text, "M5 MPP TensorOps exact A8/I4/I32 M32N128 BK128 device-preexpand")) {
         bit = 1u << 4;
@@ -1276,9 +1298,9 @@ static void m5_tensorops_path_log_callback(enum ggml_log_level level, const char
         bit = 1u << 11;
     }
     if (bit != 0) {
-        m5_tensorops_path_log_marker * marker = static_cast<m5_tensorops_path_log_marker *>(user_data);
         marker->tile_mask.fetch_or(bit, std::memory_order_relaxed);
-        if (strstr(text, "layout=m32k256_pair2_split8_v2") && strstr(text, "M32N128 BK128 device-preexpand")) {
+        if (strstr(text, "layout=m32k256_pair2_split8_v2") && strstr(text, "act_rows=512 ") &&
+            strstr(text, "M32N128 BK128 device-preexpand") && strstr(text, "blocked-O128-K32")) {
             marker->pair2_device_preexpand.store(true, std::memory_order_relaxed);
         }
     }
@@ -2452,6 +2474,67 @@ static bool test_metal_operator_matrix() {
         }
     }
 
+    // Non-power-of-two Pair2 dimensions cross both output and K blocks
+    // and exercise a non-512 prefill batch.
+    {
+        constexpr int64_t           pair2_o     = 1152;
+        constexpr int64_t           pair2_k     = 768;
+        constexpr int64_t           tokens      = 544;
+        const std::vector<uint8_t>  v1_codes    = make_row4_codes(pair2_o, pair2_k);
+        const std::vector<uint8_t>  pair2_codes = make_row4_pair2_codes(pair2_o, pair2_k);
+        const std::vector<uint16_t> scales      = make_row4_scales(pair2_o);
+        const std::vector<float>    input       = make_input(pair2_k, tokens);
+        const std::vector<float>    expected    = oracle_row4_linear(input, v1_codes, scales, pair2_o, pair2_k, tokens);
+        std::vector<float>          actual;
+        if (!run_operator_backend(actual, linear_kind::row4_pair2, input, pair2_codes, scales, {}, {}, pair2_o, pair2_k,
+                                  tokens, nullptr, false, metal) ||
+            !compare_exact("Row4 pair2 Metal O1152 K768 B544", actual, expected)) {
+            ok = false;
+        }
+    }
+
+    // Blocked expansion and cooperative M64 stores: minimum O, non-power-
+    // of-two O/K, a partial group of token tiles, and the wide N128 path.
+    // Random codes distinguish output tiles; an odd token period also
+    // exposes row-tile permutations without a huge oracle.
+    const int64_t preexpanded_shapes[][3] = {
+        { 128,   512,  512 },
+        { 384,   768,  544 },
+        { 1152,  1024, 576 },
+        { 16384, 512,  512 },
+    };
+    for (const auto & shape : preexpanded_shapes) {
+        const int64_t        o      = shape[0];
+        const int64_t        k      = shape[1];
+        const int64_t        tokens = shape[2];
+        constexpr int64_t    period = 17;
+        std::vector<uint8_t> logical((size_t) (o / 4) * k);
+        uint32_t             state = 42;
+        for (uint8_t & code : logical) {
+            state = state * 1664525u + 1013904223u;
+            code  = (uint8_t) (state >> 28);
+        }
+        const auto         v1_codes         = pack_row4_codes(logical, o, k);
+        const auto         pair2_codes      = pack_row4_pair2_codes(logical, o, k);
+        const auto         scales           = make_row4_scales(o);
+        const auto         input_pattern    = make_input(k, period);
+        const auto         expected_pattern = oracle_row4_linear(input_pattern, v1_codes, scales, o, k, period);
+        std::vector<float> input((size_t) tokens * k);
+        std::vector<float> expected((size_t) tokens * o);
+        std::vector<float> actual;
+        for (int64_t token = 0; token < tokens; ++token) {
+            std::copy_n(input_pattern.data() + (token % period) * k, k, input.data() + token * k);
+            std::copy_n(expected_pattern.data() + (token % period) * o, o, expected.data() + token * o);
+        }
+        const std::string label = "Row4 pair2 preexpanded O=" + std::to_string(o) + " K=" + std::to_string(k) +
+                                  " B=" + std::to_string(tokens);
+        if (!run_operator_backend(actual, linear_kind::row4_pair2, input, pair2_codes, scales, {}, {}, o, k, tokens,
+                                  nullptr, false, metal, true) ||
+            !compare_exact(label.c_str(), actual, expected)) {
+            ok = false;
+        }
+    }
+
     // Real-K prefill cases. Row4 covers all 96 K tiles of ffn_down and
     // includes both the maximum sum and cancellation. W8 crosses four K1024
     // segments so an implementation cannot accidentally use one inexact F32
@@ -2508,7 +2591,12 @@ static bool test_metal_operator_matrix() {
             ok = false;
         }
         if (!m5_marker.pair2_device_preexpand.load(std::memory_order_relaxed)) {
-            fprintf(stderr, "M5 TensorOps Pair2 B512 device-preexpand marker was not observed\n");
+            fprintf(stderr, "M5 TensorOps Pair2 B512 device-preexpand coalesced-expand marker was not observed\n");
+            ok = false;
+        }
+        if (!m5_marker.pair2_cooperative_n64.load(std::memory_order_relaxed) ||
+            !m5_marker.pair2_cooperative_n128.load(std::memory_order_relaxed)) {
+            fprintf(stderr, "M5 TensorOps Pair2 M64 cooperative-store markers were not observed\n");
             ok = false;
         }
     }

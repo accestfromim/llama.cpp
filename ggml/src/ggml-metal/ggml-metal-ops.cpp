@@ -2227,6 +2227,26 @@ static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(b
     // token tile read ordinary device INT4 amortizes the extra write/read. At
     // smaller B, online BK128 decode into 16 KiB of threadgroup memory wins.
     if (act_rows >= 512 && act_rows % 32 == 0 && m % 128 == 0) {
+        // Full Pair2 M64 tiles use static extents and cooperative output
+        // stores. Wide projections amortize eight SIMDgroups with N128.
+        if (layout == 2 && act_rows % 64 == 0 && k % 512 == 0) {
+            if (m >= 16384) {
+                return {
+                    "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512",
+                    "M5 MPP TensorOps exact A8/I4/I32 M64N128 BK512 device-preexpand SG8 grouped-M4 cooperative-store",
+                    64,
+                    128,
+                    8,
+                    true
+                };
+            }
+            return { "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512",
+                     "M5 MPP TensorOps exact A8/I4/I32 M64N64 BK512 device-preexpand SG4 grouped-M2 cooperative-store",
+                     64,
+                     64,
+                     4,
+                     true };
+        }
         return {
             k % 512 == 0 ? "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512" :
                            "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
@@ -2661,8 +2681,9 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                 "BF16 boundary)\n",
                 suffix, act_rows, m, k, row4_pair2_decode_marker, row4_path_detail);
         } else if (row4) {
-            GGML_LOG_INFO("ROW4 Metal W1A8 path: %s layout=%s act_rows=%d O=%d K=%d (%s, BF16 boundary)\n", suffix,
-                          row4_v2 ? "m32k256_pair2_split8_v2" : "m16k128_split8_v1", act_rows, m, k, row4_path_detail);
+            GGML_LOG_INFO("ROW4 Metal W1A8 path: %s layout=%s act_rows=%d O=%d K=%d (%s%s, BF16 boundary)\n", suffix,
+                          row4_v2 ? "m32k256_pair2_split8_v2" : "m16k128_split8_v1", act_rows, m, k, row4_path_detail,
+                          row4_v2 && row4_m5_tensorops.preexpanded_weights ? " coalesced-expand blocked-O128-K32" : "");
         } else {
             const char * w8_path_detail = w8_row_tile == 8  ? "M5 MPP TensorOps exact A8/I8/I32 M8N16 direct-device" :
                                           w8_row_tile == 16 ? "M5 MPP TensorOps exact A8/I8/I32 M16N16 direct-device" :
@@ -2687,9 +2708,12 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                 ggml_metal_library_compile_pipeline(lib, expand_pipeline_name, expand_pipeline_name, nullptr);
         }
 
-        constexpr int nth          = 256;
-        const size_t  source_bytes = (size_t) m * (size_t) k / 8;
-        const size_t  threadgroups = (source_bytes + nth - 1) / nth;
+        // Pair2 expands O128 x K32 per group with K blocks varying fastest.
+        // Schema v1 retains its source-linear grid.
+        const int    nth          = row4_v2 ? 128 : 256;
+        const size_t source_bytes = (size_t) m * (size_t) k / 8;
+        const size_t threadgroups = row4_v2 ? (size_t) k / 32 : (source_bytes + nth - 1) / nth;
+        const int    grid_rows    = row4_v2 ? m / 128 : 1;
         GGML_ASSERT(threadgroups <= (size_t) std::numeric_limits<int>::max());
         GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(expand_pipeline));
 
@@ -2697,7 +2721,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(codes), 1);
         ggml_metal_encoder_set_buffer(enc, preexpanded_i4, 2);
-        ggml_metal_encoder_dispatch_threadgroups(enc, (int) threadgroups, 1, 1, nth, 1, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) threadgroups, grid_rows, 1, nth, 1, 1);
 
         // Publish the complete row-major numeric INT4 tensor before MPP reads it.
         ggml_metal_encoder_memory_barrier(enc);

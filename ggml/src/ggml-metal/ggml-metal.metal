@@ -1362,45 +1362,39 @@ kernel void kernel_row4_m5_preexpand_int4(
     weight_i4[high_offset + 1UL] = row4_m5_pack_int4(high.z, high.w);
 }
 
-// Losslessly expand the physical m32k256_pair2_split8_v2 code stream into the
-// same ordinary K-major numeric signed INT4 tensor consumed by MPP. One source
-// byte still describes four output rows at two K positions; pair2 only changes
-// how the output group, K128 half, split, and j coordinate are interleaved.
+// Losslessly expand Pair2 into K-major numeric INT4. Each 128-thread group
+// covers O128 x K32, reusing nearby source cache lines while keeping stores
+// contiguous along O. The grid visits K blocks first for source locality.
+// The preexpanded selector guarantees O % 128 == 0 and K % 256 == 0.
 kernel void kernel_row4_m5_preexpand_int4_pair2(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
         device const uchar * codes                        [[buffer(1)]],
         device uchar * weight_i4                          [[buffer(2)]],
-        uint gid                                          [[thread_position_in_grid]]) {
-    const ulong source_bytes = (ulong) (uint) args.m * (ulong) (uint) args.k / 8UL;
-    if ((ulong) gid >= source_bytes) {
-        return;
+        uint2 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tiitg                                        [[thread_index_in_threadgroup]]) {
+    const uint output_group = tgpig.y * 32U + (tiitg & 15U) * 2U;
+    const uint k_low = tgpig.x * 32U + ((tiitg & 64U) >> 2) + ((tiitg & 48U) >> 3);
+    const uint lane = (tgpig.x & 3U) * 8U + (tiitg >> 4);
+    const uint byte = ((tgpig.x >> 2) & 1U) * 2U;
+    const ulong source_offset =
+        (((ulong) (output_group >> 3) * ((uint) args.k >> 8) + (tgpig.x >> 3)) * 8UL +
+         (output_group & 7U)) * 128UL + lane * 4U + byte;
+    const ushort code0 = *((device const ushort *) (codes + source_offset));
+    const ushort code1 = *((device const ushort *) (codes + source_offset + 128UL));
+
+    #pragma unroll
+    for (uint j = 0; j < 2; ++j) {
+        const uint c0 = (code0 >> (j * 8U)) & 255U;
+        const uint c1 = (code1 >> (j * 8U)) & 255U;
+        const uint low = (uint) k_row4_m5_packed_int4_codebook[c0 & 15U] |
+                         ((uint) k_row4_m5_packed_int4_codebook[c1 & 15U] << 16);
+        const uint high = (uint) k_row4_m5_packed_int4_codebook[c0 >> 4] |
+                          ((uint) k_row4_m5_packed_int4_codebook[c1 >> 4] << 16);
+        const ulong low_offset = ((ulong) (k_low + j) * (uint) args.m) / 2UL + output_group * 2UL;
+        const ulong high_offset = low_offset + (ulong) args.m * 4UL;
+        *((device uint *) (weight_i4 + low_offset)) = low;
+        *((device uint *) (weight_i4 + high_offset)) = high;
     }
-
-    uint x           = gid;
-    const uint byte  = x & 3U;
-    x >>= 2;
-    const uint lane  = x & 31U;
-    x >>= 5;
-    const uint group = x & 7U;
-    x >>= 3;
-    const uint k_pairs = (uint) args.k >> 8;
-    const uint kp      = x % k_pairs;
-    const uint ob      = x / k_pairs;
-
-    const uint split  = lane >> 2;
-    const uint j      = ((lane & 3U) << 1U) | (byte & 1U);
-    const uint k_half = byte >> 1;
-    const uint output = ob * 32U + group * 4U;
-    const uint k_low  = kp * 256U + k_half * 128U + split * 16U + j;
-    const uint k_high = k_low + 8U;
-    const uchar code_pair = codes[gid];
-    const ushort low      = k_row4_m5_packed_int4_codebook[(uint) (code_pair & 0x0fU)];
-    const ushort high     = k_row4_m5_packed_int4_codebook[(uint) (code_pair >> 4)];
-
-    const ulong low_offset  = ((ulong) k_low * (ulong) args.m + (ulong) output) >> 1;
-    const ulong high_offset = ((ulong) k_high * (ulong) args.m + (ulong) output) >> 1;
-    *((device ushort *) (weight_i4 + low_offset)) = low;
-    *((device ushort *) (weight_i4 + high_offset)) = high;
 }
 
 // Large prefills amortize one complete Row4 expansion across many token tiles.
@@ -1480,6 +1474,87 @@ kernel void name( \
 ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128, 128)
 ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512, 512)
 #undef ROW4_M5_PREFILL_PREEXPANDED
+
+// Full M64 tiles can write the exact BF16 epilogue through the cooperative
+// INT32 tensor. Keep its fragment layout and store the F32 result bit patterns
+// so the cooperative store does not introduce a numeric conversion.
+template<int output_tile, int n_simdgroups, int grouped_rows>
+static inline void row4_m5_prefill_cooperative_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device int8_t * act_q,
+        device uchar * weight_i4,
+        device const float * act_scales,
+        device const ushort * scales,
+        device float * dst,
+        uint3 tgpig) {
+    constexpr int row_tile = 64;
+    constexpr int k_tile   = 512;
+    constexpr auto desc = matmul2d_descriptor(
+        row_tile, output_tile, k_tile, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<n_simdgroups>> op;
+
+    using activation_tensor = tensor<device int8_t, extents<int, k_tile, row_tile>, tensor_inline>;
+    using weight_tensor     = tensor<device int4b_format, extents<int, output_tile, k_tile>, tensor_inline>;
+    auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    // Visit a short group of token tiles before advancing along O, reusing
+    // their weight columns in cache. The last group may contain fewer rows.
+    const uint nx = (uint) args.m / output_tile;
+    const uint ny = (uint) args.act_rows / row_tile;
+    const ulong linear = (ulong) tgpig.x + (ulong) nx * tgpig.y;
+    const ulong group_size = (ulong) grouped_rows * nx;
+    const uint first_row = (uint) (linear / group_size) * grouped_rows;
+    const uint group_rows = min((uint) grouped_rows, ny - first_row);
+    const uint offset = (uint) (linear % group_size);
+    const uint output_base = (offset / group_rows) * output_tile;
+    const uint row_base = (first_row + offset % group_rows) * row_tile;
+
+    for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
+        activation_tensor activation(
+            act_q + (ulong) row_base * (uint) args.k + k_base,
+            extents<int, k_tile, row_tile>(), array<int, 2>{ 1, args.k });
+        weight_tensor weight(
+            weight_i4 + (((ulong) k_base * (uint) args.m + output_base) >> 1),
+            extents<int, output_tile, k_tile>(), array<int, 2>{ 1, args.m });
+        op.run(activation, weight, acc);
+    }
+
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto coordinate = acc.get_multidimensional_index(i);
+            acc[i] = as_type<int32_t>(row4_finish_i32(
+                acc[i], act_scales[row_base + (uint) coordinate[1]], scales[output_base + (uint) coordinate[0]]));
+        }
+    }
+    auto target = tensor((device int32_t *) dst + (ulong) row_base * (uint) args.m + output_base,
+                         extents<int, output_tile, row_tile>(), array<int, 2>{ 1, args.m });
+    acc.store(target);
+}
+
+#define ROW4_M5_PREFILL_COOPERATIVE(name, output_tile, n_simdgroups, grouped_rows) \
+kernel void name( \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]], \
+        device int8_t * act_q [[buffer(1)]], \
+        device uchar * weight_i4 [[buffer(2)]], \
+        device const float * act_scales [[buffer(3)]], \
+        device const ushort * scales [[buffer(4)]], \
+        device float * dst [[buffer(5)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]]) { \
+    row4_m5_prefill_cooperative_impl<output_tile, n_simdgroups, grouped_rows>( \
+        args, act_q, weight_i4, act_scales, scales, dst, tgpig); \
+}
+
+ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512, 64, 4, 2)
+ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512, 128, 8, 4)
+#undef ROW4_M5_PREFILL_COOPERATIVE
 
 template<int row_tile, int output_tile, int n_simdgroups>
 static inline void row4_w1a8_m5_tensorops_prefill_impl(
