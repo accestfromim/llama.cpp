@@ -1005,7 +1005,8 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_
                                                                      bool                 has_bias,
                                                                      bool                 has_scap,
                                                                      int32_t              nsg,
-                                                                     bool                 turbo_gqa4) {
+                                                                     bool                 turbo_gqa4,
+                                                                     bool                 fairy_gqa2) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -1025,7 +1026,11 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_
                        type_k == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0 ||
                        type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || mixed;
 
-    if (turbo_gqa4) {
+    if (fairy_gqa2) {
+        GGML_ASSERT(type_k == GGML_TYPE_BF16 && type_v == GGML_TYPE_BF16 && dk == 128 && dv == 128 &&
+                    ggml_flash_attn_ext_get_fairy2i_flash3(op));
+        snprintf(base, sizeof(base), "kernel_flash_attn_ext_fairy_bf16_gqa2_dk128_dv128");
+    } else if (turbo_gqa4) {
         GGML_ASSERT(
             type_k == GGML_TYPE_TURBO4_0 &&
             (type_v == GGML_TYPE_TURBO4_0 || (type_v >= GGML_TYPE_TURBO2M4_S4 && type_v <= GGML_TYPE_TURBO2M4_G16)) &&

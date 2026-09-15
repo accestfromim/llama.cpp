@@ -1836,9 +1836,23 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+static int ggml_metal_fuse_rms_rope_qat(ggml_metal_op_t ctx, int idx, const ggml_tensor * weight_override);
+
 int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     ggml_cgraph * gf = ctx->gf;
     ggml_tensor * op = ggml_graph_node(gf, idx);
+
+    if (ctx->use_fusion && op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_F32 &&
+        ggml_nelements(op) == 128 && idx + 1 < ctx->idx_end && op->op == GGML_OP_CPY && op->src[1] == op &&
+        !op->view_src && ggml_metal_node_has_n_raw_uses(ctx->gf, idx, 2)) {
+        const ggml_tensor * next = ggml_graph_node(ctx->gf, idx + 1);
+        if (next->op == GGML_OP_FAIRY2I_RMS_NORM_EXACT && next->src[1] == op) {
+            const int fused = ggml_metal_fuse_rms_rope_qat(ctx, idx + 1, op->src[0]);
+            if (fused) {
+                return fused + 1;
+            }
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -4376,6 +4390,12 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                                  (type_v != GGML_TYPE_TURBO3_0 && ggml_metal_turbo4_specialized_v(type_v))) &&
                                 has_mask && !has_sinks && !has_bias && !has_scap && ne00 == 128 && ne20 == 128 &&
                                 ne01 >= 20 && ne02 == 4 * ne12 && ne03 == ne13 && ne12 == ne22 && ne32 == 1;
+        // Two Q heads reuse K/V loads once the cache is long enough to
+        // amortize the additional shared memory and accumulator registers.
+        const bool fairy_gqa2 = ctx->use_fusion && props_dev->has_mpp_tensorops && fairy2i_flash3 &&
+                                type_k == GGML_TYPE_BF16 && type_v == GGML_TYPE_BF16 && has_mask && !has_sinks &&
+                                !has_bias && !has_scap && ne00 == 128 && ne20 == 128 && ne01 >= 512 && ne11 >= 1024 &&
+                                ne02 == 4 * ne12 && ne03 == ne13 && ne12 == ne22 && ne32 == 1;
         int32_t    nsg        = turbo_gqa4 ? 2 : 4;
 
         size_t smem = FATTN_SMEM(nsg);
@@ -4383,6 +4403,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             smem = (size_t(32) * (ne00 + GGML_PAD(ne20, 64)) + size_t(32) * ncpsg + size_t(8) * ncpsg +
                     size_t(nsg) * 16 * 32) *
                    sizeof(ggml_fp16_t);
+        }
+
+        if (fairy_gqa2) {
+            smem = size_t(16) * (ne00 + 2 * GGML_PAD(ne20, 64)) * sizeof(ggml_fp16_t) +
+                   size_t(16) * ncpsg * sizeof(float) + size_t(8) * ncpsg * sizeof(ggml_fp16_t);
         }
 
         ggml_metal_kargs_flash_attn_ext args = {
@@ -4420,7 +4445,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         };
 
         ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(
-            lib, op, has_mask, has_sinks, has_bias, has_scap, nsg, turbo_gqa4);
+            lib, op, has_mask, has_sinks, has_bias, has_scap, nsg, turbo_gqa4, fairy_gqa2);
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -4443,8 +4468,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
         GGML_ASSERT(ne01 <= std::numeric_limits<int>::max() && ne02 <= std::numeric_limits<int>::max() &&
                     ne03 <= std::numeric_limits<int>::max() && ne12 <= std::numeric_limits<int>::max());
-        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((ne01 + nqptg - 1) / nqptg),
-                                                 (int) (turbo_gqa4 ? ne12 : ne02), (int) ne03, 32, nsg, 1);
+        const int dispatch_heads = turbo_gqa4 ? ne12 : ne02 / (fairy_gqa2 ? 2 : 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((ne01 + nqptg - 1) / nqptg), dispatch_heads, (int) ne03,
+                                                 32, nsg, 1);
+        if (ctx->debug_fusion > 1 && fairy_gqa2) {
+            GGML_LOG_DEBUG("FAIRY2I Flash3 GQA2 reuse: queries=%lld kv=%lld heads=%lld\n", (long long) ne01,
+                           (long long) ne11, (long long) ne02);
+        }
 #undef FATTN_SMEM
     } else {
         // half4x4 kernel
@@ -4942,7 +4972,150 @@ int ggml_metal_op_rms_norm(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+static int ggml_metal_fuse_rms_rope_qat(ggml_metal_op_t ctx, int idx, const ggml_tensor * weight_override) {
+    if (!ctx->use_fusion || !ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops || idx + 1 >= ctx->idx_end) {
+        return 0;
+    }
+    ggml_tensor * rms      = ggml_graph_node(ctx->gf, idx);
+    int           rope_idx = idx + 1;
+    for (; rope_idx < std::min(ctx->idx_end, idx + 5); ++rope_idx) {
+        const ggml_op op = ggml_graph_node(ctx->gf, rope_idx)->op;
+        if (op != GGML_OP_VIEW && op != GGML_OP_RESHAPE && op != GGML_OP_PERMUTE && op != GGML_OP_TRANSPOSE) {
+            break;
+        }
+    }
+    if (rope_idx >= ctx->idx_end) {
+        return 0;
+    }
+    ggml_tensor * rope = ggml_graph_node(ctx->gf, rope_idx);
+    if (rms->op != GGML_OP_FAIRY2I_RMS_NORM_EXACT || !ggml_fairy2i_exact_get_qat(rms) ||
+        !ggml_metal_device_supports_op(ctx->dev, rms) || !ggml_node_has_n_uses(ctx->gf, idx, 1) ||
+        (rms->flags & GGML_TENSOR_FLAG_OUTPUT) || rope->op != GGML_OP_FAIRY2I_ROPE_EXACT || rope->src[0] != rms ||
+        !ggml_fairy2i_exact_get_qat(rope) || !ggml_metal_device_supports_op(ctx->dev, rope)) {
+        return 0;
+    }
+    const ggml_tensor * x      = rms->src[0];
+    const ggml_tensor * weight = weight_override ? weight_override : rms->src[1];
+    if (!x || !weight || x->type != GGML_TYPE_F32 || x->ne[0] != 128 || (x->ne[1] != 8 && x->ne[1] != 32) ||
+        x->ne[2] < 32 || x->ne[3] != 1 || x->nb[0] != sizeof(float) || !ggml_is_contiguous(rope) ||
+        (weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_BF16) || weight->ne[0] != 128 ||
+        ggml_nelements(weight) != 128 || !ggml_is_contiguous(weight) || ggml_get_op_params_i32(rope, 1) != 128 ||
+        ggml_get_op_params_i32(rope, 2) != GGML_ROPE_TYPE_NEOX || !ggml_is_contiguous(rope->src[1])) {
+        return 0;
+    }
+
+    // A following carrier SET_ROWS can consume the normalized/rotated K
+    // directly. Only cross metadata nodes; every real dependency stays ordered.
+    ggml_tensor * store = nullptr;
+    int           end   = rope_idx;
+    for (int j = rope_idx + 1; j < std::min(ctx->idx_end, idx + 9); ++j) {
+        ggml_tensor * next = ggml_graph_node(ctx->gf, j);
+        if (ggml_is_empty(next)) {
+            break;
+        }
+        if (next->op == GGML_OP_VIEW || next->op == GGML_OP_RESHAPE || next->op == GGML_OP_PERMUTE ||
+            next->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+        const ggml_tensor * rows = next->src[0];
+        if (next->op == GGML_OP_SET_ROWS && ggml_get_op_params_i32(next, 0) == GGML_SET_ROWS_BF16_CARRIER_ROWS &&
+            ggml_metal_device_supports_op(ctx->dev, next) && ggml_metal_node_has_n_raw_uses(ctx->gf, rope_idx, 1) &&
+            rows && rows->view_src == rope && rows->view_offs == 0 && rows->ne[0] == 128 * x->ne[1] &&
+            rows->ne[1] == x->ne[2] && rows->ne[2] == 1 && rows->ne[3] == 1 && rows->nb[1] == rope->nb[2] &&
+            next->src[1]->type == GGML_TYPE_I64 && ggml_is_contiguous(next->src[1]) &&
+            ggml_nelements(next->src[1]) == x->ne[2] && ggml_is_contiguous_rows(next)) {
+            int rows_idx = -1;
+            for (int k = rope_idx + 1; k < j; ++k) {
+                if (ggml_graph_node(ctx->gf, k) == rows) {
+                    rows_idx = k;
+                    break;
+                }
+            }
+            if (ggml_metal_node_has_n_raw_uses(ctx->gf, rows_idx, 1)) {
+                store = next;
+                end   = j;
+            }
+        }
+        break;
+    }
+    ggml_tensor *              dst     = store ? store : rope;
+    const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(dst);
+    for (const ggml_tensor * source :
+         { x, weight, static_cast<const ggml_tensor *>(rope->src[1]), static_cast<const ggml_tensor *>(rope->src[2]),
+           store ? static_cast<const ggml_tensor *>(store->src[1]) : nullptr }) {
+        if (source) {
+            // Distinct Metal mappings can still alias the same host range.
+            const uintptr_t address = (uintptr_t) dst->data;
+            const uintptr_t other   = (uintptr_t) source->data;
+            const bool      overlaps =
+                address <= other ? other - address < ggml_nbytes(dst) : address - other < ggml_nbytes(source);
+            if (overlaps || ggml_metal_buffer_ranges_overlap(bid_dst, ggml_nbytes(dst),
+                                                             ggml_metal_get_buffer_id(source), ggml_nbytes(source))) {
+                return 0;
+            }
+        }
+    }
+
+    ggml_metal_kargs_fairy2i_rms_norm_exact rms_args = {};
+    rms_args.ne00                                    = 128;
+    rms_args.nb01                                    = x->nb[1];
+    rms_args.nb02                                    = x->nb[2];
+    rms_args.nb03                                    = x->nb[3];
+    rms_args.nb10                                    = weight->nb[0];
+    memcpy(&rms_args.eps, rms->op_params, sizeof(float));
+    GGML_ASSERT(rms_args.eps >= 0.0f);
+    ggml_metal_kargs_rope rope_args = {};
+    rope_args.nb1                   = rope->nb[1];
+    rope_args.nb2                   = rope->nb[2];
+    rope_args.nb3                   = rope->nb[3];
+    rope_args.n_dims                = 128;
+    rope_args.n_ctx_orig            = ggml_get_op_params_i32(rope, 4);
+    memcpy(&rope_args.freq_base, rope->op_params + 5, sizeof(float));
+    memcpy(&rope_args.freq_scale, rope->op_params + 6, sizeof(float));
+    memcpy(&rope_args.ext_factor, rope->op_params + 7, sizeof(float));
+    memcpy(&rope_args.attn_factor, rope->op_params + 8, sizeof(float));
+    memcpy(&rope_args.beta_fast, rope->op_params + 9, sizeof(float));
+    memcpy(&rope_args.beta_slow, rope->op_params + 10, sizeof(float));
+    uint64_t kv_stride = store ? store->nb[1] : 0;
+    uint32_t has_freq  = rope->src[2] != nullptr;
+
+    for (int j = idx; j <= end; ++j) {
+        if (!ggml_metal_op_concurrency_check(ctx, ggml_graph_node(ctx->gf, j))) {
+            ggml_metal_op_concurrency_reset(ctx);
+            break;
+        }
+    }
+    const char *          name     = store ? "kernel_fairy2i_rms_rope_qat_k128_kv" : "kernel_fairy2i_rms_rope_qat_k128";
+    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(ctx->lib, name);
+    if (!pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(ctx->lib, name, name, nullptr);
+    }
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &rms_args, sizeof(rms_args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(x), 1);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(weight), 2);
+    ggml_metal_encoder_set_buffer(ctx->enc, bid_dst, 3);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(rope->src[1]), 4);
+    ggml_metal_encoder_set_bytes(ctx->enc, &rope_args, sizeof(rope_args), 5);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(rope->src[2] ? rope->src[2] : x), 6);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(store ? store->src[1] : x), 7);
+    ggml_metal_encoder_set_bytes(ctx->enc, &kv_stride, sizeof(kv_stride), 8);
+    ggml_metal_encoder_set_bytes(ctx->enc, &has_freq, sizeof(has_freq), 9);
+    ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, GGML_PAD(137 * sizeof(float), 16), 0);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, x->ne[1], x->ne[2], x->ne[3], 128, 1, 1);
+    if (ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("%s: fuse QAT RMS128 + RoPE (heads=%lld tokens=%lld bf16-weight=%d kv-store=%d)\n", __func__,
+                       (long long) x->ne[1], (long long) x->ne[2], weight_override != nullptr, store != nullptr);
+    }
+    return end - idx + 1;
+}
+
 int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
+    const int fused = ggml_metal_fuse_rms_rope_qat(ctx, idx, nullptr);
+    if (fused) {
+        return fused;
+    }
+
     ggml_tensor * op = ggml_graph_node(ctx->gf, idx);
 
     GGML_ASSERT(op->op == GGML_OP_FAIRY2I_RMS_NORM_EXACT);

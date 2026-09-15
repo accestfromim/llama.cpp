@@ -149,7 +149,8 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_
                                                                      bool                       has_bias,
                                                                      bool                       has_scap,
                                                                      int32_t                    nsg,
-                                                                     bool                       turbo_gqa4);
+                                                                     bool                       turbo_gqa4,
+                                                                     bool                       fairy_gqa2);
 
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(ggml_metal_library_t       lib,
                                                                          const struct ggml_tensor * op,

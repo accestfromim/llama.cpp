@@ -12919,6 +12919,85 @@ kernel void kernel_fairy2i_rope_neox_qat_f32(
     }
 }
 
+// K128 QAT RMSNorm + NEOX RoPE, preserving the original 256-thread
+// reduction and every BF16 boundary. Optional K stores avoid a carrier copy.
+template<bool store_k>
+kernel void kernel_fairy2i_rms_rope_qat_k128(
+    constant ggml_metal_kargs_fairy2i_rms_norm_exact & ra [[buffer(0)]],
+    const device char * src0 [[buffer(1)]],
+    const device char * weight [[buffer(2)]],
+    device char * dst [[buffer(3)]],
+    const device int32_t * pos [[buffer(4)]],
+    constant ggml_metal_kargs_rope & args [[buffer(5)]],
+    const device float * freq [[buffer(6)]],
+    const device int64_t * indices [[buffer(7)]],
+    constant uint64_t & kv_stride [[buffer(8)]],
+    constant uint32_t & has_freq [[buffer(9)]],
+    threadgroup float * shared [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]]) {
+    const uint head = group.x, token = group.y, batch = group.z;
+    const device float * x = (const device float *) (src0 + head*ra.nb01 + token*ra.nb02 + batch*ra.nb03);
+    const float value = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(x[tid]));
+    const float sum = simd_sum(precise::fma(value, value, 0.0f));
+    if ((tid & 31) == 0) {
+        shared[tid >> 5] = sum;
+    }
+    if (tid >= 4 && tid < 8) {
+        shared[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float row_sum = 0.0f;
+        for (ushort sg = 0; sg < 8; ++sg) {
+            row_sum = precise::fma(1.0f, shared[sg], row_sum);
+        }
+        shared[8] = 1.0f / precise::sqrt(row_sum / 128.0f + ra.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float normalized = fairy2i_round_to_bf16_f32(value * shared[8]);
+    const float w = ra.nb10 == 2 ? fairy2i_bf16_to_f32(((const device ushort *) weight)[tid]) :
+                                  ((const device float *) weight)[tid];
+    const float w_bf16 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(w));
+    ((threadgroup uint *) (shared + 9))[tid] = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 64) {
+        const int i0 = 2*tid;
+        float corr_dims[2];
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+        const float theta_base = (float) pos[token];
+        const float inv_ndims = -1.0f / (float) args.n_dims;
+        const float theta = theta_base * pow(args.freq_base, inv_ndims * (float) i0);
+        const float factor = has_freq ? freq[tid] : 1.0f;
+        float cos_theta, sin_theta;
+        rope_yarn(theta / factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float x0 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(shared[9+tid]));
+        const float x1 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(shared[9+tid+64]));
+        const float c = fairy2i_round_to_bf16_f32(cos_theta);
+        const float s = fairy2i_round_to_bf16_f32(sin_theta);
+        const float x0c = fairy2i_round_to_bf16_f32(x0*c);
+        const float x1s = fairy2i_round_to_bf16_f32(x1*s);
+        const float x0s = fairy2i_round_to_bf16_f32(x0*s);
+        const float x1c = fairy2i_round_to_bf16_f32(x1*c);
+        const ushort y0 = fairy2i_f32_to_bf16(x0c-x1s);
+        const ushort y1 = fairy2i_f32_to_bf16(x0s+x1c);
+        if (store_k) {
+            device ushort * y = (device ushort *) (dst + indices[token]*kv_stride) + head*128;
+            y[tid] = y0;
+            y[tid+64] = y1;
+        } else {
+            device uint * y = (device uint *) (dst + head*args.nb1 + token*args.nb2 + batch*args.nb3);
+            y[tid] = (uint) y0 << 16;
+            y[tid+64] = (uint) y1 << 16;
+        }
+    }
+}
+
+typedef decltype(kernel_fairy2i_rms_rope_qat_k128<false>) fairy2i_rms_rope_qat_k128_t;
+template [[host_name("kernel_fairy2i_rms_rope_qat_k128")]] kernel fairy2i_rms_rope_qat_k128_t kernel_fairy2i_rms_rope_qat_k128<false>;
+template [[host_name("kernel_fairy2i_rms_rope_qat_k128_kv")]] kernel fairy2i_rms_rope_qat_k128_t kernel_fairy2i_rms_rope_qat_k128<true>;
+
 // TODO: obolete -- remove
 //typedef void (im2col_t)(
 //        constant ggml_metal_kargs_im2col & args,
@@ -14096,7 +14175,7 @@ void kernel_flash_attn_ext_impl(
     constexpr short MS  = GQA == 1 ? SH : C/2;
 
     constexpr short TS = 2*SH;
-    constexpr short T  = DK + (GQA == 1 ? 2*PV : PV); // shared memory size per query in (half)
+    constexpr short T  = DK + (GQA == 1 ? 2 : sizeof(o_t)/sizeof(half))*PV; // shared memory size per query in (half)
 
     threadgroup q_t  * sq  = (threadgroup q_t  *) (shmem_f16 + 0*T); // holds the query data
     threadgroup q4_t * sq4 = (threadgroup q4_t *) (shmem_f16 + 0*T); // same as above but in q4_t
@@ -14221,7 +14300,7 @@ void kernel_flash_attn_ext_impl(
 
             // Q*K^T
             // this is compile-time check, so it does not have runtime overhead
-            if (is_same<kd4x4_t, k4x4_t>::value) {
+            if (is_same<kd4x4_t, k4x4_t>::value && GQA == 1) {
                 // we can read directly from global memory
                 device      const k_t * pk = (device const k_t *) ((device const char *) k + ic*args.nb11);
                 threadgroup const q_t * pq = sq;
@@ -14283,6 +14362,33 @@ void kernel_flash_attn_ext_impl(
                     pk += 8*(NSG*NS10 - DK8);
                     pq += 8*(NSG*0    - DK8);
                     ps += 8*(NSG);
+                }
+            } else if (is_same<kd4x4_t, k4x4_t>::value) {
+                constexpr short NC = (C/8)/NSG;
+                for (short cc = 0; cc < NC; ++cc) {
+                    qk8x8_t accum[GQA];
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        accum[g] = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
+                    }
+                    device const k_t * pk = (device const k_t *) (k + ic*args.nb11) +
+                                            8*(sgitg + cc*NSG)*NS10;
+                    FOR_UNROLL (short i = 0; i < DK8; i += 2) {
+                        k8x8_t mk[2];
+                        simdgroup_barrier(mem_flags::mem_none);
+                        simdgroup_load(mk[0], pk + 8*i, NS10, 0, true);
+                        if (i + 1 < DK8) simdgroup_load(mk[1], pk + 8*(i+1), NS10, 0, true);
+                        FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                            q8x8_t mq[2];
+                            simdgroup_load(mq[0], sq + g*Q*DK + 8*i, DK);
+                            if (i + 1 < DK8) simdgroup_load(mq[1], sq + g*Q*DK + 8*(i+1), DK);
+                            simdgroup_barrier(mem_flags::mem_none);
+                            simdgroup_multiply_accumulate(accum[g], mq[0], mk[0], accum[g]);
+                            if (i + 1 < DK8) simdgroup_multiply_accumulate(accum[g], mq[1], mk[1], accum[g]);
+                        }
+                    }
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        simdgroup_store(accum[g], ss + g*Q*SH + 8*(sgitg + cc*NSG), SH, 0, false);
+                    }
                 }
             } else {
                 // TODO: this is the quantized K cache branch - not optimized yet
@@ -14412,7 +14518,7 @@ void kernel_flash_attn_ext_impl(
             // O = O + (Q*K^T)*V
             {
                 // we can read directly from global memory
-                if (is_same<vd4x4_t, v4x4_t>::value) {
+                if (is_same<vd4x4_t, v4x4_t>::value && GQA == 1) {
                     static_assert(PV8 % NSG == 0, "");
 
                     constexpr short NO = PV8/NSG;
@@ -14461,6 +14567,33 @@ void kernel_flash_attn_ext_impl(
                             simdgroup_store(lo[ii], sot, PV, 0, false);
 
                             sot += 8*NSG;
+                        }
+                    }
+                } else if (is_same<vd4x4_t, v4x4_t>::value) {
+                    constexpr short NO = PV8/NSG;
+                    o8x8_t accum[GQA][NO];
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        FOR_UNROLL (short i = 0; i < NO; ++i) {
+                            simdgroup_load(accum[g][i], so + g*Q*PV + 8*(sgitg+i*NSG), PV, 0, false);
+                        }
+                    }
+                    FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                        s8x8_t probability[GQA];
+                        FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                            simdgroup_load(probability[g], ss + g*Q*SH + 8*cc, SH, 0, false);
+                        }
+                        device const v_t * pv = (device const v_t *) (v + (ic+8*cc)*args.nb21);
+                        FOR_UNROLL (short i = 0; i < NO; ++i) {
+                            v8x8_t mv;
+                            simdgroup_load(mv, pv + 8*(sgitg+i*NSG), NS20, 0, false);
+                            FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                                simdgroup_multiply_accumulate(accum[g][i], probability[g], mv, accum[g][i]);
+                            }
+                        }
+                    }
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        FOR_UNROLL (short i = 0; i < NO; ++i) {
+                            simdgroup_store(accum[g][i], so + g*Q*PV + 8*(sgitg+i*NSG), PV, 0, false);
                         }
                     }
                 } else {
@@ -14698,6 +14831,7 @@ template [[host_name("kernel_flash_attn_ext_f16_dk576_dv512")]]  kernel flash_at
 
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_flash_attn_ext_fairy_bf16_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_FAIRY_BF, bfloat4x4, 1, dequantize_bf16, bfloat4x4, 1, dequantize_bf16, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_fairy_bf16_gqa2_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_FAIRY_BF, bfloat4x4, 1, dequantize_bf16, bfloat4x4, 1, dequantize_bf16, 128, 128, 8, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk40_dv40"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 40,  40>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 64,  64>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 80,  80>;
