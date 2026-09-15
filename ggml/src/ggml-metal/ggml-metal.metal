@@ -1595,7 +1595,7 @@ ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m3
 // Full M64 tiles can write the exact BF16 epilogue through the cooperative
 // INT32 tensor. Keep its fragment layout and store the F32 result bit patterns
 // so the cooperative store does not introduce a numeric conversion.
-template<int output_tile, int n_simdgroups, int grouped_rows, bool has_residual = false>
+template<int output_tile, int n_simdgroups, int grouped_rows, bool has_residual = false, bool has_v_store = false>
 static inline void row4_m5_prefill_cooperative_impl(
         constant ggml_metal_kargs_row_quant_linear & args,
         device int8_t * act_q,
@@ -1604,7 +1604,10 @@ static inline void row4_m5_prefill_cooperative_impl(
         device const ushort * scales,
         device float * dst,
         uint3 tgpig,
-        device const uint * residual = nullptr) {
+        device const uint * residual = nullptr,
+        device char * v_cache = nullptr,
+        device const int64_t * v_rows = nullptr,
+        ulong v_stride = 0) {
     constexpr int row_tile = 64;
     constexpr int k_tile   = 512;
     constexpr auto desc = matmul2d_descriptor(
@@ -1650,6 +1653,11 @@ static inline void row4_m5_prefill_cooperative_impl(
             const auto coordinate = acc.get_multidimensional_index(i);
             acc[i] = as_type<int32_t>(row4_finish_i32(
                 acc[i], act_scales[row_base + (uint) coordinate[1]], scales[output_base + (uint) coordinate[0]]));
+            if (has_v_store && output_base >= 5120) {
+                const uint row = row_base + (uint) coordinate[1];
+                device ushort * target = (device ushort *) (v_cache + v_rows[row] * v_stride);
+                target[output_base - 5120 + (uint) coordinate[0]] = ushort(as_type<uint>(acc[i]) >> 16);
+            }
             if (has_residual) {
                 // Preserve the materialized BF16 boundary. Folding the low
                 // component's +0 changes signed zero, subnormal flushing and
@@ -1685,6 +1693,21 @@ kernel void name( \
 ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512, 64, 4, 2)
 ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512, 128, 8, 4)
 #undef ROW4_M5_PREFILL_COOPERATIVE
+
+kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512_v_store(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device int8_t * act_q [[buffer(1)]],
+        device uchar * weight_i4 [[buffer(2)]],
+        device const float * act_scales [[buffer(3)]],
+        device const ushort * scales [[buffer(4)]],
+        device float * dst [[buffer(5)]],
+        device char * v_cache [[buffer(6)]],
+        device const int64_t * v_rows [[buffer(7)]],
+        constant ulong & v_stride [[buffer(8)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    row4_m5_prefill_cooperative_impl<64, 4, 2, false, true>(
+        args, act_q, weight_i4, act_scales, scales, dst, tgpig, nullptr, v_cache, v_rows, v_stride);
+}
 
 kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512_qat_residual(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],

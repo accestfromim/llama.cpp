@@ -4469,6 +4469,194 @@ bool test_metal_flash3_row4_handoff() {
 
 }  // namespace
 
+namespace {
+
+void row4_v_store_log(enum ggml_log_level level, const char * text, void * user) {
+    (void) level;
+    if (strstr(text, "Row4 QKV direct BF16 V cache:")) {
+        static_cast<std::atomic<bool> *>(user)->store(true);
+    }
+}
+
+bool run_row4_v_store_graph(ggml_backend_t          backend,
+                            int                     tokens,
+                            int                     gate,
+                            std::vector<float> &    output,
+                            std::vector<uint16_t> & cache_output,
+                            std::vector<float> &    prior_output,
+                            bool &                  hit) {
+    constexpr int  k = 4096, o = 6144, v_width = 1024;
+    ggml_context * ctx    = ggml_init({ 4 * 1024 * 1024, nullptr, true });
+    ggml_tensor *  x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+    ggml_tensor *  codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, o / 32);
+    ggml_tensor *  scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
+    ggml_tensor *  qkv    = ggml_row4_linear(ctx, x, codes, scales, o, k);
+    if (gate == 5) {
+        ggml_set_output(qkv);
+    }
+    ggml_tensor * rows        = ggml_view_2d(ctx, qkv, v_width, tokens, qkv->nb[1], 5120 * sizeof(float));
+    ggml_tensor * cache       = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, v_width, tokens + 37);
+    ggml_tensor * raw_indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, tokens);
+    ggml_tensor * indices     = gate == 2 ? ggml_view_1d(ctx, raw_indices, tokens, 0) : raw_indices;
+    ggml_tensor * store       = ggml_set_rows_bf16_carrier(ctx, cache, rows, indices, GGML_SET_ROWS_BF16_CARRIER_ROWS);
+    ggml_tensor * prior       = gate == 1 ? ggml_cast(ctx, cache, GGML_TYPE_F32) : nullptr;
+    ggml_tensor * index_input = gate == 6 ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tokens) : nullptr;
+    ggml_tensor * index_alias = gate == 6 ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * tokens) : nullptr;
+    ggml_tensor * index_write = gate == 6 ? ggml_cpy(ctx, index_input, index_alias) : nullptr;
+    ggml_cgraph * graph       = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, qkv);
+    if (prior) {
+        ggml_set_output(prior);
+        ggml_build_forward_expand(graph, prior);
+    }
+    if (index_write) {
+        ggml_build_forward_expand(graph, index_write);
+    }
+    ggml_build_forward_expand(graph, store);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+    if (gate == 4 || gate == 7) {
+        cache->buffer = nullptr;
+        cache->data   = nullptr;
+        void * alias  = gate == 4 ? codes->data : static_cast<char *>(qkv->data) + ((ggml_nbytes(qkv) + 63) / 64) * 64;
+        if (ggml_backend_tensor_alloc(buffer, cache, alias) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            return false;
+        }
+        store->data = cache->data;
+    }
+    if (index_write) {
+        index_alias->buffer = nullptr;
+        index_alias->data   = nullptr;
+        if (ggml_backend_tensor_alloc(buffer, index_alias, raw_indices->data) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            return false;
+        }
+        index_write->data = raw_indices->data;
+    }
+    const auto           inputs     = make_input(k, tokens);
+    const auto           packed     = make_row4_pair2_codes(o, k);
+    const auto           scale_bits = make_row4_scales(o);
+    std::vector<int64_t> index_data(tokens);
+    for (int i = 0; i < tokens; ++i) {
+        index_data[i] = tokens + 36 - i;
+    }
+    ggml_backend_tensor_memset(cache, 0, 0, ggml_nbytes(cache));
+    ggml_backend_tensor_set(x, inputs.data(), 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(codes, packed.data(), 0, packed.size());
+    ggml_backend_tensor_set(scales, scale_bits.data(), 0, ggml_nbytes(scales));
+    ggml_backend_tensor_set(raw_indices, index_data.data(), 0, ggml_nbytes(raw_indices));
+    if (index_write) {
+        for (int i = 0; i < tokens; ++i) {
+            index_data[i] = i;
+        }
+        // CPY uses a supported F32 view to rewrite the exact I64 index bytes.
+        ggml_backend_tensor_set(index_input, index_data.data(), 0, ggml_nbytes(raw_indices));
+    }
+    std::atomic<bool> marker{ false };
+    ggml_log_set(row4_v_store_log, &marker);
+    ggml_status status;
+    if (gate == 3) {
+        ggml_cgraph * first  = ggml_new_graph(ctx);
+        ggml_cgraph * second = ggml_new_graph(ctx);
+        ggml_build_forward_expand(first, qkv);
+        ggml_graph_add_node(second, rows);
+        ggml_graph_add_node(second, store);
+        status = ggml_backend_graph_compute(backend, first);
+        if (status == GGML_STATUS_SUCCESS) {
+            status = ggml_backend_graph_compute(backend, second);
+        }
+    } else {
+        status = ggml_backend_graph_compute(backend, graph);
+    }
+    ggml_backend_synchronize(backend);
+    ggml_log_set(nullptr, nullptr);
+    hit = marker.load();
+    if (status == GGML_STATUS_SUCCESS) {
+        output.resize(ggml_nelements(qkv));
+        cache_output.resize(ggml_nelements(cache));
+        ggml_backend_tensor_get(qkv, output.data(), 0, ggml_nbytes(qkv));
+        ggml_backend_tensor_get(cache, cache_output.data(), 0, ggml_nbytes(cache));
+        if (prior) {
+            prior_output.resize(ggml_nelements(prior));
+            ggml_backend_tensor_get(prior, prior_output.data(), 0, ggml_nbytes(prior));
+        }
+        for (int row = 0; row < tokens; ++row) {
+            for (int col = 0; col < v_width; ++col) {
+                if (cache_output[index_data[row] * v_width + col] != (f32_bits(output[row * o + 5120 + col]) >> 16)) {
+                    fprintf(stderr, "QKV V-cache payload mismatch row=%d col=%d\n", row, col);
+                    status = GGML_STATUS_FAILED;
+                    break;
+                }
+            }
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return status == GGML_STATUS_SUCCESS;
+}
+
+bool test_metal_row4_v_store() {
+    const char * strict = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
+    if (!strict || strcmp(strict, "0") == 0) {
+        printf("  Metal Row4 QKV V cache: SKIP (strict M5 suite only)\n");
+        return true;
+    }
+    ggml_backend_dev_t dev = find_metal_device();
+    if (!dev) {
+        return false;
+    }
+    scoped_env_var disable("GGML_METAL_FUSION_DISABLE"), debug("GGML_METAL_FUSION_DEBUG");
+    disable.set("1");
+    ggml_backend_t baseline = ggml_backend_dev_init(dev, nullptr);
+    disable.unset();
+    debug.set("2");
+    ggml_backend_t candidate = ggml_backend_dev_init(dev, nullptr);
+    if (!baseline || !candidate) {
+        ggml_backend_free(baseline);
+        ggml_backend_free(candidate);
+        return false;
+    }
+    bool      ok         = true;
+    const int cases[][2] = {
+        { 512,  0 },
+        { 2048, 0 },
+        { 128,  0 },
+        { 544,  0 },
+        { 512,  1 },
+        { 512,  2 },
+        { 512,  3 },
+        { 512,  4 },
+        { 512,  5 },
+        { 512,  6 },
+        { 512,  7 }
+    };
+    for (const auto & c : cases) {
+        std::vector<float>    expected, actual, expected_prior, actual_prior;
+        std::vector<uint16_t> expected_cache, actual_cache;
+        bool                  baseline_hit = false, candidate_hit = false;
+        const bool            ran =
+            run_row4_v_store_graph(baseline, c[0], c[1], expected, expected_cache, expected_prior, baseline_hit) &&
+            run_row4_v_store_graph(candidate, c[0], c[1], actual, actual_cache, actual_prior, candidate_hit);
+        const bool eligible = c[0] >= 512 && c[0] % 64 == 0 && (c[1] == 0 || c[1] == 5);
+        ok = ran && compare_exact("QKV full carriers", actual, expected) && actual_cache == expected_cache &&
+             compare_exact("V-cache preceding readers", actual_prior, expected_prior) && !baseline_hit &&
+             candidate_hit == eligible && ok;
+    }
+    ggml_backend_free(baseline);
+    ggml_backend_free(candidate);
+    printf("  Metal Row4 QKV V cache: payloads, indices, outputs, readers, aliases, splits - %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+}  // namespace
+
 int main() {
     ggml_cpu_init();
 
@@ -4492,6 +4680,7 @@ int main() {
     failed += !test_metal_rms_row4_fusion();
     failed += !test_metal_rms_rope_fusion();
     failed += !test_metal_flash3_gqa_reuse();
+    failed += !test_metal_row4_v_store();
     failed += !test_metal_flash3_row4_handoff();
     failed += !test_row4_cache_updates();
     failed += !test_metal_row4_preexpand_lookahead();
