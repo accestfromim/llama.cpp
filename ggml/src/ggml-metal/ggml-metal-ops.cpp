@@ -1839,17 +1839,20 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
 }
 
 static int ggml_metal_fuse_rms_rope_qat(ggml_metal_op_t ctx, int idx, const ggml_tensor * weight_override);
+static int ggml_metal_op_fairy2i_rms_norm_exact_impl(ggml_metal_op_t ctx, int idx, const ggml_tensor * weight_override);
 
 int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     ggml_cgraph * gf = ctx->gf;
     ggml_tensor * op = ggml_graph_node(gf, idx);
 
     if (ctx->use_fusion && op->src[0]->type == GGML_TYPE_BF16 && op->type == GGML_TYPE_F32 &&
-        ggml_nelements(op) == 128 && idx + 1 < ctx->idx_end && op->op == GGML_OP_CPY && op->src[1] == op &&
-        !op->view_src && ggml_metal_node_has_n_raw_uses(ctx->gf, idx, 2)) {
+        (ggml_nelements(op) == 128 || ggml_nelements(op) == 4096) && idx + 1 < ctx->idx_end && op->op == GGML_OP_CPY &&
+        op->src[1] == op && !op->view_src && ggml_metal_node_has_n_raw_uses(ctx->gf, idx, 2)) {
         const ggml_tensor * next = ggml_graph_node(ctx->gf, idx + 1);
         if (next->op == GGML_OP_FAIRY2I_RMS_NORM_EXACT && next->src[1] == op) {
-            const int fused = ggml_metal_fuse_rms_rope_qat(ctx, idx + 1, op->src[0]);
+            const int fused = ggml_nelements(op) == 128 ?
+                                  ggml_metal_fuse_rms_rope_qat(ctx, idx + 1, op->src[0]) :
+                                  ggml_metal_op_fairy2i_rms_norm_exact_impl(ctx, idx + 1, op->src[0]);
             if (fused) {
                 return fused + 1;
             }
@@ -5176,7 +5179,9 @@ static int ggml_metal_fuse_rms_rope_qat(ggml_metal_op_t ctx, int idx, const ggml
     return end - idx + 1;
 }
 
-int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
+static int ggml_metal_op_fairy2i_rms_norm_exact_impl(ggml_metal_op_t     ctx,
+                                                     int                 idx,
+                                                     const ggml_tensor * weight_override) {
     const int fused = ggml_metal_fuse_rms_rope_qat(ctx, idx, nullptr);
     if (fused) {
         return fused;
@@ -5200,7 +5205,7 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(eps >= 0.0f);
 
     const ggml_tensor * src0   = op->src[0];
-    const ggml_tensor * weight = op->src[1];
+    const ggml_tensor * weight = weight_override ? weight_override : op->src[1];
 
     ggml_metal_kargs_fairy2i_rms_norm_exact args = {
         /*.ne00 =*/(int32_t) src0->ne[0],
@@ -5226,9 +5231,9 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
 
     const bool qat = ggml_fairy2i_exact_get_qat(op);
 
-    // Preserve the exact RMS destination for graph callbacks, but form the
-    // following Row4 activation quantization in the same dispatch. Prefill
-    // rows must fill the selected MPP tile, so no padded A8 rows are needed.
+    // Form the following Row4 activation quantization in the same dispatch.
+    // Unobserved prefill RMS carriers stay in registers. Requested outputs,
+    // extra users and split graphs retain their original materialization.
     const int64_t rows    = ggml_nrows(op);
     const bool    prefill = rows >= 32 && rows % 32 == 0 && ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops;
     if (ctx->use_fusion && qat && idx + 1 < ctx->idx_end && ggml_node_has_n_uses(ctx->gf, idx, 1) &&
@@ -5256,8 +5261,12 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
             const ggml_metal_buffer_id weight_buffer = ggml_metal_get_buffer_id(weight);
             const size_t               act_q_bytes   = (size_t) rows * 4096 * sizeof(int8_t);
             const size_t               quant_bytes   = act_q_bytes + (size_t) rows * sizeof(float);
+            const uintptr_t            quant_address = (uintptr_t) linear->data + GGML_PAD(ggml_nbytes(linear), 64);
             const bool                 scratch_isolated =
                 rms_dst.metal && src0_buffer.metal && weight_buffer.metal && act_q.metal &&
+                !ggml_metal_row4_range_overlaps_tensor(quant_address, quant_bytes, op) &&
+                !ggml_metal_row4_range_overlaps_tensor(quant_address, quant_bytes, src0) &&
+                !ggml_metal_row4_range_overlaps_tensor(quant_address, quant_bytes, weight) &&
                 !ggml_metal_buffer_ranges_overlap(rms_dst, ggml_nbytes(op), act_q, quant_bytes) &&
                 !ggml_metal_buffer_ranges_overlap(src0_buffer, ggml_nbytes(src0), act_q, quant_bytes) &&
                 !ggml_metal_buffer_ranges_overlap(weight_buffer, ggml_nbytes(weight), act_q, quant_bytes);
@@ -5275,17 +5284,27 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
                 // scratch tail is disjoint from the still-live RMS operands.
                 const bool   overlap_preexpand =
                     m5_tensorops.preexpanded_weights &&
+                    !ggml_metal_row4_range_overlaps_tensor(quant_address, scratch_bytes, op) &&
+                    !ggml_metal_row4_range_overlaps_tensor(quant_address, scratch_bytes, src0) &&
+                    !ggml_metal_row4_range_overlaps_tensor(quant_address, scratch_bytes, weight) &&
                     !ggml_metal_buffer_ranges_overlap(rms_dst, ggml_nbytes(op), act_q, scratch_bytes) &&
                     !ggml_metal_buffer_ranges_overlap(src0_buffer, ggml_nbytes(src0), act_q, scratch_bytes) &&
                     !ggml_metal_buffer_ranges_overlap(weight_buffer, ggml_nbytes(weight), act_q, scratch_bytes);
 
-                if (!ggml_metal_op_concurrency_check(ctx, linear)) {
+                // A cast-elision entry has only checked the cast's operands.
+                // The RMS input may still be produced by an earlier dispatch.
+                if ((weight_override && !ggml_metal_op_concurrency_check(ctx, op)) ||
+                    !ggml_metal_op_concurrency_check(ctx, linear)) {
                     ggml_metal_op_concurrency_reset(ctx);
                 }
 
-                const char * pipeline_name =
-                    prefill ? "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096" :
-                              "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096";
+                const bool   no_store      = prefill && ggml_metal_node_has_n_raw_uses(ctx->gf, idx, 1);
+                const char * pipeline_name = "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096";
+                if (prefill) {
+                    pipeline_name =
+                        no_store ? "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_no_store" :
+                                   "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096";
+                }
                 ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(ctx->lib, pipeline_name);
                 if (!pipeline) {
                     pipeline = ggml_metal_library_compile_pipeline(ctx->lib, pipeline_name, pipeline_name, nullptr);
@@ -5311,14 +5330,18 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
                 if (ctx->debug_fusion > 1) {
                     GGML_LOG_DEBUG(
                         "%s: fuse QAT FAIRY2I_RMS_NORM_EXACT + ROW4_LINEAR activation quantization "
-                        "(B=%lld K=4096 preexpand-overlap=%d)\n",
-                        __func__, (long long) rows, overlap_preexpand);
+                        "(B=%lld K=4096 preexpand-overlap=%d rms-store=%d bf16-weight=%d)\n",
+                        __func__, (long long) rows, overlap_preexpand, !no_store, weight_override != nullptr);
                 }
                 return 2;
             }
         }
     }
 
+    // A failed cast-elision probe must leave the original cast/consumer intact.
+    if (weight_override) {
+        return 0;
+    }
     ggml_metal_pipeline_t pipeline = ggml_metal_get_pipeline_fairy2i_rms_norm_exact(ctx->lib, qat);
 
     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
@@ -5330,6 +5353,10 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, src0->ne[1], src0->ne[2], src0->ne[3], qat ? 256 : 32, 1, 1);
 
     return 1;
+}
+
+int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_fairy2i_rms_norm_exact_impl(ctx, idx, nullptr);
 }
 
 int ggml_metal_op_fairy2i_elementwise_exact(ggml_metal_op_t ctx, int idx) {

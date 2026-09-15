@@ -955,7 +955,9 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
             const uint  col        = i + j;
             const float value      = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[col]));
             const float normalized = fairy2i_round_to_bf16_f32(value * inv_rms);
-            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(weight[col]));
+            const float w_value    = rms_args.nb10 == sizeof(ushort) ?
+                                        fairy2i_bf16_to_f32(((device const ushort *) weight)[col]) : weight[col];
+            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(w_value));
             const uint  bits       = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
             rms_dst[col]           = bits;
             xb[j]                  = as_type<float>(bits);
@@ -997,7 +999,8 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
 
 // Contiguous K4096 prefill rows. Keep the standalone 256-thread RMS reduction
 // and all BF16/A8 rounding boundaries, retaining 16 normalized values per thread.
-kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096(
+template<bool store_rms>
+kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl(
         constant ggml_metal_kargs_fairy2i_rms_norm_exact & rms_args [[buffer(0)]],
         device const float * src0                                   [[buffer(1)]],
         device const float * weight                                 [[buffer(2)]],
@@ -1058,9 +1061,13 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k409
             const uint  col        = i + j;
             const float value      = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[col]));
             const float normalized = fairy2i_round_to_bf16_f32(value * inv_rms);
-            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(weight[col]));
+            const float w_value    = rms_args.nb10 == sizeof(ushort) ?
+                                        fairy2i_bf16_to_f32(((device const ushort *) weight)[col]) : weight[col];
+            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(w_value));
             const uint  bits       = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
-            rms_dst[col]           = bits;
+            if (store_rms) {
+                rms_dst[col] = bits;
+            }
             xb[j]                  = as_type<float>(bits);
         }
         values[i / 1024U] = xb;
@@ -1098,6 +1105,10 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k409
         *(device char4 *) (act_q + i) = char4(clamp(q, int4(-127), int4(127)));
     }
 }
+
+typedef decltype(kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl<true>) fairy2i_rms_row4_prefill_t;
+template [[host_name("kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096")]] kernel fairy2i_rms_row4_prefill_t kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl<true>;
+template [[host_name("kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_no_store")]] kernel fairy2i_rms_row4_prefill_t kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl<false>;
 
 // Packed-BF16 entry point for the fused QAT SwiGLU -> Row4 down path. The
 // producer already materialized the checkpoint BF16 payload, so widening it by

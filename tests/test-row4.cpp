@@ -1561,24 +1561,39 @@ enum class rms_row4_gate : uint8_t {
     strided,
     repeated_weight,
     nonqat,
-    aliased_weight
+    aliased_weight,
+    cast_output,
+    cast_extra,
+    produced_input
+};
+
+struct rms_row4_marker {
+    std::atomic<bool> hit{ false };
+    std::atomic<bool> no_store{ false };
+    std::atomic<bool> bf16{ false };
 };
 
 static void rms_row4_fusion_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     if (strstr(text, "fuse QAT FAIRY2I_RMS_NORM_EXACT + ROW4_LINEAR activation quantization")) {
-        static_cast<std::atomic<bool> *>(user_data)->store(true, std::memory_order_relaxed);
+        auto & marker = *static_cast<rms_row4_marker *>(user_data);
+        marker.hit.store(true, std::memory_order_relaxed);
+        marker.no_store.store(strstr(text, "rms-store=0") != nullptr, std::memory_order_relaxed);
+        marker.bf16.store(strstr(text, "bf16-weight=1") != nullptr, std::memory_order_relaxed);
     }
 }
 
-static bool run_rms_row4_backend(ggml_backend_t       backend,
-                                 int64_t              k,
-                                 int64_t              tokens,
-                                 bool                 pair2,
-                                 rms_row4_gate        gate,
-                                 std::vector<float> & norm,
-                                 std::vector<float> & output,
-                                 bool &               fusion_hit) {
+static bool run_rms_row4_backend(ggml_backend_t             backend,
+                                 int64_t                    k,
+                                 int64_t                    tokens,
+                                 bool                       pair2,
+                                 rms_row4_gate              gate,
+                                 std::vector<float> &       norm,
+                                 std::vector<float> &       output,
+                                 bool &                     fusion_hit,
+                                 bool                       bf16           = false,
+                                 bool                       edge           = false,
+                                 const std::vector<float> * norm_reference = nullptr) {
     constexpr int64_t      O      = 128;
     const ggml_init_params params = { 1024 * 1024, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
@@ -1588,8 +1603,16 @@ static bool run_rms_row4_backend(ggml_backend_t       backend,
     const bool    strided = gate == rms_row4_gate::strided;
     ggml_tensor * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (strided ? 4 : 0), tokens);
     ggml_tensor * x       = strided ? ggml_view_2d(ctx, storage, k, tokens, storage->nb[1], 0) : storage;
-    ggml_tensor * weight  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, gate == rms_row4_gate::repeated_weight ? 2 : 1);
-    ggml_tensor * rms     = ggml_fairy2i_rms_norm_exact(ctx, x, weight, 1.0e-6f);
+    if (gate == rms_row4_gate::produced_input) {
+        x = ggml_scale(ctx, x, 0.5f);
+    }
+    ggml_tensor * weight      = ggml_new_tensor_2d(ctx, bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32, k,
+                                                   gate == rms_row4_gate::repeated_weight ? 2 : 1);
+    ggml_tensor * norm_weight = bf16 ? ggml_cast(ctx, weight, GGML_TYPE_F32) : weight;
+    if (gate == rms_row4_gate::cast_output) {
+        ggml_set_output(norm_weight);
+    }
+    ggml_tensor * rms = ggml_fairy2i_rms_norm_exact(ctx, x, norm_weight, 1.0e-6f);
     ggml_fairy2i_exact_set_qat(rms, gate != rms_row4_gate::nonqat);
     if (gate == rms_row4_gate::output) {
         ggml_set_output(rms);
@@ -1600,7 +1623,9 @@ static bool run_rms_row4_backend(ggml_backend_t       backend,
     ggml_tensor * linear = ggml_row4_linear(ctx, rms, codes, scales, O, k);
     ggml_cgraph * graph  = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, linear);
-    ggml_tensor * extra = gate == rms_row4_gate::extra_use ? ggml_add(ctx, rms, rms) : nullptr;
+    ggml_tensor * extra = gate == rms_row4_gate::extra_use  ? ggml_add(ctx, rms, rms) :
+                          gate == rms_row4_gate::cast_extra ? ggml_add(ctx, norm_weight, norm_weight) :
+                                                              nullptr;
     if (extra) {
         ggml_build_forward_expand(graph, extra);
     }
@@ -1641,12 +1666,29 @@ static bool run_rms_row4_backend(ggml_backend_t       backend,
     for (size_t i = 0; i < weights.size(); ++i) {
         weights[i] = (float) ((int) (i % 67) - 33) / 32.0f + ((i & 1) ? 0x1p-18f : -0x1p-18f);
     }
+    if (edge) {
+        const uint32_t bits[] = { 0,           0x80000000u, 0x00010000u, 0x80010000u, 0x7f7f0000u,
+                                  0xff7f0000u, 0x7f800000u, 0xff800000u, 0x7fc10000u };
+        for (size_t i = 0; i < weights.size(); ++i) {
+            memcpy(&weights[i], &bits[i % 9], sizeof(float));
+        }
+    }
     const auto packed     = pair2 ? make_row4_pair2_codes(O, k) : make_row4_codes(O, k);
     const auto scale_bits = make_row4_scales(O);
-    ggml_backend_tensor_set(weight, weights.data(), 0, weights.size() * sizeof(float));
+    if (bf16) {
+        std::vector<uint16_t> bits(weights.size());
+        for (size_t i = 0; i < bits.size(); ++i) {
+            bits[i]    = oracle_bf16_bits(weights[i]);
+            weights[i] = oracle_bf16_round(weights[i]);
+        }
+        ggml_backend_tensor_set(weight, bits.data(), 0, bits.size() * sizeof(uint16_t));
+    } else {
+        ggml_backend_tensor_set(weight, weights.data(), 0, weights.size() * sizeof(float));
+    }
+    ggml_backend_tensor_memset(rms, 0xa5, 0, ggml_nbytes(rms));
     ggml_backend_tensor_set(codes, packed.data(), 0, packed.size());
     ggml_backend_tensor_set(scales, scale_bits.data(), 0, scale_bits.size() * sizeof(uint16_t));
-    std::atomic<bool> marker{ false };
+    rms_row4_marker marker;
     ggml_log_set(rms_row4_fusion_log_callback, &marker);
     ggml_status status;
     if (gate == rms_row4_gate::split) {
@@ -1662,21 +1704,71 @@ static bool run_rms_row4_backend(ggml_backend_t       backend,
         status = ggml_backend_graph_compute(backend, graph);
     }
     ggml_log_set(nullptr, nullptr);
-    fusion_hit = marker.load(std::memory_order_relaxed);
+    fusion_hit = marker.hit.load(std::memory_order_relaxed);
     bool ok    = status == GGML_STATUS_SUCCESS;
     if (ok) {
         norm.resize((size_t) k * tokens);
         output.resize((size_t) O * tokens);
         ggml_backend_tensor_get(rms, norm.data(), 0, norm.size() * sizeof(float));
         ggml_backend_tensor_get(linear, output.data(), 0, output.size() * sizeof(float));
-        if (extra) {
-            std::vector<float> actual(norm.size());
-            std::vector<float> expected(norm.size());
-            ggml_backend_tensor_get(extra, actual.data(), 0, actual.size() * sizeof(float));
-            for (size_t i = 0; i < norm.size(); ++i) {
-                expected[i] = norm[i] + norm[i];
+        if (marker.no_store.load()) {
+            for (float value : norm) {
+                if (f32_bits(value) != 0xa5a5a5a5u) {
+                    fprintf(stderr, "dead RMS output was unexpectedly written\n");
+                    ok = false;
+                    break;
+                }
             }
-            ok = compare_exact("RMS Row4 extra consumer", actual, expected) && ok;
+            norm.clear();
+        }
+        if (fusion_hit && norm_reference && !edge) {
+            ggml_tensor quant = *linear;
+            quant.type        = GGML_TYPE_I8;
+            quant.data        = (char *) linear->data + ((ggml_nbytes(linear) + 63) & ~size_t(63));
+            quant.view_src    = nullptr;
+            quant.ne[0]       = k;
+            quant.ne[1]       = tokens;
+            quant.ne[2] = quant.ne[3] = 1;
+            quant.nb[0]               = 1;
+            quant.nb[1]               = k;
+            quant.nb[2] = quant.nb[3] = k * tokens;
+            std::vector<int8_t> actual_q((size_t) k * tokens);
+            ggml_backend_tensor_get(&quant, actual_q.data(), 0, actual_q.size());
+            ggml_tensor scales_view = quant;
+            scales_view.type        = GGML_TYPE_F32;
+            scales_view.data        = (char *) quant.data + actual_q.size();
+            scales_view.ne[0]       = tokens;
+            scales_view.ne[1]       = 1;
+            scales_view.nb[0]       = sizeof(float);
+            scales_view.nb[1] = scales_view.nb[2] = scales_view.nb[3] = tokens * sizeof(float);
+            std::vector<float> actual_s((size_t) tokens);
+            ggml_backend_tensor_get(&scales_view, actual_s.data(), 0, actual_s.size() * sizeof(float));
+            for (int64_t row = 0; row < tokens; ++row) {
+                const auto expected = oracle_quantize_token(norm_reference->data() + row * k, k);
+                if (memcmp(actual_q.data() + row * k, expected.values.data(), k) != 0 ||
+                    f32_bits(actual_s[row]) != f32_bits(expected.scale)) {
+                    fprintf(stderr, "RMS fused A8/scale oracle mismatch row=%lld\n", (long long) row);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if (extra || gate == rms_row4_gate::cast_output) {
+            ggml_tensor *      observed  = extra ? extra : norm_weight;
+            const auto &       reference = gate == rms_row4_gate::extra_use ? norm : weights;
+            std::vector<float> actual(reference.size());
+            std::vector<float> expected(reference.size());
+            ggml_backend_tensor_get(observed, actual.data(), 0, actual.size() * sizeof(float));
+            for (size_t i = 0; i < reference.size(); ++i) {
+                expected[i] = extra ? reference[i] + reference[i] : reference[i];
+            }
+            ok = compare_exact("RMS Row4 observable consumer", actual, expected) && ok;
+        }
+        if (fusion_hit &&
+            (marker.bf16.load() != (bf16 && gate != rms_row4_gate::cast_output && gate != rms_row4_gate::cast_extra) ||
+             marker.no_store.load() != (tokens >= 32))) {
+            fprintf(stderr, "RMS direct-weight/materialization path mismatch\n");
+            ok = false;
         }
     }
     ggml_backend_buffer_free(buffer);
@@ -1710,29 +1802,49 @@ static bool test_metal_rms_row4_fusion() {
         int64_t       k, tokens;
         bool          pair2;
         rms_row4_gate gate;
+        bool          bf16 = false;
+        bool          edge = false;
     };
 
     const test_case cases[] = {
-        { 4096, 1,    true,  rms_row4_gate::normal          },
-        { 4096, 16,   true,  rms_row4_gate::normal          },
-        { 4096, 31,   true,  rms_row4_gate::normal          },
-        { 4096, 32,   true,  rms_row4_gate::normal          },
-        { 4096, 33,   true,  rms_row4_gate::normal          },
-        { 4096, 64,   true,  rms_row4_gate::normal          },
-        { 4096, 128,  true,  rms_row4_gate::normal          },
-        { 4096, 256,  true,  rms_row4_gate::normal          },
-        { 4096, 512,  true,  rms_row4_gate::normal          },
-        { 4096, 512,  true,  rms_row4_gate::aliased_weight  },
-        { 4096, 544,  true,  rms_row4_gate::normal          },
-        { 4096, 2048, true,  rms_row4_gate::normal          },
-        { 4096, 32,   false, rms_row4_gate::normal          },
-        { 512,  32,   true,  rms_row4_gate::normal          },
-        { 4096, 32,   true,  rms_row4_gate::output          },
-        { 4096, 32,   true,  rms_row4_gate::extra_use       },
-        { 4096, 32,   true,  rms_row4_gate::split           },
-        { 4096, 32,   true,  rms_row4_gate::strided         },
-        { 4096, 32,   true,  rms_row4_gate::repeated_weight },
-        { 4096, 32,   true,  rms_row4_gate::nonqat          },
+        { 4096, 1, true, rms_row4_gate::normal },
+        { 4096, 16, true, rms_row4_gate::normal },
+        { 4096, 31, true, rms_row4_gate::normal },
+        { 4096, 32, true, rms_row4_gate::normal },
+        { 4096, 33, true, rms_row4_gate::normal },
+        { 4096, 64, true, rms_row4_gate::normal },
+        { 4096, 128, true, rms_row4_gate::normal },
+        { 4096, 256, true, rms_row4_gate::normal },
+        { 4096, 512, true, rms_row4_gate::normal },
+        { 4096, 512, true, rms_row4_gate::aliased_weight },
+        { 4096, 544, true, rms_row4_gate::normal },
+        { 4096, 2048, true, rms_row4_gate::normal },
+        { 4096, 32, false, rms_row4_gate::normal },
+        { 512, 32, true, rms_row4_gate::normal },
+        { 4096, 32, true, rms_row4_gate::output },
+        { 4096, 32, true, rms_row4_gate::extra_use },
+        { 4096, 32, true, rms_row4_gate::split },
+        { 4096, 32, true, rms_row4_gate::strided },
+        { 4096, 32, true, rms_row4_gate::repeated_weight },
+        { 4096, 32, true, rms_row4_gate::nonqat },
+        { 4096, 1, true, rms_row4_gate::normal, true },
+        { 4096, 512, true, rms_row4_gate::normal, true },
+        { 4096, 544, true, rms_row4_gate::normal, true },
+        { 4096, 2048, true, rms_row4_gate::normal, true },
+        { 4096, 33, true, rms_row4_gate::normal, true },
+        { 4096, 512, true, rms_row4_gate::aliased_weight, true },
+        { 4096, 32, true, rms_row4_gate::output, true },
+        { 4096, 32, true, rms_row4_gate::extra_use, true },
+        { 4096, 32, true, rms_row4_gate::split, true },
+        { 4096, 32, true, rms_row4_gate::strided, true },
+        { 4096, 32, true, rms_row4_gate::repeated_weight, true },
+        { 4096, 32, true, rms_row4_gate::nonqat, true },
+        { 4096, 512, true, rms_row4_gate::cast_output, true },
+        { 4096, 512, true, rms_row4_gate::cast_extra, true },
+        { 4096, 512, true, rms_row4_gate::produced_input, true },
+        { 4096, 1, true, rms_row4_gate::produced_input, true },
+        { 4096, 32, true, rms_row4_gate::normal, false, true },
+        { 4096, 32, true, rms_row4_gate::normal, true, true },
     };
     bool ok = true;
     for (const auto & c : cases) {
@@ -1747,13 +1859,17 @@ static bool test_metal_rms_row4_fusion() {
         bool               unfused_hit = false;
         bool               fused_hit   = false;
         const std::string  label       = "RMS/Row4 B=" + std::to_string(c.tokens) + " K=" + std::to_string(c.k) +
-                                         " gate=" + std::to_string((int) c.gate);
-        const bool         ran =
-            run_rms_row4_backend(unfused, c.k, c.tokens, c.pair2, c.gate, norm_ref, linear_ref, unfused_hit) &&
-            run_rms_row4_backend(fused, c.k, c.tokens, c.pair2, c.gate, norm, linear, fused_hit);
-        ok                  = ran && compare_exact((label + " RMS carriers").c_str(), norm, norm_ref) &&
-                              compare_exact((label + " linear").c_str(), linear, linear_ref) && ok;
-        const bool eligible = (c.gate == rms_row4_gate::normal || c.gate == rms_row4_gate::aliased_weight) &&
+                                         " gate=" + std::to_string((int) c.gate) + " bf16=" + std::to_string(c.bf16) +
+                                         " edge=" + std::to_string(c.edge);
+        const bool ran = run_rms_row4_backend(unfused, c.k, c.tokens, c.pair2, c.gate, norm_ref, linear_ref,
+                                              unfused_hit, c.bf16, c.edge) &&
+                         run_rms_row4_backend(fused, c.k, c.tokens, c.pair2, c.gate, norm, linear, fused_hit, c.bf16,
+                                              c.edge, &norm_ref);
+        ok             = ran && (norm.empty() || compare_exact((label + " RMS carriers").c_str(), norm, norm_ref)) &&
+                         compare_exact((label + " linear").c_str(), linear, linear_ref) && ok;
+        const bool eligible = (c.gate == rms_row4_gate::normal || c.gate == rms_row4_gate::aliased_weight ||
+                               c.gate == rms_row4_gate::cast_output || c.gate == rms_row4_gate::cast_extra ||
+                               c.gate == rms_row4_gate::produced_input) &&
                               c.k == 4096 && (c.tokens == 1 || c.tokens % 32 == 0);
         if (unfused_hit || (fused_hit && !eligible) || (eligible && (require_m5 || c.tokens == 1) && !fused_hit)) {
             fprintf(stderr, "%s unexpected fusion path: disabled=%d enabled=%d eligible=%d\n", label.c_str(),
@@ -1762,7 +1878,7 @@ static bool test_metal_rms_row4_fusion() {
         }
         // Independent Row4 oracle on small cases; larger tiles also compare
         // every RMS and linear output against the standalone Metal graph.
-        if (ran && c.tokens <= 33) {
+        if (ran && !c.edge && c.tokens <= 33) {
             const auto expected =
                 oracle_row4_linear(norm_ref, make_row4_codes(128, c.k), make_row4_scales(128), 128, c.k, c.tokens);
             ok = compare_exact((label + " Row4 oracle").c_str(), linear, expected) && ok;
