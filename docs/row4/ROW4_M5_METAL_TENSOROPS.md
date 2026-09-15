@@ -32,7 +32,9 @@ packed Row4 code stream
 ```
 
 The following tables record the earlier M5 implementation measurements. The
-2026-09-05 Pair2 follow-up is described separately below.
+2026-09-05 Pair2 follow-up, 2026-09-10 coalesced expansion and cooperative
+M64 stores, 2026-09-11 blocked expansion, and 2026-09-12 RMSNorm/A8 fusion
+and scheduling overlap are described separately below.
 
 On the Apple M5 Max used for that development, the results were:
 
@@ -117,11 +119,22 @@ one complete lossless expansion is faster than repeating the codebook lookup in
 each threadgroup. `kernel_row4_m5_preexpand_int4` expands schema v1, while
 `kernel_row4_m5_preexpand_int4_pair2` applies the exact Pair2 inverse
 permutation for schema v2. Both produce ordinary signed-INT4 bytes in row-major
-`{K, O}` order. The direct MPP kernel uses M32N128 with four SIMDgroups and
-BK512 when K is divisible by 512, otherwise BK128. It retains INT32 across all
-K and applies `row4_finish_i32()` directly from the cooperative accumulator.
-Pair2 expansion uses an equivalent packed ushort codebook to write four
-numeric INT4 coefficients at once.
+`{K, O}` order. Pair2 with B divisible by 64 and K divisible by 512 uses
+M64N64/SG4, or M64N128/SG8 for O at least 16384. These full tiles use static
+extents, short groups of token tiles for cache reuse, and cooperative output
+stores. The exact `row4_finish_i32()` F32 result bits replace the final INT32
+accumulator elements before an INT32 cooperative store; no numeric conversion
+is performed by the store. Other large-prefill shapes retain M32N128/SG4,
+with BK512 when K is divisible by 512, otherwise BK128. All routes retain
+INT32 accumulation across K and the same BF16 output boundary.
+Pair2 expansion uses an equivalent packed ushort codebook. Each 128-thread
+group covers O128 x K32, with K blocks varying fastest in the two-dimensional
+grid. A thread reads two adjacent K positions for two four-output groups,
+using two aligned ushort loads. It packs each pair of codebook results into a
+32-bit store for eight output coefficients; the four stores cover K, K+1,
+K+8, and K+9. Nearby threads reuse source cache lines while keeping stores
+contiguous along O. The selector guarantees complete O128/K32 blocks, so no
+tail masking or persistent weight state is needed.
 
 The temporary is `O*K/2` bytes: 12 MiB for qkv, 8 MiB for attention output,
 48 MiB for gate/up, and 24 MiB for down. It is backend-private trailing scratch,
@@ -177,8 +190,11 @@ The measured selector is:
 | schema v1, complete M8 groups above 16 | `O % 128 == 0` | M8N128 | 4 | 128 |
 
 For B at least 512 and divisible by 32, `O % 128 == 0` selects layout-specific
-device pre-expansion plus direct M32N128 TensorOps before this online-staging
-table. The grid is `{O / N_tile, ceil(B / M_tile), 1}`. When a TensorOps tile is
+device pre-expansion before this online-staging table. Pair2 selects the M64
+tiles described above when `B % 64 == 0 && K % 512 == 0`; other shapes and
+schema v1 retain M32N128. M64N64 groups two token tiles, and M64N128 groups
+four, before advancing along O. Partial final groups are supported.
+The grid is `{O / N_tile, B / M_tile, 1}`. When a TensorOps tile is
 available, the old gate/up producer fusion is deliberately bypassed so both
 Row4 linear operations can use the faster M5 path; exact SiLU and multiply
 semantics are unchanged. MPP shapes allocate only the A8 activation and its F32
@@ -187,7 +203,9 @@ scale, not the portable path's unused half transpose.
 The earlier choices came from real qkv, attention-output, gate/up, and down shape
 sweeps. The pre-expanded path additionally swept all 32 combinations of
 TM={32,64,128,256}, TN={32,64,128,256}, and SG={4,8}; M32N128/SG4 was the
-common winner. Every route is covered by opt-in markers and bit-exact tests.
+common winner for the original scalar epilogue. The later cooperative-store
+sweep selected M64 tiles for eligible Pair2 shapes. Every route is covered by
+opt-in markers and bit-exact tests.
 
 ## Pair2 profiling follow-up, 2026-09-05
 
@@ -228,6 +246,156 @@ greedy decode steps. All 39,199,488 prefill/decode logits matched the original
 binary byte for byte. Raw traces, tests, binary hashes, benchmark JSON, commands and
 the detailed report are in the local artifact directory
 `~/row4-metal-profile-20260905/`.
+
+## Pair2 coalesced expansion follow-up, 2026-09-10
+
+Changing the Pair2 expansion thread order reduced its pp512-weighted GPU time
+from 19.210 ms to 11.219 ms (41.60%). The complete A8/expand/MPP/epilogue chain
+fell from 112.596 ms to 104.626 ms. These are warm operator microbenchmarks,
+weighted by 36/36/35/35 batched qkv/o/gate_up/down projections, not an exclusive
+full-graph profiler breakdown. Both candidate threadgroup sizes, 128 and 256,
+produced byte-identical INT4 buffers and outputs for all four real projections;
+256 was faster overall and is the production choice.
+
+Full-model measurements against commit `fe79b5dc5a449922caa64a37451948f30c124318`:
+
+| workload | original tok/s | coalesced tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp512 | 3705.970 | 3935.643 | +6.20% |
+| pp2048 | 3251.274 | 3424.861 | +5.34% |
+| pp128 | 3017.314 | 3017.659 | +0.01% |
+| tg128 | 145.856 | 145.035 | -0.56% |
+
+Each workload used serial A/B/B/A launches, five samples per launch, all ten
+samples per version included in the mean, warmup, and at least 15 seconds
+between runs. The guarded Row4 harness verified the model inventory and paths.
+Only Pair2 device pre-expansion changes; pp128 and tg128 are unchanged-path
+controls. The new prefill marker appends `coalesced-expand` to the existing
+`M32N128 BK512 device-preexpand` or `BK128 device-preexpand` marker.
+
+Hardware: Apple M5 Max, 18 CPU / 40 GPU cores, 128 GB, macOS 26.5.1, AC power,
+automatic power mode (`powermode=0`), no Linux governor or fixed clocks.
+Build: Apple clang 21.0.0, Release `-O3 -DNDEBUG`, `GGML_NATIVE=ON`,
+`GGML_METAL=ON`, `GGML_METAL_EMBED_LIBRARY=ON`, MSL 4.0. Workload: Qwen3 8B
+Pair2 schema v2 with its original W8A8 head, eight host threads, b2048/ub512,
+BF16 KV, FA1, ngl99, mmap1, empty-history prefill and last-token logits.
+Both binaries and dynamic libraries were pinned separately for the comparison.
+
+There is no persistent expansion cache or added scratch. Both versions use a
+314.77 MiB Metal compute buffer for pp512. Strict M5 and portable real-shape
+Row4 tests, the full output-head matrix, and relevant Metal backend-op tests
+passed. A new O1152/K768/B544 test covers non-power-of-two dimensions and a
+partial expansion threadgroup. Full-model pp512, pp643, and pp2048 followed
+by 128 greedy decode steps matched the original full-vocabulary logits and
+generated text byte for byte: 58,799,232 float values in total.
+
+Local raw evidence is under `/Users/1806-admin/row4-prefill-opt-20260910/`:
+`full-model/*.json`, `*.meta`, `*.paths.log`, and `*.stderr.log` record every
+launch; `full-model-summary.json` lists their names and means. The same directory
+contains `prototypes/`, `quality/summary.json`, exact test logs, the source patch,
+a binary SHA-256 manifest, and `REPORT.zh-CN.md`. Reproduction drivers are
+`run-bench.py` and `quality/run-quality.py`. Measurements exclude initial model
+loading and shader compilation.
+
+## Pair2 cooperative M64 stores follow-up, 2026-09-10
+
+Starting from the coalesced expansion version, the full-tile Pair2 prefill path
+now uses static tensor extents, grouped token-tile traversal, and cooperative
+INT32 stores of the exact F32 epilogue bits. The M64N64/SG4 path serves qkv,
+attention output, and down; wide projections use M64N128/SG8. The selected
+complete Row4 chain fell from 104.872 ms to 97.302 ms in the weighted operator
+probe, and GEMM plus epilogue fell from 86.875 ms to 78.965 ms. No buffers were
+added, and the pp512 Metal compute buffer remains 314.77 MiB.
+
+Full-model A/B/B/A measurements against the coalesced expansion version:
+
+| workload | coalesced baseline tok/s | M64 cooperative tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp512 | 3935.473 | 4091.295 | +3.96% |
+| pp2048 | 3423.312 | 3543.686 | +3.52% |
+| pp128 | 3017.320 | 3010.026 | -0.24% |
+| tg128 | 144.882 | 147.351 | +1.70% |
+
+The same Qwen3 8B Pair2/W8A8-head model and M5 Max configuration described in
+the preceding section were used: eight host threads, b2048/ub512, BF16 KV,
+FA1, ngl99, mmap1, warmup, five repetitions per launch, and at least 15 seconds
+between serial launches. Each mean includes ten samples per version. Baseline
+is `fe79b5dc` plus the first coalescing patch; binaries and dynamic libraries
+were separately pinned. pp128 and tg128 remain unchanged-path controls.
+
+Strict M5/portable real-shape tests and relevant backend-op tests passed.
+Random codes distinguish output tiles in the new O128/K512/B512,
+O1152/K1024/B576, and O16384/K512/B512 oracle cases. A 17-token input period
+also exposes row-tile permutations. Full-vocabulary logits for pp512, pp643,
+and pp2048, each followed by 128 greedy decode steps, match the coalesced
+baseline byte for byte (58,799,232 F32 values); generated text is identical.
+Runtime tests require both new `cooperative-store` path markers.
+
+The experiment follows the tile, static-extents, walk-order and cooperative
+store guidance in Apple's [MPP programming guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf).
+Candidates that failed exact output comparisons were excluded. A separate
+index-arithmetic simplification showed no stable chain improvement and was
+not retained. Operator timings are hot-buffer service times, not exclusive
+full-model phase costs.
+
+Raw evidence, source and binary manifests, and the reproducible serial harness
+are under `/Users/1806-admin/row4-prefill-opt2-20260910/`: `full-model/`,
+`full-model-summary.json`, `prototypes/`, `quality/`, the test logs, and
+`REPORT.zh-CN.md`. No persistent INT4 cache or ubatch change is part of this
+optimization.
+
+## Pair2 blocked expansion follow-up, 2026-09-11
+
+The Pair2 pre-expansion kernel now uses O128 x K32 blocks, two aligned ushort
+loads per thread, and four 32-bit stores. K blocks vary fastest in the grid.
+This improves source locality while preserving contiguous output stores and
+the existing numeric INT4 layout. The same M64/M32 GEMM paths consume it.
+No persistent cache or additional allocation was introduced; the pp512 Metal
+compute buffer remains 314.77 MiB.
+
+Full-model A/B/B/A against the preceding M64 cooperative version:
+
+| workload | M64 baseline tok/s | blocked expansion tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp512 | 4082.464 | 4242.469 | +3.92% |
+| pp2048 | 3542.433 | 3658.217 | +3.27% |
+| pp128 | 3006.463 | 3007.952 | +0.05% |
+| tg128 | 147.869 | 145.396 | -1.67% |
+
+The same Qwen3 8B Pair2/W8A8-head model and M5 Max were used: eight host
+threads, b2048/ub512, BF16 KV, FA1, ngl99, mmap1, warmup, five samples per
+launch, and at least 15 seconds between serial launches. Each mean includes
+ten samples per version. No samples were removed. This measures warm eval
+throughput, excluding model loading and initial shader compilation.
+
+The tg128 decrease repeated in an additional A/B/B/A (-1.71%). Pooling all
+20 samples per version gives 147.761 -> 145.260 tok/s (-1.69%).
+Both builds select the same decode pipeline, whose source is unchanged; the
+cause has not been isolated. This is a measured decode regression alongside
+the prefill improvement, not evidence of unchanged decode throughput.
+
+The weighted expansion microbenchmark fell from 11.350 to 5.763 ms, and
+the complete A8/expansion/GEMM/epilogue chain from 97.066 to 90.423 ms.
+These are hot-buffer service times, not exclusive full-graph costs or DRAM
+bandwidth measurements. The production marker adds `blocked-O128-K32`.
+
+Strict M5 and portable real-shape matrices, full-head tests and relevant
+backend-op tests passed. Random O384/K768/B544 adds coverage of the M32 BK128
+route. Four random preexpanded cases update weights after a poison run while
+reusing the same graph and scratch, then compare against an independent v1
+oracle. Full-vocabulary logits for fresh-context pp512, pp643 and pp2048,
+each followed by 128 greedy decode steps, match the baseline byte for byte
+(58,799,232 F32 values); generated text is identical.
+
+Raw timings, pinned runtimes, source patches, path markers, tests, quality
+outputs and the reproducible driver are under
+`/Users/1806-admin/row4-prefill-opt3-20260911/`, especially `REPORT.zh-CN.md`,
+`full-model-summary.json`, `tg-pooled-summary.json`, `phase-summary.json`,
+`path-evidence.json`, `prototypes/steady.log` and `quality/summary.json`.
+The conditional estimate from eliminating the remaining expansion is about
+4455 tok/s (+5.01%), assuming every other cost stays fixed;
+a persistent full-model INT4 copy would require another 3.473 GB and safe
+weight lifetime/concurrency handling.
 
 ## Single-stream and continuous-batch decode
 
@@ -371,6 +539,8 @@ final test matrix covers:
   256, and 512;
 - all four schema v1 online M5 tiles plus both layout-specific pre-expanded
   paths, with a required Pair2 B512 `device-preexpand` marker;
+- both Pair2 M64 cooperative-store paths, random output-tile patterns, and
+  a B576 partial group of token tiles;
 - real qkv O6144/K4096, output O4096/K4096, gate/up O24576/K4096, and down
   O4096/K12288 shapes;
 - signed BF16 scales, QAT SwiGLU/down, decode residual fusion, and the full
@@ -421,6 +591,9 @@ LLAMA_ROW4_FULL_LM_HEAD_TESTS=1 \
 ```
 
 ## Performance ceiling
+
+The following measurements describe the original schema v1 implementation.
+The dated Pair2 sections above contain its later prefill and decode results.
 
 The online M256N32 Row4 kernels measured 49.20, 46.34, 56.99, and 49.34
 TOPS for qkv, attention output, gate/up, and down. A direct-device numeric
@@ -503,3 +676,545 @@ evidence and are not model or repository assets.
   or a lossless temporary numeric-INT4 expansion is unavoidable with this API.
 - The measured MPP and memory roofs are empirical results for this machine,
   operating system, driver, and compiler, not published chip peak values.
+
+
+## RMSNorm/A8 fusion follow-up, 2026-09-12
+
+QAT RMSNorm can now produce the following Row4 A8 activation in the same
+kernel for contiguous K4096 inputs on M5, when B is at least 32 and divisible
+by 32. The RMS node must have one adjacent Row4 consumer in the same graph
+segment and a single contiguous weight row. The host checks the full Row4
+scratch allocation and overlap with the RMS operands. Other shapes and graph
+boundaries retain their independent operators; schema v1 and Pair2 are both
+covered.
+
+The kernel preserves the standalone 256-thread RMS reduction and every BF16
+rounding boundary. It writes the complete RMS carrier and retains 16 values
+per thread to form A8 without reading that carrier twice. Scale calculation,
+half-away rounding, INT32 products, and output rounding remain unchanged.
+For pp512 this removes 71 dispatches and about 1.191 GB of logical reads,
+including cache traffic. It does not allocate a persistent expanded-weight
+cache or change b2048/ub512.
+
+The first prototype exposed a shared-memory race also present in the older
+B1 fusion: an A8 maximum could overwrite the inverse RMS before another
+SIMDgroup loaded it. The final B1 and prefill kernels reserve a separate
+inverse-RMS slot, with 48 bytes of aligned threadgroup storage. A pp643
+full-model comparison caught the race after the pp512 and operator tests had
+passed; the failed candidate and its measurements are excluded from the
+reported results.
+
+Final validation covers full RMS carriers and linear outputs, independent
+Row4 oracles, B1/16/31/32/33/64/128/256/512/544/2048, schema v1, partial graph
+execution, repeated weights, noncontiguous input, extra consumers, requested
+outputs and non-QAT gates. Strict M5, portable and real-shape backend tests
+passed. For pp512, pp643 and pp2048, each followed by 128 greedy decode steps,
+all 58,799,232 F32 logits and generated text match the starting runtime byte
+for byte.
+
+An isolated profiler uses one encoder per dispatch because dispatch-boundary
+counter sampling is unavailable on this device. The complete pp512 graph
+contains 1012 dispatches before fusion and 941 after it. K4096 RMS/A8 time in
+this instrumented graph decreases from 5.523 to 3.824 ms. Encoder splitting
+perturbs scheduling and adds overhead; these times are diagnostic, and all
+reported throughput comes from the uninstrumented runtime.
+
+The earlier decode regression was also investigated with old/new host and
+shader combinations. It followed the shader module in whole-model tg128, but
+did not reproduce in decode kernels running on identical buffers in one
+process. Its underlying cause remains unresolved; the shared-memory fix is
+not claimed to explain that performance regression. Detailed evidence,
+including all rejected runs, is in `~/row4-prefill-opt4-20260912/`.
+
+Final uninstrumented A/B/B/A means (five samples per launch, all ten samples
+per version included, at least 15 seconds between launches):
+
+| workload | starting tok/s | fused tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp128 | 3011.574 | 3051.371 | +1.32% |
+| pp512 | 4244.360 | 4290.640 | +1.09% |
+| pp2048 | 3658.181 | 3705.905 | +1.30% |
+| tg128 | 144.798 | 145.339 | +0.37% |
+
+The model, eight host threads, b2048/ub512, BF16 KV, FA1, ngl99, mmap1 and
+warmup are identical to the preceding round. The machine is the same M5 Max
+with AC automatic power mode and Apple clang 21.0.0 Release build. Exact
+commands, path evidence and raw artifact paths are in
+`~/row4-prefill-opt4-20260912/benchmark-summary.json`.
+
+## Prefill scheduling overlap follow-up, 2026-09-12
+
+Activation preparation and lossless weight expansion are independent. For
+preexpanded MPP shapes, their shared buffer barrier now comes after both
+dispatches, immediately before MPP. RMS/A8 fusion checks the whole scratch
+tail against its still-live operands before allowing this overlap. The
+ordinary quantizer and expansion use disjoint regions of the linear output
+allocation.
+
+After a preexpanded MPP dispatch, a bounded lookahead searches the next 63
+nodes within the same command buffer for a Pair2 expansion that can safely
+run alongside it. Each encoding context holds at most one pending target.
+The checks include every intervening node and source, full backing storage
+for views, backend scratch, and possible writes to the future codes. The
+expanded weights stay in their original graph allocation; the target's
+pre-MPP barrier publishes them before use. No state survives a graph compute
+or crosses a command-buffer boundary, so updated weights and partial graphs
+retain their existing semantics. Serial encoders skip this lookahead.
+
+On pp512, 34 gate/up expansions move earlier: one alongside qkv MPP and 33
+alongside an earlier down MPP. Activation preparation loses 142 redundant
+barriers. Dispatch count and weight traffic are unchanged. Metal compute
+storage remains 314.77 MiB at b2048/ub512, with no additional GPU allocation.
+The existing CPU encoding/GPU execution overlap is preserved.
+
+A same-buffer microbenchmark uses a concurrent encoder and compares explicit
+serial barriers against overlap. Down MPP plus an independent gate/up
+expansion decreases from 762.235 to 695.190 microseconds (-8.80%). Dispatch
+order matters: starting the large expansion first does not yield the same
+benefit. Per-dispatch encoder splitting would disable the concurrency being
+measured, so it is not used to claim this gain.
+
+Validation adds B512/B544 two-linear graphs with an independent integer
+oracle, live data deliberately placed in future INT4 scratch, serial and
+split-graph gates, and updated codes on repeated execution. A separate RMS
+case places its weight in future INT4 scratch and verifies that expansion
+waits for the weight reads. Strict M5, portable and real-shape backend cases
+pass. Full-model pp512/pp643/pp2048 plus 128 greedy decode steps compare
+58,799,232 F32 logits and generated text byte for byte.
+
+Final serial ABBA means (ten samples per version, b2048/ub512, t8,
+BF16 KV, FA1, ngl99, mmap1, warmup, at least 15 seconds cooldown):
+
+| workload | starting tok/s | overlap tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp512 | 4299.376 | 4453.458 | +3.58% |
+| pp2048 | 3703.025 | 3805.436 | +2.77% |
+| pp128 | 3050.731 | 3045.810 | -0.16% |
+| tg128 | 145.128 | 144.682 | -0.31% |
+
+Full-model ABBA results and raw evidence are recorded under
+`/Users/1806-admin/row4-prefill-opt5-20260912/`, with `run-bench.py`,
+`benchmark-summary.json`, `micro/`, `quality/` and `checks/`.
+
+## SwiGLU/A8 preparation fusion follow-up, 2026-09-14
+
+The K12288 QAT SwiGLU kernel can now prepare A8 and its complete row scale
+directly for a sole adjacent Pair2 down projection. The existing M5 selector
+must choose preexpanded weights (B >= 512, divisible by 32), and the pipeline
+must support 1024 threads per threadgroup. Each thread retains three `ushort4`
+values across the row maximum reduction. The two BF16 rounding boundaries,
+exact scale division, half-away A8 rounding and subsequent INT32 MPP products
+are unchanged.
+
+A8 and scales occupy the otherwise-dead MUL allocation. The host checks this
+compact range against the full gate/up backing allocation and the full down
+allocation, including backend scratch. In the actual graph, down scratch can
+reuse still-live gate/up data, so the producer barrier before down expansion
+remains necessary. The INT4 weights retain their original down scratch, and
+the existing gate/up expansion lookahead remains active. Observable MUL
+outputs, extra consumers, split graphs, incompatible aliases, other shapes
+and portable paths retain their existing execution.
+
+For pp512, runtime markers confirm 35 SwiGLU/A8 fusions and the existing 34
+gate/up lookaheads. This removes 35 independent quantization dispatches and
+36 MiB of logical packed-BF16 writes/reads per fused layer, or 1.230 GiB over
+the 35 layers. Logical traffic includes cache traffic; it is not a measured
+DRAM saving. Metal compute storage remains 314.77 MiB at b2048/ub512.
+
+The threadgroup size was selected using the complete FFN chain with shared
+scratch and the existing next-gate/up lookahead. A 512-thread prototype reduced
+isolated SwiGLU/A8 preparation from 146.944 to 101.597 microseconds, but reduced
+full-model pp512 throughput by 0.345%. Copying A8 back to down scratch did not
+resolve the complete-chain regression. The 1024-thread variant instead reduced
+the complete FFN microbenchmark from 2009.076 to 1996.893 microseconds (-0.606%).
+All compared outputs were byte exact. These experiments do not establish a
+specific cache or register-allocation cause.
+
+Final uninstrumented measurements combine ABBA and reverse BAAB, ten samples
+per launch, all 40 samples per version for pp512/pp2048. The pp128/tg128
+controls use one ABBA with five samples per launch and ten per version.
+All launches are sequential with warmup and at least 15 seconds cooldown.
+
+| workload | starting tok/s | fused tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp512 | 4458.265 | 4471.634 | +0.30% |
+| pp2048 | 3813.561 | 3822.374 | +0.23% |
+| pp128 | 3046.536 | 3051.611 | +0.17% |
+| tg128 | 145.386 | 145.065 | -0.22% |
+
+The two rounds separately give +0.378%/+0.222% for pp512 and
++0.169%/+0.293% for pp2048. These are small measured improvements. The new
+branch is inactive for the short-prefill and decode controls; their single
+ABBA does not establish a persistent gain or regression. The model is
+`qwen3-row4-v2-pair2.gguf`, with t8, b2048/ub512, BF16 KV, FA1, ngl99, mmap1
+and warmup. Hardware is an M5 Max (40 GPU cores, 18 CPU cores, 128 GB), macOS
+26.5.1, AC automatic power mode with unfixed clocks. Apple clang 21.0.0 builds
+Release with `-O3 -DNDEBUG`, native code, embedded Metal and Apple BLAS.
+The starting revision is `fe79b5dc5a449922caa64a37451948f30c124318` plus the
+preceding production changes captured in `baseline.patch`.
+
+Strict M5 tests check every A8 integer against an independent CPU oracle,
+exact scales and down outputs, zero/tiny rows, B128/B512/B544, requested
+outputs, extra consumers, split graphs and aliased scratch. Portable Row4
+and real-shape ROW4_LINEAR/W8A8_LINEAR backend tests also pass. Full-model
+pp512/pp643/pp2048, each followed by 128 greedy decode steps, compare
+58,799,232 F32 logits and generated text byte for byte against the starting
+runtime. The prefill comparison covers the last prompt token's logits;
+every decode step's logits are checked. Scoped formatting passes, with no
+clang-tidy diagnostics on lines added or changed in this round.
+
+An attention/o-projection overlap experiment also enabled all 36 attention
+windows while retaining 34 gate/up lookaheads, but full-model pp512/pp2048
+changes were only +0.059%/-0.059%; it is saved as an experiment and is not
+enabled in production. The prior local preparation already overlaps A8
+quantization and o-weight expansion. Moving expansion earlier therefore
+cannot remove its entire isolated 10.577 microseconds: the measured residual
+above quantization is about 3.313 microseconds per layer, roughly 0.119 ms
+over 36 layers before additional contention. This is a diagnostic estimate,
+not a full-model bound or prediction.
+
+Source/binary snapshots, both final measurement orders, exact commands and
+path markers are under `/Users/1806-admin/row4-prefill-opt6-20260914/`:
+`fusion1024-summary.json`, `fusion1024-model/`, `fusion1024-confirm/`,
+`fusion1024-quality/`, `micro/`, `checks/` and `REPORT.zh-CN.md`.
+
+## Scratch, residual and token-pipeline trials, 2026-09-14
+
+Prefill o/down projections now fuse an adjacent QAT COMPLEX_ADD into the
+M64N64 MPP epilogue. Eligibility is limited to Pair2, O4096, K4096/K12288,
+B >= 512 divisible by 64, and a sole unobserved projection consumer in the
+same encoding range. Observable projections, extra consumers, reversed
+operands, non-QAT adds, partial tiles and conflicting scratch aliases retain
+the existing path. Exact in-place residual addition is supported. The host
+protects the A8/scale/INT4 tail, weights, packed MUL activation and partially
+overlapping residual storage before selecting this fusion.
+
+The projection's BF16 boundary is retained before adding either complex
+component. A thread-local volatile integer materializes its carrier bits:
+without this boundary, the compiler can fold the low component's addition
+of zero, changing signed zero, subnormal flushing and NaN canonicalization.
+The ordinary prototype failed 917,504 of 2,097,152 edge-profile outputs;
+the retained variant matches the original Metal COMPLEX_ADD_QAT byte for
+byte. No device-memory intermediate is required for that boundary.
+
+At pp512, runtime markers confirm 70 residual fusions, the existing 35
+SwiGLU/A8 fusions and 34 gate/up expansion lookaheads. Eliminating one 8 MiB
+projection write and read per residual saves 1.094 GiB of logical traffic
+and 70 separate add dispatches per 512-token microbatch. This includes cache
+traffic and is not a measured DRAM saving. Metal compute storage remains
+314.77 MiB at b2048/ub512.
+
+With complete FFN scratch reuse and the next-gate/up lookahead, the residual
+microbenchmark decreases from 2064.108 to 2024.101 microseconds (-1.94%).
+Full-model measurements combine ABBA and BAAB, ten samples per launch and
+all 40 samples per version for the main prefill workloads. Controls use
+one ABBA, five samples per launch and ten per version.
+
+| workload | starting tok/s | residual-fused tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp512 | 4464.601 | 4533.122 | +1.53% |
+| pp2048 | 3821.721 | 3868.039 | +1.21% |
+| pp128 | 3049.842 | 3048.889 | -0.03% |
+| tg128 | 144.809 | 145.098 | +0.20% |
+
+The separate ABBA/BAAB changes are +1.510%/+1.560% for pp512 and
++1.329%/+1.095% for pp2048. The new branch is inactive in the controls;
+their small differences do not establish persistent performance changes.
+All launches are sequential, warmed up, with at least 15 seconds cooldown.
+The model is qwen3-row4-v2-pair2.gguf, t8, b2048/ub512, BF16 KV, FA1,
+ngl99 and mmap1. Hardware remains Apple M5 Max (40 GPU cores, 18 CPU cores,
+128 GB), macOS 26.5.1, AC automatic power mode with unfixed clocks, and
+Apple clang 21.0.0 Release (-O3 -DNDEBUG), native/embedded Metal/Apple BLAS.
+The baseline is fe79b5dc5a449922caa64a37451948f30c124318 plus the preceding
+production changes captured in this round's baseline.patch.
+
+Before this fusion, two isolated down-INT4 scratch variants were tested.
+A persistent private 24 MiB buffer made expansion overlap gate/up MPP,
+but full-model ABBA changes were only -0.052%/+0.067% for pp512/pp2048.
+Reusing the dead SiLU allocation avoided the extra memory and enabled
+35 such overlaps while retaining 34 old lookaheads, but combined ABBA/BAAB
+changes were -0.288%/-0.115%. Neither experiment established a gain;
+both remain in external source/binary snapshots.
+
+The token-pipeline experiment tries 64/128/256-row chunks, complete K12288
+quantization rows and the original large-prefill MPP kernels. It includes
+serial chunks, gate/up with preceding SwiGLU overlap, and a three-stage
+pipeline adding earlier down chunks, in both dispatch orders. All outputs
+are byte exact. After baseline drift in the initial sweep, paired ABBA and
+BAAB complete-FFN measurements with residual fusion gave +17.05%, +3.34%
+and +0.52% time for the 64/128/256-row gate/SwiGLU pipeline, respectively.
+The 256-row three-stage variants took +16.22%/+13.02% time. These are
+microbenchmark results. The closest candidate, a 256-row two-stage pipeline,
+was also integrated into the runtime and tested against the residual-fused
+version, with strict path assertions and full-model exact comparisons.
+It enabled 35 token pipelines and preserved the other fusion/lookahead
+counts and 314.77 MiB compute storage. ABBA plus BAAB, 40 samples per version,
+gave:
+
+| workload | residual-only tok/s | token-pipeline tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp512 | 4526.164 | 4514.668 | -0.25% |
+| pp2048 | 3865.758 | 3853.787 | -0.31% |
+
+Both orders were slightly slower for both workloads. The token pipeline
+remains an external experiment; only residual fusion is retained. More
+independent dispatches did not produce an additional throughput gain for
+these shapes. The experiments do not establish a specific cache, occupancy
+or frequency cause.
+
+Raw benchmarks, exact comparison logs, source/binary snapshots and scripts
+are under /Users/1806-admin/row4-prefill-opt7-20260914/: stage1-private-summary.json,
+stage1-pool-summary.json, stage2-summary.json, quality/, micro/, checks/,
+and REPORT.zh-CN.md. Snapshots pin DYLD_LIBRARY_PATH, and quality logs
+record the actual loaded Metal library. All samples, including the drifting
+initial microbenchmark baseline, are retained.
+
+Final Release, strict M5, portable and real-shape ROW4_LINEAR/W8A8_LINEAR
+checks pass. Residual tests include BF16 edge values, B128/B512/B544,
+observable outputs, extra consumers, reversed/non-QAT/split graphs,
+scratch aliases, in-place addition and complete FFN graphs. Full-model
+pp512/pp643/pp2048 plus 128 greedy decode steps compare 58,799,232 F32
+logits and text byte for byte with the starting runtime (last prompt-token
+logits and every decode step). All final runtime libraries and llama-bench
+are byte-identical to the measured residual snapshot; only a test setup's
+nested conditional was rewritten, followed by another strict M5 run.
+Scoped git clang-format passes, with no clang-tidy diagnostics on lines
+added or changed in the final implementation and tests. The initial
+stage-3 sweep drift, all paired measurements and unretained source/binary
+snapshots remain available for future reproduction.
+
+## Output pruning, norm/RoPE, Flash3 and INT4 cache trials, 2026-09-14
+
+Four follow-up directions were tested in order. The retained default changes
+move last-layer output-row selection before the o projection, fuse eligible
+Q/K RMSNorm with RoPE and K-cache storage, read BF16 norm weights directly,
+and reuse BF16 K/V tiles across two query heads in long FlashAttention-3
+prefill. The full Q/attention pruning and matrix tile/traversal experiments
+were correct but did not improve full-model performance and are not retained.
+
+Last-layer o pruning keeps all K/V rows and requested output semantics. It
+reduces Metal compute storage from 314.77 to 306.77 MiB at b2048/ub512.
+Its isolated ABBA/BAAB gains are small: +0.124%/+0.165% for pp512/pp2048.
+Full Q pruning instead gives -0.982%/-0.502%, including the padded query
+variant that preserves matrix reduction order.
+
+The RMS128 fusion supports M5 QAT heads8/32 with at least 32 tokens and
+compatible strides. It crosses checked metadata-only nodes, retains the
+original reduction order and every BF16 boundary, and optionally writes
+BF16 K directly through an exclusive SET_ROWS. Sole-use BF16 norm weights
+avoid the intermediate F32 cast; observable casts and incompatible layouts
+keep the original graph. Output/extra-use/split/alias gates remain in place.
+An explicit frequency-present argument handles a frequency vector aliased
+to X, while a first-dimension check rejects unsupported broadcast weights.
+Both Metal and host address ranges protect the K write. Each B512 model
+microbatch has 72 RMS/RoPE fusions, 72 direct BF16 weights and 36 K stores.
+The isolated full-model gain is +2.562%/+2.351%.
+
+The actual production attention is BF16 FlashAttention-3 with online
+softmax. Its new GQA2 branch reuses each K/V 8x8 load while retaining Q8/C64,
+K accumulation order and F32 softmax/P/O arithmetic. It uses four SIMD
+groups and 17,408 bytes of shared memory. Selection requires M5, Q >= 512,
+KV >= 1024, D128, a Q/KV head ratio of four and compatible ordinary mask,
+sequence and stride settings, with no sinks/bias/softcap. The original GQA1
+and other data-type paths retain their original computation. The initially
+broader selector gave -0.083%/+1.215% for pp512/pp2048, so short cases retain
+the existing path. Final pp2048/ub512 has 108 GQA2 dispatches; pp512 has none.
+
+`GGML_METAL_ROW4_INT4_CACHE=1` enables an optional persistent lossless INT4
+expansion cache for eligible Pair2 leaf codes in Metal WEIGHTS buffers.
+It defaults off. Cold expansion completes before current graph command
+buffers are enqueued; warm graphs skip repeated expansion and its lookahead.
+Backend set/memset/clear, partial aliases, async writes and graph writes
+invalidate the cache, including a write from a cache-disabled context.
+Owner buffer release frees cache storage. Invalidated storage remains alive
+for preceding commands until safely rebuilt. Each source weight buffer has
+a 4 GiB cap, with device available-memory and allocation fallback checks.
+
+This last-token-logits workload caches 141 matrices, adding 3,388,997,632
+bytes (3.15625 GiB) beyond the unchanged compute allocation. All-output
+requests can involve 144 matrices. Initial isolated warm throughput gains
+are +2.736%/+2.611%; the 141 cold builds took about 86-107 ms in individual
+diagnostic runs. Those cold samples include first pipeline compilation and
+are not a repeated cold-start comparison. Repeated prefill can amortize this
+cost; the cache is not enabled unconditionally.
+
+Matrix reuse trials cover four M/N/SG geometries and group-M=1/2/4/8, all
+four model shapes at B512/B2048, cached GEMM and expand-plus-GEMM, rotating
+eight weight buffers and both measurement orders. Some microbenchmarks gain
+2-7%, but the integrated candidate loses 0.426%/0.418% for pp512/pp2048 at
+ub512 and is flat (-0.031%) at pp2048/ub2048. It is archived as `reuse-tuned`;
+production retains M64N64/G2 and gate/up M64N128/G4.
+
+Final measurements use pinned source/library snapshots with all numerical
+fixes and rejected experiments removed. Main workloads use balanced order
+ABCCBACABBAC (A baseline, B default, C cache), ten timed samples per launch,
+40 samples per version, warmup and at least 15 seconds cooldown. All launches
+are serial, with no concurrent GPU job, compilation or static analysis.
+Fusion debug is confined to separate correctness/path-validation runs.
+
+| workload | baseline tok/s | final default tok/s | final cached tok/s |
+| --- | ---: | ---: | ---: |
+| pp512-ub512 | 4523.570 | 4651.248（+2.82%） | 4796.717（+6.04%） |
+| pp2048-ub512 | 3868.552 | 4009.613（+3.65%） | 4121.510（+6.54%） |
+
+The baseline is this round's starting runtime, including prior optimizations,
+not clean upstream HEAD. Controls use five samples per launch: pp128 uses
+ABBA (10 per version). An initial tg128 ABBA showed a small decrease with
+baseline drift, so a reverse BAAB was added; all 20 samples per version are
+combined below. The individual rounds remain in final-tg-control-summary.json.
+Both orders show a small decrease (-0.410%/-0.352%, combined -0.381%).
+This measured decode cost is retained alongside the prefill gains; its cause
+has not been isolated, so it is not attributed directly to device noise.
+
+| workload | baseline tok/s | default tok/s | change |
+| --- | ---: | ---: | ---: |
+| pp128-ub512 | 3049.390 | 3134.202 | +2.78% |
+| tg128-ub512 | 144.966 | 144.414 | -0.38% |
+
+The cache-disabled ubatch trial at pp2048 gives 4002.509, 4175.190 and
+4247.489 tok/s for ub512/1024/2048 (+0%, +4.31%, +6.12%), 40 samples each.
+Metal compute storage is 306.77/613.52/1227.02 MiB; CPU compute storage is
+8.01/16.03/32.05 MiB. Final ub2048 default/cache means are
+4248.946/4297.767 tok/s (40 samples each). Ubatch stays an explicit
+caller choice: ub2048 adds 920.25 MiB of GPU compute storage over ub512.
+Neither these memory figures nor the optional 3.15625 GiB cache include
+the model's other allocations.
+
+Final full-model baseline/default and default/cache comparisons each check
+58,799,232 F32 logits byte for byte: pp512/pp643/pp2048 last-token logits
+plus 128 greedy decode steps per prompt, including identical generated text.
+Both final configurations also pass full-logit comparisons across ub512,
+ub1024 and ub2048. Selected/all-output and separate/unified multi-sequence
+graphs pass across all three versions, with eight continuation steps.
+Strict M5, portable, real-shape Row4/W8A8 and 56 BF16 FlashAttention backend
+cases pass. New cases cover rounding edges, strides, tails, observables,
+aliases, frequency/broadcast corner cases and 36 cache-update/lifetime steps.
+Scoped git clang-format passes; four changed C++ sources have no clang-tidy
+diagnostics on changed lines. Final runtime libraries match the measured
+snapshots.
+
+Reproduction uses qwen3-row4-v2-pair2.gguf, t8, b2048/ub512 unless specified,
+BF16 KV, FA1, ngl99, mmap1 and warmup. Hardware remains M5 Max (40 GPU/18 CPU
+cores, 128 GB), macOS 26.5.1, AC automatic mode with unfixed clocks, Apple
+clang 21 Release (-O3 -DNDEBUG), native/embedded Metal/Apple BLAS enabled.
+Use the existing Row4 benchmark harness with `BINARY=build-rel/bin/llama-bench`,
+`THREADS=8 REPS=10 BATCH=2048 UBATCH=512 N_PROMPT=512` and the model path;
+change N_PROMPT to 2048 for long prefill, UBATCH to 2048 for that explicit
+configuration, and set GGML_METAL_ROW4_INT4_CACHE=1 to enable persistence.
+
+All experiments, raw samples, exact commands, path counts, cold diagnostics,
+source/binary snapshots and checks are under
+`/Users/1806-admin/row4-prefill-opt8-20260914/`: `REPORT.zh-CN.md`,
+`final-results-summary.json`, `final-comparison/`, `final-tg-confirm/`, `quality/`, `checks/`,
+`micro/`, the individual stage `*-summary.json` files and `environment-final.json`.
+
+
+## Round 9: compact BF16 handoff and batched cold cache (2026-09-14)
+
+All six follow-up directions were implemented and tested sequentially. This
+round retains dead RMS carrier elimination/direct BF16 norm weights, actual-mask
+Flash3 bounds, compact BF16 attention output into whole-token A8, QKV epilogue
+V-cache stores, reduced host preparation work and batched persistent INT4 builds.
+A full-mask scan and selective persistent caching were tested and rejected.
+
+RMS4096 fusion preserves its original reduction order and BF16 rounding, while
+unobserved sole-use prefill outputs avoid F32 stores. Cast-elision checks include
+the RMS input dependency. Flash3 bounds are derived from the actual F16 mask by
+scanning backwards to the last non-minus-infinity key per query; contributing
+C64 tiles retain their order. Noncausal, nonmonotonic and all-masked cases work.
+The full-mask-scan prototype was slower at ub512 and is not retained. The retained
+bound mainly benefits ub2048 (+0.54% isolated); ub512 is essentially neutral.
+
+A sole, unobserved FA->RESHAPE->Row4 consumer in one command buffer can pass a
+compact BF16 carrier directly to the existing full-K4096 A8 quantizer. Output,
+extra-user, split and incompatible cases retain their original path. The prefill
+residual epilogue remains fused. Isolated pp512/pp2048 gains are +0.69%/+0.38%.
+
+QKV MPP writes BF16 V cache in its epilogue and elides the later SET_ROWS dispatch,
+while preserving the full F32 QKV carrier. Early cache readers/writers, writes
+through index aliases, aliases of the live A8/INT4 tail, incompatible layouts
+and split command buffers fall back. Isolated gains are +0.26%/+0.21%.
+
+Host preparation skips cache invalidation graph scans only before any cache has
+existed on the device, so cache-disabled writer contexts still invalidate old
+entries. Buffer-owned hash buckets replace linear cache lookup, and preexpand
+lookahead searches start at the current node. Existing graph use_counts already
+provide hashed use checks. A synthetic graph of 1024 nodes cache-disabled scan saves about
+1.5 us, but full-model throughput is neutral; no throughput gain is claimed for
+this host change.
+
+Cold persistent INT4 preparation encodes builds in one command buffer and waits
+once. Entries are published only after completion, with pending-batch identity
+and write-generation checks. Cancellation, unsupported graphs and allocation
+failure retain ordinary expansion fallback; invalidated allocations stay alive
+for preceding work. Tests cover duplicate/conflicting batches, writes during
+preparation, cancellation, partial eligibility and repeated buffer lifetimes.
+
+Four fresh processes per version/workload, in ABBA+BAAB order, give:
+
+| workload | serial cold prefill ms | batched cold prefill ms | change |
+| --- | ---: | ---: | ---: |
+| pp512/ub512 | 206.725 | 164.759 | -20.30% |
+| pp2048/ub512 | 604.466 | 553.518 | -8.43% |
+
+Model/context loading is outside this timing; first decode+synchronize and
+initial operator preparation are inside. These are fresh device caches, not
+filesystem-cold loads. Cache-build times are 91.630 -> 55.042 ms and 98.862 -> 55.303 ms.
+Two subsequent warm prefills per process remain essentially unchanged. Every
+full-logit output matches. These cold latency reductions are not warm TPS gains.
+
+A selective candidate caches only matrices up to 32 MiB, leaving the 35 gate/up
+matrices on safe lookahead. It reduces persistent storage from 141 matrices /
+3.15625 GiB to 106 matrices / 1.515625 GiB and restores 34 lookahead expansions, but loses
+2.44%/2.00% at pp512/pp2048 in ABBA+BAAB. It is rejected on the current 128 GB device.
+The public setting remains `GGML_METAL_ROW4_INT4_CACHE=1` for the full optional
+cache, default off; no extra cache policy is exposed.
+
+Final pinned baseline-to-deliverable throughput, comparing the same cache mode
+on both sides (b2048, t8, BF16 KV, FA1, ngl99, mmap1, warmup):
+
+| configuration / workload | round-start tok/s | final tok/s | change |
+| --- | ---: | ---: | ---: |
+| default, ub512, pp512 | 4652.977 | 4680.163 | +0.58% |
+| default, ub512, pp2048 | 3970.699 | 3993.711 | +0.58% |
+| INT4 cache, ub512, pp512 | 4791.903 | 4815.189 | +0.49% |
+| INT4 cache, ub512, pp2048 | 4050.726 | 4079.437 | +0.71% |
+| default control, ub512, pp128 | 3131.314 | 3136.694 | +0.17% |
+| default control, ub512, tg128 | 144.390 | 145.308 | +0.64% |
+| default, ub2048, pp2048 | 4250.538 | 4316.972 | +1.56% |
+
+Stage ablations use ABBA+BAAB and 40 samples/version. Final core comparisons start
+with 20 samples/launch (40/version); default prefill receives a reverse comparison of 10 samples per launch
+confirmation after startup drift, retaining every sample. Short/tg controls use
+five samples/launch; ub2048 is reported separately. Exact sample counts, orders
+and commands are in the summary JSONs. Runs are serial, without concurrent GPU
+tests, compilation or static checks. Clocks remain unfixed in AC automatic mode.
+Do not add isolated stage deltas or attribute a drifting run to a specific
+hardware cause without separate evidence.
+
+At pp512, markers show 71 RMS no-stores, 70 direct BF16 norm weights, 36 mask bounds,
+35 compact attention handoffs and 36 V stores. Default lookahead 34, residual 70 and
+SwiGLU 35 remain. Logical traffic avoided is 568 MiB of RMS writes, 140 MiB attention
+writes, 280 MiB across two quantizer reads and 72 MiB V-copy reads. This 1060 MiB total
+is not a measured DRAM traffic reduction. Compute buffers remain 306.77 MiB Metal
+and 8.01 MiB CPU; optional persistent INT4 adds 3,388,997,632 bytes.
+
+Final default versus round start and final cache versus default each compare
+58,799,232 F32 logits byte-for-byte (pp512/643/2048 plus 128 greedy steps per prompt).
+Both final modes pass cross-ub512/1024/2048 checks. Selected/all-output and
+separate/unified multi-sequence graphs match across all versions with eight
+continuation steps. Strict M5 and portable Row4 tests, 60 Row4/23 W8A8 backend cases
+and 56 BF16 attention cases pass. Scoped git clang-format and changed-line
+clang-tidy checks pass. Existing user files are unchanged; no commit is made.
+
+Environment is M5 Max (40 GPU/18 CPU cores, 128 GB), macOS 26.5.1 (25F80), Apple clang 21,
+Release -O3 -DNDEBUG, native/embedded Metal/Apple BLAS enabled. The round-start
+baseline includes earlier dirty work on fe79b5dc5a449922caa64a37451948f30c124318,
+not clean upstream. The historical 6963.448 tok/s integer-matrix reference is not
+a full-model theoretical ceiling or GPU utilization metric.
+
+Evidence and reproduction are under
+`/Users/1806-admin/row4-prefill-opt9-20260914/`: `REPORT.zh-CN.md`,
+`final-*-summary.json`, `final-path-proof.json`, `cold-abba-baab/`, `quality/`,
+`checks/`, `environment-final.json`, `this-round.patch`, and the pinned
+`final-default/`, `final-cache/` and `final-deliverable/` snapshots.

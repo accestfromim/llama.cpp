@@ -10496,6 +10496,12 @@ struct llm_build_qwen3_row4 : public llm_graph_context {
                 cur = build_attn(inp_attn, nullptr, nullptr, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                                  1.0f / sqrtf(float(n_embd_head)), il, true, true, true);
 
+                // All K/V rows have already been stored. The last output projection
+                // and FFN only need the rows requested by the caller.
+                if (il == n_layer - 1 && inp_out_ids) {
+                    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+                }
+
                 const auto & out_weight = model.layers[il].wo_row4;
                 cur = ggml_row4_linear(ctx0, cur, out_weight.codes, out_weight.scales, out_weight.logical_o,
                                        out_weight.logical_k);
@@ -10503,7 +10509,6 @@ struct llm_build_qwen3_row4 : public llm_graph_context {
             }
 
             if (il == n_layer - 1 && inp_out_ids) {
-                cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 

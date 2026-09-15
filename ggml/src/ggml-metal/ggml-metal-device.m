@@ -5,6 +5,7 @@
 
 #import "ggml-impl.h"
 #import "ggml-threading.h"
+#import "ggml-metal-impl.h"
 
 #include <Foundation/Foundation.h>
 
@@ -508,6 +509,7 @@ struct ggml_metal_device {
 
     ggml_metal_buffer_t scratch;
     size_t scratch_size;
+    bool row4_cache_seen;
 };
 
 static void ggml_metal_device_disable_mpp_tensorops(ggml_metal_device_t dev) {
@@ -597,6 +599,8 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                     "kernel_row4_m5_preexpand_int4_pair2",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512",
+                    "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
                     "kernel_row4_pair2_decode_o32_b2_shared",
                     "kernel_row4_pair2_decode_o32_b4_shared",
@@ -1255,6 +1259,25 @@ struct ggml_metal_fairy2i_w1_coeff_lut {
     struct ggml_metal_fairy2i_w1_coeff_lut * next;
 };
 
+#define GGML_METAL_ROW4_CACHE_BUCKETS 256
+
+static size_t ggml_metal_row4_cache_bucket(uintptr_t address) {
+    return (((uint64_t) address >> 6) * UINT64_C(0x9e3779b97f4a7c15)) >> 56;
+}
+
+struct ggml_metal_row4_cache {
+    uintptr_t address;
+    size_t source_bytes;
+    int32_t k;
+    int32_t m;
+    bool valid;
+    uint64_t generation;
+    ggml_metal_row4_cache_batch_t pending;
+    ggml_metal_buffer_t storage;
+    struct ggml_metal_row4_cache * next;
+    struct ggml_metal_row4_cache * hash_next;
+};
+
 struct ggml_metal_buffer {
     void * all_data; // TODO: https://github.com/ggml-org/llama.cpp/pull/15985
     size_t all_size;
@@ -1278,7 +1301,82 @@ struct ggml_metal_buffer {
     id<MTLCommandQueue> queue;
 
     struct ggml_metal_fairy2i_w1_coeff_lut * fairy2i_w1_coeff_luts;
+    struct ggml_metal_row4_cache * row4_caches;
+    struct ggml_metal_row4_cache ** row4_cache_index;
+    size_t row4_cache_bytes;
 };
+
+struct ggml_metal_row4_cache_pending {
+    struct ggml_metal_row4_cache * cache;
+    ggml_metal_buffer_t owner;
+    uint64_t generation;
+    char name[GGML_MAX_NAME];
+    struct ggml_metal_row4_cache_pending * next;
+};
+
+struct ggml_metal_row4_cache_batch {
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+    struct ggml_metal_row4_cache_pending * entries;
+    int64_t start_us;
+    size_t bytes;
+    size_t count;
+    bool failed;
+};
+
+ggml_metal_row4_cache_batch_t ggml_metal_row4_cache_batch_init(void) {
+    ggml_metal_row4_cache_batch_t batch = calloc(1, sizeof(*batch));
+    if (batch) {
+        batch->start_us = ggml_time_us();
+    }
+    return batch;
+}
+
+bool ggml_metal_row4_cache_batch_finish(ggml_metal_row4_cache_batch_t batch, bool submit) {
+    if (!batch) {
+        // The getter falls back to the original serial build on allocation failure.
+        return true;
+    }
+    bool ok = submit && !batch->failed;
+    [batch->encoder endEncoding];
+    if (ok && batch->command) {
+        [batch->command commit];
+        [batch->command waitUntilCompleted];
+        ok = batch->command.status == MTLCommandBufferStatusCompleted;
+    }
+    const double elapsed_ms = (ggml_time_us() - batch->start_us) / 1000.0;
+    const bool completed = ok;
+    struct ggml_metal_row4_cache_pending * entry = batch->entries;
+    while (entry) {
+        struct ggml_metal_row4_cache_pending * next = entry->next;
+        @synchronized (entry->owner->buffers[0].metal) {
+            struct ggml_metal_row4_cache * cache = entry->cache;
+            if (cache->pending == batch) {
+                cache->pending = NULL;
+                cache->valid = completed && cache->generation == entry->generation;
+                if (cache->valid) {
+                    GGML_LOG_INFO("Row4 persistent INT4 cache build: %s O=%d K=%d bytes=%zu total_bytes=%zu batched=1\n",
+                                  entry->name, cache->m, cache->k, (size_t) cache->m * cache->k / 2,
+                                  entry->owner->row4_cache_bytes);
+                } else {
+                    ok = false;
+                }
+            } else {
+                ok = false;
+            }
+        }
+        free(entry);
+        entry = next;
+    }
+    if (ok && batch->count) {
+        GGML_LOG_INFO("Row4 persistent INT4 cache batch: matrices=%zu bytes=%zu elapsed_ms=%.3f\n",
+                      batch->count, batch->bytes, elapsed_ms);
+    }
+    [batch->encoder release];
+    [batch->command release];
+    free(batch);
+    return ok;
+}
 
 static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_aligned) {
 #ifndef GGML_METAL_NDEBUG
@@ -1543,6 +1641,14 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    free(buf->row4_cache_index);
+    struct ggml_metal_row4_cache * cache = buf->row4_caches;
+    while (cache) {
+        struct ggml_metal_row4_cache * next = cache->next;
+        ggml_metal_buffer_free(cache->storage);
+        free(cache);
+        cache = next;
+    }
     struct ggml_metal_fairy2i_w1_coeff_lut * lut = buf->fairy2i_w1_coeff_luts;
     while (lut) {
         struct ggml_metal_fairy2i_w1_coeff_lut * next = lut->next;
@@ -1671,6 +1777,7 @@ size_t ggml_metal_fairy2i_packed_weight_extra(const struct ggml_tensor * tensor)
 }
 
 void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_metal_buffer_invalidate_row4_cache(buf, tensor, offset, size);
     @synchronized (buf->buffers[0].metal) {
         ggml_metal_fairy2i_invalidate_w1_coeff_lut(buf, tensor);
     }
@@ -1704,6 +1811,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
 }
 
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_metal_buffer_invalidate_row4_cache(buf, tensor, offset, size);
     @synchronized (buf->buffers[0].metal) {
         ggml_metal_fairy2i_invalidate_w1_coeff_lut(buf, tensor);
     }
@@ -1798,6 +1906,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 }
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
+    ggml_metal_buffer_invalidate_row4_cache(buf, NULL, 0, 0);
     @synchronized (buf->buffers[0].metal) {
         struct ggml_metal_fairy2i_w1_coeff_lut * lut = buf->fairy2i_w1_coeff_luts;
         while (lut) {
@@ -1908,6 +2017,158 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_fairy2i_w1_coeff_lut(
         ggml_metal_log_allocated_size(buf->device, lut_size);
         return (struct ggml_metal_buffer_id) { metal, 0 };
     }
+}
+
+bool ggml_metal_device_has_row4_cache(ggml_metal_device_t dev) {
+    // Latches on the first allocation, across all contexts on this device.
+    // Cache-disabled writer graphs must still invalidate existing caches.
+    return __atomic_load_n(&dev->row4_cache_seen, __ATOMIC_ACQUIRE);
+}
+
+void ggml_metal_buffer_invalidate_row4_cache(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor,
+                                           size_t offset, size_t size) {
+    const uintptr_t address = tensor ? (uintptr_t) tensor->data + offset : 0;
+    @synchronized (buf->buffers[0].metal) {
+        for (struct ggml_metal_row4_cache * cache = buf->row4_caches; cache; cache = cache->next) {
+            const bool overlap = !tensor || (address <= cache->address ? cache->address - address < size :
+                                                                       address - cache->address < cache->source_bytes);
+            if (overlap) {
+                // Keep the allocation alive: preceding asynchronous graphs may
+                // still reference it. Rebuilds are ordered on the device queue.
+                cache->valid = false;
+                ++cache->generation;
+            }
+        }
+    }
+}
+
+static struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_impl(
+        ggml_metal_buffer_t buf, ggml_metal_device_t dev, ggml_metal_library_t lib,
+        const struct ggml_tensor * codes, int32_t k, int32_t m, bool create, ggml_metal_row4_cache_batch_t batch) {
+    const struct ggml_metal_buffer_id none = { nil, 0 };
+    @synchronized (buf->buffers[0].metal) {
+        const size_t bucket = ggml_metal_row4_cache_bucket((uintptr_t) codes->data);
+        struct ggml_metal_row4_cache * cache = buf->row4_cache_index ? buf->row4_cache_index[bucket] : buf->row4_caches;
+        for (; cache; cache = buf->row4_cache_index ? cache->hash_next : cache->next) {
+            if (cache->address == (uintptr_t) codes->data && cache->k == k && cache->m == m &&
+                cache->source_bytes == ggml_nbytes(codes)) {
+                break;
+            }
+        }
+        if (cache && cache->valid) {
+            return (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 };
+        }
+        if (cache && cache->pending) {
+            // Reuse a duplicate in this batch; never wait on another uncommitted batch.
+            return batch && cache->pending == batch ?
+                       (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 } : none;
+        }
+        if (!create) {
+            return none;
+        }
+        const int64_t start = ggml_time_us();
+        const size_t bytes = (size_t) m * k / 2;
+        if (!cache) {
+            // Keep the opt-in cache bounded per source buffer. Query memory
+            // through the common device API so older Metal targets fall back.
+            size_t available;
+            size_t total;
+            ggml_metal_device_get_memory(dev, &available, &total);
+            if (available > total || bytes > available ||
+                bytes > (size_t) 4 * 1024 * 1024 * 1024 - buf->row4_cache_bytes) {
+                return none;
+            }
+            ggml_metal_buffer_t storage = ggml_metal_buffer_init(dev, bytes, false);
+            if (!storage) {
+                return none;
+            }
+            cache = calloc(1, sizeof(*cache));
+            if (!cache) {
+                ggml_metal_buffer_free(storage);
+                return none;
+            }
+            cache->address = (uintptr_t) codes->data;
+            cache->source_bytes = ggml_nbytes(codes);
+            cache->k = k;
+            cache->m = m;
+            cache->storage = storage;
+            if (!buf->row4_caches) {
+                buf->row4_cache_index = calloc(GGML_METAL_ROW4_CACHE_BUCKETS, sizeof(*buf->row4_cache_index));
+            }
+            if (buf->row4_cache_index) {
+                cache->hash_next = buf->row4_cache_index[bucket];
+                buf->row4_cache_index[bucket] = cache;
+            }
+            cache->next = buf->row4_caches;
+            buf->row4_caches = cache;
+            __atomic_store_n(&dev->row4_cache_seen, true, __ATOMIC_RELEASE);
+            buf->row4_cache_bytes += bytes;
+        }
+        const char * name = "kernel_row4_m5_preexpand_int4_pair2";
+        ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(lib, name);
+        if (!pipeline) {
+            pipeline = ggml_metal_library_compile_pipeline(lib, name, name, NULL);
+        }
+        struct ggml_metal_buffer_id source = ggml_metal_buffer_get_id(buf, codes);
+        if (!pipeline || !source.metal) {
+            return none;
+        }
+        ggml_metal_kargs_row_quant_linear args = { k, m, 0, 0, 2 };
+        if (batch) {
+            if (!batch->command) {
+                batch->command = [[buf->queue commandBuffer] retain];
+                batch->encoder = [[batch->command computeCommandEncoder] retain];
+            }
+            struct ggml_metal_row4_cache_pending * pending = calloc(1, sizeof(*pending));
+            if (!batch->command || !batch->encoder || !pending) {
+                free(pending);
+                batch->failed = true;
+                return none;
+            }
+            pending->cache = cache;
+            pending->owner = buf;
+            pending->generation = cache->generation;
+            memcpy(pending->name, codes->name, sizeof(pending->name));
+            pending->next = batch->entries;
+            batch->entries = pending;
+            batch->bytes += bytes;
+            ++batch->count;
+            cache->pending = batch;
+        }
+        id<MTLCommandBuffer> command = batch ? batch->command : [buf->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = batch ? batch->encoder : [command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline->obj];
+        [encoder setBytes:&args length:sizeof(args) atIndex:0];
+        [encoder setBuffer:source.metal offset:source.offs atIndex:1];
+        [encoder setBuffer:cache->storage->buffers[0].metal offset:0 atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(k / 32, m / 128, 1)
+                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (batch) {
+            return (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 };
+        }
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            return none;
+        }
+        cache->valid = true;
+        GGML_LOG_INFO("Row4 persistent INT4 cache build: %s O=%d K=%d bytes=%zu total_bytes=%zu elapsed_ms=%.3f\n",
+                      codes->name, m, k, bytes, buf->row4_cache_bytes, (ggml_time_us() - start) / 1000.0);
+        return (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 };
+    }
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
+        ggml_metal_buffer_t buf, ggml_metal_device_t dev, ggml_metal_library_t lib,
+        const struct ggml_tensor * codes, int32_t k, int32_t m, bool create) {
+    return ggml_metal_buffer_get_row4_cache_impl(buf, dev, lib, codes, k, m, create, NULL);
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_batch(
+        ggml_metal_buffer_t buf, ggml_metal_device_t dev, ggml_metal_library_t lib,
+        const struct ggml_tensor * codes, int32_t k, int32_t m, ggml_metal_row4_cache_batch_t batch) {
+    return ggml_metal_buffer_get_row4_cache_impl(buf, dev, lib, codes, k, m, true, batch);
 }
 
 struct ggml_metal_buffer_id ggml_metal_device_get_scratch(ggml_metal_device_t dev, size_t size) {

@@ -38,6 +38,8 @@ struct ggml_metal {
 
     bool use_bfloat;
     bool use_fusion;
+    bool use_row4_cache;
+    bool row4_cache_ready;
     bool use_concurrency;
     bool use_graph_optimize;
 
@@ -126,6 +128,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
+    const char * cache_value = getenv("GGML_METAL_ROW4_INT4_CACHE");
+    res->use_row4_cache = cache_value && atoi(cache_value) != 0;
     res->use_bfloat      = props_dev->has_bfloat;
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
@@ -255,6 +259,8 @@ static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_te
 }
 
 void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_buffer_t owner = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_metal_buffer_invalidate_row4_cache(owner->context, tensor, offset, size);
     @autoreleasepool {
         // wrap the source data into a Metal buffer
         id<MTLBuffer> buf_src = [ctx->device newBufferWithBytes:data
@@ -347,6 +353,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     // tests on M1 Pro and M2 Ultra using LLaMA models, show that optimal values for n_cb are 1 or 2
 
     @autoreleasepool {
+        ctx->row4_cache_ready = ggml_metal_op_prepare_row4_cache(ctx->dev, ctx->lib, gf, ctx->use_row4_cache);
         ctx->gf = gf;
 
         ctx->n_nodes_0 = MIN(n_main, gf->n_nodes);
@@ -538,6 +545,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             idx_start,
             idx_end,
             ctx->use_fusion,
+            ctx->row4_cache_ready,
             ctx->use_concurrency,
             ctx->capture_next_compute,
             ctx->debug_graph,

@@ -935,12 +935,14 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
         for (ushort isg = 0; isg < ntg.x / N_SIMDWIDTH; ++isg) {
             row_sum = precise::fma(1.0f, shared[isg], row_sum);
         }
-        shared[0] = 1.0f / precise::sqrt(row_sum / (float) k + rms_args.eps);
+        shared[8] = 1.0f / precise::sqrt(row_sum / (float) k + rms_args.eps);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float inv_rms   = shared[0];
+    // Keep the inverse RMS outside the slots reused by the A8 max reduction.
+    // Another SIMDgroup may start writing its maximum before this group reads.
+    const float inv_rms   = shared[8];
     const uint  simd_lane = tiitg & 31U;
     const uint  simd_group = tiitg >> 5;
     float       thread_max = 0.0f;
@@ -953,7 +955,9 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
             const uint  col        = i + j;
             const float value      = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[col]));
             const float normalized = fairy2i_round_to_bf16_f32(value * inv_rms);
-            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(weight[col]));
+            const float w_value    = rms_args.nb10 == sizeof(ushort) ?
+                                        fairy2i_bf16_to_f32(((device const ushort *) weight)[col]) : weight[col];
+            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(w_value));
             const uint  bits       = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
             rms_dst[col]           = bits;
             xb[j]                  = as_type<float>(bits);
@@ -992,6 +996,119 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
         *(device char4 *) (act_q + i) = char4(clamp(q, int4(-127), int4(127)));
     }
 }
+
+// Contiguous K4096 prefill rows. Keep the standalone 256-thread RMS reduction
+// and all BF16/A8 rounding boundaries, retaining 16 normalized values per thread.
+template<bool store_rms>
+kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl(
+        constant ggml_metal_kargs_fairy2i_rms_norm_exact & rms_args [[buffer(0)]],
+        device const float * src0                                   [[buffer(1)]],
+        device const float * weight                                 [[buffer(2)]],
+        device uint * rms_dst                                       [[buffer(3)]],
+        device char * act_q                                         [[buffer(4)]],
+        device float * act_scales                                   [[buffer(5)]],
+        threadgroup float * shared                                  [[threadgroup(0)]],
+        uint3 tgpig                                                  [[threadgroup_position_in_grid]],
+        ushort tiitg                                                 [[thread_index_in_threadgroup]],
+        ushort3 ntg                                                  [[threads_per_threadgroup]]) {
+    constexpr int k = 4096;
+    const ulong row_base = (ulong) tgpig.x * k;
+    src0 += row_base;
+    rms_dst += row_base;
+    act_q += row_base;
+    act_scales += tgpig.x;
+
+    // Exact copy of the QAT RMS sum partition and reduction.
+    float sum = 0.0f;
+    for (int i0 = tiitg; i0 < k; i0 += ntg.x) {
+        const float value = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[i0]));
+        sum = precise::fma(value, value, sum);
+    }
+    sum = simd_sum(sum);
+
+    const ushort tiisg = tiitg % N_SIMDWIDTH;
+    const ushort sgitg = tiitg / N_SIMDWIDTH;
+    if (tiisg == 0) {
+        shared[sgitg] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg == 0) {
+        float row_sum = 0.0f;
+        for (ushort isg = 0; isg < ntg.x / N_SIMDWIDTH; ++isg) {
+            row_sum = precise::fma(1.0f, shared[isg], row_sum);
+        }
+        shared[8] = 1.0f / precise::sqrt(row_sum / (float) k + rms_args.eps);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Keep the inverse RMS outside the slots reused by the A8 max reduction.
+    // Another SIMDgroup may start writing its maximum before this group reads.
+    const float inv_rms   = shared[8];
+    const uint  simd_lane = tiitg & 31U;
+    const uint  simd_group = tiitg >> 5;
+    float       thread_max = 0.0f;
+
+    float4 values[4];
+
+    // Materialize exactly the same RMS destination bits while forming the
+    // first activation-quantization max pass from those carrier values.
+    for (uint i = (uint) tiitg * 4U; i < (uint) k; i += 256U * 4U) {
+        float4 xb;
+        for (uint j = 0; j < 4U; ++j) {
+            const uint  col        = i + j;
+            const float value      = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[col]));
+            const float normalized = fairy2i_round_to_bf16_f32(value * inv_rms);
+            const float w_value    = rms_args.nb10 == sizeof(ushort) ?
+                                        fairy2i_bf16_to_f32(((device const ushort *) weight)[col]) : weight[col];
+            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(w_value));
+            const uint  bits       = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
+            if (store_rms) {
+                rms_dst[col] = bits;
+            }
+            xb[j]                  = as_type<float>(bits);
+        }
+        values[i / 1024U] = xb;
+        const float4 abs_xb = fabs(xb);
+        const float max_01  = max(abs_xb.x, abs_xb.y);
+        const float max_23  = max(abs_xb.z, abs_xb.w);
+        thread_max = max(thread_max, max(max_01, max_23));
+    }
+
+    const float group_max = simd_max(thread_max);
+    if (simd_lane == 0U) {
+        shared[simd_group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0U) {
+        float value = simd_lane < 8U ? shared[simd_lane] : 0.0f;
+        value = simd_max(value);
+        if (simd_lane == 0U) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(value), 127U);
+            shared[0] = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[0] = shared[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reuse the exact carrier values in registers instead of reading the RMS
+    // destination again. The host barrier publishes both outputs.
+    const float sx = shared[0];
+    for (uint i = (uint) tiitg * 4U; i < (uint) k; i += 256U * 4U) {
+        const float4 xb = values[i / 1024U];
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
+        int4 q = int4(magnitude);
+        q = select(q, -q, xb < float4(0.0f));
+        *(device char4 *) (act_q + i) = char4(clamp(q, int4(-127), int4(127)));
+    }
+}
+
+typedef decltype(kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl<true>) fairy2i_rms_row4_prefill_t;
+template [[host_name("kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096")]] kernel fairy2i_rms_row4_prefill_t kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl<true>;
+template [[host_name("kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_no_store")]] kernel fairy2i_rms_row4_prefill_t kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096_impl<false>;
 
 // Packed-BF16 entry point for the fused QAT SwiGLU -> Row4 down path. The
 // producer already materialized the checkpoint BF16 payload, so widening it by
@@ -1362,45 +1479,39 @@ kernel void kernel_row4_m5_preexpand_int4(
     weight_i4[high_offset + 1UL] = row4_m5_pack_int4(high.z, high.w);
 }
 
-// Losslessly expand the physical m32k256_pair2_split8_v2 code stream into the
-// same ordinary K-major numeric signed INT4 tensor consumed by MPP. One source
-// byte still describes four output rows at two K positions; pair2 only changes
-// how the output group, K128 half, split, and j coordinate are interleaved.
+// Losslessly expand Pair2 into K-major numeric INT4. Each 128-thread group
+// covers O128 x K32, reusing nearby source cache lines while keeping stores
+// contiguous along O. The grid visits K blocks first for source locality.
+// The preexpanded selector guarantees O % 128 == 0 and K % 256 == 0.
 kernel void kernel_row4_m5_preexpand_int4_pair2(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
         device const uchar * codes                        [[buffer(1)]],
         device uchar * weight_i4                          [[buffer(2)]],
-        uint gid                                          [[thread_position_in_grid]]) {
-    const ulong source_bytes = (ulong) (uint) args.m * (ulong) (uint) args.k / 8UL;
-    if ((ulong) gid >= source_bytes) {
-        return;
+        uint2 tgpig                                       [[threadgroup_position_in_grid]],
+        uint tiitg                                        [[thread_index_in_threadgroup]]) {
+    const uint output_group = tgpig.y * 32U + (tiitg & 15U) * 2U;
+    const uint k_low = tgpig.x * 32U + ((tiitg & 64U) >> 2) + ((tiitg & 48U) >> 3);
+    const uint lane = (tgpig.x & 3U) * 8U + (tiitg >> 4);
+    const uint byte = ((tgpig.x >> 2) & 1U) * 2U;
+    const ulong source_offset =
+        (((ulong) (output_group >> 3) * ((uint) args.k >> 8) + (tgpig.x >> 3)) * 8UL +
+         (output_group & 7U)) * 128UL + lane * 4U + byte;
+    const ushort code0 = *((device const ushort *) (codes + source_offset));
+    const ushort code1 = *((device const ushort *) (codes + source_offset + 128UL));
+
+    #pragma unroll
+    for (uint j = 0; j < 2; ++j) {
+        const uint c0 = (code0 >> (j * 8U)) & 255U;
+        const uint c1 = (code1 >> (j * 8U)) & 255U;
+        const uint low = (uint) k_row4_m5_packed_int4_codebook[c0 & 15U] |
+                         ((uint) k_row4_m5_packed_int4_codebook[c1 & 15U] << 16);
+        const uint high = (uint) k_row4_m5_packed_int4_codebook[c0 >> 4] |
+                          ((uint) k_row4_m5_packed_int4_codebook[c1 >> 4] << 16);
+        const ulong low_offset = ((ulong) (k_low + j) * (uint) args.m) / 2UL + output_group * 2UL;
+        const ulong high_offset = low_offset + (ulong) args.m * 4UL;
+        *((device uint *) (weight_i4 + low_offset)) = low;
+        *((device uint *) (weight_i4 + high_offset)) = high;
     }
-
-    uint x           = gid;
-    const uint byte  = x & 3U;
-    x >>= 2;
-    const uint lane  = x & 31U;
-    x >>= 5;
-    const uint group = x & 7U;
-    x >>= 3;
-    const uint k_pairs = (uint) args.k >> 8;
-    const uint kp      = x % k_pairs;
-    const uint ob      = x / k_pairs;
-
-    const uint split  = lane >> 2;
-    const uint j      = ((lane & 3U) << 1U) | (byte & 1U);
-    const uint k_half = byte >> 1;
-    const uint output = ob * 32U + group * 4U;
-    const uint k_low  = kp * 256U + k_half * 128U + split * 16U + j;
-    const uint k_high = k_low + 8U;
-    const uchar code_pair = codes[gid];
-    const ushort low      = k_row4_m5_packed_int4_codebook[(uint) (code_pair & 0x0fU)];
-    const ushort high     = k_row4_m5_packed_int4_codebook[(uint) (code_pair >> 4)];
-
-    const ulong low_offset  = ((ulong) k_low * (ulong) args.m + (ulong) output) >> 1;
-    const ulong high_offset = ((ulong) k_high * (ulong) args.m + (ulong) output) >> 1;
-    *((device ushort *) (weight_i4 + low_offset)) = low;
-    *((device ushort *) (weight_i4 + high_offset)) = high;
 }
 
 // Large prefills amortize one complete Row4 expansion across many token tiles.
@@ -1480,6 +1591,133 @@ kernel void name( \
 ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128, 128)
 ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512, 512)
 #undef ROW4_M5_PREFILL_PREEXPANDED
+
+// Full M64 tiles can write the exact BF16 epilogue through the cooperative
+// INT32 tensor. Keep its fragment layout and store the F32 result bit patterns
+// so the cooperative store does not introduce a numeric conversion.
+template<int output_tile, int n_simdgroups, int grouped_rows, bool has_residual = false, bool has_v_store = false>
+static inline void row4_m5_prefill_cooperative_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device int8_t * act_q,
+        device uchar * weight_i4,
+        device const float * act_scales,
+        device const ushort * scales,
+        device float * dst,
+        uint3 tgpig,
+        device const uint * residual = nullptr,
+        device char * v_cache = nullptr,
+        device const int64_t * v_rows = nullptr,
+        ulong v_stride = 0) {
+    constexpr int row_tile = 64;
+    constexpr int k_tile   = 512;
+    constexpr auto desc = matmul2d_descriptor(
+        row_tile, output_tile, k_tile, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<n_simdgroups>> op;
+
+    using activation_tensor = tensor<device int8_t, extents<int, k_tile, row_tile>, tensor_inline>;
+    using weight_tensor     = tensor<device int4b_format, extents<int, output_tile, k_tile>, tensor_inline>;
+    auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    // Visit a short group of token tiles before advancing along O, reusing
+    // their weight columns in cache. The last group may contain fewer rows.
+    const uint nx = (uint) args.m / output_tile;
+    const uint ny = (uint) args.act_rows / row_tile;
+    const ulong linear = (ulong) tgpig.x + (ulong) nx * tgpig.y;
+    const ulong group_size = (ulong) grouped_rows * nx;
+    const uint first_row = (uint) (linear / group_size) * grouped_rows;
+    const uint group_rows = min((uint) grouped_rows, ny - first_row);
+    const uint offset = (uint) (linear % group_size);
+    const uint output_base = (offset / group_rows) * output_tile;
+    const uint row_base = (first_row + offset % group_rows) * row_tile;
+
+    for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
+        activation_tensor activation(
+            act_q + (ulong) row_base * (uint) args.k + k_base,
+            extents<int, k_tile, row_tile>(), array<int, 2>{ 1, args.k });
+        weight_tensor weight(
+            weight_i4 + (((ulong) k_base * (uint) args.m + output_base) >> 1),
+            extents<int, output_tile, k_tile>(), array<int, 2>{ 1, args.m });
+        op.run(activation, weight, acc);
+    }
+
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto coordinate = acc.get_multidimensional_index(i);
+            acc[i] = as_type<int32_t>(row4_finish_i32(
+                acc[i], act_scales[row_base + (uint) coordinate[1]], scales[output_base + (uint) coordinate[0]]));
+            if (has_v_store && output_base >= 5120) {
+                const uint row = row_base + (uint) coordinate[1];
+                device ushort * target = (device ushort *) (v_cache + v_rows[row] * v_stride);
+                target[output_base - 5120 + (uint) coordinate[0]] = ushort(as_type<uint>(acc[i]) >> 16);
+            }
+            if (has_residual) {
+                // Preserve the materialized BF16 boundary. Folding the low
+                // component's +0 changes signed zero, subnormal flushing and
+                // NaN canonicalization versus COMPLEX_ADD_QAT.
+                thread volatile uint rounded = as_type<uint>(acc[i]);
+                const uint a = rounded;
+                const uint b = residual[(ulong) (row_base + (uint) coordinate[1]) * args.m +
+                                        output_base + (uint) coordinate[0]];
+                const float real = fairy2i_bf16_to_f32(ushort(a)) + fairy2i_bf16_to_f32(ushort(b));
+                const float imag = fairy2i_bf16_to_f32(ushort(a >> 16)) + fairy2i_bf16_to_f32(ushort(b >> 16));
+                acc[i] = as_type<int32_t>(fairy2i_pack_bf16_pair(real, imag));
+            }
+        }
+    }
+    auto target = tensor((device int32_t *) dst + (ulong) row_base * (uint) args.m + output_base,
+                         extents<int, output_tile, row_tile>(), array<int, 2>{ 1, args.m });
+    acc.store(target);
+}
+
+#define ROW4_M5_PREFILL_COOPERATIVE(name, output_tile, n_simdgroups, grouped_rows) \
+kernel void name( \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]], \
+        device int8_t * act_q [[buffer(1)]], \
+        device uchar * weight_i4 [[buffer(2)]], \
+        device const float * act_scales [[buffer(3)]], \
+        device const ushort * scales [[buffer(4)]], \
+        device float * dst [[buffer(5)]], \
+        uint3 tgpig [[threadgroup_position_in_grid]]) { \
+    row4_m5_prefill_cooperative_impl<output_tile, n_simdgroups, grouped_rows>( \
+        args, act_q, weight_i4, act_scales, scales, dst, tgpig); \
+}
+
+ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512, 64, 4, 2)
+ROW4_M5_PREFILL_COOPERATIVE(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512, 128, 8, 4)
+#undef ROW4_M5_PREFILL_COOPERATIVE
+
+kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512_v_store(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device int8_t * act_q [[buffer(1)]],
+        device uchar * weight_i4 [[buffer(2)]],
+        device const float * act_scales [[buffer(3)]],
+        device const ushort * scales [[buffer(4)]],
+        device float * dst [[buffer(5)]],
+        device char * v_cache [[buffer(6)]],
+        device const int64_t * v_rows [[buffer(7)]],
+        constant ulong & v_stride [[buffer(8)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    row4_m5_prefill_cooperative_impl<64, 4, 2, false, true>(
+        args, act_q, weight_i4, act_scales, scales, dst, tgpig, nullptr, v_cache, v_rows, v_stride);
+}
+
+kernel void kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512_qat_residual(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device int8_t * act_q [[buffer(1)]], device uchar * weight_i4 [[buffer(2)]],
+        device const float * act_scales [[buffer(3)]], device const ushort * scales [[buffer(4)]],
+        device float * dst [[buffer(5)]], device const uint * residual [[buffer(6)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    row4_m5_prefill_cooperative_impl<64, 4, 2, true>(args, act_q, weight_i4, act_scales, scales, dst, tgpig, residual);
+}
+
 
 template<int row_tile, int output_tile, int n_simdgroups>
 static inline void row4_w1a8_m5_tensorops_prefill_impl(
@@ -10929,6 +11167,66 @@ kernel void kernel_fairy2i_swiglu_qat_packed_bf16(
     dst[(ulong) row * args.ne0 + col] = fairy2i_mul_qat_bf16(silu_bits, up_bits);
 }
 
+// Keep the two QAT BF16 boundaries and each row's complete absmax.
+// Three ushort4 values per thread retain the SwiGLU output without device
+// round trips; only the sole Row4 consumer may use this compact A8 handoff.
+kernel void kernel_fairy2i_swiglu_qat_row4_quantize_activation_i8_k12288(
+    constant ggml_metal_kargs_fairy2i_elementwise_exact & args [[buffer(0)]],
+    const device uint *                                   gate [[buffer(1)]],
+    const device uint *                                   up [[buffer(2)]],
+    device char *                                         act_q [[buffer(3)]],
+    device float *                                        act_scales [[buffer(4)]],
+    threadgroup float *                                   maxima [[threadgroup(0)]],
+    uint                                                  row [[threadgroup_position_in_grid]],
+    uint                                                  tid [[thread_index_in_threadgroup]]) {
+    constexpr uint      n_threads = 1024;
+    constexpr uint      k         = 12288;
+    constexpr uint      n_values  = k / (4 * n_threads);
+    ushort4             values[n_values];
+    const device uint * gate_row   = (const device uint *) ((const device char *) gate + (ulong) row * args.src0_nb1);
+    const device uint * up_row     = (const device uint *) ((const device char *) up + (ulong) row * args.src1_nb1);
+    float               thread_max = 0.0f;
+    FOR_UNROLL(uint j = 0; j < n_values; ++j) {
+        const uint    i         = 4 * (tid + j * n_threads);
+        const uint4   gate_bits = *(const device uint4 *) (gate_row + i);
+        const uint4   up_bits   = *(const device uint4 *) (up_row + i);
+        const ushort4 out_bits =
+            ushort4(fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.x >> 16)), ushort(up_bits.x >> 16)),
+                    fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.y >> 16)), ushort(up_bits.y >> 16)),
+                    fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.z >> 16)), ushort(up_bits.z >> 16)),
+                    fairy2i_mul_qat_bf16(fairy2i_silu_qat_bf16(ushort(gate_bits.w >> 16)), ushort(up_bits.w >> 16)));
+        const float4 xb     = as_type<float4>(uint4(out_bits) << 16);
+        values[j]           = out_bits;
+        const float4 abs_xb = fabs(xb);
+        thread_max          = max(thread_max, max(max(abs_xb.x, abs_xb.y), max(abs_xb.z, abs_xb.w)));
+    }
+    const uint lane = tid & 31, group = tid >> 5;
+    float      group_max = simd_max(thread_max);
+    if (lane == 0) {
+        maxima[group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (group == 0) {
+        float m = lane < n_threads / 32 ? maxima[lane] : 0.0f;
+        m       = simd_max(m);
+        if (lane == 0) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(m), 127U);
+            maxima[0]             = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[row]       = maxima[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float sx = maxima[0];
+    FOR_UNROLL(uint j = 0; j < n_values; ++j) {
+        const float4 xb        = as_type<float4>(uint4(values[j]) << 16);
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + 0.5f);
+        int4         q         = int4(magnitude);
+        q                      = select(q, -q, xb < float4(0));
+        *(device char4 *) (act_q + (ulong) row * k + 4 * (tid + j * n_threads)) =
+            char4(clamp(q, int4(-127), int4(127)));
+    }
+}
+
 kernel void kernel_fairy2i_pack_bf16_exact(constant ulong &    ne,
                                            const device uint * src0,
                                            device ushort *     dst,
@@ -12655,6 +12953,85 @@ kernel void kernel_fairy2i_rope_neox_qat_f32(
     }
 }
 
+// K128 QAT RMSNorm + NEOX RoPE, preserving the original 256-thread
+// reduction and every BF16 boundary. Optional K stores avoid a carrier copy.
+template<bool store_k>
+kernel void kernel_fairy2i_rms_rope_qat_k128(
+    constant ggml_metal_kargs_fairy2i_rms_norm_exact & ra [[buffer(0)]],
+    const device char * src0 [[buffer(1)]],
+    const device char * weight [[buffer(2)]],
+    device char * dst [[buffer(3)]],
+    const device int32_t * pos [[buffer(4)]],
+    constant ggml_metal_kargs_rope & args [[buffer(5)]],
+    const device float * freq [[buffer(6)]],
+    const device int64_t * indices [[buffer(7)]],
+    constant uint64_t & kv_stride [[buffer(8)]],
+    constant uint32_t & has_freq [[buffer(9)]],
+    threadgroup float * shared [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    ushort tid [[thread_index_in_threadgroup]]) {
+    const uint head = group.x, token = group.y, batch = group.z;
+    const device float * x = (const device float *) (src0 + head*ra.nb01 + token*ra.nb02 + batch*ra.nb03);
+    const float value = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(x[tid]));
+    const float sum = simd_sum(precise::fma(value, value, 0.0f));
+    if ((tid & 31) == 0) {
+        shared[tid >> 5] = sum;
+    }
+    if (tid >= 4 && tid < 8) {
+        shared[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float row_sum = 0.0f;
+        for (ushort sg = 0; sg < 8; ++sg) {
+            row_sum = precise::fma(1.0f, shared[sg], row_sum);
+        }
+        shared[8] = 1.0f / precise::sqrt(row_sum / 128.0f + ra.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float normalized = fairy2i_round_to_bf16_f32(value * shared[8]);
+    const float w = ra.nb10 == 2 ? fairy2i_bf16_to_f32(((const device ushort *) weight)[tid]) :
+                                  ((const device float *) weight)[tid];
+    const float w_bf16 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(w));
+    ((threadgroup uint *) (shared + 9))[tid] = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 64) {
+        const int i0 = 2*tid;
+        float corr_dims[2];
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+        const float theta_base = (float) pos[token];
+        const float inv_ndims = -1.0f / (float) args.n_dims;
+        const float theta = theta_base * pow(args.freq_base, inv_ndims * (float) i0);
+        const float factor = has_freq ? freq[tid] : 1.0f;
+        float cos_theta, sin_theta;
+        rope_yarn(theta / factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor,
+                  &cos_theta, &sin_theta);
+        const float x0 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(shared[9+tid]));
+        const float x1 = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(shared[9+tid+64]));
+        const float c = fairy2i_round_to_bf16_f32(cos_theta);
+        const float s = fairy2i_round_to_bf16_f32(sin_theta);
+        const float x0c = fairy2i_round_to_bf16_f32(x0*c);
+        const float x1s = fairy2i_round_to_bf16_f32(x1*s);
+        const float x0s = fairy2i_round_to_bf16_f32(x0*s);
+        const float x1c = fairy2i_round_to_bf16_f32(x1*c);
+        const ushort y0 = fairy2i_f32_to_bf16(x0c-x1s);
+        const ushort y1 = fairy2i_f32_to_bf16(x0s+x1c);
+        if (store_k) {
+            device ushort * y = (device ushort *) (dst + indices[token]*kv_stride) + head*128;
+            y[tid] = y0;
+            y[tid+64] = y1;
+        } else {
+            device uint * y = (device uint *) (dst + head*args.nb1 + token*args.nb2 + batch*args.nb3);
+            y[tid] = (uint) y0 << 16;
+            y[tid+64] = (uint) y1 << 16;
+        }
+    }
+}
+
+typedef decltype(kernel_fairy2i_rms_rope_qat_k128<false>) fairy2i_rms_rope_qat_k128_t;
+template [[host_name("kernel_fairy2i_rms_rope_qat_k128")]] kernel fairy2i_rms_rope_qat_k128_t kernel_fairy2i_rms_rope_qat_k128<false>;
+template [[host_name("kernel_fairy2i_rms_rope_qat_k128_kv")]] kernel fairy2i_rms_rope_qat_k128_t kernel_fairy2i_rms_rope_qat_k128<true>;
+
 // TODO: obolete -- remove
 //typedef void (im2col_t)(
 //        constant ggml_metal_kargs_im2col & args,
@@ -13755,6 +14132,44 @@ kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<2
 #endif
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
+// Derive the bound from the actual mask, without assuming causal positions.
+// All query heads share this Q8 bound. Interior masked tiles retain the original
+// skip logic and every contributing C64 tile retains its original order.
+kernel void kernel_fairy2i_flash3_mask_bounds(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * mask,
+        device int * bounds,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup int partial[8];
+    int last = 0;
+    const int row = int(group.x) * 8 + simd;
+    if (row < args.ne01) {
+        device const half * values = (device const half *)
+            (mask + row * args.nb31 + (group.y % args.ne33) * args.nb33);
+        // One SIMDgroup per query, stopping at its last visible key. This
+        // avoids scanning the history and avoids division inside the loop.
+        for (int block = ((args.ne11 + 31) / 32) * 32 - 32; block >= 0; block -= 32) {
+            const int col = block + lane;
+            last = simd_max(col < args.ne11 && values[col] != -INFINITY ? col + 1 : 0);
+            if (last) {
+                break;
+            }
+        }
+    }
+    if (lane == 0) {
+        partial[simd] = last;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0) {
+        last = simd_max(lane < 8 ? partial[lane] : 0);
+        if (lane == 0) {
+            bounds[group.y * ((args.ne01 + 7) / 8) + group.x] = ((last + 63) / 64) * 64;
+        }
+    }
+}
+
 template<
     typename q_t,     // query types in shared memory
     typename q4_t,
@@ -13832,7 +14247,7 @@ void kernel_flash_attn_ext_impl(
     constexpr short MS  = GQA == 1 ? SH : C/2;
 
     constexpr short TS = 2*SH;
-    constexpr short T  = DK + (GQA == 1 ? 2*PV : PV); // shared memory size per query in (half)
+    constexpr short T  = DK + (GQA == 1 ? 2 : sizeof(o_t)/sizeof(half))*PV; // shared memory size per query in (half)
 
     threadgroup q_t  * sq  = (threadgroup q_t  *) (shmem_f16 + 0*T); // holds the query data
     threadgroup q4_t * sq4 = (threadgroup q4_t *) (shmem_f16 + 0*T); // same as above but in q4_t
@@ -13923,7 +14338,14 @@ void kernel_flash_attn_ext_impl(
 
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-        for (int ic = 0; ic < args.ne11; ic += C) {
+        int cache_end = args.ne11;
+#if defined(GGML_METAL_HAS_BF16)
+        if (is_same<q_t, bfloat>::value && is_same<o_t, float>::value && args.mask_bounds_offset) {
+            device const int * bounds = (device const int *) (dst + args.mask_bounds_offset);
+            cache_end = bounds[iq3 * ((args.ne01 + Q - 1) / Q) + tgpig.x];
+        }
+#endif
+        for (int ic = 0; ic < cache_end; ic += C) {
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
                 FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -13957,7 +14379,7 @@ void kernel_flash_attn_ext_impl(
 
             // Q*K^T
             // this is compile-time check, so it does not have runtime overhead
-            if (is_same<kd4x4_t, k4x4_t>::value) {
+            if (is_same<kd4x4_t, k4x4_t>::value && GQA == 1) {
                 // we can read directly from global memory
                 device      const k_t * pk = (device const k_t *) ((device const char *) k + ic*args.nb11);
                 threadgroup const q_t * pq = sq;
@@ -14019,6 +14441,33 @@ void kernel_flash_attn_ext_impl(
                     pk += 8*(NSG*NS10 - DK8);
                     pq += 8*(NSG*0    - DK8);
                     ps += 8*(NSG);
+                }
+            } else if (is_same<kd4x4_t, k4x4_t>::value) {
+                constexpr short NC = (C/8)/NSG;
+                for (short cc = 0; cc < NC; ++cc) {
+                    qk8x8_t accum[GQA];
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        accum[g] = make_filled_simdgroup_matrix<qk_t, 8>((qk_t) 0.0f);
+                    }
+                    device const k_t * pk = (device const k_t *) (k + ic*args.nb11) +
+                                            8*(sgitg + cc*NSG)*NS10;
+                    FOR_UNROLL (short i = 0; i < DK8; i += 2) {
+                        k8x8_t mk[2];
+                        simdgroup_barrier(mem_flags::mem_none);
+                        simdgroup_load(mk[0], pk + 8*i, NS10, 0, true);
+                        if (i + 1 < DK8) simdgroup_load(mk[1], pk + 8*(i+1), NS10, 0, true);
+                        FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                            q8x8_t mq[2];
+                            simdgroup_load(mq[0], sq + g*Q*DK + 8*i, DK);
+                            if (i + 1 < DK8) simdgroup_load(mq[1], sq + g*Q*DK + 8*(i+1), DK);
+                            simdgroup_barrier(mem_flags::mem_none);
+                            simdgroup_multiply_accumulate(accum[g], mq[0], mk[0], accum[g]);
+                            if (i + 1 < DK8) simdgroup_multiply_accumulate(accum[g], mq[1], mk[1], accum[g]);
+                        }
+                    }
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        simdgroup_store(accum[g], ss + g*Q*SH + 8*(sgitg + cc*NSG), SH, 0, false);
+                    }
                 }
             } else {
                 // TODO: this is the quantized K cache branch - not optimized yet
@@ -14148,7 +14597,7 @@ void kernel_flash_attn_ext_impl(
             // O = O + (Q*K^T)*V
             {
                 // we can read directly from global memory
-                if (is_same<vd4x4_t, v4x4_t>::value) {
+                if (is_same<vd4x4_t, v4x4_t>::value && GQA == 1) {
                     static_assert(PV8 % NSG == 0, "");
 
                     constexpr short NO = PV8/NSG;
@@ -14197,6 +14646,33 @@ void kernel_flash_attn_ext_impl(
                             simdgroup_store(lo[ii], sot, PV, 0, false);
 
                             sot += 8*NSG;
+                        }
+                    }
+                } else if (is_same<vd4x4_t, v4x4_t>::value) {
+                    constexpr short NO = PV8/NSG;
+                    o8x8_t accum[GQA][NO];
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        FOR_UNROLL (short i = 0; i < NO; ++i) {
+                            simdgroup_load(accum[g][i], so + g*Q*PV + 8*(sgitg+i*NSG), PV, 0, false);
+                        }
+                    }
+                    FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                        s8x8_t probability[GQA];
+                        FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                            simdgroup_load(probability[g], ss + g*Q*SH + 8*cc, SH, 0, false);
+                        }
+                        device const v_t * pv = (device const v_t *) (v + (ic+8*cc)*args.nb21);
+                        FOR_UNROLL (short i = 0; i < NO; ++i) {
+                            v8x8_t mv;
+                            simdgroup_load(mv, pv + 8*(sgitg+i*NSG), NS20, 0, false);
+                            FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                                simdgroup_multiply_accumulate(accum[g][i], probability[g], mv, accum[g][i]);
+                            }
+                        }
+                    }
+                    FOR_UNROLL (short g = 0; g < GQA; ++g) {
+                        FOR_UNROLL (short i = 0; i < NO; ++i) {
+                            simdgroup_store(accum[g][i], so + g*Q*PV + 8*(sgitg+i*NSG), PV, 0, false);
                         }
                     }
                 } else {
@@ -14315,7 +14791,16 @@ void kernel_flash_attn_ext_impl(
                     result = fairy2i_round_to_bf16_f32(result);
                 }
 #endif
-                dst4[i] = result;
+#if defined(GGML_METAL_HAS_BF16)
+                if (is_same<q_t, bfloat>::value && is_same<o_t, float>::value && args.packed_output) {
+                    device ushort4 * packed = (device ushort4 *) dst +
+                        ((uint64_t) iq3 * args.ne2 * args.ne1 + iq2 + ih + (uint64_t) (iq1 + iq) * args.ne1) * DV4;
+                    packed[i] = ushort4(as_type<uint4>(result) >> 16);
+                } else
+#endif
+                {
+                    dst4[i] = result;
+                }
             }
         } else {
             for (short i = tiisg; i < DV4; i += NW) {
@@ -14434,6 +14919,7 @@ template [[host_name("kernel_flash_attn_ext_f16_dk576_dv512")]]  kernel flash_at
 
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_flash_attn_ext_fairy_bf16_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_FAIRY_BF, bfloat4x4, 1, dequantize_bf16, bfloat4x4, 1, dequantize_bf16, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_fairy_bf16_gqa2_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_FAIRY_BF, bfloat4x4, 1, dequantize_bf16, bfloat4x4, 1, dequantize_bf16, 128, 128, 8, 64, 2>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk40_dv40"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 40,  40>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 64,  64>;
 template [[host_name("kernel_flash_attn_ext_bf16_dk80_dv80"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES_BF, bfloat4x4,  1, dequantize_bf16, bfloat4x4,  1, dequantize_bf16, 80,  80>;

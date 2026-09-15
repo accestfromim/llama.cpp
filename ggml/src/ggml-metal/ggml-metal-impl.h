@@ -321,6 +321,8 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    uint64_t mask_bounds_offset;  // optional per-Q8 last unmasked KV tile
+    uint32_t packed_output;       // internal BF16 handoff to a sole Row4 consumer
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {

@@ -149,7 +149,8 @@ ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext(ggml_metal_
                                                                      bool                       has_bias,
                                                                      bool                       has_scap,
                                                                      int32_t                    nsg,
-                                                                     bool                       turbo_gqa4);
+                                                                     bool                       turbo_gqa4,
+                                                                     bool                       fairy_gqa2);
 
 ggml_metal_pipeline_t ggml_metal_library_get_pipeline_flash_attn_ext_vec(ggml_metal_library_t       lib,
                                                                          const struct ggml_tensor * op,
@@ -240,6 +241,31 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id_for_size(ggml_metal_buffer_
                                                               size_t                     size);
 struct ggml_metal_buffer_id ggml_metal_buffer_get_fairy2i_w1_coeff_lut(ggml_metal_buffer_t        buf,
                                                                        const struct ggml_tensor * scales);
+
+bool ggml_metal_device_has_row4_cache(ggml_metal_device_t dev);
+
+typedef struct ggml_metal_row4_cache_batch * ggml_metal_row4_cache_batch_t;
+ggml_metal_row4_cache_batch_t                ggml_metal_row4_cache_batch_init(void);
+bool                        ggml_metal_row4_cache_batch_finish(ggml_metal_row4_cache_batch_t batch, bool submit);
+struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_batch(ggml_metal_buffer_t           buf,
+                                                                   ggml_metal_device_t           dev,
+                                                                   ggml_metal_library_t          lib,
+                                                                   const struct ggml_tensor *    codes,
+                                                                   int32_t                       k,
+                                                                   int32_t                       m,
+                                                                   ggml_metal_row4_cache_batch_t batch);
+
+void                        ggml_metal_buffer_invalidate_row4_cache(ggml_metal_buffer_t        buf,
+                                                                    const struct ggml_tensor * tensor,
+                                                                    size_t                     offset,
+                                                                    size_t                     size);
+struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(ggml_metal_buffer_t        buf,
+                                                             ggml_metal_device_t        dev,
+                                                             ggml_metal_library_t       lib,
+                                                             const struct ggml_tensor * codes,
+                                                             int32_t                    k,
+                                                             int32_t                    m,
+                                                             bool                       create);
 
 size_t ggml_metal_fairy2i_packed_weight_extra(const struct ggml_tensor * tensor);
 
