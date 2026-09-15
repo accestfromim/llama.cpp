@@ -2758,7 +2758,7 @@ bool test_metal_row4_prefill_residual() {
 
     std::vector<test_case> cases;
     for (int64_t k : { 4096, 12288 }) {
-        for (int64_t rows : { 128, 512, 544 }) {
+        for (int64_t rows : { 128, 512, 544, 2048 }) {
             cases.push_back({ k, rows, mode::normal });
         }
         for (mode kind :
@@ -4026,6 +4026,147 @@ bool test_metal_flash3_gqa_reuse() {
 
 }  // namespace
 
+namespace {
+
+struct cache_test_marker {
+    std::atomic<int> builds{ 0 };
+    std::atomic<int> uses{ 0 };
+};
+
+void cache_test_log(enum ggml_log_level level, const char * text, void * user) {
+    (void) level;
+    auto & marker = *static_cast<cache_test_marker *>(user);
+    if (strstr(text, "Row4 persistent INT4 cache build:")) {
+        ++marker.builds;
+    }
+    if (strstr(text, "Row4 persistent INT4 cache reuse:")) {
+        ++marker.uses;
+    }
+}
+
+bool test_row4_cache_updates() {
+    const char * strict = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
+    if (!strict || strcmp(strict, "0") == 0) {
+        printf("  Metal Row4 persistent INT4 cache: SKIP (strict M5 suite only)\n");
+        return true;
+    }
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = find_metal_device();
+    if (!dev) {
+        return false;
+    }
+    scoped_env_var enable("GGML_METAL_ROW4_INT4_CACHE");
+    scoped_env_var debug("GGML_METAL_FUSION_DEBUG");
+    enable.set("0");
+    ggml_backend_t baseline = ggml_backend_dev_init(dev, nullptr);
+    enable.set("1");
+    debug.set("2");
+    ggml_backend_t candidate = ggml_backend_dev_init(dev, nullptr);
+    if (!baseline || !candidate) {
+        return false;
+    }
+    bool          ok = true;
+    constexpr int o  = 128;
+    constexpr int k  = 512;
+    constexpr int b  = 512;
+    for (int lifetime = 0; lifetime < 3 && ok; ++lifetime) {
+        ggml_context *        weights = ggml_init({ 1024 * 1024, nullptr, true });
+        ggml_tensor *         codes = ggml_new_tensor_4d(weights, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, o / 32);
+        ggml_backend_buffer_t wb    = ggml_backend_alloc_ctx_tensors(weights, candidate);
+        ggml_backend_buffer_set_usage(wb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_context * ctx    = ggml_init({ 4 * 1024 * 1024, nullptr, true });
+        ggml_tensor *  x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, b);
+        ggml_tensor *  sw     = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
+        ggml_tensor *  fresh  = ggml_dup_tensor(ctx, codes);
+        ggml_tensor *  copy   = ggml_cpy(ctx, fresh, codes);
+        ggml_tensor *  alias  = ggml_view_1d(ctx, codes, 128, 128);
+        ggml_tensor *  result = ggml_row4_linear(ctx, x, codes, sw, o, k);
+        ggml_cgraph *  normal = ggml_new_graph(ctx);
+        ggml_build_forward_expand(normal, result);
+        ggml_cgraph * writer = ggml_new_graph(ctx);
+        ggml_build_forward_expand(writer, copy);
+        ggml_build_forward_expand(writer, result);
+        ggml_cgraph * writer_only = ggml_new_graph(ctx);
+        ggml_build_forward_expand(writer_only, copy);
+        ggml_backend_buffer_t buf    = ggml_backend_alloc_ctx_tensors(ctx, candidate);
+        auto                  packed = make_row4_pair2_codes(o, k);
+        for (auto & value : packed) {
+            value ^= uint8_t(lifetime * 37);
+        }
+        auto       input  = make_input(k, b);
+        const auto scales = make_row4_scales(o);
+        ggml_backend_tensor_set(codes, packed.data(), 0, packed.size());
+        ggml_backend_tensor_set(fresh, packed.data(), 0, packed.size());
+        ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+        ggml_backend_tensor_set(sw, scales.data(), 0, ggml_nbytes(sw));
+        for (int step = 0; step < 12 && ok; ++step) {
+            const bool graph_write    = step == 7;
+            const bool cache_fallback = graph_write || step == 10;
+            if (step == 10 || step == 11) {
+                ggml_backend_buffer_set_usage(
+                    wb, step == 10 ? GGML_BACKEND_BUFFER_USAGE_ANY : GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
+            if (step == 2) {
+                for (int i = 0; i < 256; ++i) {
+                    packed[i] ^= 0xA5;
+                }
+                ggml_backend_tensor_set(codes, packed.data(), 0, 256);
+            } else if (step == 3) {
+                ggml_backend_tensor_memset(alias, 0x37, 16, 64);
+            } else if (step == 4) {
+                ggml_backend_tensor_set_async(candidate, codes, packed.data() + 192, 192, 24);
+                ggml_backend_synchronize(candidate);
+            } else if (step == 5) {
+                ggml_backend_buffer_clear(wb, 0);
+            } else if (step == 6) {
+                input[0] += 1.25f;
+                ggml_backend_tensor_set(x, input.data(), 0, ggml_nbytes(x));
+            } else if (step == 8) {
+                // A separate graph with caching disabled must invalidate a
+                // shared weight's existing entry even without any Row4 op.
+                for (auto & value : packed) {
+                    value ^= 0x6F;
+                }
+                ggml_backend_tensor_set(fresh, packed.data(), 0, packed.size());
+                ok = ggml_backend_graph_compute(baseline, writer_only) == GGML_STATUS_SUCCESS && ok;
+                ggml_backend_synchronize(baseline);
+            }
+            ggml_cgraph *      graph = graph_write ? writer : normal;
+            std::vector<float> expected(ggml_nelements(result));
+            std::vector<float> actual(expected.size());
+            cache_test_marker  marker;
+            ok = ggml_backend_graph_compute(baseline, graph) == GGML_STATUS_SUCCESS && ok;
+            ggml_backend_tensor_get(result, expected.data(), 0, ggml_nbytes(result));
+            ggml_log_set(cache_test_log, &marker);
+            ok = ggml_backend_graph_compute(candidate, graph) == GGML_STATUS_SUCCESS && ok;
+            ggml_backend_synchronize(candidate);
+            ggml_log_set(nullptr, nullptr);
+            ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+            const bool        expect_build = step == 0 || (step >= 2 && step <= 5) || step == 8;
+            const std::string label =
+                "Row4 INT4 cache lifetime=" + std::to_string(lifetime) + " step=" + std::to_string(step);
+            ok = compare_exact(label.c_str(), actual, expected) && ok;
+            if (marker.uses != (cache_fallback ? 0 : 1) || marker.builds != (expect_build ? 1 : 0)) {
+                fprintf(stderr, "%s unexpected cache builds=%d uses=%d\n", label.c_str(), marker.builds.load(),
+                        marker.uses.load());
+                ok = false;
+            }
+            printf("%s builds=%d uses=%d exact=%d\n", label.c_str(), marker.builds.load(), marker.uses.load(), ok);
+        }
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_buffer_free(wb);
+        ggml_free(weights);
+    }
+    ggml_backend_free(candidate);
+    ggml_backend_free(baseline);
+    printf("  Metal Row4 persistent INT4 cache: warm reuse, writes, aliases, graph gates, lifetimes - %s\n",
+           ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+}  // namespace
+
 int main() {
     ggml_cpu_init();
 
@@ -4049,6 +4190,7 @@ int main() {
     failed += !test_metal_rms_row4_fusion();
     failed += !test_metal_rms_rope_fusion();
     failed += !test_metal_flash3_gqa_reuse();
+    failed += !test_row4_cache_updates();
     failed += !test_metal_row4_preexpand_lookahead();
     failed += !test_metal_row4_swiglu_fusion();
     failed += !test_metal_row4_swiglu_down_fusion();

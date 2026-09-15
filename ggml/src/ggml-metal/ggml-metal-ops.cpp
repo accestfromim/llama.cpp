@@ -341,6 +341,7 @@ struct ggml_metal_op {
     int idx_end;
 
     bool use_fusion;
+    bool use_row4_cache;
     bool use_concurrency;
     bool use_capture;
 
@@ -348,17 +349,17 @@ struct ggml_metal_op {
     int debug_fusion;
 };
 
-ggml_metal_op_t ggml_metal_op_init(
-        ggml_metal_device_t dev,
-        ggml_metal_cmd_buf_t cmd_buf,
-        ggml_cgraph * gf,
-        int idx_start,
-        int idx_end,
-        bool use_fusion,
-        bool use_concurrency,
-        bool use_capture,
-        int debug_graph,
-        int debug_fusion) {
+ggml_metal_op_t ggml_metal_op_init(ggml_metal_device_t  dev,
+                                   ggml_metal_cmd_buf_t cmd_buf,
+                                   ggml_cgraph *        gf,
+                                   int                  idx_start,
+                                   int                  idx_end,
+                                   bool                 use_fusion,
+                                   bool                 use_row4_cache,
+                                   bool                 use_concurrency,
+                                   bool                 use_capture,
+                                   int                  debug_graph,
+                                   int                  debug_fusion) {
     ggml_metal_op_t res = new ggml_metal_op();
 
     *res = {
@@ -371,6 +372,7 @@ ggml_metal_op_t ggml_metal_op_init(
         /*.idx_start       =*/idx_start,
         /*.idx_end         =*/idx_end,
         /*.use_fusion      =*/use_fusion,
+        /*.use_row4_cache  =*/use_row4_cache,
         /*.use_concurrency =*/use_concurrency,
         /*.use_capture     =*/use_capture,
         /*.debug_graph     =*/debug_graph,
@@ -2371,6 +2373,63 @@ static int ggml_metal_w8_m5_row_tile(ggml_metal_device_t dev, const ggml_tensor 
                0;
 }
 
+// This runs before any command buffer of the current graph is enqueued. Cold
+// expansion can then wait on the device queue without blocking an uncommitted
+// graph ahead of it. Warm graphs only look up buffer-owned, immutable weights.
+bool ggml_metal_op_prepare_row4_cache(ggml_metal_device_t  dev,
+                                      ggml_metal_library_t lib,
+                                      ggml_cgraph *        gf,
+                                      bool                 enabled) {
+    bool has_weight_write = false;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        switch (node->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                continue;
+            default:
+                break;
+        }
+        ggml_backend_buffer_t buffer = node->view_src ? node->view_src->buffer : node->buffer;
+        if (buffer && buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && buffer->buft->device &&
+            buffer->buft->device->context == dev) {
+            ggml_metal_buffer_invalidate_row4_cache((ggml_metal_buffer_t) buffer->context, nullptr, 0, 0);
+            has_weight_write = true;
+        }
+    }
+    if (!enabled || has_weight_write || !ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
+        return false;
+    }
+    bool any = false;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * op = ggml_graph_node(gf, i);
+        if (op->op != GGML_OP_ROW4_LINEAR || ggml_get_op_params_i32(op, 0) != 2) {
+            continue;
+        }
+        const int32_t rows   = (int32_t) ggml_nrows(op->src[0]);
+        const int32_t k      = ggml_get_op_params_i32(op, 2);
+        const int32_t m      = ggml_get_op_params_i32(op, 1);
+        const auto    config = ggml_metal_row4_m5_tensorops_select(true, false, 2, rows, m, k);
+        if (!config.preexpanded_weights) {
+            continue;
+        }
+        const ggml_tensor *   codes  = op->src[1];
+        ggml_backend_buffer_t buffer = codes->view_src ? codes->view_src->buffer : codes->buffer;
+        if (codes->op != GGML_OP_NONE || !buffer || buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            !buffer->buft->device || buffer->buft->device->context != dev || !ggml_is_contiguous(codes) ||
+            !ggml_metal_device_supports_op(dev, op) ||
+            !ggml_metal_buffer_get_row4_cache((ggml_metal_buffer_t) buffer->context, dev, lib, codes, k, m, true)
+                 .metal) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
+}
+
 size_t ggml_metal_op_row_quant_linear_extra_act_q(ggml_metal_device_t dev, const ggml_tensor * op) {
     assert(op->op == GGML_OP_ROW4_LINEAR || op->op == GGML_OP_W8A8_LINEAR);
     assert(op->src[0]);
@@ -2527,7 +2586,7 @@ static ggml_tensor * ggml_metal_row4_prefill_qat_residual_add(ggml_metal_op_t ct
 }
 
 static void ggml_metal_row4_preexpand_lookahead(ggml_metal_op_t ctx, const ggml_tensor * current) {
-    if (!ctx->use_concurrency || ctx->row4_preexpanded) {
+    if (ctx->use_row4_cache || !ctx->use_concurrency || ctx->row4_preexpanded) {
         return;
     }
 
@@ -2877,7 +2936,14 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     }
 
     if (row4_m5_tensorops.preexpanded_weights) {
-        if (ctx->row4_preexpanded == op) {
+        if (ctx->use_row4_cache) {
+            preexpanded_i4 =
+                ggml_metal_buffer_get_row4_cache(ggml_metal_get_buffer(codes), ctx->dev, lib, codes, k, m, false);
+            GGML_ASSERT(preexpanded_i4.metal);
+            if (ctx->debug_fusion > 1) {
+                GGML_LOG_DEBUG("Row4 persistent INT4 cache reuse: %s B=%d O=%d K=%d\n", codes->name, act_rows, m, k);
+            }
+        } else if (ctx->row4_preexpanded == op) {
             ctx->row4_preexpanded = nullptr;
         } else {
             ggml_metal_row4_preexpand(ctx, op, preexpanded_i4);
