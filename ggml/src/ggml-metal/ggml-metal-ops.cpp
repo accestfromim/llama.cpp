@@ -2393,6 +2393,9 @@ bool ggml_metal_op_prepare_row4_cache(ggml_metal_device_t  dev,
                                       ggml_metal_library_t lib,
                                       ggml_cgraph *        gf,
                                       bool                 enabled) {
+    if (!enabled && !ggml_metal_device_has_row4_cache(dev)) {
+        return false;
+    }
     bool has_weight_write = false;
     for (int i = 0; i < gf->n_nodes; ++i) {
         const ggml_tensor * node = ggml_graph_node(gf, i);
@@ -2603,7 +2606,7 @@ static void ggml_metal_row4_preexpand_lookahead(ggml_metal_op_t ctx, const ggml_
         return;
     }
 
-    int current_idx = ctx->idx_start;
+    int current_idx = ctx->idx_current;
     while (current_idx < ctx->idx_end && ggml_graph_node(ctx->gf, current_idx) != current) {
         ++current_idx;
     }

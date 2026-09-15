@@ -509,6 +509,7 @@ struct ggml_metal_device {
 
     ggml_metal_buffer_t scratch;
     size_t scratch_size;
+    bool row4_cache_seen;
 };
 
 static void ggml_metal_device_disable_mpp_tensorops(ggml_metal_device_t dev) {
@@ -1258,6 +1259,12 @@ struct ggml_metal_fairy2i_w1_coeff_lut {
     struct ggml_metal_fairy2i_w1_coeff_lut * next;
 };
 
+#define GGML_METAL_ROW4_CACHE_BUCKETS 256
+
+static size_t ggml_metal_row4_cache_bucket(uintptr_t address) {
+    return (((uint64_t) address >> 6) * UINT64_C(0x9e3779b97f4a7c15)) >> 56;
+}
+
 struct ggml_metal_row4_cache {
     uintptr_t address;
     size_t source_bytes;
@@ -1266,6 +1273,7 @@ struct ggml_metal_row4_cache {
     bool valid;
     ggml_metal_buffer_t storage;
     struct ggml_metal_row4_cache * next;
+    struct ggml_metal_row4_cache * hash_next;
 };
 
 struct ggml_metal_buffer {
@@ -1292,6 +1300,7 @@ struct ggml_metal_buffer {
 
     struct ggml_metal_fairy2i_w1_coeff_lut * fairy2i_w1_coeff_luts;
     struct ggml_metal_row4_cache * row4_caches;
+    struct ggml_metal_row4_cache ** row4_cache_index;
     size_t row4_cache_bytes;
 };
 
@@ -1558,6 +1567,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
+    free(buf->row4_cache_index);
     struct ggml_metal_row4_cache * cache = buf->row4_caches;
     while (cache) {
         struct ggml_metal_row4_cache * next = cache->next;
@@ -1935,6 +1945,12 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_fairy2i_w1_coeff_lut(
     }
 }
 
+bool ggml_metal_device_has_row4_cache(ggml_metal_device_t dev) {
+    // Latches on the first allocation, across all contexts on this device.
+    // Cache-disabled writer graphs must still invalidate existing caches.
+    return __atomic_load_n(&dev->row4_cache_seen, __ATOMIC_ACQUIRE);
+}
+
 void ggml_metal_buffer_invalidate_row4_cache(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor,
                                            size_t offset, size_t size) {
     const uintptr_t address = tensor ? (uintptr_t) tensor->data + offset : 0;
@@ -1956,8 +1972,9 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
         const struct ggml_tensor * codes, int32_t k, int32_t m, bool create) {
     const struct ggml_metal_buffer_id none = { nil, 0 };
     @synchronized (buf->buffers[0].metal) {
-        struct ggml_metal_row4_cache * cache = buf->row4_caches;
-        for (; cache; cache = cache->next) {
+        const size_t bucket = ggml_metal_row4_cache_bucket((uintptr_t) codes->data);
+        struct ggml_metal_row4_cache * cache = buf->row4_cache_index ? buf->row4_cache_index[bucket] : buf->row4_caches;
+        for (; cache; cache = buf->row4_cache_index ? cache->hash_next : cache->next) {
             if (cache->address == (uintptr_t) codes->data && cache->k == k && cache->m == m &&
                 cache->source_bytes == ggml_nbytes(codes)) {
                 break;
@@ -1995,8 +2012,16 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
             cache->k = k;
             cache->m = m;
             cache->storage = storage;
+            if (!buf->row4_caches) {
+                buf->row4_cache_index = calloc(GGML_METAL_ROW4_CACHE_BUCKETS, sizeof(*buf->row4_cache_index));
+            }
+            if (buf->row4_cache_index) {
+                cache->hash_next = buf->row4_cache_index[bucket];
+                buf->row4_cache_index[bucket] = cache;
+            }
             cache->next = buf->row4_caches;
             buf->row4_caches = cache;
+            __atomic_store_n(&dev->row4_cache_seen, true, __ATOMIC_RELEASE);
             buf->row4_cache_bytes += bytes;
         }
         const char * name = "kernel_row4_m5_preexpand_int4_pair2";
