@@ -4127,6 +4127,13 @@ static int32_t ggml_metal_flash_attn_ext_turbo4_nwg(const ggml_tensor * op) {
     return 32;
 }
 
+static bool ggml_metal_flash3_mask_bounds_shape(const ggml_tensor * op) {
+    return ggml_flash_attn_ext_get_fairy2i_flash3(op) && op->src[1]->type == GGML_TYPE_BF16 &&
+           op->src[2]->type == GGML_TYPE_BF16 && op->src[0]->ne[0] == 128 && op->src[2]->ne[0] == 128 &&
+           op->src[0]->ne[1] >= 512 && op->src[1]->ne[1] >= 512 && op->src[3] && op->src[3]->type == GGML_TYPE_F16 &&
+           op->src[3]->ne[2] == 1 && !op->src[4];
+}
+
 size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -4142,7 +4149,10 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     }
 
     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
-        return 0;
+        return ggml_metal_flash3_mask_bounds_shape(op) ?
+                   GGML_PAD(ggml_nbytes(op), 4) - ggml_nbytes(op) +
+                       (size_t) GGML_PAD(op->src[0]->ne[1], 8) / 8 * op->src[0]->ne[3] * sizeof(int32_t) :
+                   0;
     }
 
     const int64_t ne01 = op->src[0]->ne[1];
@@ -4159,6 +4169,34 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     const int32_t nwg         = ggml_metal_flash_attn_ext_turbo4_nwg(op);
     const size_t  turbo_bytes = (size_t) nrows * nwg * (ne20 * sizeof(ggml_fp16_t) + 2 * sizeof(float));
     return std::max(generic_bytes, turbo_bytes);
+}
+
+static ggml_tensor * ggml_metal_flash3_row4_output(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * op = ggml_graph_node(ctx->gf, idx);
+    if (!ctx->use_fusion || !ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops ||
+        !ggml_flash_attn_ext_get_fairy2i_flash3(op) || idx + 2 >= ctx->idx_end || op->src[1]->type != GGML_TYPE_BF16 ||
+        op->src[2]->type != GGML_TYPE_BF16 || op->ne[0] != 128 || op->ne[1] != 32 || op->ne[2] < 32 || op->ne[2] % 32 ||
+        op->ne[3] != 1 || !ggml_is_contiguous(op) || !ggml_metal_node_has_n_raw_uses(ctx->gf, idx, 1)) {
+        return nullptr;
+    }
+    const ggml_tensor * view   = ggml_graph_node(ctx->gf, idx + 1);
+    ggml_tensor *       linear = ggml_graph_node(ctx->gf, idx + 2);
+    if (view->op != GGML_OP_RESHAPE || view->view_src != op || view->view_offs ||
+        !ggml_metal_node_has_n_raw_uses(ctx->gf, idx + 1, 1) || !ggml_is_contiguous(view) ||
+        linear->op != GGML_OP_ROW4_LINEAR || linear->src[0] != view || ggml_get_op_params_i32(linear, 2) != 4096 ||
+        ggml_get_op_params_i32(linear, 1) != 4096 || !ggml_metal_device_supports_op(ctx->dev, linear)) {
+        return nullptr;
+    }
+    ggml_metal_buffer_id scratch = ggml_metal_get_buffer_id_for_size(
+        linear, ggml_nbytes(linear) + ggml_metal_op_row_quant_linear_extra_act_q(ctx->dev, linear));
+    scratch.offs += GGML_PAD(ggml_nbytes(linear), 64);
+    const size_t quant_bytes = (size_t) op->ne[2] * (4096 + sizeof(float));
+    if (ggml_metal_row4_range_overlaps_tensor((uintptr_t) linear->data + GGML_PAD(ggml_nbytes(linear), 64), quant_bytes,
+                                              op) ||
+        ggml_metal_buffer_ranges_overlap(ggml_metal_get_buffer_id(op), ggml_nbytes(op), scratch, quant_bytes)) {
+        return nullptr;
+    }
+    return linear;
 }
 
 int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
@@ -4301,6 +4339,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.m1            =*/1.0f,
             /*.n_head_log2   =*/n_head_log2,
             /*.logit_softcap =*/0.0f,
+            /*.mask_bounds_offset =*/0,
+            /*.packed_output =*/0,
         };
 
         if (ggml_metal_op_flash_attn_ext_use_fairy2i_decode_vec(op)) {
@@ -4479,39 +4519,78 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                    size_t(16) * ncpsg * sizeof(float) + size_t(8) * ncpsg * sizeof(ggml_fp16_t);
         }
 
+        ggml_tensor * row4_output = ggml_metal_flash3_row4_output(ctx, idx);
+        ggml_tensor * row4_residual =
+            row4_output ? ggml_metal_row4_prefill_qat_residual_add(ctx, idx + 2, row4_output) : nullptr;
+        if (row4_output && (!ggml_metal_op_concurrency_check(ctx, row4_output) ||
+                            (row4_residual && !ggml_metal_op_concurrency_check(ctx, row4_residual)))) {
+            ggml_metal_op_concurrency_reset(ctx);
+        }
+
         ggml_metal_kargs_flash_attn_ext args = {
-            /*.ne01          =*/ ne01,
-            /*.ne02          =*/ ne02,
-            /*.ne03          =*/ ne03,
-            /*.nb01          =*/ nb01,
-            /*.nb02          =*/ nb02,
-            /*.nb03          =*/ nb03,
-            /*.ne11          =*/ ne11,
-            /*.ne_12_2       =*/ ne12,
-            /*.ne_12_3       =*/ ne13,
-            /*.ns10          =*/ int32_t(nb11/nb10),
-            /*.nb11          =*/ nb11,
-            /*.nb12          =*/ nb12,
-            /*.nb13          =*/ nb13,
-            /*.ns20          =*/ int32_t(nb21/nb20),
-            /*.nb21          =*/ nb21,
-            /*.nb22          =*/ nb22,
-            /*.nb23          =*/ nb23,
-            /*.ne32          =*/ ne32,
-            /*.ne33          =*/ ne33,
-            /*.nb31          =*/ nb31,
-            /*.nb32          =*/ nb32,
-            /*.nb33          =*/ nb33,
-            /*.ne1           =*/ ne1,
-            /*.ne2           =*/ ne2,
-            /*.ne3           =*/ ne3,
-            /*.scale         =*/ scale,
-            /*.max_bias      =*/ max_bias,
-            /*.m0            =*/ m0,
-            /*.m1            =*/ m1,
-            /*.n_head_log2   =*/ n_head_log2,
-            /*.logit_softcap =*/ logit_softcap,
+            /*.ne01          =*/ne01,
+            /*.ne02          =*/ne02,
+            /*.ne03          =*/ne03,
+            /*.nb01          =*/nb01,
+            /*.nb02          =*/nb02,
+            /*.nb03          =*/nb03,
+            /*.ne11          =*/ne11,
+            /*.ne_12_2       =*/ne12,
+            /*.ne_12_3       =*/ne13,
+            /*.ns10          =*/int32_t(nb11 / nb10),
+            /*.nb11          =*/nb11,
+            /*.nb12          =*/nb12,
+            /*.nb13          =*/nb13,
+            /*.ns20          =*/int32_t(nb21 / nb20),
+            /*.nb21          =*/nb21,
+            /*.nb22          =*/nb22,
+            /*.nb23          =*/nb23,
+            /*.ne32          =*/ne32,
+            /*.ne33          =*/ne33,
+            /*.nb31          =*/nb31,
+            /*.nb32          =*/nb32,
+            /*.nb33          =*/nb33,
+            /*.ne1           =*/ne1,
+            /*.ne2           =*/ne2,
+            /*.ne3           =*/ne3,
+            /*.scale         =*/scale,
+            /*.max_bias      =*/max_bias,
+            /*.m0            =*/m0,
+            /*.m1            =*/m1,
+            /*.n_head_log2   =*/n_head_log2,
+            /*.logit_softcap =*/logit_softcap,
+            /*.mask_bounds_offset =*/0,
+            /*.packed_output =*/0,
         };
+
+        const bool           mask_bounds = ctx->use_fusion && props_dev->has_mpp_tensorops &&
+                                           ggml_metal_flash3_mask_bounds_shape(op) && !has_bias && !has_scap;
+        ggml_metal_buffer_id output =
+            mask_bounds ?
+                ggml_metal_get_buffer_id_for_size(op, ggml_nbytes(op) + ggml_metal_op_flash_attn_ext_extra_tmp(op)) :
+                ggml_metal_get_buffer_id(op);
+        if (mask_bounds) {
+            args.mask_bounds_offset     = GGML_PAD(ggml_nbytes(op), 4);
+            ggml_metal_buffer_id bounds = output;
+            bounds.offs += args.mask_bounds_offset;
+            const char *          name    = "kernel_fairy2i_flash3_mask_bounds";
+            ggml_metal_pipeline_t prepass = ggml_metal_library_get_pipeline(lib, name);
+            if (!prepass) {
+                prepass = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+            }
+            ggml_metal_encoder_set_pipeline(enc, prepass);
+            ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[3]), 1);
+            ggml_metal_encoder_set_buffer(enc, bounds, 2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 7) / 8, ne03, 1, 256, 1, 1);
+            ggml_metal_encoder_memory_barrier(enc);
+            if (ctx->debug_fusion > 1) {
+                GGML_LOG_DEBUG("FAIRY2I Flash3 mask bounds: queries=%lld kv=%lld\n", (long long) ne01,
+                               (long long) ne11);
+            }
+        }
+
+        args.packed_output = row4_output != nullptr;
 
         ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline_flash_attn_ext(
             lib, op, has_mask, has_sinks, has_bias, has_scap, nsg, turbo_gqa4, fairy_gqa2);
@@ -4531,7 +4610,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         } else {
             ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 5);
         }
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         6);
+        ggml_metal_encoder_set_buffer(enc, output, 6);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -4543,6 +4622,14 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         if (ctx->debug_fusion > 1 && fairy_gqa2) {
             GGML_LOG_DEBUG("FAIRY2I Flash3 GQA2 reuse: queries=%lld kv=%lld heads=%lld\n", (long long) ne01,
                            (long long) ne11, (long long) ne02);
+        }
+        if (row4_output) {
+            ggml_metal_encoder_memory_barrier(enc);
+            ggml_metal_op_row_quant_linear_impl(ctx, row4_output, ggml_metal_get_buffer_id(op), true, row4_residual);
+            if (ctx->debug_fusion > 1) {
+                GGML_LOG_DEBUG("FAIRY2I Flash3 packed BF16 -> Row4 A8: queries=%lld K=4096\n", (long long) ne01);
+            }
+            return row4_residual ? 4 : 3;
         }
 #undef FATTN_SMEM
     } else {

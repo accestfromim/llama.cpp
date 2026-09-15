@@ -3978,19 +3978,28 @@ struct flash3_case {
     bool bias;
     bool softcap;
     bool sinks;
+    int  mask_kind = 0;
+};
+
+struct flash3_marker {
+    std::atomic<bool> gqa{ false };
+    std::atomic<bool> bounds{ false };
 };
 
 void flash3_gqa_log(enum ggml_log_level level, const char * text, void * user) {
     (void) level;
     if (strstr(text, "Flash3 GQA2 reuse:")) {
-        static_cast<std::atomic<bool> *>(user)->store(true, std::memory_order_relaxed);
+        static_cast<flash3_marker *>(user)->gqa.store(true, std::memory_order_relaxed);
+    }
+    if (strstr(text, "Flash3 mask bounds:")) {
+        static_cast<flash3_marker *>(user)->bounds.store(true, std::memory_order_relaxed);
     }
 }
 
 bool run_flash3_backend(ggml_backend_t       backend,
                         const flash3_case &  c,
                         std::vector<float> & output,
-                        std::atomic<bool> &  marker) {
+                        flash3_marker &      marker) {
     constexpr int  d        = 128;
     constexpr int  kv_heads = 2;
     const int      heads    = kv_heads * c.ratio;
@@ -4036,11 +4045,22 @@ bool run_flash3_backend(ggml_backend_t       backend,
         values[i] = ggml_fp32_to_bf16(std::sin(float(i % 613) * 0.11f));
     }
     for (size_t i = 0; i < masks.size(); ++i) {
-        const int   pos        = int(i % c.cache);
-        const int   query      = int((i / c.cache) % mask->ne[1]);
+        const int pos    = int(i % c.cache);
+        const int query  = int((i / c.cache) % mask->ne[1]);
         // Causal future blocks, a fully masked interior C64 block, and
         // finite mask offsets exercise the unchanged online softmax order.
-        const bool  masked     = pos > c.cache - c.queries + query || (pos >= 128 && pos < 192);
+        bool      masked = pos > c.cache - c.queries + query || (pos >= 128 && pos < 192);
+        if (c.mask_kind == 1) {
+            // Noncausal visibility in the final tile must keep the full bound.
+            masked = pos != c.cache - 1 && (pos >= 64 || query % 8 == 0);
+        } else if (c.mask_kind == 2) {
+            // Different Q8 blocks have unrelated upper bounds, with holes.
+            masked = pos >= 1 + ((query / 8 * 149 + int(i / (c.cache * mask->ne[1])) * 73) % c.cache) ||
+                     (pos % 7 == 0 && pos != 0);
+        }
+        if (c.mask_kind == 3 && query < 8) {
+            masked = true;
+        }
         const float mask_value = pos % 17 == 0 ? -0.25f : 0.0f;
         masks[i]               = ggml_fp32_to_fp16(masked ? -INFINITY : mask_value);
     }
@@ -4101,35 +4121,47 @@ bool test_metal_flash3_gqa_reuse() {
         return !required;
     }
     const flash3_case cases[] = {
-        { 512,  1024, 4, 1, 1, 1, false, false, false, false },
-        { 513,  2048, 4, 1, 1, 1, true,  false, false, false },
-        { 1024, 2048, 4, 2, 2, 1, true,  false, false, false },
+        { 512, 1024, 4, 1, 1, 1, false, false, false, false },
+        { 513, 2048, 4, 1, 1, 1, true, false, false, false },
+        { 1024, 2048, 4, 2, 2, 1, true, false, false, false },
         { 2048, 2048, 4, 1, 1, 1, false, false, false, false },
-        { 512,  512,  4, 1, 1, 1, false, false, false, false },
-        { 511,  1024, 4, 1, 1, 1, false, false, false, false },
-        { 33,   1024, 4, 1, 1, 1, true,  false, false, false },
-        { 1,    1024, 4, 1, 1, 1, false, false, false, false },
-        { 512,  1024, 2, 1, 1, 1, false, false, false, false },
-        { 512,  1024, 4, 1, 1, 2, false, false, false, false },
-        { 512,  1024, 4, 1, 1, 1, false, true,  false, false },
-        { 512,  1024, 4, 1, 1, 1, false, false, true,  false },
-        { 512,  1024, 4, 1, 1, 1, false, false, false, true  },
+        { 512, 512, 4, 1, 1, 1, false, false, false, false },
+        { 511, 1024, 4, 1, 1, 1, false, false, false, false },
+        { 33, 1024, 4, 1, 1, 1, true, false, false, false },
+        { 1, 1024, 4, 1, 1, 1, false, false, false, false },
+        { 512, 1024, 2, 1, 1, 1, false, false, false, false },
+        { 512, 1024, 4, 1, 1, 2, false, false, false, false },
+        { 512, 1024, 4, 1, 1, 1, false, true, false, false },
+        { 512, 1024, 4, 1, 1, 1, false, false, true, false },
+        { 512, 1024, 4, 1, 1, 1, false, false, false, true },
+        { 512, 1024, 4, 1, 1, 1, false, false, false, false, 1 },
+        { 512, 1024, 4, 1, 1, 1, false, false, false, false, 3 },
+        { 513, 2048, 4, 2, 2, 1, true, false, false, false, 2 },
     };
     bool ok = true;
     for (const auto & c : cases) {
         std::vector<float> expected;
         std::vector<float> actual;
-        std::atomic<bool>  baseline_hit{ false };
-        std::atomic<bool>  candidate_hit{ false };
-        const bool         ran = run_flash3_backend(baseline, c, expected, baseline_hit) &&
-                                 run_flash3_backend(candidate, c, actual, candidate_hit);
+        flash3_marker      baseline_marker;
+        flash3_marker      candidate_marker;
+        const bool         ran = run_flash3_backend(baseline, c, expected, baseline_marker) &&
+                                 run_flash3_backend(candidate, c, actual, candidate_marker);
         const bool eligible    = c.queries >= 512 && c.cache >= 1024 && c.ratio == 4 && c.sequences == c.kv_sequences &&
                                  c.mask_heads == 1 && !c.bias && !c.softcap && !c.sinks;
-        const std::string label = "Flash3 GQA reuse Q=" + std::to_string(c.queries) + " KV=" + std::to_string(c.cache);
-        ok                      = ran && compare_exact(label.c_str(), actual, expected) && ok;
+        const std::string label  = "Flash3 GQA reuse Q=" + std::to_string(c.queries) + " KV=" + std::to_string(c.cache);
+        ok                       = ran && compare_exact(label.c_str(), actual, expected) && ok;
+        const bool baseline_hit  = baseline_marker.gqa.load();
+        const bool candidate_hit = candidate_marker.gqa.load();
+        const bool bounds_eligible =
+            c.queries >= 512 && c.cache >= 512 && c.mask_heads == 1 && !c.bias && !c.softcap && !c.sinks;
+        if (baseline_marker.bounds.load() || (candidate_marker.bounds.load() && !bounds_eligible) ||
+            (required && bounds_eligible && !candidate_marker.bounds.load())) {
+            fprintf(stderr, "%s unexpected mask bound path\n", label.c_str());
+            ok = false;
+        }
         if (baseline_hit || (candidate_hit && !eligible) || (required && eligible && !candidate_hit)) {
             fprintf(stderr, "%s unexpected reuse path: baseline=%d candidate=%d eligible=%d\n", label.c_str(),
-                    baseline_hit.load(), candidate_hit.load(), eligible);
+                    baseline_hit, candidate_hit, eligible);
             ok = false;
         }
     }
@@ -4283,6 +4315,160 @@ bool test_row4_cache_updates() {
 
 }  // namespace
 
+namespace {
+
+void flash3_row4_log(enum ggml_log_level level, const char * text, void * user) {
+    (void) level;
+    if (strstr(text, "Flash3 packed BF16 -> Row4 A8:")) {
+        static_cast<std::atomic<bool> *>(user)->store(true);
+    }
+}
+
+bool run_flash3_row4_graph(ggml_backend_t       backend,
+                           int                  tokens,
+                           int                  gate,
+                           std::vector<float> & output,
+                           std::vector<float> & observed,
+                           bool &               hit) {
+    constexpr int  d = 128, heads = 32, kv_heads = 8, width = d * heads;
+    const int      cache = GGML_PAD(tokens, 64);
+    ggml_context * ctx   = ggml_init({ 4 * 1024 * 1024, nullptr, true });
+    ggml_tensor *  q     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, tokens, heads);
+    ggml_tensor *  k     = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, d, cache, kv_heads);
+    ggml_tensor *  v     = ggml_dup_tensor(ctx, k);
+    ggml_tensor *  mask  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, cache, GGML_PAD(tokens, 64));
+    ggml_tensor *  attn  = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.125f, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_fairy2i_flash3(attn, true);
+    ggml_tensor * flat = ggml_reshape_2d(ctx, attn, width, tokens);
+    if (gate == 1) {
+        ggml_set_output(attn);
+    } else if (gate == 2) {
+        ggml_set_output(flat);
+    }
+    ggml_tensor * codes    = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, width / 256, width / 32);
+    ggml_tensor * scales   = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, width);
+    ggml_tensor * linear   = ggml_row4_linear(ctx, flat, codes, scales, width, width);
+    ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, tokens);
+    ggml_tensor * result   = ggml_complex_add(ctx, linear, residual);
+    ggml_complex_add_set_qat(result, true);
+    ggml_tensor * extra = gate == 3 ? ggml_add(ctx, attn, attn) : nullptr;
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    if (extra) {
+        ggml_build_forward_expand(graph, extra);
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+    std::vector<float>       q_data(ggml_nelements(q));
+    std::vector<ggml_bf16_t> k_data(ggml_nelements(k)), v_data(ggml_nelements(v));
+    std::vector<ggml_fp16_t> masks(ggml_nelements(mask));
+    for (size_t i = 0; i < q_data.size(); ++i) {
+        q_data[i] = oracle_bf16_round(float(int(i % 251) - 125) / 128.0f);
+    }
+    for (size_t i = 0; i < k_data.size(); ++i) {
+        k_data[i] = ggml_fp32_to_bf16(float(int(i % 113) - 56) / 64.0f);
+        v_data[i] = ggml_fp32_to_bf16(float(int(i % 131) - 65) / 64.0f);
+    }
+    for (size_t i = 0; i < masks.size(); ++i) {
+        masks[i] = ggml_fp32_to_fp16(int(i % cache) <= int(i / cache) ? 0.0f : -INFINITY);
+    }
+    const auto packed     = make_row4_pair2_codes(width, width);
+    const auto scale_bits = make_row4_scales(width);
+    ggml_backend_tensor_set(q, q_data.data(), 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data.data(), 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data.data(), 0, ggml_nbytes(v));
+    ggml_backend_tensor_set(mask, masks.data(), 0, ggml_nbytes(mask));
+    ggml_backend_tensor_set(codes, packed.data(), 0, packed.size());
+    ggml_backend_tensor_set(scales, scale_bits.data(), 0, ggml_nbytes(scales));
+    ggml_backend_tensor_set(residual, q_data.data(), 0, ggml_nbytes(residual));
+    std::atomic<bool> marker{ false };
+    ggml_log_set(flash3_row4_log, &marker);
+    ggml_status status;
+    if (gate == 4) {
+        ggml_cgraph * first  = ggml_new_graph(ctx);
+        ggml_cgraph * second = ggml_new_graph(ctx);
+        ggml_build_forward_expand(first, attn);
+        ggml_graph_add_node(second, flat);
+        ggml_graph_add_node(second, linear);
+        ggml_graph_add_node(second, result);
+        status = ggml_backend_graph_compute(backend, first);
+        if (status == GGML_STATUS_SUCCESS) {
+            status = ggml_backend_graph_compute(backend, second);
+        }
+    } else {
+        status = ggml_backend_graph_compute(backend, graph);
+    }
+    ggml_backend_synchronize(backend);
+    ggml_log_set(nullptr, nullptr);
+    hit = marker.load();
+    if (status == GGML_STATUS_SUCCESS) {
+        output.resize(ggml_nelements(result));
+        ggml_backend_tensor_get(result, output.data(), 0, ggml_nbytes(result));
+        if (gate > 0) {
+            ggml_tensor * observable = extra ? extra : attn;
+            observed.resize(ggml_nelements(observable));
+            ggml_backend_tensor_get(observable, observed.data(), 0, ggml_nbytes(observable));
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return status == GGML_STATUS_SUCCESS;
+}
+
+bool test_metal_flash3_row4_handoff() {
+    const char * strict = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
+    if (!strict || strcmp(strict, "0") == 0) {
+        printf("  Metal Flash3/Row4 packed handoff: SKIP (strict M5 suite only)\n");
+        return true;
+    }
+    ggml_backend_dev_t dev = find_metal_device();
+    if (!dev) {
+        return false;
+    }
+    scoped_env_var disable("GGML_METAL_FUSION_DISABLE"), debug("GGML_METAL_FUSION_DEBUG");
+    disable.set("1");
+    ggml_backend_t baseline = ggml_backend_dev_init(dev, nullptr);
+    disable.unset();
+    debug.set("2");
+    ggml_backend_t candidate = ggml_backend_dev_init(dev, nullptr);
+    if (!baseline || !candidate) {
+        ggml_backend_free(baseline);
+        ggml_backend_free(candidate);
+        return false;
+    }
+    bool      ok         = true;
+    const int cases[][2] = {
+        { 512,  0 },
+        { 2048, 0 },
+        { 544,  0 },
+        { 128,  0 },
+        { 33,   0 },
+        { 512,  1 },
+        { 512,  2 },
+        { 512,  3 },
+        { 512,  4 }
+    };
+    for (const auto & c : cases) {
+        std::vector<float> expected, actual, expected_observed, actual_observed;
+        bool               baseline_hit = false, candidate_hit = false;
+        const bool ran      = run_flash3_row4_graph(baseline, c[0], c[1], expected, expected_observed, baseline_hit) &&
+                              run_flash3_row4_graph(candidate, c[0], c[1], actual, actual_observed, candidate_hit);
+        const bool eligible = c[1] == 0 && c[0] % 32 == 0;
+        ok = ran && compare_exact("Flash3/Row4 final output", actual, expected) &&
+             compare_exact("Flash3/Row4 observable carriers", actual_observed, expected_observed) && !baseline_hit &&
+             candidate_hit == eligible && ok;
+    }
+    ggml_backend_free(baseline);
+    ggml_backend_free(candidate);
+    printf("  Metal Flash3/Row4 packed handoff: output, residual, tails and graph gates - %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+}  // namespace
+
 int main() {
     ggml_cpu_init();
 
@@ -4306,6 +4492,7 @@ int main() {
     failed += !test_metal_rms_row4_fusion();
     failed += !test_metal_rms_rope_fusion();
     failed += !test_metal_flash3_gqa_reuse();
+    failed += !test_metal_flash3_row4_handoff();
     failed += !test_row4_cache_updates();
     failed += !test_metal_row4_preexpand_lookahead();
     failed += !test_metal_row4_swiglu_fusion();

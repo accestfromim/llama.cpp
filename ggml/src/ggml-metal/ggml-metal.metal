@@ -14109,6 +14109,44 @@ kernel fairy2i_flash_attn_ext_exact_t kernel_fairy2i_flash_attn_ext_exact_bf16<2
 #endif
 
 // ref: https://arxiv.org/pdf/2307.08691.pdf
+// Derive the bound from the actual mask, without assuming causal positions.
+// All query heads share this Q8 bound. Interior masked tiles retain the original
+// skip logic and every contributing C64 tile retains its original order.
+kernel void kernel_fairy2i_flash3_mask_bounds(
+        constant ggml_metal_kargs_flash_attn_ext & args,
+        device const char * mask,
+        device int * bounds,
+        uint2 group [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort simd [[simdgroup_index_in_threadgroup]]) {
+    threadgroup int partial[8];
+    int last = 0;
+    const int row = int(group.x) * 8 + simd;
+    if (row < args.ne01) {
+        device const half * values = (device const half *)
+            (mask + row * args.nb31 + (group.y % args.ne33) * args.nb33);
+        // One SIMDgroup per query, stopping at its last visible key. This
+        // avoids scanning the history and avoids division inside the loop.
+        for (int block = ((args.ne11 + 31) / 32) * 32 - 32; block >= 0; block -= 32) {
+            const int col = block + lane;
+            last = simd_max(col < args.ne11 && values[col] != -INFINITY ? col + 1 : 0);
+            if (last) {
+                break;
+            }
+        }
+    }
+    if (lane == 0) {
+        partial[simd] = last;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd == 0) {
+        last = simd_max(lane < 8 ? partial[lane] : 0);
+        if (lane == 0) {
+            bounds[group.y * ((args.ne01 + 7) / 8) + group.x] = ((last + 63) / 64) * 64;
+        }
+    }
+}
+
 template<
     typename q_t,     // query types in shared memory
     typename q4_t,
@@ -14277,7 +14315,14 @@ void kernel_flash_attn_ext_impl(
 
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-        for (int ic = 0; ic < args.ne11; ic += C) {
+        int cache_end = args.ne11;
+#if defined(GGML_METAL_HAS_BF16)
+        if (is_same<q_t, bfloat>::value && is_same<o_t, float>::value && args.mask_bounds_offset) {
+            device const int * bounds = (device const int *) (dst + args.mask_bounds_offset);
+            cache_end = bounds[iq3 * ((args.ne01 + Q - 1) / Q) + tgpig.x];
+        }
+#endif
+        for (int ic = 0; ic < cache_end; ic += C) {
             // read the mask into shared mem
             if (FC_flash_attn_ext_has_mask) {
                 FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
@@ -14723,7 +14768,16 @@ void kernel_flash_attn_ext_impl(
                     result = fairy2i_round_to_bf16_f32(result);
                 }
 #endif
-                dst4[i] = result;
+#if defined(GGML_METAL_HAS_BF16)
+                if (is_same<q_t, bfloat>::value && is_same<o_t, float>::value && args.packed_output) {
+                    device ushort4 * packed = (device ushort4 *) dst +
+                        ((uint64_t) iq3 * args.ne2 * args.ne1 + iq2 + ih + (uint64_t) (iq1 + iq) * args.ne1) * DV4;
+                    packed[i] = ushort4(as_type<uint4>(result) >> 16);
+                } else
+#endif
+                {
+                    dst4[i] = result;
+                }
             }
         } else {
             for (short i = tiisg; i < DV4; i += NW) {
