@@ -1583,17 +1583,17 @@ static void rms_row4_fusion_log_callback(enum ggml_log_level level, const char *
     }
 }
 
-static bool run_rms_row4_backend(ggml_backend_t             backend,
-                                 int64_t                    k,
-                                 int64_t                    tokens,
-                                 bool                       pair2,
-                                 rms_row4_gate              gate,
-                                 std::vector<float> &       norm,
-                                 std::vector<float> &       output,
-                                 bool &                     fusion_hit,
-                                 bool                       bf16           = false,
-                                 bool                       edge           = false,
-                                 const std::vector<float> * norm_reference = nullptr) {
+bool run_rms_row4_backend(ggml_backend_t             backend,
+                          int64_t                    k,
+                          int64_t                    tokens,
+                          bool                       pair2,
+                          rms_row4_gate              gate,
+                          std::vector<float> &       norm,
+                          std::vector<float> &       output,
+                          bool &                     fusion_hit,
+                          bool                       bf16           = false,
+                          bool                       edge           = false,
+                          const std::vector<float> * norm_reference = nullptr) {
     constexpr int64_t      O      = 128;
     const ggml_init_params params = { 1024 * 1024, nullptr, true };
     ggml_context *         ctx    = ggml_init(params);
@@ -1623,9 +1623,12 @@ static bool run_rms_row4_backend(ggml_backend_t             backend,
     ggml_tensor * linear = ggml_row4_linear(ctx, rms, codes, scales, O, k);
     ggml_cgraph * graph  = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, linear);
-    ggml_tensor * extra = gate == rms_row4_gate::extra_use  ? ggml_add(ctx, rms, rms) :
-                          gate == rms_row4_gate::cast_extra ? ggml_add(ctx, norm_weight, norm_weight) :
-                                                              nullptr;
+    ggml_tensor * extra = nullptr;
+    if (gate == rms_row4_gate::extra_use) {
+        extra = ggml_add(ctx, rms, rms);
+    } else if (gate == rms_row4_gate::cast_extra) {
+        extra = ggml_add(ctx, norm_weight, norm_weight);
+    }
     if (extra) {
         ggml_build_forward_expand(graph, extra);
     }
@@ -4330,14 +4333,17 @@ bool run_flash3_row4_graph(ggml_backend_t       backend,
                            std::vector<float> & output,
                            std::vector<float> & observed,
                            bool &               hit) {
-    constexpr int  d = 128, heads = 32, kv_heads = 8, width = d * heads;
-    const int      cache = GGML_PAD(tokens, 64);
-    ggml_context * ctx   = ggml_init({ 4 * 1024 * 1024, nullptr, true });
-    ggml_tensor *  q     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, tokens, heads);
-    ggml_tensor *  k     = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, d, cache, kv_heads);
-    ggml_tensor *  v     = ggml_dup_tensor(ctx, k);
-    ggml_tensor *  mask  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, cache, GGML_PAD(tokens, 64));
-    ggml_tensor *  attn  = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.125f, 0.0f, 0.0f);
+    constexpr int  d        = 128;
+    constexpr int  heads    = 32;
+    constexpr int  kv_heads = 8;
+    constexpr int  width    = d * heads;
+    const int      cache    = GGML_PAD(tokens, 64);
+    ggml_context * ctx      = ggml_init({ 4 * 1024 * 1024, nullptr, true });
+    ggml_tensor *  q        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, tokens, heads);
+    ggml_tensor *  k        = ggml_new_tensor_3d(ctx, GGML_TYPE_BF16, d, cache, kv_heads);
+    ggml_tensor *  v        = ggml_dup_tensor(ctx, k);
+    ggml_tensor *  mask     = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, cache, GGML_PAD(tokens, 64));
+    ggml_tensor *  attn     = ggml_flash_attn_ext(ctx, q, k, v, mask, 0.125f, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_fairy2i_flash3(attn, true);
     ggml_tensor * flat = ggml_reshape_2d(ctx, attn, width, tokens);
     if (gate == 1) {
@@ -4363,7 +4369,8 @@ bool run_flash3_row4_graph(ggml_backend_t       backend,
         return false;
     }
     std::vector<float>       q_data(ggml_nelements(q));
-    std::vector<ggml_bf16_t> k_data(ggml_nelements(k)), v_data(ggml_nelements(v));
+    std::vector<ggml_bf16_t> k_data(ggml_nelements(k));
+    std::vector<ggml_bf16_t> v_data(ggml_nelements(v));
     std::vector<ggml_fp16_t> masks(ggml_nelements(mask));
     for (size_t i = 0; i < q_data.size(); ++i) {
         q_data[i] = oracle_bf16_round(float(int(i % 251) - 125) / 128.0f);
@@ -4428,7 +4435,8 @@ bool test_metal_flash3_row4_handoff() {
     if (!dev) {
         return false;
     }
-    scoped_env_var disable("GGML_METAL_FUSION_DISABLE"), debug("GGML_METAL_FUSION_DEBUG");
+    scoped_env_var disable("GGML_METAL_FUSION_DISABLE");
+    scoped_env_var debug("GGML_METAL_FUSION_DEBUG");
     disable.set("1");
     ggml_backend_t baseline = ggml_backend_dev_init(dev, nullptr);
     disable.unset();
@@ -4452,8 +4460,12 @@ bool test_metal_flash3_row4_handoff() {
         { 512,  4 }
     };
     for (const auto & c : cases) {
-        std::vector<float> expected, actual, expected_observed, actual_observed;
-        bool               baseline_hit = false, candidate_hit = false;
+        std::vector<float> expected;
+        std::vector<float> actual;
+        std::vector<float> expected_observed;
+        std::vector<float> actual_observed;
+        bool               baseline_hit  = false;
+        bool               candidate_hit = false;
         const bool ran      = run_flash3_row4_graph(baseline, c[0], c[1], expected, expected_observed, baseline_hit) &&
                               run_flash3_row4_graph(candidate, c[0], c[1], actual, actual_observed, candidate_hit);
         const bool eligible = c[1] == 0 && c[0] % 32 == 0;
@@ -4485,12 +4497,14 @@ bool run_row4_v_store_graph(ggml_backend_t          backend,
                             std::vector<uint16_t> & cache_output,
                             std::vector<float> &    prior_output,
                             bool &                  hit) {
-    constexpr int  k = 4096, o = 6144, v_width = 1024;
-    ggml_context * ctx    = ggml_init({ 4 * 1024 * 1024, nullptr, true });
-    ggml_tensor *  x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
-    ggml_tensor *  codes  = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, o / 32);
-    ggml_tensor *  scales = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
-    ggml_tensor *  qkv    = ggml_row4_linear(ctx, x, codes, scales, o, k);
+    constexpr int  k       = 4096;
+    constexpr int  o       = 6144;
+    constexpr int  v_width = 1024;
+    ggml_context * ctx     = ggml_init({ 4 * 1024 * 1024, nullptr, true });
+    ggml_tensor *  x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+    ggml_tensor *  codes   = ggml_new_tensor_4d(ctx, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, o / 32);
+    ggml_tensor *  scales  = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, o);
+    ggml_tensor *  qkv     = ggml_row4_linear(ctx, x, codes, scales, o, k);
     if (gate == 5) {
         ggml_set_output(qkv);
     }
@@ -4611,7 +4625,8 @@ bool test_metal_row4_v_store() {
     if (!dev) {
         return false;
     }
-    scoped_env_var disable("GGML_METAL_FUSION_DISABLE"), debug("GGML_METAL_FUSION_DEBUG");
+    scoped_env_var disable("GGML_METAL_FUSION_DISABLE");
+    scoped_env_var debug("GGML_METAL_FUSION_DEBUG");
     disable.set("1");
     ggml_backend_t baseline = ggml_backend_dev_init(dev, nullptr);
     disable.unset();
@@ -4637,9 +4652,14 @@ bool test_metal_row4_v_store() {
         { 512,  7 }
     };
     for (const auto & c : cases) {
-        std::vector<float>    expected, actual, expected_prior, actual_prior;
-        std::vector<uint16_t> expected_cache, actual_cache;
-        bool                  baseline_hit = false, candidate_hit = false;
+        std::vector<float>    expected;
+        std::vector<float>    actual;
+        std::vector<float>    expected_prior;
+        std::vector<float>    actual_prior;
+        std::vector<uint16_t> expected_cache;
+        std::vector<uint16_t> actual_cache;
+        bool                  baseline_hit  = false;
+        bool                  candidate_hit = false;
         const bool            ran =
             run_row4_v_store_graph(baseline, c[0], c[1], expected, expected_cache, expected_prior, baseline_hit) &&
             run_row4_v_store_graph(candidate, c[0], c[1], actual, actual_cache, actual_prior, candidate_hit);

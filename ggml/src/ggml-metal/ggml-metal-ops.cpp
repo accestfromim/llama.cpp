@@ -2419,7 +2419,9 @@ bool ggml_metal_op_prepare_row4_cache(ggml_metal_device_t  dev,
     if (!enabled || has_weight_write || !ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
         return false;
     }
-    bool any = false;
+    ggml_metal_row4_cache_batch_t batch = ggml_metal_row4_cache_batch_init();
+    bool                          any   = false;
+    bool                          ready = true;
     for (int i = 0; i < gf->n_nodes; ++i) {
         const ggml_tensor * op = ggml_graph_node(gf, i);
         if (op->op != GGML_OP_ROW4_LINEAR || ggml_get_op_params_i32(op, 0) != 2) {
@@ -2437,13 +2439,15 @@ bool ggml_metal_op_prepare_row4_cache(ggml_metal_device_t  dev,
         if (codes->op != GGML_OP_NONE || !buffer || buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
             !buffer->buft->device || buffer->buft->device->context != dev || !ggml_is_contiguous(codes) ||
             !ggml_metal_device_supports_op(dev, op) ||
-            !ggml_metal_buffer_get_row4_cache((ggml_metal_buffer_t) buffer->context, dev, lib, codes, k, m, true)
+            !ggml_metal_buffer_get_row4_cache_batch((ggml_metal_buffer_t) buffer->context, dev, lib, codes, k, m, batch)
                  .metal) {
-            return false;
+            ready = false;
+            break;
         }
         any = true;
     }
-    return any;
+    const bool completed = ggml_metal_row4_cache_batch_finish(batch, ready);
+    return any && ready && completed;
 }
 
 size_t ggml_metal_op_row_quant_linear_extra_act_q(ggml_metal_device_t dev, const ggml_tensor * op) {

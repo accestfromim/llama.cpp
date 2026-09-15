@@ -1271,6 +1271,8 @@ struct ggml_metal_row4_cache {
     int32_t k;
     int32_t m;
     bool valid;
+    uint64_t generation;
+    ggml_metal_row4_cache_batch_t pending;
     ggml_metal_buffer_t storage;
     struct ggml_metal_row4_cache * next;
     struct ggml_metal_row4_cache * hash_next;
@@ -1303,6 +1305,78 @@ struct ggml_metal_buffer {
     struct ggml_metal_row4_cache ** row4_cache_index;
     size_t row4_cache_bytes;
 };
+
+struct ggml_metal_row4_cache_pending {
+    struct ggml_metal_row4_cache * cache;
+    ggml_metal_buffer_t owner;
+    uint64_t generation;
+    char name[GGML_MAX_NAME];
+    struct ggml_metal_row4_cache_pending * next;
+};
+
+struct ggml_metal_row4_cache_batch {
+    id<MTLCommandBuffer> command;
+    id<MTLComputeCommandEncoder> encoder;
+    struct ggml_metal_row4_cache_pending * entries;
+    int64_t start_us;
+    size_t bytes;
+    size_t count;
+    bool failed;
+};
+
+ggml_metal_row4_cache_batch_t ggml_metal_row4_cache_batch_init(void) {
+    ggml_metal_row4_cache_batch_t batch = calloc(1, sizeof(*batch));
+    if (batch) {
+        batch->start_us = ggml_time_us();
+    }
+    return batch;
+}
+
+bool ggml_metal_row4_cache_batch_finish(ggml_metal_row4_cache_batch_t batch, bool submit) {
+    if (!batch) {
+        // The getter falls back to the original serial build on allocation failure.
+        return true;
+    }
+    bool ok = submit && !batch->failed;
+    [batch->encoder endEncoding];
+    if (ok && batch->command) {
+        [batch->command commit];
+        [batch->command waitUntilCompleted];
+        ok = batch->command.status == MTLCommandBufferStatusCompleted;
+    }
+    const double elapsed_ms = (ggml_time_us() - batch->start_us) / 1000.0;
+    const bool completed = ok;
+    struct ggml_metal_row4_cache_pending * entry = batch->entries;
+    while (entry) {
+        struct ggml_metal_row4_cache_pending * next = entry->next;
+        @synchronized (entry->owner->buffers[0].metal) {
+            struct ggml_metal_row4_cache * cache = entry->cache;
+            if (cache->pending == batch) {
+                cache->pending = NULL;
+                cache->valid = completed && cache->generation == entry->generation;
+                if (cache->valid) {
+                    GGML_LOG_INFO("Row4 persistent INT4 cache build: %s O=%d K=%d bytes=%zu total_bytes=%zu batched=1\n",
+                                  entry->name, cache->m, cache->k, (size_t) cache->m * cache->k / 2,
+                                  entry->owner->row4_cache_bytes);
+                } else {
+                    ok = false;
+                }
+            } else {
+                ok = false;
+            }
+        }
+        free(entry);
+        entry = next;
+    }
+    if (ok && batch->count) {
+        GGML_LOG_INFO("Row4 persistent INT4 cache batch: matrices=%zu bytes=%zu elapsed_ms=%.3f\n",
+                      batch->count, batch->bytes, elapsed_ms);
+    }
+    [batch->encoder release];
+    [batch->command release];
+    free(batch);
+    return ok;
+}
 
 static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_aligned) {
 #ifndef GGML_METAL_NDEBUG
@@ -1962,14 +2036,15 @@ void ggml_metal_buffer_invalidate_row4_cache(ggml_metal_buffer_t buf, const stru
                 // Keep the allocation alive: preceding asynchronous graphs may
                 // still reference it. Rebuilds are ordered on the device queue.
                 cache->valid = false;
+                ++cache->generation;
             }
         }
     }
 }
 
-struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
+static struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_impl(
         ggml_metal_buffer_t buf, ggml_metal_device_t dev, ggml_metal_library_t lib,
-        const struct ggml_tensor * codes, int32_t k, int32_t m, bool create) {
+        const struct ggml_tensor * codes, int32_t k, int32_t m, bool create, ggml_metal_row4_cache_batch_t batch) {
     const struct ggml_metal_buffer_id none = { nil, 0 };
     @synchronized (buf->buffers[0].metal) {
         const size_t bucket = ggml_metal_row4_cache_bucket((uintptr_t) codes->data);
@@ -1982,6 +2057,11 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
         }
         if (cache && cache->valid) {
             return (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 };
+        }
+        if (cache && cache->pending) {
+            // Reuse a duplicate in this batch; never wait on another uncommitted batch.
+            return batch && cache->pending == batch ?
+                       (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 } : none;
         }
         if (!create) {
             return none;
@@ -2034,14 +2114,38 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
             return none;
         }
         ggml_metal_kargs_row_quant_linear args = { k, m, 0, 0, 2 };
-        id<MTLCommandBuffer> command = [buf->queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (batch) {
+            if (!batch->command) {
+                batch->command = [[buf->queue commandBuffer] retain];
+                batch->encoder = [[batch->command computeCommandEncoder] retain];
+            }
+            struct ggml_metal_row4_cache_pending * pending = calloc(1, sizeof(*pending));
+            if (!batch->command || !batch->encoder || !pending) {
+                free(pending);
+                batch->failed = true;
+                return none;
+            }
+            pending->cache = cache;
+            pending->owner = buf;
+            pending->generation = cache->generation;
+            memcpy(pending->name, codes->name, sizeof(pending->name));
+            pending->next = batch->entries;
+            batch->entries = pending;
+            batch->bytes += bytes;
+            ++batch->count;
+            cache->pending = batch;
+        }
+        id<MTLCommandBuffer> command = batch ? batch->command : [buf->queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = batch ? batch->encoder : [command computeCommandEncoder];
         [encoder setComputePipelineState:pipeline->obj];
         [encoder setBytes:&args length:sizeof(args) atIndex:0];
         [encoder setBuffer:source.metal offset:source.offs atIndex:1];
         [encoder setBuffer:cache->storage->buffers[0].metal offset:0 atIndex:2];
         [encoder dispatchThreadgroups:MTLSizeMake(k / 32, m / 128, 1)
                   threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (batch) {
+            return (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 };
+        }
         [encoder endEncoding];
         [command commit];
         [command waitUntilCompleted];
@@ -2053,6 +2157,18 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
                       codes->name, m, k, bytes, buf->row4_cache_bytes, (ggml_time_us() - start) / 1000.0);
         return (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 };
     }
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache(
+        ggml_metal_buffer_t buf, ggml_metal_device_t dev, ggml_metal_library_t lib,
+        const struct ggml_tensor * codes, int32_t k, int32_t m, bool create) {
+    return ggml_metal_buffer_get_row4_cache_impl(buf, dev, lib, codes, k, m, create, NULL);
+}
+
+struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_batch(
+        ggml_metal_buffer_t buf, ggml_metal_device_t dev, ggml_metal_library_t lib,
+        const struct ggml_tensor * codes, int32_t k, int32_t m, ggml_metal_row4_cache_batch_t batch) {
+    return ggml_metal_buffer_get_row4_cache_impl(buf, dev, lib, codes, k, m, true, batch);
 }
 
 struct ggml_metal_buffer_id ggml_metal_device_get_scratch(ggml_metal_device_t dev, size_t size) {
