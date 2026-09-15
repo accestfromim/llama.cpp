@@ -935,12 +935,14 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
         for (ushort isg = 0; isg < ntg.x / N_SIMDWIDTH; ++isg) {
             row_sum = precise::fma(1.0f, shared[isg], row_sum);
         }
-        shared[0] = 1.0f / precise::sqrt(row_sum / (float) k + rms_args.eps);
+        shared[8] = 1.0f / precise::sqrt(row_sum / (float) k + rms_args.eps);
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float inv_rms   = shared[0];
+    // Keep the inverse RMS outside the slots reused by the A8 max reduction.
+    // Another SIMDgroup may start writing its maximum before this group reads.
+    const float inv_rms   = shared[8];
     const uint  simd_lane = tiitg & 31U;
     const uint  simd_group = tiitg >> 5;
     float       thread_max = 0.0f;
@@ -986,6 +988,110 @@ kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096(
     const float sx = shared[0];
     for (uint i = (uint) tiitg * 4U; i < (uint) k; i += 256U * 4U) {
         const float4 xb = *(device const float4 *) (rms_dst + i);
+        const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
+        int4 q = int4(magnitude);
+        q = select(q, -q, xb < float4(0.0f));
+        *(device char4 *) (act_q + i) = char4(clamp(q, int4(-127), int4(127)));
+    }
+}
+
+// Contiguous K4096 prefill rows. Keep the standalone 256-thread RMS reduction
+// and all BF16/A8 rounding boundaries, retaining 16 normalized values per thread.
+kernel void kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096(
+        constant ggml_metal_kargs_fairy2i_rms_norm_exact & rms_args [[buffer(0)]],
+        device const float * src0                                   [[buffer(1)]],
+        device const float * weight                                 [[buffer(2)]],
+        device uint * rms_dst                                       [[buffer(3)]],
+        device char * act_q                                         [[buffer(4)]],
+        device float * act_scales                                   [[buffer(5)]],
+        threadgroup float * shared                                  [[threadgroup(0)]],
+        uint3 tgpig                                                  [[threadgroup_position_in_grid]],
+        ushort tiitg                                                 [[thread_index_in_threadgroup]],
+        ushort3 ntg                                                  [[threads_per_threadgroup]]) {
+    constexpr int k = 4096;
+    const ulong row_base = (ulong) tgpig.x * k;
+    src0 += row_base;
+    rms_dst += row_base;
+    act_q += row_base;
+    act_scales += tgpig.x;
+
+    // Exact copy of the QAT RMS sum partition and reduction.
+    float sum = 0.0f;
+    for (int i0 = tiitg; i0 < k; i0 += ntg.x) {
+        const float value = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[i0]));
+        sum = precise::fma(value, value, sum);
+    }
+    sum = simd_sum(sum);
+
+    const ushort tiisg = tiitg % N_SIMDWIDTH;
+    const ushort sgitg = tiitg / N_SIMDWIDTH;
+    if (tiisg == 0) {
+        shared[sgitg] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiitg == 0) {
+        float row_sum = 0.0f;
+        for (ushort isg = 0; isg < ntg.x / N_SIMDWIDTH; ++isg) {
+            row_sum = precise::fma(1.0f, shared[isg], row_sum);
+        }
+        shared[8] = 1.0f / precise::sqrt(row_sum / (float) k + rms_args.eps);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Keep the inverse RMS outside the slots reused by the A8 max reduction.
+    // Another SIMDgroup may start writing its maximum before this group reads.
+    const float inv_rms   = shared[8];
+    const uint  simd_lane = tiitg & 31U;
+    const uint  simd_group = tiitg >> 5;
+    float       thread_max = 0.0f;
+
+    float4 values[4];
+
+    // Materialize exactly the same RMS destination bits while forming the
+    // first activation-quantization max pass from those carrier values.
+    for (uint i = (uint) tiitg * 4U; i < (uint) k; i += 256U * 4U) {
+        float4 xb;
+        for (uint j = 0; j < 4U; ++j) {
+            const uint  col        = i + j;
+            const float value      = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(src0[col]));
+            const float normalized = fairy2i_round_to_bf16_f32(value * inv_rms);
+            const float w_bf16     = fairy2i_bf16_to_f32(fairy2i_f32_to_bf16(weight[col]));
+            const uint  bits       = (uint) fairy2i_f32_to_bf16(normalized * w_bf16) << 16;
+            rms_dst[col]           = bits;
+            xb[j]                  = as_type<float>(bits);
+        }
+        values[i / 1024U] = xb;
+        const float4 abs_xb = fabs(xb);
+        const float max_01  = max(abs_xb.x, abs_xb.y);
+        const float max_23  = max(abs_xb.z, abs_xb.w);
+        thread_max = max(thread_max, max(max_01, max_23));
+    }
+
+    const float group_max = simd_max(thread_max);
+    if (simd_lane == 0U) {
+        shared[simd_group] = group_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0U) {
+        float value = simd_lane < 8U ? shared[simd_lane] : 0.0f;
+        value = simd_max(value);
+        if (simd_lane == 0U) {
+            const uint scale_bits = fairy2i_div_f32_by_positive_int_bits_rne(as_type<uint>(value), 127U);
+            shared[0] = max(as_type<float>(scale_bits), 1.0e-8f);
+            act_scales[0] = shared[0];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reuse the exact carrier values in registers instead of reading the RMS
+    // destination again. The host barrier publishes both outputs.
+    const float sx = shared[0];
+    for (uint i = (uint) tiitg * 4U; i < (uint) k; i += 256U * 4U) {
+        const float4 xb = values[i / 1024U];
         const float4 magnitude = floor(fabs(precise::divide(xb, float4(sx))) + float4(0.5f));
         int4 q = int4(magnitude);
         q = select(q, -q, xb < float4(0.0f));

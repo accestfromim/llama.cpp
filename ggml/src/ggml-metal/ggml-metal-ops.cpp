@@ -335,6 +335,7 @@ struct ggml_metal_op {
     ggml_mem_ranges_t    mem_ranges;
 
     ggml_cgraph * gf;
+    const ggml_tensor * row4_preexpanded;
 
     int idx_start;
     int idx_end;
@@ -361,18 +362,19 @@ ggml_metal_op_t ggml_metal_op_init(
     ggml_metal_op_t res = new ggml_metal_op();
 
     *res = {
-        /*.dev             =*/ dev,
-        /*.lib             =*/ ggml_metal_device_get_library(dev),
-        /*.enc             =*/ ggml_metal_encoder_init(cmd_buf, use_concurrency),
-        /*.mem_ranges      =*/ ggml_mem_ranges_init(debug_graph),
-        /*.gf              =*/ gf,
-        /*.idx_start       =*/ idx_start,
-        /*.idx_end         =*/ idx_end,
-        /*.use_fusion      =*/ use_fusion,
-        /*.use_concurrency =*/ use_concurrency,
-        /*.use_capture     =*/ use_capture,
-        /*.debug_graph     =*/ debug_graph,
-        /*.debug_fusion    =*/ debug_fusion,
+        /*.dev             =*/dev,
+        /*.lib             =*/ggml_metal_device_get_library(dev),
+        /*.enc             =*/ggml_metal_encoder_init(cmd_buf, use_concurrency),
+        /*.mem_ranges      =*/ggml_mem_ranges_init(debug_graph),
+        /*.gf              =*/gf,
+        /*.row4_preexpanded =*/nullptr,
+        /*.idx_start       =*/idx_start,
+        /*.idx_end         =*/idx_end,
+        /*.use_fusion      =*/use_fusion,
+        /*.use_concurrency =*/use_concurrency,
+        /*.use_capture     =*/use_capture,
+        /*.debug_graph     =*/debug_graph,
+        /*.debug_fusion    =*/debug_fusion,
     };
 
     return res;
@@ -2434,6 +2436,115 @@ static bool ggml_metal_buffer_ranges_overlap(ggml_metal_buffer_id lhs,
     return lhs.offs <= rhs.offs ? rhs.offs - lhs.offs < lhs_size : lhs.offs - rhs.offs < rhs_size;
 }
 
+static void ggml_metal_row4_preexpand(ggml_metal_op_t ctx, const ggml_tensor * op, ggml_metal_buffer_id dst) {
+    ggml_metal_kargs_row_quant_linear args = {
+        ggml_get_op_params_i32(op, 2),    ggml_get_op_params_i32(op, 1), (int32_t) ggml_nrows(op->src[0]),
+        (int32_t) ggml_nrows(op->src[0]), ggml_get_op_params_i32(op, 0),
+    };
+    const bool            pair2    = args.layout == 2;
+    const char *          name     = pair2 ? "kernel_row4_m5_preexpand_int4_pair2" : "kernel_row4_m5_preexpand_int4";
+    ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(ctx->lib, name);
+    if (!pipeline) {
+        pipeline = ggml_metal_library_compile_pipeline(ctx->lib, name, name, nullptr);
+    }
+
+    const int    nth          = pair2 ? 128 : 256;
+    const size_t source_bytes = (size_t) args.m * (size_t) args.k / 8;
+    const size_t groups       = pair2 ? (size_t) args.k / 32 : (source_bytes + nth - 1) / nth;
+    GGML_ASSERT(groups <= (size_t) std::numeric_limits<int>::max());
+    GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+    ggml_metal_encoder_set_buffer(ctx->enc, dst, 2);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (int) groups, pair2 ? args.m / 128 : 1, 1, nth, 1, 1);
+}
+
+static bool ggml_metal_row4_range_overlaps_tensor(uintptr_t address, size_t size, const ggml_tensor * tensor) {
+    if (!tensor) {
+        return false;
+    }
+    tensor = tensor->view_src ? tensor->view_src : tensor;
+    if (!tensor->buffer || !tensor->data) {
+        return true;
+    }
+    // Include backend scratch and the full backing allocation of views. Host
+    // addresses also detect aliases represented by different Metal buffer views.
+    const uintptr_t other      = (uintptr_t) tensor->data;
+    const size_t    other_size = ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor);
+    return address <= other ? other - address < size : address - other < other_size;
+}
+
+static void ggml_metal_row4_preexpand_lookahead(ggml_metal_op_t ctx, const ggml_tensor * current) {
+    if (!ctx->use_concurrency || ctx->row4_preexpanded) {
+        return;
+    }
+
+    int current_idx = ctx->idx_start;
+    while (current_idx < ctx->idx_end && ggml_graph_node(ctx->gf, current_idx) != current) {
+        ++current_idx;
+    }
+    // A bounded search within this command buffer. At most one future weight
+    // is prepared, and it remains in its existing graph allocation.
+    const int end = std::min(ctx->idx_end, current_idx + 64);
+    for (int idx = current_idx + 1; idx < end; ++idx) {
+        const ggml_tensor * next = ggml_graph_node(ctx->gf, idx);
+        if (next->op != GGML_OP_ROW4_LINEAR || next->view_src || !next->buffer || !next->data ||
+            ggml_get_op_params_i32(next, 0) != 2 || next->src[1]->op != GGML_OP_NONE ||
+            !ggml_metal_device_supports_op(ctx->dev, next)) {
+            continue;
+        }
+        const int32_t rows   = (int32_t) ggml_nrows(next->src[0]);
+        const int32_t k      = ggml_get_op_params_i32(next, 2);
+        const int32_t m      = ggml_get_op_params_i32(next, 1);
+        const auto    config = ggml_metal_row4_m5_tensorops_select(true, false, 2, rows, m, k);
+        if (!config.preexpanded_weights) {
+            continue;
+        }
+        const size_t allocation = ggml_nbytes(next) + ggml_metal_op_row_quant_linear_extra_act_q(ctx->dev, next);
+        const auto   base       = ggml_metal_get_buffer_id_for_size(next, allocation);
+        if (!base.metal) {
+            continue;
+        }
+        auto dst = base;
+        dst.offs = GGML_PAD(base.offs + GGML_PAD(ggml_nbytes(next), 64) + (size_t) rows * (k + sizeof(float)), 64);
+        const uintptr_t address       = (uintptr_t) next->data + dst.offs - base.offs;
+        const size_t    bytes         = (size_t) m * k / 2;
+        const uintptr_t codes_address = (uintptr_t) next->src[1]->data;
+        const size_t    codes_bytes   = ggml_nbytes(next->src[1]);
+        bool            isolated      = true;
+        for (int j = current_idx; isolated && j <= idx; ++j) {
+            const ggml_tensor * node = ggml_graph_node(ctx->gf, j);
+            if (j < idx && (ggml_metal_row4_range_overlaps_tensor(address, bytes, node) ||
+                            ggml_metal_row4_range_overlaps_tensor(codes_address, codes_bytes, node))) {
+                isolated = false;
+                break;
+            }
+            for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                if (ggml_metal_row4_range_overlaps_tensor(address, bytes, node->src[src])) {
+                    isolated = false;
+                    break;
+                }
+            }
+        }
+        if (!isolated) {
+            continue;
+        }
+
+        // The barrier immediately before the current MPP dispatch completed
+        // earlier accesses. The checks above exclude conflicts with that MPP
+        // and every intervening node, including fused scratch writes. The
+        // consumer's pre-MPP barrier will publish this expansion before use.
+        ggml_metal_row4_preexpand(ctx, next, dst);
+        ctx->row4_preexpanded = next;
+        if (ctx->debug_fusion > 1) {
+            GGML_LOG_DEBUG("%s: Row4 M5 preexpand lookahead %s -> %s (B=%d O=%d K=%d bytes=%zu)\n", __func__,
+                           current->name, next->name, rows, m, k, bytes);
+        }
+        return;
+    }
+}
+
 static constexpr int32_t      row4_pair2_f32_exact_k_max = 65536;
 static constexpr const char * row4_pair2_decode_marker   = "lut16-const-rows-f32";
 
@@ -2526,9 +2637,12 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_threadgroup_memory_size(enc, 8 * sizeof(float), 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, staged_rows, 1, 1, nth, 1, 1);
 
-        // Publish token-major I8 and scales before the optional coalesced
-        // K-major half transpose or the linear dispatch.
-        ggml_metal_encoder_memory_barrier(enc);
+        // Weight expansion does not read the activation and writes a disjoint
+        // part of this allocation. Let both preparations run concurrently;
+        // the barrier after expansion publishes both inputs to MPP.
+        if (!row4_m5_tensorops.preexpanded_weights) {
+            ggml_metal_encoder_memory_barrier(enc);
+        }
     }
 
     if (row4_direct_act) {
@@ -2700,30 +2814,13 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     }
 
     if (row4_m5_tensorops.preexpanded_weights) {
-        const char * expand_pipeline_name =
-            row4_v2 ? "kernel_row4_m5_preexpand_int4_pair2" : "kernel_row4_m5_preexpand_int4";
-        ggml_metal_pipeline_t expand_pipeline = ggml_metal_library_get_pipeline(lib, expand_pipeline_name);
-        if (!expand_pipeline) {
-            expand_pipeline =
-                ggml_metal_library_compile_pipeline(lib, expand_pipeline_name, expand_pipeline_name, nullptr);
+        if (ctx->row4_preexpanded == op) {
+            ctx->row4_preexpanded = nullptr;
+        } else {
+            ggml_metal_row4_preexpand(ctx, op, preexpanded_i4);
         }
 
-        // Pair2 expands O128 x K32 per group with K blocks varying fastest.
-        // Schema v1 retains its source-linear grid.
-        const int    nth          = row4_v2 ? 128 : 256;
-        const size_t source_bytes = (size_t) m * (size_t) k / 8;
-        const size_t threadgroups = row4_v2 ? (size_t) k / 32 : (source_bytes + nth - 1) / nth;
-        const int    grid_rows    = row4_v2 ? m / 128 : 1;
-        GGML_ASSERT(threadgroups <= (size_t) std::numeric_limits<int>::max());
-        GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(expand_pipeline));
-
-        ggml_metal_encoder_set_pipeline(enc, expand_pipeline);
-        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(codes), 1);
-        ggml_metal_encoder_set_buffer(enc, preexpanded_i4, 2);
-        ggml_metal_encoder_dispatch_threadgroups(enc, (int) threadgroups, grid_rows, 1, nth, 1, 1);
-
-        // Publish the complete row-major numeric INT4 tensor before MPP reads it.
+        // Publish activation preparation and local or lookahead INT4 expansion.
         ggml_metal_encoder_memory_barrier(enc);
 
         const int direct_nth = row4_m5_tensorops.n_simdgroups * 32;
@@ -2737,6 +2834,7 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
         ggml_metal_encoder_set_buffer(enc, op_buffer, 5);
         ggml_metal_encoder_dispatch_threadgroups(enc, m / row4_m5_tensorops.output_tile,
                                                  act_rows / row4_m5_tensorops.row_tile, 1, direct_nth, 1, 1);
+        ggml_metal_row4_preexpand_lookahead(ctx, op);
         return 1;
     }
 
@@ -4829,30 +4927,36 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
 
     const bool qat = ggml_fairy2i_exact_get_qat(op);
 
-    // Decode-only Qwen3 fusion. Preserve the exact RMS destination for graph
-    // callbacks, but form the following Row4 activation quantization in the
-    // same dispatch. All other RMS and row-quant shapes keep their independent
-    // kernels.
+    // Preserve the exact RMS destination for graph callbacks, but form the
+    // following Row4 activation quantization in the same dispatch. Prefill
+    // rows must fill the selected MPP tile, so no padded A8 rows are needed.
+    const int64_t rows    = ggml_nrows(op);
+    const bool    prefill = rows >= 32 && rows % 32 == 0 && ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops;
     if (ctx->use_fusion && qat && idx + 1 < ctx->idx_end && ggml_node_has_n_uses(ctx->gf, idx, 1) &&
-        ggml_nrows(op) == 1 && op->ne[0] == 4096 && ggml_is_contiguous(src0) && ggml_is_contiguous(weight) &&
+        (rows == 1 || prefill) && op->ne[0] == 4096 && ggml_is_contiguous(src0) && ggml_is_contiguous(weight) &&
         ggml_is_contiguous(op) && weight->ne[0] == 4096 && weight->ne[1] == 1 && weight->ne[2] == 1 &&
         weight->ne[3] == 1) {
         ggml_tensor * linear = ggml_graph_node(ctx->gf, idx + 1);
 
         const bool row4_linear = linear->op == GGML_OP_ROW4_LINEAR && linear->src[0] == op &&
-                                 ggml_nrows(linear->src[0]) == 1 && ggml_get_op_params_i32(linear, 2) == 4096 &&
+                                 ggml_get_op_params_i32(linear, 2) == 4096 &&
                                  ggml_metal_device_supports_op(ctx->dev, linear);
 
         if (row4_linear) {
             const size_t linear_pad = GGML_PAD(ggml_nbytes(linear), 64) - ggml_nbytes(linear);
 
-            ggml_metal_buffer_id act_q = ggml_metal_get_buffer_id(linear);
+            ggml_metal_buffer_id act_q =
+                prefill ?
+                    ggml_metal_get_buffer_id_for_size(
+                        linear, ggml_nbytes(linear) + ggml_metal_op_row_quant_linear_extra_act_q(ctx->dev, linear)) :
+                    ggml_metal_get_buffer_id(linear);
             act_q.offs += ggml_nbytes(linear) + linear_pad;
 
             const ggml_metal_buffer_id rms_dst       = ggml_metal_get_buffer_id(op);
             const ggml_metal_buffer_id src0_buffer   = ggml_metal_get_buffer_id(src0);
             const ggml_metal_buffer_id weight_buffer = ggml_metal_get_buffer_id(weight);
-            const size_t               quant_bytes   = (size_t) linear->src[0]->ne[0] * sizeof(int8_t) + sizeof(float);
+            const size_t               act_q_bytes   = (size_t) rows * 4096 * sizeof(int8_t);
+            const size_t               quant_bytes   = act_q_bytes + (size_t) rows * sizeof(float);
             const bool                 scratch_isolated =
                 rms_dst.metal && src0_buffer.metal && weight_buffer.metal && act_q.metal &&
                 !ggml_metal_buffer_ranges_overlap(rms_dst, ggml_nbytes(op), act_q, quant_bytes) &&
@@ -4861,14 +4965,28 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
 
             if (scratch_isolated) {
                 ggml_metal_buffer_id act_scales = act_q;
-                act_scales.offs += (size_t) linear->src[0]->ne[0] * sizeof(int8_t);
+                act_scales.offs += act_q_bytes;
+
+                const auto m5_tensorops =
+                    ggml_metal_row4_m5_tensorops_select(prefill, false, ggml_get_op_params_i32(linear, 0),
+                                                        (int32_t) rows, ggml_get_op_params_i32(linear, 1), 4096);
+                const size_t scratch_bytes = ggml_metal_op_row_quant_linear_extra_act_q(ctx->dev, linear) - linear_pad;
+                // The allocator may reuse the RMS input for the following
+                // linear's INT4 scratch. Only overlap expansion when the entire
+                // scratch tail is disjoint from the still-live RMS operands.
+                const bool   overlap_preexpand =
+                    m5_tensorops.preexpanded_weights &&
+                    !ggml_metal_buffer_ranges_overlap(rms_dst, ggml_nbytes(op), act_q, scratch_bytes) &&
+                    !ggml_metal_buffer_ranges_overlap(src0_buffer, ggml_nbytes(src0), act_q, scratch_bytes) &&
+                    !ggml_metal_buffer_ranges_overlap(weight_buffer, ggml_nbytes(weight), act_q, scratch_bytes);
 
                 if (!ggml_metal_op_concurrency_check(ctx, linear)) {
                     ggml_metal_op_concurrency_reset(ctx);
                 }
 
-                constexpr const char * pipeline_name =
-                    "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096";
+                const char * pipeline_name =
+                    prefill ? "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_prefill_k4096" :
+                              "kernel_fairy2i_rms_norm_qat_row4_quantize_activation_i8_b1_k4096";
                 ggml_metal_pipeline_t pipeline = ggml_metal_library_get_pipeline(ctx->lib, pipeline_name);
                 if (!pipeline) {
                     pipeline = ggml_metal_library_compile_pipeline(ctx->lib, pipeline_name, pipeline_name, nullptr);
@@ -4883,16 +5001,19 @@ int ggml_metal_op_fairy2i_rms_norm_exact(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(ctx->enc, rms_dst, 3);
                 ggml_metal_encoder_set_buffer(ctx->enc, act_q, 4);
                 ggml_metal_encoder_set_buffer(ctx->enc, act_scales, 5);
-                ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 8 * sizeof(float), 0);
-                ggml_metal_encoder_dispatch_threadgroups(ctx->enc, 1, 1, 1, nth, 1, 1);
+                ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, GGML_PAD(9 * sizeof(float), 16), 0);
+                ggml_metal_encoder_dispatch_threadgroups(ctx->enc, rows, 1, 1, nth, 1, 1);
 
-                ggml_metal_encoder_memory_barrier(ctx->enc);
+                if (!overlap_preexpand) {
+                    ggml_metal_encoder_memory_barrier(ctx->enc);
+                }
                 ggml_metal_op_row_quant_linear_impl(ctx, linear, ggml_metal_get_buffer_id(op), false, nullptr, true);
 
                 if (ctx->debug_fusion > 1) {
                     GGML_LOG_DEBUG(
-                        "%s: fuse QAT FAIRY2I_RMS_NORM_EXACT + ROW4_LINEAR activation quantization (B=1 K=4096)\n",
-                        __func__);
+                        "%s: fuse QAT FAIRY2I_RMS_NORM_EXACT + ROW4_LINEAR activation quantization "
+                        "(B=%lld K=4096 preexpand-overlap=%d)\n",
+                        __func__, (long long) rows, overlap_preexpand);
                 }
                 return 2;
             }
