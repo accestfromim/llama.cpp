@@ -4265,6 +4265,7 @@ namespace {
 struct cache_test_marker {
     std::atomic<int> builds{ 0 };
     std::atomic<int> uses{ 0 };
+    std::atomic<int> splits{ 0 };
 };
 
 void cache_test_log(enum ggml_log_level level, const char * text, void * user) {
@@ -4275,6 +4276,9 @@ void cache_test_log(enum ggml_log_level level, const char * text, void * user) {
     }
     if (strstr(text, "Row4 persistent INT4 cache reuse:") || strstr(text, "Row4 persistent INT2 cache reuse:")) {
         ++marker.uses;
+    }
+    if (strstr(text, "Row4 INT2 split-K decode:")) {
+        ++marker.splits;
     }
 }
 
@@ -4383,6 +4387,13 @@ bool test_row4_cache_updates_shape(int o, int k, int b) {
                         marker.uses.load());
                 ok = false;
             }
+            const char * require_decode = getenv("LLAMA_ROW4_REQUIRE_INT2_DECODE_TESTS");
+            const bool expect_split = require_decode && strcmp(require_decode, "0") != 0 && !cache_fallback && b >= 4 &&
+                                      b <= 16 && ((k == 4096 && (o == 4096 || o == 6144)) || (k == 12288 && o == 4096));
+            if (marker.splits != (expect_split ? 1 : 0)) {
+                fprintf(stderr, "%s unexpected split-K dispatches=%d\n", label.c_str(), marker.splits.load());
+                ok = false;
+            }
             printf("%s builds=%d uses=%d exact=%d\n", label.c_str(), marker.builds.load(), marker.uses.load(), ok);
         }
         ggml_backend_buffer_free(buf);
@@ -4401,13 +4412,18 @@ bool test_row4_cache_updates() {
     bool         ok             = test_row4_cache_updates_shape(128, 512, 512);
     const char * require_decode = getenv("LLAMA_ROW4_REQUIRE_INT2_DECODE_TESTS");
     if (require_decode && strcmp(require_decode, "0") != 0) {
-        // Cover both padded M8/M32 gate-up and M16 QKV/O/down tiles. The
-        // uncached backend remains an independent compressed-LUT reference.
+        // Cover padded gate-up tiles and every split-K decode geometry,
+        // including partial token tiles. The uncached backend remains an
+        // independent compressed-LUT reference. Each case also exercises
+        // cache invalidation, aliases, output/scratch lifetimes and reuse.
         for (const auto & shape : {
                  std::array<int, 3>{ 24576, 4096,  5  },
                  { 24576, 4096,  9  },
+                 { 6144,  4096,  5  },
                  { 6144,  4096,  16 },
+                 { 4096,  4096,  4  },
                  { 4096,  4096,  12 },
+                 { 4096,  12288, 7  },
                  { 4096,  12288, 16 }
         }) {
             ok = test_row4_cache_updates_shape(shape[0], shape[1], shape[2]) && ok;

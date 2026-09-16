@@ -2238,6 +2238,7 @@ struct ggml_metal_row4_m5_tensorops_config {
     int          output_tile;
     int          n_simdgroups;
     bool         preexpanded_weights;
+    int          split_k = 0;
 };
 
 static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(bool    available,
@@ -2295,6 +2296,45 @@ static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(b
     // expanded weights per decode step would erase the compute savings.
     if (int2 && cached_decode && layout == 2 && act_rows >= 4 && act_rows <= 16 && m >= 4096 && m % 128 == 0 &&
         k >= 4096 && k % 512 == 0) {
+        // Small M/N grids leave too few independent reductions in flight.
+        // Split the measured QKV/O/down shapes, then merge I32 partials before
+        // reconstructing the quartet or applying any scale/BF16 rounding.
+        if (k == 4096 && (m == 4096 || m == 6144)) {
+            if (m == 6144 && act_rows <= 8) {
+                return { "kernel_row4_m5_decode_split_m8n128_sg4",
+                         "M5 MPP TensorOps exact A8/I4/I32 M8N128 BK512 cached decode split-K4",
+                         8,
+                         128,
+                         4,
+                         true,
+                         4 };
+            }
+            return { "kernel_row4_m5_decode_split_m16n64_sg4",
+                     "M5 MPP TensorOps exact A8/I4/I32 M16N64 BK512 cached decode split-K4",
+                     16,
+                     64,
+                     4,
+                     true,
+                     4 };
+        }
+        if (m == 4096 && k == 12288) {
+            if (act_rows <= 8) {
+                return { "kernel_row4_m5_decode_split_m8n64_sg1",
+                         "M5 MPP TensorOps exact A8/I4/I32 M8N64 BK512 cached decode split-K8",
+                         8,
+                         64,
+                         1,
+                         true,
+                         8 };
+            }
+            return { "kernel_row4_m5_decode_split_m16n64_sg4",
+                     "M5 MPP TensorOps exact A8/I4/I32 M16N64 BK512 cached decode split-K4",
+                     16,
+                     64,
+                     4,
+                     true,
+                     4 };
+        }
         if (m >= 16384 && k == 4096) {
             return { act_rows <= 8 ? "kernel_row4_w1a8_m5_tensorops_preexpanded_m8n128_bk512" :
                                      "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512",
@@ -2507,10 +2547,13 @@ size_t ggml_metal_op_row_quant_linear_extra_act_q(ggml_metal_device_t dev, const
     // The allocation base is only guaranteed to be 32-byte aligned. Reserve
     // enough slop for the runtime to align the absolute device weight offset.
     const size_t preexpanded_alignment_slop = ggml_metal_device_get_props(dev)->row4_m5_int2 ? 127 : 63;
+    const size_t split_bytes =
+        (size_t) m5_tensorops.split_k * act_rows * (size_t) ggml_get_op_params_i32(op, 1) * sizeof(int32_t);
     const size_t preexpanded_bytes =
         m5_tensorops.preexpanded_weights ?
             preexpanded_alignment_slop +
-                ggml_metal_device_row4_preexpanded_size(dev, ggml_get_op_params_i32(op, 1), (int32_t) k) :
+                std::max(ggml_metal_device_row4_preexpanded_size(dev, ggml_get_op_params_i32(op, 1), (int32_t) k),
+                         split_bytes) :
             0;
 
     return pad + quant_bytes + preexpanded_bytes +
@@ -3066,6 +3109,9 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
     }
 
     if (row4_m5_tensorops.preexpanded_weights) {
+        // A ready persistent cache leaves the local expansion allocation free
+        // for exact split-K partials. Its lifetime is part of this op's scratch.
+        const ggml_metal_buffer_id split_partials = preexpanded_i4;
         if (ctx->use_row4_cache) {
             preexpanded_i4 =
                 ggml_metal_buffer_get_row4_cache(ggml_metal_get_buffer(codes), ctx->dev, lib, codes, k, m, false);
@@ -3085,6 +3131,40 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
 
         const int direct_nth = row4_m5_tensorops.n_simdgroups * 32;
         GGML_ASSERT(direct_nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        if (row4_m5_tensorops.split_k) {
+            GGML_ASSERT(ctx->use_row4_cache && props_dev->row4_m5_int2 && !qat_residual_add && !v_store);
+            GGML_ASSERT(k % (row4_m5_tensorops.split_k * 512) == 0);
+            if (ctx->debug_fusion > 1) {
+                GGML_LOG_DEBUG("Row4 INT2 split-K decode: B=%d O=%d K=%d splits=%d I32-merge\n", act_rows, m, k,
+                               row4_m5_tensorops.split_k);
+            }
+            args.reserved = row4_m5_tensorops.split_k;
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, act_q, 1);
+            ggml_metal_encoder_set_buffer(enc, preexpanded_i4, 2);
+            ggml_metal_encoder_set_buffer(enc, split_partials, 5);
+            ggml_metal_encoder_dispatch_threadgroups(enc, m / row4_m5_tensorops.output_tile,
+                                                     staged_rows / row4_m5_tensorops.row_tile,
+                                                     row4_m5_tensorops.split_k, direct_nth, 1, 1);
+            ggml_metal_encoder_memory_barrier(enc);
+
+            constexpr const char * reduce_name = "kernel_row4_m5_decode_split_reduce";
+            ggml_metal_pipeline_t  reduce      = ggml_metal_library_get_pipeline(lib, reduce_name);
+            if (!reduce) {
+                reduce = ggml_metal_library_compile_pipeline(lib, reduce_name, reduce_name, nullptr);
+            }
+            constexpr int nth = 256;
+            GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(reduce));
+            ggml_metal_encoder_set_pipeline(enc, reduce);
+            ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer(enc, split_partials, 1);
+            ggml_metal_encoder_set_buffer(enc, act_scales, 2);
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(scales), 3);
+            ggml_metal_encoder_set_buffer(enc, op_buffer, 4);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (m / 4 * act_rows + nth - 1) / nth, 1, 1, nth, 1, 1);
+            return 1;
+        }
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer(enc, act_q, 1);

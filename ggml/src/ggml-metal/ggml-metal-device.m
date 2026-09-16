@@ -672,6 +672,23 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                 }
             }
 
+            if (dev->props.row4_m5_int2_decode) {
+                const char * const decode_pipeline_names[] = {
+                    "kernel_row4_m5_decode_split_m8n128_sg4",
+                    "kernel_row4_m5_decode_split_m16n64_sg4",
+                    "kernel_row4_m5_decode_split_m8n64_sg1",
+                    "kernel_row4_m5_decode_split_reduce",
+                };
+                for (size_t i = 0; i < sizeof(decode_pipeline_names) / sizeof(decode_pipeline_names[0]); ++i) {
+                    const char * name = decode_pipeline_names[i];
+                    if (!ggml_metal_library_compile_pipeline(dev->library, name, name, NULL)) {
+                        GGML_LOG_WARN("%s: INT2 split-K pipeline probe failed; using original decode paths\n", __func__);
+                        dev->props.row4_m5_int2_decode = false;
+                        break;
+                    }
+                }
+            }
+
             // --------------------------------------------------
 
             // print MTL GPU family:

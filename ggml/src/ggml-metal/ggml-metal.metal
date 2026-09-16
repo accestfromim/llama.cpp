@@ -1684,6 +1684,93 @@ ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_preexpanded_m8n128_bk5
 ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_preexpanded_m16n64_bk512, 512, 16, 64)
 #undef ROW4_M5_PREFILL_PREEXPANDED
 
+#if GGML_METAL_ROW4_M5_INT2
+// Cached multi-stream decode uses more independent K reductions than the
+// full-K prefill grid. Partials remain integers; there is exactly one scale
+// and BF16 boundary after all K partitions have been merged.
+template<int row_tile, int output_tile, int n_simdgroups>
+static inline void row4_m5_decode_split_impl(
+        constant ggml_metal_kargs_row_quant_linear & args,
+        device int8_t * act_q,
+        device uchar * weights,
+        device int32_t * partials,
+        uint3 tgpig) {
+    constexpr int k_tile = 512;
+    constexpr auto desc = matmul2d_descriptor(
+        row_tile, output_tile, k_tile, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<n_simdgroups>> op;
+    using activation_tensor = tensor<device int8_t, extents<int, k_tile, row_tile>, tensor_inline>;
+    using weight_tensor = tensor<device row4_m5_preexpanded_format, extents<int, output_tile, k_tile>, tensor_inline>;
+    auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            acc[i] = 0;
+        }
+    }
+
+    const uint output_base = tgpig.x * output_tile;
+    const uint row_base = tgpig.y * row_tile;
+    const uint stride = row4_m5_preexpanded_stride((uint) args.m);
+    const uint segment = (uint) args.k / (uint) args.reserved;
+    const uint begin = tgpig.z * segment;
+    for (uint k_base = begin; k_base < begin + segment; k_base += k_tile) {
+        activation_tensor a(act_q + (ulong) row_base * args.k + k_base,
+                            extents<int, k_tile, row_tile>(), array<int, 2>{ 1, args.k });
+        weight_tensor w(weights + (((ulong) k_base * stride + output_base) >> row4_m5_preexpanded_shift),
+                        extents<int, output_tile, k_tile>(), array<int, 2>{ 1, (int) stride });
+        op.run(a, w, acc);
+    }
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+        if (acc.is_valid_element(i)) {
+            const auto coordinate = acc.get_multidimensional_index(i);
+            const uint row = row_base + (uint) coordinate[1];
+            if (row < (uint) args.act_rows) {
+                partials[((ulong) tgpig.z * args.act_rows + row) * args.m + output_base + coordinate[0]] = acc[i];
+            }
+        }
+    }
+}
+
+#define ROW4_M5_DECODE_SPLIT(name, rm, cn, sg) \
+kernel void name( \
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]], \
+        device int8_t * act_q [[buffer(1)]], device uchar * weights [[buffer(2)]], \
+        device int32_t * partials [[buffer(5)]], uint3 tgpig [[threadgroup_position_in_grid]]) { \
+    row4_m5_decode_split_impl<rm, cn, sg>(args, act_q, weights, partials, tgpig); \
+}
+ROW4_M5_DECODE_SPLIT(kernel_row4_m5_decode_split_m8n128_sg4, 8, 128, 4)
+ROW4_M5_DECODE_SPLIT(kernel_row4_m5_decode_split_m16n64_sg4, 16, 64, 4)
+ROW4_M5_DECODE_SPLIT(kernel_row4_m5_decode_split_m8n64_sg1, 8, 64, 1)
+#undef ROW4_M5_DECODE_SPLIT
+
+kernel void kernel_row4_m5_decode_split_reduce(
+        constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
+        device const int4 * partials [[buffer(1)]],
+        device const float * act_scales [[buffer(2)]],
+        device const ushort * scales [[buffer(3)]],
+        device float * dst [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]) {
+    const uint quartets = (uint) args.m / 4;
+    if (gid >= (uint) args.act_rows * quartets) {
+        return;
+    }
+    int4 basis = 0;
+    for (int split = 0; split < args.reserved; ++split) {
+        basis += partials[(ulong) split * args.act_rows * quartets + gid];
+    }
+    const int4 values = int4(basis.x + basis.z, basis.w - basis.y, basis.y + basis.w, basis.x - basis.z);
+    const uint row = gid / quartets;
+    const uint output = (gid % quartets) * 4;
+    #pragma unroll
+    for (uint j = 0; j < 4; ++j) {
+        dst[(ulong) gid * 4 + j] = row4_finish_i32(values[j], act_scales[row], scales[output + j]);
+    }
+}
+#endif
+
 // Full M64 tiles can write the exact BF16 epilogue through the cooperative
 // INT32 tensor. Keep its fragment layout and store the F32 result bit patterns
 // so the cooperative store does not introduce a numeric conversion.

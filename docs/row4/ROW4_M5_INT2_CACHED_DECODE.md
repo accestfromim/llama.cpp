@@ -42,3 +42,5 @@ The prefill guide records the Release build, M5 Max, compiler, power settings an
 These are recorded results before splitting the existing implementation into commits. Cache-enabled B1/B2 controls did not show gains; their decode paths remain unchanged. Full-model comparisons across pp128/512/2048 and B1/2/4/8/16 followed by 128 decode steps checked 646,791,552 float32 logits bitwise equal to the reference.
 
 Raw artifacts: `/Users/1806-admin/row4-int2-opt-20260915/decode-abba/`, `decode-controls/`, `quality2-summary.json`, `path-proof.json` and `REPORT.zh-CN.md`. The benchmark driver is `run-decode-bench.py`, using `probes/bench-decode.cpp` in that directory. All GPU workloads were run serially.
+
+The table above records the initial full-K kernels. [The subsequent split-K optimization](ROW4_M5_INT2_DECODE_SPLIT_K.md) now overrides QKV/O/down at the measured B4–B16 shapes; the wide gate/up dispatch and cache representation above remain in use. Strict cache tests also require the split-K markers for those shapes.
