@@ -7187,6 +7187,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_row_quant_linear(w8a8, 128, 9, 256));
     }
     const char * row4_real_shapes = getenv("LLAMA_ROW4_REAL_SHAPE_TESTS");
+    // Device-preexpanded Row4: BK128/BK512. Pair2's Metal-only buffer
+    // requirements are exercised separately by test-row4.
+    test_cases.emplace_back(new test_row_quant_linear(false, 128, 512, 128));
+    test_cases.emplace_back(new test_row_quant_linear(false, 128, 544, 512));
     if (row4_real_shapes && strcmp(row4_real_shapes, "0") != 0) {
         const std::pair<int64_t, int64_t> row4_shapes[] = {
             { 6144,  4096  },

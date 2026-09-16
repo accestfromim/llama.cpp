@@ -1435,14 +1435,73 @@ constexpr constant static ushort k_row4_m5_packed_int4_codebook[16] = {
     0x1111, 0xf11f, 0x0200, 0x0020, 0x1ff1, 0xffff, 0x00e0, 0x0e00,
 };
 
+#if GGML_METAL_ROW4_M5_TERNARY_BASIS
+// The code is u_axis | (v_axis << 2), where each axis is +R, -R, +I, or -I.
+// Store [u_real, u_imag, v_real, v_imag], all in {-1, 0, 1}. Both the
+// INT4 control and native INT2 path reconstruct the original integer dots.
+constexpr constant static char4 k_row4_m5_ternary_codebook[16] = {
+    char4( 1,  0,  1,  0), char4(-1,  0,  1,  0),
+    char4( 0,  1,  1,  0), char4( 0, -1,  1,  0),
+    char4( 1,  0, -1,  0), char4(-1,  0, -1,  0),
+    char4( 0,  1, -1,  0), char4( 0, -1, -1,  0),
+    char4( 1,  0,  0,  1), char4(-1,  0,  0,  1),
+    char4( 0,  1,  0,  1), char4( 0, -1,  0,  1),
+    char4( 1,  0,  0, -1), char4(-1,  0,  0, -1),
+    char4( 0,  1,  0, -1), char4( 0, -1,  0, -1),
+};
+
+constexpr constant static ushort k_row4_m5_packed_ternary_codebook[16] = {
+    0x0101, 0x010f, 0x0110, 0x01f0, 0x0f01, 0x0f0f, 0x0f10, 0x0ff0,
+    0x1001, 0x100f, 0x1010, 0x10f0, 0xf001, 0xf00f, 0xf010, 0xf0f0,
+};
+
+template<typename T>
+static inline void row4_m5_reconstruct(thread T & acc) {
+    // Validated on M5 / MSL 4.1 for M32N128 SG4, M64N64 SG4 and M64N128
+    // SG8: each output quartet stays within one thread.
+    #pragma unroll
+    for (uint16_t i = 0; i < acc.get_capacity(); i += 4) {
+        if (acc.is_valid_element(i)) {
+            const int ur = acc[i + 0];
+            const int ui = acc[i + 1];
+            const int vr = acc[i + 2];
+            const int vi = acc[i + 3];
+            acc[i + 0] = ur + vr;
+            acc[i + 1] = vi - ui;
+            acc[i + 2] = ui + vi;
+            acc[i + 3] = ur - vr;
+        }
+    }
+}
+#endif
+
+#if GGML_METAL_ROW4_M5_INT2
+using row4_m5_preexpanded_format = int2b_format;
+constexpr constant uint row4_m5_preexpanded_shift = 2;
+constexpr constant static uchar k_row4_m5_packed_int2_codebook[16] = {
+    0x11, 0x13, 0x14, 0x1c, 0x31, 0x33, 0x34, 0x3c,
+    0x41, 0x43, 0x44, 0x4c, 0xc1, 0xc3, 0xc4, 0xcc,
+};
+#else
+using row4_m5_preexpanded_format = int4b_format;
+constexpr constant uint row4_m5_preexpanded_shift = 1;
+#endif
+
+static inline uint row4_m5_preexpanded_stride(uint m) {
+#if GGML_METAL_ROW4_M5_INT2
+    return (m + 511U) & ~511U;
+#else
+    return m;
+#endif
+}
+
 static inline uchar row4_m5_pack_int4(char low, char high) {
     return (uchar) (((uint) ((uchar) low) & 0x0fU) | (((uint) ((uchar) high) & 0x0fU) << 4U));
 }
 
 // Losslessly expand the physical m16k128_split8_v1 code stream into ordinary
-// row-major numeric signed INT4.  One source byte contains the two K8 halves
-// for a group of four output rows and therefore produces four destination
-// bytes (eight INT4 values).
+// K-major numeric INT4 or ternary INT2. One source byte contains the two
+// K8 halves for a group of four output rows and produces eight values.
 kernel void kernel_row4_m5_preexpand_int4(
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]],
         device const uchar * codes                        [[buffer(1)]],
@@ -1468,8 +1527,18 @@ kernel void kernel_row4_m5_preexpand_int4(
     const uint k_low  = kt * 128U + split * 16U + j;
     const uint k_high = k_low + 8U;
     const uchar code_pair = codes[gid];
+#if GGML_METAL_ROW4_M5_INT2
+    const uint stride = row4_m5_preexpanded_stride((uint) args.m);
+    weight_i4[((ulong) k_low * stride + output) >> 2] = k_row4_m5_packed_int2_codebook[code_pair & 15U];
+    weight_i4[((ulong) k_high * stride + output) >> 2] = k_row4_m5_packed_int2_codebook[code_pair >> 4];
+#else
+#if GGML_METAL_ROW4_M5_TERNARY_BASIS
+    const char4 low        = k_row4_m5_ternary_codebook[(uint) (code_pair & 0x0fU)];
+    const char4 high       = k_row4_m5_ternary_codebook[(uint) (code_pair >> 4)];
+#else
     const char4 low        = k_row4_m5_int4_codebook[(uint) (code_pair & 0x0fU)];
     const char4 high       = k_row4_m5_int4_codebook[(uint) (code_pair >> 4)];
+#endif
 
     const ulong low_offset  = ((ulong) k_low * (ulong) args.m + (ulong) output) >> 1;
     const ulong high_offset = ((ulong) k_high * (ulong) args.m + (ulong) output) >> 1;
@@ -1477,9 +1546,10 @@ kernel void kernel_row4_m5_preexpand_int4(
     weight_i4[low_offset + 1UL]  = row4_m5_pack_int4(low.z, low.w);
     weight_i4[high_offset + 0UL] = row4_m5_pack_int4(high.x, high.y);
     weight_i4[high_offset + 1UL] = row4_m5_pack_int4(high.z, high.w);
+#endif
 }
 
-// Losslessly expand Pair2 into K-major numeric INT4. Each 128-thread group
+// Losslessly expand Pair2 into K-major INT4 or INT2. Each 128-thread group
 // covers O128 x K32, reusing nearby source cache lines while keeping stores
 // contiguous along O. The grid visits K blocks first for source locality.
 // The preexpanded selector guarantees O % 128 == 0 and K % 256 == 0.
@@ -1499,18 +1569,35 @@ kernel void kernel_row4_m5_preexpand_int4_pair2(
     const ushort code0 = *((device const ushort *) (codes + source_offset));
     const ushort code1 = *((device const ushort *) (codes + source_offset + 128UL));
 
+#if GGML_METAL_ROW4_M5_INT2
+    constant uchar * codebook = k_row4_m5_packed_int2_codebook;
+#elif GGML_METAL_ROW4_M5_TERNARY_BASIS
+    constant ushort * codebook = k_row4_m5_packed_ternary_codebook;
+#else
+    constant ushort * codebook = k_row4_m5_packed_int4_codebook;
+#endif
     #pragma unroll
     for (uint j = 0; j < 2; ++j) {
         const uint c0 = (code0 >> (j * 8U)) & 255U;
         const uint c1 = (code1 >> (j * 8U)) & 255U;
-        const uint low = (uint) k_row4_m5_packed_int4_codebook[c0 & 15U] |
-                         ((uint) k_row4_m5_packed_int4_codebook[c1 & 15U] << 16);
-        const uint high = (uint) k_row4_m5_packed_int4_codebook[c0 >> 4] |
-                          ((uint) k_row4_m5_packed_int4_codebook[c1 >> 4] << 16);
+#if GGML_METAL_ROW4_M5_INT2
+        const ushort low = (ushort) codebook[c0 & 15U] | ((ushort) codebook[c1 & 15U] << 8);
+        const ushort high = (ushort) codebook[c0 >> 4] | ((ushort) codebook[c1 >> 4] << 8);
+        const uint stride = row4_m5_preexpanded_stride((uint) args.m);
+        const ulong low_offset = ((ulong) (k_low + j) * stride) / 4UL + output_group;
+        const ulong high_offset = low_offset + (ulong) stride * 2UL;
+        *((device ushort *) (weight_i4 + low_offset)) = low;
+        *((device ushort *) (weight_i4 + high_offset)) = high;
+#else
+        const uint low = (uint) codebook[c0 & 15U] |
+                         ((uint) codebook[c1 & 15U] << 16);
+        const uint high = (uint) codebook[c0 >> 4] |
+                          ((uint) codebook[c1 >> 4] << 16);
         const ulong low_offset = ((ulong) (k_low + j) * (uint) args.m) / 2UL + output_group * 2UL;
         const ulong high_offset = low_offset + (ulong) args.m * 4UL;
         *((device uint *) (weight_i4 + low_offset)) = low;
         *((device uint *) (weight_i4 + high_offset)) = high;
+#endif
     }
 }
 
@@ -1539,7 +1626,7 @@ static inline void row4_m5_prefill_preexpanded_impl(
     matmul2d<desc, execution_simdgroups<4>> op;
 
     using activation_tensor = tensor<device int8_t, dextents<int, 2>, tensor_inline>;
-    using weight_tensor     = tensor<device int4b_format, dextents<int, 2>, tensor_inline>;
+    using weight_tensor     = tensor<device row4_m5_preexpanded_format, dextents<int, 2>, tensor_inline>;
     auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
     #pragma unroll
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
@@ -1550,17 +1637,22 @@ static inline void row4_m5_prefill_preexpanded_impl(
 
     const uint output_base = tgpig.x * output_tile;
     const uint row_base    = tgpig.y * row_tile;
+    const uint weight_stride = row4_m5_preexpanded_stride((uint) args.m);
     for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
         activation_tensor activation(
             act_q + (ulong) row_base * (ulong) args.k + (ulong) k_base,
             dextents<int, 2>(k_tile, row_tile),
             array<int, 2>{ 1, args.k });
         weight_tensor weight(
-            weight_i4 + (((ulong) k_base * (ulong) args.m + (ulong) output_base) >> 1),
+            weight_i4 + (((ulong) k_base * weight_stride + output_base) >> row4_m5_preexpanded_shift),
             dextents<int, 2>(output_tile, k_tile),
-            array<int, 2>{ 1, args.m });
+            array<int, 2>{ 1, (int) weight_stride });
         op.run(activation, weight, acc);
     }
+
+#if GGML_METAL_ROW4_M5_TERNARY_BASIS
+    row4_m5_reconstruct(acc);
+#endif
 
     #pragma unroll
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
@@ -1616,7 +1708,7 @@ static inline void row4_m5_prefill_cooperative_impl(
     matmul2d<desc, execution_simdgroups<n_simdgroups>> op;
 
     using activation_tensor = tensor<device int8_t, extents<int, k_tile, row_tile>, tensor_inline>;
-    using weight_tensor     = tensor<device int4b_format, extents<int, output_tile, k_tile>, tensor_inline>;
+    using weight_tensor     = tensor<device row4_m5_preexpanded_format, extents<int, output_tile, k_tile>, tensor_inline>;
     auto acc = op.template get_destination_cooperative_tensor<activation_tensor, weight_tensor, int32_t>();
     #pragma unroll
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
@@ -1636,16 +1728,21 @@ static inline void row4_m5_prefill_cooperative_impl(
     const uint offset = (uint) (linear % group_size);
     const uint output_base = (offset / group_rows) * output_tile;
     const uint row_base = (first_row + offset % group_rows) * row_tile;
+    const uint weight_stride = row4_m5_preexpanded_stride((uint) args.m);
 
     for (uint k_base = 0; k_base < (uint) args.k; k_base += k_tile) {
         activation_tensor activation(
             act_q + (ulong) row_base * (uint) args.k + k_base,
             extents<int, k_tile, row_tile>(), array<int, 2>{ 1, args.k });
         weight_tensor weight(
-            weight_i4 + (((ulong) k_base * (uint) args.m + output_base) >> 1),
-            extents<int, output_tile, k_tile>(), array<int, 2>{ 1, args.m });
+            weight_i4 + (((ulong) k_base * weight_stride + output_base) >> row4_m5_preexpanded_shift),
+            extents<int, output_tile, k_tile>(), array<int, 2>{ 1, (int) weight_stride });
         op.run(activation, weight, acc);
     }
+
+#if GGML_METAL_ROW4_M5_TERNARY_BASIS
+    row4_m5_reconstruct(acc);
+#endif
 
     #pragma unroll
     for (uint16_t i = 0; i < acc.get_capacity(); ++i) {

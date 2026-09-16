@@ -193,6 +193,8 @@ struct ggml_metal_device_props {
     bool supports_gpu_family_apple7;
     bool supports_gpu_family_apple10;
     bool has_mpp_tensorops;
+    bool row4_m5_ternary_basis;
+    bool row4_m5_int2;
 };
 
 ggml_metal_device_t ggml_metal_device_init(void);
@@ -212,6 +214,8 @@ void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t
 bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_tensor * op);
 
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+
+size_t ggml_metal_device_row4_preexpanded_size(ggml_metal_device_t dev, int32_t m, int32_t k);
 
 //
 // device buffers
