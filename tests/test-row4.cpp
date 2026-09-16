@@ -1245,6 +1245,8 @@ struct m5_tensorops_path_log_marker {
     std::atomic<bool>     pair2_device_preexpand = false;
     std::atomic<bool>     pair2_cooperative_n64  = false;
     std::atomic<bool>     pair2_cooperative_n128 = false;
+    std::atomic<bool>     ternary_basis          = false;
+    std::atomic<uint32_t> int2_tile_mask         = 0;
 };
 
 static void gate_up_fusion_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
@@ -1263,6 +1265,24 @@ static void gate_up_fusion_log_callback(enum ggml_log_level level, const char * 
 static void m5_tensorops_path_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
     auto * marker = static_cast<m5_tensorops_path_log_marker *>(user_data);
+    std::string  normalized = text;
+    const size_t int2_pos   = normalized.find("M5 MPP TensorOps exact A8/I2/I32 ");
+    if (int2_pos != std::string::npos && strstr(text, "native INT2 ternary-basis/I32 reconstruct")) {
+        uint32_t tile = 0;
+        if (strstr(text, "M32N128 BK128")) {
+            tile = 1u;
+        } else if (strstr(text, "M32N128 BK512")) {
+            tile = 2u;
+        } else if (strstr(text, "M64N64 BK512")) {
+            tile = 4u;
+        } else if (strstr(text, "M64N128 BK512")) {
+            tile = 8u;
+        }
+        marker->int2_tile_mask.fetch_or(tile, std::memory_order_relaxed);
+        marker->ternary_basis.store(true, std::memory_order_relaxed);
+        normalized.replace(int2_pos, strlen("M5 MPP TensorOps exact A8/I2/I32 "), "M5 MPP TensorOps exact A8/I4/I32 ");
+        text = normalized.c_str();
+    }
     if (strstr(text, "layout=m32k256_pair2_split8_v2") && strstr(text, "cooperative-store")) {
         if (strstr(text, "M64N64 BK512 device-preexpand")) {
             marker->pair2_cooperative_n64.store(true, std::memory_order_relaxed);
@@ -1299,6 +1319,9 @@ static void m5_tensorops_path_log_callback(enum ggml_log_level level, const char
     }
     if (bit != 0) {
         marker->tile_mask.fetch_or(bit, std::memory_order_relaxed);
+        if (strstr(text, "ternary-basis INT4 control/I32 reconstruct")) {
+            marker->ternary_basis.store(true, std::memory_order_relaxed);
+        }
         if (strstr(text, "layout=m32k256_pair2_split8_v2") && strstr(text, "act_rows=512 ") &&
             strstr(text, "M32N128 BK128 device-preexpand") && strstr(text, "blocked-O128-K32")) {
             marker->pair2_device_preexpand.store(true, std::memory_order_relaxed);
@@ -3226,7 +3249,12 @@ static bool test_metal_row4_decode_residual_fusion() {
 
 static bool test_metal_operator_matrix() {
     const char *       require_m5_value     = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
-    const bool         require_m5_tensorops = require_m5_value && strcmp(require_m5_value, "0") != 0;
+    const char *       require_basis_value  = getenv("LLAMA_ROW4_REQUIRE_TERNARY_BASIS_TESTS");
+    const char *       require_int2_value   = getenv("LLAMA_ROW4_REQUIRE_INT2_TESTS");
+    const bool         require_int2         = require_int2_value && strcmp(require_int2_value, "0") != 0;
+    const bool         require_basis        = require_basis_value && strcmp(require_basis_value, "0") != 0;
+    const bool         require_m5_tensorops =
+        require_int2 || require_basis || (require_m5_value && strcmp(require_m5_value, "0") != 0);
     ggml_backend_dev_t dev = find_metal_device();
     if (!dev) {
         const char * require_metal = getenv("LLAMA_ROW4_REQUIRE_METAL_TESTS");
@@ -3375,6 +3403,53 @@ static bool test_metal_operator_matrix() {
         }
     }
 
+    // Cover device-preexpanded BK128 and BK512 with all 16 codewords,
+    // cancellation, saturated activations, and distinct signed/zero scales.
+    // An independent v1 oracle checks both physical layouts. In particular,
+    // this detects a change in the thread-local quartet layout used by the
+    // experimental ternary-basis epilogue.
+    for (int64_t prefill_k : { 128, 512, 12288 }) {
+        std::vector<uint8_t> logical((size_t) (O / 4) * prefill_k);
+        for (int64_t group = 0; group < O / 4; ++group) {
+            for (int64_t k = 0; k < prefill_k; ++k) {
+                logical[(size_t) group * prefill_k + k] = (uint8_t) ((group < 16 ? group : group + k) & 15);
+            }
+        }
+        const std::vector<uint8_t> codes = pack_row4_codes(logical, O, prefill_k);
+        const std::vector<uint8_t> pair2_codes =
+            prefill_k % 256 == 0 ? pack_row4_pair2_codes(logical, O, prefill_k) : std::vector<uint8_t>{};
+        std::vector<uint16_t> scales((size_t) O);
+        for (int64_t row = 0; row < O; ++row) {
+            scales[(size_t) row] =
+                oracle_bf16_bits(row % 7 == 0 ? 0.0f : (row & 1 ? -1.0f : 1.0f) * (float) (1 + row % 5) / 32.0f);
+        }
+        const std::vector<float> input_seed    = make_input(prefill_k, 2);
+        const std::vector<float> expected_seed = oracle_row4_linear(input_seed, codes, scales, O, prefill_k, 2);
+        for (int64_t tokens : { 512, 544 }) {
+            std::vector<float> input((size_t) prefill_k * tokens);
+            std::vector<float> expected((size_t) O * tokens);
+            for (int64_t token = 0; token < tokens; ++token) {
+                memcpy(input.data() + token * prefill_k, input_seed.data() + (token % 2) * prefill_k,
+                       (size_t) prefill_k * sizeof(float));
+                memcpy(expected.data() + token * O, expected_seed.data() + (token % 2) * O, (size_t) O * sizeof(float));
+            }
+            for (bool pair2 : { false, true }) {
+                if (pair2 && pair2_codes.empty()) {
+                    continue;
+                }
+                std::vector<float> actual;
+                const std::string  label = std::string("Row4 preexpanded all-codes ") + (pair2 ? "pair2" : "v1") +
+                                           " K=" + std::to_string(prefill_k) + " B=" + std::to_string(tokens);
+                if (!run_operator_backend(actual, pair2 ? linear_kind::row4_pair2 : linear_kind::row4, input,
+                                          pair2 ? pair2_codes : codes, scales, {}, {}, O, prefill_k, tokens, nullptr,
+                                          false, metal) ||
+                    !compare_exact(label.c_str(), actual, expected)) {
+                    ok = false;
+                }
+            }
+        }
+    }
+
     // Real-K prefill cases. Row4 covers all 96 K tiles of ffn_down and
     // includes both the maximum sum and cancellation. W8 crosses four K1024
     // segments so an implementation cannot accidentally use one inexact F32
@@ -3437,6 +3512,14 @@ static bool test_metal_operator_matrix() {
         if (!m5_marker.pair2_cooperative_n64.load(std::memory_order_relaxed) ||
             !m5_marker.pair2_cooperative_n128.load(std::memory_order_relaxed)) {
             fprintf(stderr, "M5 TensorOps Pair2 M64 cooperative-store markers were not observed\n");
+            ok = false;
+        }
+        if (require_basis && !m5_marker.ternary_basis.load(std::memory_order_relaxed)) {
+            fprintf(stderr, "M5 TensorOps ternary-basis marker was not observed\n");
+            ok = false;
+        }
+        if (require_int2 && m5_marker.int2_tile_mask.load(std::memory_order_relaxed) != 15u) {
+            fprintf(stderr, "M5 TensorOps native INT2 M32/M64 tile markers were not all observed\n");
             ok = false;
         }
     }
@@ -4182,23 +4265,27 @@ namespace {
 struct cache_test_marker {
     std::atomic<int> builds{ 0 };
     std::atomic<int> uses{ 0 };
+    std::atomic<int> splits{ 0 };
 };
 
 void cache_test_log(enum ggml_log_level level, const char * text, void * user) {
     (void) level;
     auto & marker = *static_cast<cache_test_marker *>(user);
-    if (strstr(text, "Row4 persistent INT4 cache build:")) {
+    if (strstr(text, "Row4 persistent INT4 cache build:") || strstr(text, "Row4 persistent INT2 cache build:")) {
         ++marker.builds;
     }
-    if (strstr(text, "Row4 persistent INT4 cache reuse:")) {
+    if (strstr(text, "Row4 persistent INT4 cache reuse:") || strstr(text, "Row4 persistent INT2 cache reuse:")) {
         ++marker.uses;
+    }
+    if (strstr(text, "Row4 INT2 split-K decode:")) {
+        ++marker.splits;
     }
 }
 
-bool test_row4_cache_updates() {
+bool test_row4_cache_updates_shape(int o, int k, int b) {
     const char * strict = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
     if (!strict || strcmp(strict, "0") == 0) {
-        printf("  Metal Row4 persistent INT4 cache: SKIP (strict M5 suite only)\n");
+        printf("  Metal Row4 persistent weight cache: SKIP (strict M5 suite only)\n");
         return true;
     }
     ggml_backend_load_all();
@@ -4216,10 +4303,7 @@ bool test_row4_cache_updates() {
     if (!baseline || !candidate) {
         return false;
     }
-    bool          ok = true;
-    constexpr int o  = 128;
-    constexpr int k  = 512;
-    constexpr int b  = 512;
+    bool ok = true;
     for (int lifetime = 0; lifetime < 3 && ok; ++lifetime) {
         ggml_context *        weights = ggml_init({ 1024 * 1024, nullptr, true });
         ggml_tensor *         codes = ggml_new_tensor_4d(weights, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, o / 32);
@@ -4294,12 +4378,20 @@ bool test_row4_cache_updates() {
             ggml_log_set(nullptr, nullptr);
             ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
             const bool        expect_build = step == 0 || (step >= 2 && step <= 5) || step == 8;
-            const std::string label =
-                "Row4 INT4 cache lifetime=" + std::to_string(lifetime) + " step=" + std::to_string(step);
+            const std::string label        = "Row4 cache O=" + std::to_string(o) + " K=" + std::to_string(k) +
+                                             " B=" + std::to_string(b) + " lifetime=" + std::to_string(lifetime) +
+                                             " step=" + std::to_string(step);
             ok = compare_exact(label.c_str(), actual, expected) && ok;
             if (marker.uses != (cache_fallback ? 0 : 1) || marker.builds != (expect_build ? 1 : 0)) {
                 fprintf(stderr, "%s unexpected cache builds=%d uses=%d\n", label.c_str(), marker.builds.load(),
                         marker.uses.load());
+                ok = false;
+            }
+            const char * require_decode = getenv("LLAMA_ROW4_REQUIRE_INT2_DECODE_TESTS");
+            const bool expect_split = require_decode && strcmp(require_decode, "0") != 0 && !cache_fallback && b >= 4 &&
+                                      b <= 16 && ((k == 4096 && (o == 4096 || o == 6144)) || (k == 12288 && o == 4096));
+            if (marker.splits != (expect_split ? 1 : 0)) {
+                fprintf(stderr, "%s unexpected split-K dispatches=%d\n", label.c_str(), marker.splits.load());
                 ok = false;
             }
             printf("%s builds=%d uses=%d exact=%d\n", label.c_str(), marker.builds.load(), marker.uses.load(), ok);
@@ -4311,8 +4403,32 @@ bool test_row4_cache_updates() {
     }
     ggml_backend_free(candidate);
     ggml_backend_free(baseline);
-    printf("  Metal Row4 persistent INT4 cache: warm reuse, writes, aliases, graph gates, lifetimes - %s\n",
+    printf("  Metal Row4 persistent weight cache: warm reuse, writes, aliases, graph gates, lifetimes - %s\n",
            ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool test_row4_cache_updates() {
+    bool         ok             = test_row4_cache_updates_shape(128, 512, 512);
+    const char * require_decode = getenv("LLAMA_ROW4_REQUIRE_INT2_DECODE_TESTS");
+    if (require_decode && strcmp(require_decode, "0") != 0) {
+        // Cover padded gate-up tiles and every split-K decode geometry,
+        // including partial token tiles. The uncached backend remains an
+        // independent compressed-LUT reference. Each case also exercises
+        // cache invalidation, aliases, output/scratch lifetimes and reuse.
+        for (const auto & shape : {
+                 std::array<int, 3>{ 24576, 4096,  5  },
+                 { 24576, 4096,  9  },
+                 { 6144,  4096,  5  },
+                 { 6144,  4096,  16 },
+                 { 4096,  4096,  4  },
+                 { 4096,  4096,  12 },
+                 { 4096,  12288, 7  },
+                 { 4096,  12288, 16 }
+        }) {
+            ok = test_row4_cache_updates_shape(shape[0], shape[1], shape[2]) && ok;
+        }
+    }
     return ok;
 }
 

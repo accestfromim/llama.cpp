@@ -31,8 +31,10 @@ static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
 static const NSInteger MTLGPUFamilyApple10_GGML = 1010;
 static const MTLLanguageVersion MTLLanguageVersion4_0_GGML = (MTLLanguageVersion) (4 << 16);
+static const MTLLanguageVersion MTLLanguageVersion4_1_GGML = (MTLLanguageVersion) ((4 << 16) | 1);
 
 static void ggml_metal_device_disable_mpp_tensorops(ggml_metal_device_t dev);
+static void ggml_metal_device_disable_row4_int2(ggml_metal_device_t dev);
 
 static bool ggml_metal_env_flag(const char * name, bool default_value) {
     const char * value = getenv(name);
@@ -286,6 +288,12 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
 
                 if (ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
                     [prep setObject:@"1" forKey:@"GGML_METAL_HAS_MPP_TENSOROPS"];
+                    if (ggml_metal_device_get_props(dev)->row4_m5_ternary_basis) {
+                        [prep setObject:@"1" forKey:@"GGML_METAL_ROW4_M5_TERNARY_BASIS"];
+                    }
+                    if (ggml_metal_device_get_props(dev)->row4_m5_int2) {
+                        [prep setObject:@"1" forKey:@"GGML_METAL_ROW4_M5_INT2"];
+                    }
                 }
 
 #if GGML_METAL_EMBED_LIBRARY
@@ -295,12 +303,26 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                 MTLCompileOptions * options = [MTLCompileOptions new];
                 options.preprocessorMacros = prep;
                 if (ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
-                    options.languageVersion = MTLLanguageVersion4_0_GGML;
+                    options.languageVersion = ggml_metal_device_get_props(dev)->row4_m5_int2 ?
+                                                  MTLLanguageVersion4_1_GGML : MTLLanguageVersion4_0_GGML;
                 }
 
                 //[options setFastMathEnabled:false];
 
                 library = [device newLibraryWithSource:src options:options error:&error];
+                if (!library && ggml_metal_device_get_props(dev)->row4_m5_int2) {
+                    GGML_LOG_WARN("%s: INT2 source compile failed; retrying MSL 4.0 INT4 TensorOps: %s\n",
+                                  __func__, [[error description] UTF8String]);
+                    ggml_metal_device_disable_row4_int2(dev);
+                    [prep removeObjectForKey:@"GGML_METAL_ROW4_M5_INT2"];
+                    if (!ggml_metal_device_get_props(dev)->row4_m5_ternary_basis) {
+                        [prep removeObjectForKey:@"GGML_METAL_ROW4_M5_TERNARY_BASIS"];
+                    }
+                    options.preprocessorMacros = prep;
+                    options.languageVersion = MTLLanguageVersion4_0_GGML;
+                    error = nil;
+                    library = [device newLibraryWithSource:src options:options error:&error];
+                }
                 if (!library && ggml_metal_device_get_props(dev)->has_mpp_tensorops) {
                     GGML_LOG_WARN("%s: M5 MPP TensorOps source compile failed; retrying portable Metal path\n", __func__);
                     if (error) {
@@ -308,6 +330,8 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                     }
                     ggml_metal_device_disable_mpp_tensorops(dev);
                     [prep removeObjectForKey:@"GGML_METAL_HAS_MPP_TENSOROPS"];
+                    [prep removeObjectForKey:@"GGML_METAL_ROW4_M5_TERNARY_BASIS"];
+                    [prep removeObjectForKey:@"GGML_METAL_ROW4_M5_INT2"];
                     error = nil;
 
                     MTLCompileOptions * fallback_options = [MTLCompileOptions new];
@@ -514,6 +538,16 @@ struct ggml_metal_device {
 
 static void ggml_metal_device_disable_mpp_tensorops(ggml_metal_device_t dev) {
     dev->props.has_mpp_tensorops = false;
+    dev->props.row4_m5_ternary_basis = false;
+    dev->props.row4_m5_int2 = false;
+    dev->props.row4_m5_int2_decode = false;
+}
+
+static void ggml_metal_device_disable_row4_int2(ggml_metal_device_t dev) {
+    dev->props.row4_m5_int2 = false;
+    dev->props.row4_m5_int2_decode = false;
+    dev->props.row4_m5_ternary_basis = dev->props.has_mpp_tensorops &&
+        ggml_metal_env_flag("GGML_METAL_ROW4_M5_TERNARY_BASIS", false);
 }
 
 ggml_metal_device_t ggml_metal_device_init(void) {
@@ -579,6 +613,16 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             } else {
                 dev->props.has_mpp_tensorops = false;
             }
+            if (@available(macOS 27.0, iOS 27.0, tvOS 27.0, visionOS 27.0, *)) {
+                dev->props.row4_m5_int2 = dev->props.has_mpp_tensorops &&
+                    ggml_metal_env_flag("GGML_METAL_ROW4_M5_INT2", false);
+            }
+            // Native INT2 needs the exact ternary basis; retain the INT4
+            // control to isolate its reconstruction cost on either runtime.
+            dev->props.row4_m5_ternary_basis = dev->props.has_mpp_tensorops &&
+                (dev->props.row4_m5_int2 || ggml_metal_env_flag("GGML_METAL_ROW4_M5_TERNARY_BASIS", false));
+            dev->props.row4_m5_int2_decode = dev->props.row4_m5_int2 &&
+                ggml_metal_env_flag("GGML_METAL_ROW4_M5_INT2_DECODE", false);
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
             dev->props.max_working_set_size       = dev->mtl_device.recommendedMaxWorkingSetSize;
@@ -601,6 +645,8 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512",
+                    "kernel_row4_w1a8_m5_tensorops_preexpanded_m8n128_bk512",
+                    "kernel_row4_w1a8_m5_tensorops_preexpanded_m16n64_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
                     "kernel_row4_pair2_decode_o32_b2_shared",
                     "kernel_row4_pair2_decode_o32_b4_shared",
@@ -620,7 +666,24 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                     if (!ggml_metal_library_compile_pipeline(dev->library, name, name, NULL)) {
                         GGML_LOG_WARN(
                             "%s: M5 MPP TensorOps pipeline probe failed; using portable Row4 kernels\n", __func__);
-                        dev->props.has_mpp_tensorops = false;
+                        ggml_metal_device_disable_mpp_tensorops(dev);
+                        break;
+                    }
+                }
+            }
+
+            if (dev->props.row4_m5_int2_decode) {
+                const char * const decode_pipeline_names[] = {
+                    "kernel_row4_m5_decode_split_m8n128_sg4",
+                    "kernel_row4_m5_decode_split_m16n64_sg4",
+                    "kernel_row4_m5_decode_split_m8n64_sg1",
+                    "kernel_row4_m5_decode_split_reduce",
+                };
+                for (size_t i = 0; i < sizeof(decode_pipeline_names) / sizeof(decode_pipeline_names[0]); ++i) {
+                    const char * name = decode_pipeline_names[i];
+                    if (!ggml_metal_library_compile_pipeline(dev->library, name, name, NULL)) {
+                        GGML_LOG_WARN("%s: INT2 split-K pipeline probe failed; using original decode paths\n", __func__);
+                        dev->props.row4_m5_int2_decode = false;
                         break;
                     }
                 }
@@ -1237,6 +1300,11 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
     return &dev->props;
 }
 
+size_t ggml_metal_device_row4_preexpanded_size(ggml_metal_device_t dev, int32_t m, int32_t k) {
+    // Match the shader's 128-byte INT2 row stride, including non-power-of-two O.
+    return dev->props.row4_m5_int2 ? GGML_PAD((size_t) m, 512) * (size_t) k / 4 : (size_t) m * (size_t) k / 2;
+}
+
 //
 // device buffers
 //
@@ -1268,6 +1336,8 @@ static size_t ggml_metal_row4_cache_bucket(uintptr_t address) {
 struct ggml_metal_row4_cache {
     uintptr_t address;
     size_t source_bytes;
+    size_t bytes;
+    int weight_bits;
     int32_t k;
     int32_t m;
     bool valid;
@@ -1355,8 +1425,8 @@ bool ggml_metal_row4_cache_batch_finish(ggml_metal_row4_cache_batch_t batch, boo
                 cache->pending = NULL;
                 cache->valid = completed && cache->generation == entry->generation;
                 if (cache->valid) {
-                    GGML_LOG_INFO("Row4 persistent INT4 cache build: %s O=%d K=%d bytes=%zu total_bytes=%zu batched=1\n",
-                                  entry->name, cache->m, cache->k, (size_t) cache->m * cache->k / 2,
+                    GGML_LOG_INFO("Row4 persistent INT%d cache build: %s O=%d K=%d bytes=%zu total_bytes=%zu batched=1\n",
+                                  cache->weight_bits, entry->name, cache->m, cache->k, cache->bytes,
                                   entry->owner->row4_cache_bytes);
                 } else {
                     ok = false;
@@ -1369,7 +1439,7 @@ bool ggml_metal_row4_cache_batch_finish(ggml_metal_row4_cache_batch_t batch, boo
         entry = next;
     }
     if (ok && batch->count) {
-        GGML_LOG_INFO("Row4 persistent INT4 cache batch: matrices=%zu bytes=%zu elapsed_ms=%.3f\n",
+        GGML_LOG_INFO("Row4 persistent weight cache batch: matrices=%zu bytes=%zu elapsed_ms=%.3f\n",
                       batch->count, batch->bytes, elapsed_ms);
     }
     [batch->encoder release];
@@ -2067,7 +2137,7 @@ static struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_impl(
             return none;
         }
         const int64_t start = ggml_time_us();
-        const size_t bytes = (size_t) m * k / 2;
+        const size_t bytes = ggml_metal_device_row4_preexpanded_size(dev, m, k);
         if (!cache) {
             // Keep the opt-in cache bounded per source buffer. Query memory
             // through the common device API so older Metal targets fall back.
@@ -2089,6 +2159,8 @@ static struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_impl(
             }
             cache->address = (uintptr_t) codes->data;
             cache->source_bytes = ggml_nbytes(codes);
+            cache->bytes = bytes;
+            cache->weight_bits = dev->props.row4_m5_int2 ? 2 : 4;
             cache->k = k;
             cache->m = m;
             cache->storage = storage;
@@ -2153,8 +2225,9 @@ static struct ggml_metal_buffer_id ggml_metal_buffer_get_row4_cache_impl(
             return none;
         }
         cache->valid = true;
-        GGML_LOG_INFO("Row4 persistent INT4 cache build: %s O=%d K=%d bytes=%zu total_bytes=%zu elapsed_ms=%.3f\n",
-                      codes->name, m, k, bytes, buf->row4_cache_bytes, (ggml_time_us() - start) / 1000.0);
+        GGML_LOG_INFO("Row4 persistent INT%d cache build: %s O=%d K=%d bytes=%zu total_bytes=%zu elapsed_ms=%.3f\n",
+                      cache->weight_bits, codes->name, m, k, bytes, buf->row4_cache_bytes,
+                      (ggml_time_us() - start) / 1000.0);
         return (struct ggml_metal_buffer_id) { cache->storage->buffers[0].metal, 0 };
     }
 }
