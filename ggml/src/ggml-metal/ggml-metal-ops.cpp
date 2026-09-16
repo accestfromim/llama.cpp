@@ -2246,7 +2246,8 @@ static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(b
                                                                                int32_t act_rows,
                                                                                int32_t m,
                                                                                int32_t k,
-                                                                               bool    int2) {
+                                                                               bool    int2,
+                                                                               bool    cached_decode = false) {
     constexpr int32_t max_i32_accumulation_k = std::numeric_limits<int32_t>::max() / (127 * 2);
     const uint64_t    packed_source_bytes =
         m > 0 && k > 0 ? (uint64_t) m * (uint64_t) k / 8 : std::numeric_limits<uint64_t>::max();
@@ -2289,6 +2290,29 @@ static ggml_metal_row4_m5_tensorops_config ggml_metal_row4_m5_tensorops_select(b
             4,
             true,
         };
+    }
+    // Only consume a ready, buffer-owned cache for small batches. Rebuilding
+    // expanded weights per decode step would erase the compute savings.
+    if (int2 && cached_decode && layout == 2 && act_rows >= 4 && act_rows <= 16 && m >= 4096 && m % 128 == 0 &&
+        k >= 4096 && k % 512 == 0) {
+        if (m >= 16384 && k == 4096) {
+            return { act_rows <= 8 ? "kernel_row4_w1a8_m5_tensorops_preexpanded_m8n128_bk512" :
+                                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512",
+                     act_rows <= 8 ? "M5 MPP TensorOps exact A8/I4/I32 M8N128 BK512 cached multi-decode" :
+                                     "M5 MPP TensorOps exact A8/I4/I32 M32N128 BK512 cached multi-decode",
+                     act_rows <= 8 ? 8 : 32,
+                     128,
+                     4,
+                     true };
+        }
+        if (act_rows >= 12) {
+            return { "kernel_row4_w1a8_m5_tensorops_preexpanded_m16n64_bk512",
+                     "M5 MPP TensorOps exact A8/I4/I32 M16N64 BK512 cached multi-decode",
+                     16,
+                     64,
+                     4,
+                     true };
+        }
     }
     // Small Pair2 batches favor LUTs except for wide projections, where a
     // full MPP token tile amortizes the online codebook expansion.
@@ -2432,7 +2456,8 @@ bool ggml_metal_op_prepare_row4_cache(ggml_metal_device_t  dev,
         const int32_t k      = ggml_get_op_params_i32(op, 2);
         const int32_t m      = ggml_get_op_params_i32(op, 1);
         const auto *  props  = ggml_metal_device_get_props(dev);
-        const auto    config = ggml_metal_row4_m5_tensorops_select(true, false, 2, rows, m, k, props->row4_m5_int2);
+        const auto    config = ggml_metal_row4_m5_tensorops_select(true, false, 2, rows, m, k, props->row4_m5_int2,
+                                                                   props->row4_m5_int2_decode);
         if (!config.preexpanded_weights) {
             continue;
         }
@@ -2466,7 +2491,8 @@ size_t ggml_metal_op_row_quant_linear_extra_act_q(ggml_metal_device_t dev, const
                 k <= (size_t) std::numeric_limits<int32_t>::max() ?
             ggml_metal_row4_m5_tensorops_select(ggml_metal_device_get_props(dev)->has_mpp_tensorops, false, layout,
                                                 (int32_t) act_rows, ggml_get_op_params_i32(op, 1), (int32_t) k,
-                                                ggml_metal_device_get_props(dev)->row4_m5_int2) :
+                                                ggml_metal_device_get_props(dev)->row4_m5_int2,
+                                                ggml_metal_device_get_props(dev)->row4_m5_int2_decode) :
             ggml_metal_row4_m5_tensorops_config{};
     const int    w8_row_tile = ggml_metal_w8_m5_row_tile(dev, op);
     const size_t staged_rows = m5_tensorops.pipeline_name ?
@@ -2769,11 +2795,12 @@ static int ggml_metal_op_row_quant_linear_impl(ggml_metal_op_t      ctx,
                                        (act_rows < 4 || row4_problem_size <= 64U * 1024U * 1024U);
     const bool w8_independent_rows =
         op->op == GGML_OP_W8A8_LINEAR && act_rows >= 2 && act_rows <= 4 && m % 128 == 0 && k % 128 == 0;
-    const ggml_metal_row4_m5_tensorops_config row4_m5_tensorops =
-        ggml_metal_row4_m5_tensorops_select(op->op == GGML_OP_ROW4_LINEAR && !row4_independent_rows &&
-                                                ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops,
-                                            qat_residual_add != nullptr && act_rows == 1, layout, act_rows, m, k,
-                                            ggml_metal_device_get_props(ctx->dev)->row4_m5_int2);
+    const ggml_metal_row4_m5_tensorops_config row4_m5_tensorops = ggml_metal_row4_m5_tensorops_select(
+        op->op == GGML_OP_ROW4_LINEAR && !row4_independent_rows &&
+            ggml_metal_device_get_props(ctx->dev)->has_mpp_tensorops,
+        qat_residual_add != nullptr && act_rows == 1, layout, act_rows, m, k,
+        ggml_metal_device_get_props(ctx->dev)->row4_m5_int2,
+        ctx->use_row4_cache && ggml_metal_device_get_props(ctx->dev)->row4_m5_int2_decode);
     const bool row4_m5_tensorops_prefill = row4_m5_tensorops.pipeline_name != nullptr;
     const bool    row4_pair2_independent_rows = op->op == GGML_OP_ROW4_LINEAR && layout == 2 && act_rows >= 2 &&
                                                 act_rows <= 16 && m % 32 == 0 && k % 256 == 0 &&

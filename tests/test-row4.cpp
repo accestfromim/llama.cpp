@@ -4278,10 +4278,10 @@ void cache_test_log(enum ggml_log_level level, const char * text, void * user) {
     }
 }
 
-bool test_row4_cache_updates() {
+bool test_row4_cache_updates_shape(int o, int k, int b) {
     const char * strict = getenv("LLAMA_ROW4_REQUIRE_M5_TENSOROPS_TESTS");
     if (!strict || strcmp(strict, "0") == 0) {
-        printf("  Metal Row4 persistent INT4 cache: SKIP (strict M5 suite only)\n");
+        printf("  Metal Row4 persistent weight cache: SKIP (strict M5 suite only)\n");
         return true;
     }
     ggml_backend_load_all();
@@ -4299,10 +4299,7 @@ bool test_row4_cache_updates() {
     if (!baseline || !candidate) {
         return false;
     }
-    bool          ok = true;
-    constexpr int o  = 128;
-    constexpr int k  = 512;
-    constexpr int b  = 512;
+    bool ok = true;
     for (int lifetime = 0; lifetime < 3 && ok; ++lifetime) {
         ggml_context *        weights = ggml_init({ 1024 * 1024, nullptr, true });
         ggml_tensor *         codes = ggml_new_tensor_4d(weights, GGML_TYPE_ROW4_CODES_PAIR2, 128, 8, k / 256, o / 32);
@@ -4377,8 +4374,9 @@ bool test_row4_cache_updates() {
             ggml_log_set(nullptr, nullptr);
             ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
             const bool        expect_build = step == 0 || (step >= 2 && step <= 5) || step == 8;
-            const std::string label =
-                "Row4 INT4 cache lifetime=" + std::to_string(lifetime) + " step=" + std::to_string(step);
+            const std::string label        = "Row4 cache O=" + std::to_string(o) + " K=" + std::to_string(k) +
+                                             " B=" + std::to_string(b) + " lifetime=" + std::to_string(lifetime) +
+                                             " step=" + std::to_string(step);
             ok = compare_exact(label.c_str(), actual, expected) && ok;
             if (marker.uses != (cache_fallback ? 0 : 1) || marker.builds != (expect_build ? 1 : 0)) {
                 fprintf(stderr, "%s unexpected cache builds=%d uses=%d\n", label.c_str(), marker.builds.load(),
@@ -4394,8 +4392,27 @@ bool test_row4_cache_updates() {
     }
     ggml_backend_free(candidate);
     ggml_backend_free(baseline);
-    printf("  Metal Row4 persistent INT4 cache: warm reuse, writes, aliases, graph gates, lifetimes - %s\n",
+    printf("  Metal Row4 persistent weight cache: warm reuse, writes, aliases, graph gates, lifetimes - %s\n",
            ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool test_row4_cache_updates() {
+    bool         ok             = test_row4_cache_updates_shape(128, 512, 512);
+    const char * require_decode = getenv("LLAMA_ROW4_REQUIRE_INT2_DECODE_TESTS");
+    if (require_decode && strcmp(require_decode, "0") != 0) {
+        // Cover both padded M8/M32 gate-up and M16 QKV/O/down tiles. The
+        // uncached backend remains an independent compressed-LUT reference.
+        for (const auto & shape : {
+                 std::array<int, 3>{ 24576, 4096,  5  },
+                 { 24576, 4096,  9  },
+                 { 6144,  4096,  16 },
+                 { 4096,  4096,  12 },
+                 { 4096,  12288, 16 }
+        }) {
+            ok = test_row4_cache_updates_shape(shape[0], shape[1], shape[2]) && ok;
+        }
+    }
     return ok;
 }
 

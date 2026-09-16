@@ -540,10 +540,12 @@ static void ggml_metal_device_disable_mpp_tensorops(ggml_metal_device_t dev) {
     dev->props.has_mpp_tensorops = false;
     dev->props.row4_m5_ternary_basis = false;
     dev->props.row4_m5_int2 = false;
+    dev->props.row4_m5_int2_decode = false;
 }
 
 static void ggml_metal_device_disable_row4_int2(ggml_metal_device_t dev) {
     dev->props.row4_m5_int2 = false;
+    dev->props.row4_m5_int2_decode = false;
     dev->props.row4_m5_ternary_basis = dev->props.has_mpp_tensorops &&
         ggml_metal_env_flag("GGML_METAL_ROW4_M5_TERNARY_BASIS", false);
 }
@@ -619,6 +621,8 @@ ggml_metal_device_t ggml_metal_device_init(void) {
             // control to isolate its reconstruction cost on either runtime.
             dev->props.row4_m5_ternary_basis = dev->props.has_mpp_tensorops &&
                 (dev->props.row4_m5_int2 || ggml_metal_env_flag("GGML_METAL_ROW4_M5_TERNARY_BASIS", false));
+            dev->props.row4_m5_int2_decode = dev->props.row4_m5_int2 &&
+                ggml_metal_env_flag("GGML_METAL_ROW4_M5_INT2_DECODE", false);
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
             dev->props.max_working_set_size       = dev->mtl_device.recommendedMaxWorkingSetSize;
@@ -641,6 +645,8 @@ ggml_metal_device_t ggml_metal_device_init(void) {
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n64_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m64n128_bk512",
+                    "kernel_row4_w1a8_m5_tensorops_preexpanded_m8n128_bk512",
+                    "kernel_row4_w1a8_m5_tensorops_preexpanded_m16n64_bk512",
                     "kernel_row4_w1a8_m5_tensorops_prefill_m32n128",
                     "kernel_row4_pair2_decode_o32_b2_shared",
                     "kernel_row4_pair2_decode_o32_b4_shared",

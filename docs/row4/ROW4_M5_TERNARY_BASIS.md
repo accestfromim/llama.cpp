@@ -85,3 +85,5 @@ pp128/tg128 use ten samples per mode; pp512/pp2048 use six. B1 dispatch is uncha
 Experiments and raw logs are saved in `/Users/1806-admin/row4-int2-opt-20260915/`, including standalone layout probes, kernel sweeps, whole-model bitwise comparisons, build/static checks, and balanced benchmarks. The Chinese report in that directory records the machine, source revision, commands, final measurements, and scope of each result. The pp128 gain includes lowering the preexpansion threshold and changing the tile/dispatch path; it is not an isolated measurement of INT2 arithmetic throughput.
 
 The earlier 2026-09-08 INT4-only control on macOS 26.5.1 showed no speedup. That historical experiment is retained in `/Users/1806-admin/row4-int2-prefill-20260908/`; its results do not measure native INT2.
+
+Cached multi-stream decode is an additional opt-in path described in [the cached decode guide](ROW4_M5_INT2_CACHED_DECODE.md).

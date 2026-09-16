@@ -195,6 +195,7 @@ struct ggml_metal_device_props {
     bool has_mpp_tensorops;
     bool row4_m5_ternary_basis;
     bool row4_m5_int2;
+    bool row4_m5_int2_decode;
 };
 
 ggml_metal_device_t ggml_metal_device_init(void);

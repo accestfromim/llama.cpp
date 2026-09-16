@@ -1458,7 +1458,7 @@ constexpr constant static ushort k_row4_m5_packed_ternary_codebook[16] = {
 template<typename T>
 static inline void row4_m5_reconstruct(thread T & acc) {
     // Validated on M5 / MSL 4.1 for M32N128 SG4, M64N64 SG4 and M64N128
-    // SG8: each output quartet stays within one thread.
+    // SG8, plus M8N128/M16N64 SG4: each output quartet stays within one thread.
     #pragma unroll
     for (uint16_t i = 0; i < acc.get_capacity(); i += 4) {
         if (acc.is_valid_element(i)) {
@@ -1604,7 +1604,7 @@ kernel void kernel_row4_m5_preexpand_int4_pair2(
 // Large prefills amortize one complete Row4 expansion across many token tiles.
 // Keep the cooperative INT32 accumulator live across K and write through the
 // same exact scale/BF16 epilogue as every other Row4 path.
-template<int k_tile>
+template<int k_tile, int row_tile = 32, int output_tile = 128>
 static inline void row4_m5_prefill_preexpanded_impl(
         constant ggml_metal_kargs_row_quant_linear & args,
         device int8_t * act_q,
@@ -1613,8 +1613,6 @@ static inline void row4_m5_prefill_preexpanded_impl(
         device const ushort * scales,
         device float * dst,
         uint3 tgpig) {
-    constexpr int row_tile    = 32;
-    constexpr int output_tile = 128;
     constexpr auto desc = matmul2d_descriptor(
         row_tile,
         output_tile,
@@ -1668,7 +1666,7 @@ static inline void row4_m5_prefill_preexpanded_impl(
     }
 }
 
-#define ROW4_M5_PREFILL_PREEXPANDED(name, bk) \
+#define ROW4_M5_PREFILL_PREEXPANDED(name, bk, rm, cn) \
 kernel void name( \
         constant ggml_metal_kargs_row_quant_linear & args [[buffer(0)]], \
         device int8_t * act_q [[buffer(1)]], \
@@ -1677,11 +1675,13 @@ kernel void name( \
         device const ushort * scales [[buffer(4)]], \
         device float * dst [[buffer(5)]], \
         uint3 tgpig [[threadgroup_position_in_grid]]) { \
-    row4_m5_prefill_preexpanded_impl<bk>(args, act_q, weight_i4, act_scales, scales, dst, tgpig); \
+    row4_m5_prefill_preexpanded_impl<bk, rm, cn>(args, act_q, weight_i4, act_scales, scales, dst, tgpig); \
 }
 
-ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128, 128)
-ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512, 512)
+ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128, 128, 32, 128)
+ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_prefill_preexpanded_m32n128_bk512, 512, 32, 128)
+ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_preexpanded_m8n128_bk512, 512, 8, 128)
+ROW4_M5_PREFILL_PREEXPANDED(kernel_row4_w1a8_m5_tensorops_preexpanded_m16n64_bk512, 512, 16, 64)
 #undef ROW4_M5_PREFILL_PREEXPANDED
 
 // Full M64 tiles can write the exact BF16 epilogue through the cooperative
